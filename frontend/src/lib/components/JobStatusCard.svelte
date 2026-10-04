@@ -1,9 +1,10 @@
 <script lang="ts">
   /**
    * Where a job stands, on a row of its own above the headline figures: the
-   * status badge and what it means for this job -- who is being offered its
-   * tasks, or, once finished, when and why it finished. The why used to be a
-   * note above the figures, apart from the status it explained.
+   * status badge and what it means for this job -- whether its tasks are
+   * being offered, or, once finished, when and why it finished. The why used
+   * to be a note above the figures, apart from the status it explained. Its
+   * allocation is a card of its own, so this says nothing of it.
    */
   import type { JobStats } from '$lib/api';
   import { completionText, datetime, sprtLabel, sprtState } from '$lib/format';
@@ -26,15 +27,14 @@
         : ''}: {completionText(stats)}.
     {:else if status === 'active'}
       {#if allocation}
-        Workers are being offered its tasks: it gets {allocation}% of the claims the active jobs
-        share.
+        Workers are being offered its tasks.
       {:else}
-        Active at 0%: no worker is offered its tasks until its allocation is raised.
+        Active, but no worker is being offered its tasks.
       {/if}
     {:else}
       Paused: no worker is offered its tasks{allocation === null
         ? '. It has not been activated yet'
-        : ` until it is activated again (it was at ${allocation}%)`}.
+        : ' until it is activated again'}.
     {/if}
     {#if test}
       <span class="text-muted-foreground">Its SPRT is {sprtLabel(test)} (see the SPRT card).</span>

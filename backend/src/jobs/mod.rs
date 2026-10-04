@@ -700,9 +700,9 @@ pub(crate) async fn insert_game_results(
               p1_score_mean, p1_score_sd, p2_score_mean, p2_score_sd,
               pent_0, pent_1, pent_2, pent_3, pent_4,
               divergent_games, divergent_wins, divergent_losses, divergent_ties,
-              submitted_at)
+              divergent_p1_score_mean, divergent_p2_score_mean, submitted_at)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
-                 clock_timestamp())",
+                 $21,$22,clock_timestamp())",
     )
     .bind(claim_id)
     .bind(task_id)
@@ -724,6 +724,8 @@ pub(crate) async fn insert_game_results(
     .bind(divergent.map(|d| d.wins))
     .bind(divergent.map(|d| d.losses))
     .bind(divergent.map(|d| d.ties))
+    .bind(divergent.map(|d| d.p1_score_mean))
+    .bind(divergent.map(|d| d.p2_score_mean))
     .execute(&mut *conn)
     .await?;
 

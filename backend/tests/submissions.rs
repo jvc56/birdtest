@@ -52,7 +52,10 @@ async fn game_result_row(db: &TestDb, job: Uuid) -> serde_json::Map<String, Valu
 }
 
 const PENTANOMIAL: [&str; 5] = ["pent_0", "pent_1", "pent_2", "pent_3", "pent_4"];
-const DIVERGENT: [&str; 4] = ["divergent_games", "divergent_wins", "divergent_losses", "divergent_ties"];
+const DIVERGENT: [&str; 6] = [
+    "divergent_games", "divergent_wins", "divergent_losses", "divergent_ties",
+    "divergent_p1_score_mean", "divergent_p2_score_mean",
+];
 
 /// I-SUBMIT-1: a `games` result inserts exactly one `game_results` row with
 /// its counts, and NULL in every pentanomial and divergent column -- even when
@@ -151,8 +154,8 @@ async fn a_pairs_result_stores_its_pentanomial_and_the_schema_refuses_a_contradi
     for (column, expected) in PENTANOMIAL.iter().zip([0, 0, 1, 0, 1]) {
         assert_eq!(row[*column], expected, "{column}: {row:?}");
     }
-    for (column, expected) in DIVERGENT.iter().zip([2, 2, 0, 0]) {
-        assert_eq!(row[*column], expected, "{column}: {row:?}");
+    for (column, expected) in DIVERGENT.iter().zip([2.0, 2.0, 0.0, 0.0, 420.0, 410.0]) {
+        assert_eq!(row[*column].as_f64(), Some(expected), "{column}: {row:?}");
     }
 
     // One extra pair in a bucket: three pairs for four games.

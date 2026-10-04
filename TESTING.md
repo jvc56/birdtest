@@ -724,14 +724,15 @@ Each entry's tests are the `describe` block named for its id.
   *(Covered: `format.test.ts`, `F-FMT-5b sprtState`.)*
 - `F-FMT-5` `sprtLabel` covers all four statuses. *(Covered:
   `format.test.ts`.)*
-- `F-MATCH-1` The match score table's rows, a column per player: wins
-  (player 2's are player 1's losses), draws, score W + ½D (no ".0" when whole)
-  and that as a share of the games, the average scores to a decimal place and
-  the spread signed from each player's side ("+13.4" / "-13.4", never "-0.0");
-  before any game, none of them rather than 0 or NaN. *(Covered:
-  `matchScore.test.ts`.)*
-- `F-CMP-1` A two-player table marks the higher value of a row higher (green)
-  and the other lower (red), and neither when they are equal or one is
+- `F-MATCH-1` The match score table's rows, a column per player: wins,
+  losses (player 2's wins and losses are player 1's losses and wins, and
+  fewer losses are better), draws, the average scores to a decimal place and
+  the spread signed from each player's side ("+13.4" / "-13.4", never
+  "-0.0"); before any game, no average rather than 0 or NaN. The same rows
+  serve a pairs job's divergent-games table. *(Covered: `matchScore.test.ts`.)*
+- `F-CMP-1` A two-player table marks the better value of a row better (green)
+  and the other worse (red) -- the higher, or the lower where the row says
+  fewer is better (losses) -- and neither when they are equal or one is
   missing. *(Covered: `compare.test.ts`.)*
 - `F-SET-1` The settings tables (`lib/jobSettings.ts`), in SETTINGS_COMPARISON.md's
   orders. A job's settings are one ordered list, the key rows first (type,
@@ -1796,7 +1797,11 @@ permanent.
   `units_completed` equals the pair count — **not** the divergent count.
   *(Covered: `stats::a_pairs_jobs_stats_sum_the_pentanomial_and_count_every_pair`.)*
 - `I-STATS-3` `divergent_pairs` is reported and is not what SPRT consumed.
-  *(Covered: `stats::divergent_pairs_are_reported_but_not_tested`.)*
+  The divergent games also get a match score of their own -- their wins,
+  losses and draws, and each player's mean score weighted by the divergent
+  games, from the means MAGPIE reports for the subset (`game_results.
+  divergent_p1_score_mean` / `_p2_`) -- which the job page shows beside the
+  full one. *(Covered: `stats::divergent_pairs_are_reported_but_not_tested`.)*
 - `I-STATS-1b` Each player's average score and the spread are the batches'
   means weighted by their games, for games and pairs jobs alike (10 games at
   400-380 and 30 at 440-450 are 430-432.5, spread -2.5; unweighted, 420-415).

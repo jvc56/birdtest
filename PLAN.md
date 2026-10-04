@@ -925,7 +925,10 @@ JobStats {
                        min_magpie_version, created_at, created_by, lexicon, variant }
   tasks_total, tasks_completed, tasks_available, tasks_claimed, results_accepted
   games?:            { unit: "game" | "pair", wins, losses, draws,
-                       units_completed, pentanomial?, divergent_pairs?, min_units, max_units,
+                       units_completed, pentanomial?, divergent_pairs?,
+                       divergent?: { wins, losses, draws, p1_score_mean, p2_score_mean,
+                                     spread_mean },   // pairs: the games that diverged
+                       min_units, max_units,
                        p1_score_mean, p2_score_mean, spread_mean,   // null before any game
                        win_pct, loss_pct, draw_pct,
                        sprt: { llr, lower_bound, upper_bound, status } | null,
@@ -7067,17 +7070,23 @@ CREATE TABLE game_results (
 
     -- The divergent subset: pairs whose two games did not play identically.
     -- Kept as a *diagnostic* -- it says how often two configs actually differ,
-    -- which is worth showing -- and deliberately not used as a statistical
-    -- sample. NULL for `games` jobs.
+    -- and how they fare where they do, which the job page shows as a match
+    -- score of its own -- and deliberately not used as a statistical sample.
+    -- Each player's mean score over the subset's games, as MAGPIE reports it
+    -- (0 when no pair diverged). NULL for `games` jobs.
     divergent_games   INT CHECK (divergent_games >= 0),
     divergent_wins    INT CHECK (divergent_wins >= 0),
     divergent_losses  INT CHECK (divergent_losses >= 0),
     divergent_ties    INT CHECK (divergent_ties >= 0),
+    divergent_p1_score_mean DOUBLE PRECISION,
+    divergent_p2_score_mean DOUBLE PRECISION,
     CONSTRAINT game_results_divergent_all_or_nothing CHECK (
         (divergent_games IS NULL AND divergent_wins IS NULL
-             AND divergent_losses IS NULL AND divergent_ties IS NULL)
+             AND divergent_losses IS NULL AND divergent_ties IS NULL
+             AND divergent_p1_score_mean IS NULL AND divergent_p2_score_mean IS NULL)
         OR (divergent_games IS NOT NULL AND divergent_wins IS NOT NULL
              AND divergent_losses IS NOT NULL AND divergent_ties IS NOT NULL
+             AND divergent_p1_score_mean IS NOT NULL AND divergent_p2_score_mean IS NOT NULL
              AND divergent_wins + divergent_losses + divergent_ties = divergent_games
              AND divergent_games <= games)
     ),

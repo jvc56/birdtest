@@ -106,6 +106,11 @@ pub struct GameStats {
     /// two configs actually differ — and not part of the test.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub divergent_pairs: Option<u64>,
+    /// Game pairs only: the match score over the games of the pairs that
+    /// diverged -- where the two configs actually played differently. A
+    /// diagnostic beside the full score, like `divergent_pairs`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub divergent: Option<MatchTally>,
     pub min_units: i32,
     pub max_units: i32,
     pub win_pct: f64,
@@ -667,6 +672,18 @@ async fn plain_game_stats(conn: &mut PgConnection, job: &Job) -> AppResult<GameS
 ///
 /// The per-game win/loss/tie tally is still reported for display, and the
 /// divergent counts alongside it as a diagnostic. Neither drives the test.
+/// Player 1's record over some games, and each player's mean score and player
+/// 1's spread over them (`None` before any).
+#[derive(Debug, Serialize)]
+pub struct MatchTally {
+    pub wins: u64,
+    pub losses: u64,
+    pub draws: u64,
+    pub p1_score_mean: Option<f64>,
+    pub p2_score_mean: Option<f64>,
+    pub spread_mean: Option<f64>,
+}
+
 async fn game_pair_stats(conn: &mut PgConnection, job: &Job) -> AppResult<GameStats> {
     let config =
         sqlx::query_as::<_, GamePairConfig>("SELECT * FROM job_game_pair_config WHERE job_id = $1")
@@ -685,6 +702,13 @@ async fn game_pair_stats(conn: &mut PgConnection, job: &Job) -> AppResult<GameSt
                 COALESCE(SUM(r.pent_3), 0)::bigint           AS pent_3,
                 COALESCE(SUM(r.pent_4), 0)::bigint           AS pent_4,
                 COALESCE(SUM(r.divergent_games), 0)::bigint  AS divergent_games,
+                COALESCE(SUM(r.divergent_wins), 0)::bigint   AS divergent_wins,
+                COALESCE(SUM(r.divergent_losses), 0)::bigint AS divergent_losses,
+                COALESCE(SUM(r.divergent_ties), 0)::bigint   AS divergent_ties,
+                SUM(r.divergent_games * r.divergent_p1_score_mean)
+                    / NULLIF(SUM(r.divergent_games), 0)      AS divergent_p1_mean,
+                SUM(r.divergent_games * r.divergent_p2_score_mean)
+                    / NULLIF(SUM(r.divergent_games), 0)      AS divergent_p2_mean,
                 {SCORE_MEANS}
          FROM ({GAME_RESULTS}) r"
     ))
@@ -707,7 +731,17 @@ async fn game_pair_stats(conn: &mut PgConnection, job: &Job) -> AppResult<GameSt
     // could.
     let pairs_played = pentanomial.pairs();
     let sample = Sample::from_pentanomial(&pentanomial);
-    Ok(build_game_stats(
+    let (p1, p2): (Option<f64>, Option<f64>) =
+        (row.get("divergent_p1_mean"), row.get("divergent_p2_mean"));
+    let divergent = MatchTally {
+        wins: row.get::<i64, _>("divergent_wins") as u64,
+        losses: row.get::<i64, _>("divergent_losses") as u64,
+        draws: row.get::<i64, _>("divergent_ties") as u64,
+        p1_score_mean: p1,
+        p2_score_mean: p2,
+        spread_mean: p1.zip(p2).map(|(p1, p2)| p1 - p2),
+    };
+    let mut stats = build_game_stats(
         "pair",
         tally,
         sample,
@@ -716,7 +750,9 @@ async fn game_pair_stats(conn: &mut PgConnection, job: &Job) -> AppResult<GameSt
         Some(counts),
         Some(row.get::<i64, _>("divergent_games") as u64 / 2),
         &SprtParams::from(&config),
-    ))
+    );
+    stats.divergent = Some(divergent);
+    Ok(stats)
 }
 
 /// Each player's mean score per game over the rows of
@@ -784,6 +820,7 @@ fn build_game_stats(
         spread_mean: scores.p1.zip(scores.p2).map(|(p1, p2)| p1 - p2),
         pentanomial,
         divergent_pairs,
+        divergent: None,
         min_units: params.min_units,
         max_units: params.max_units,
         win_pct: pct(tally.wins),

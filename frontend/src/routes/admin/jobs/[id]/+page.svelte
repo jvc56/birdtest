@@ -629,7 +629,7 @@
       {:else}
         <ProgressBar value={stats.tasks_completed} max={stats.tasks_total} label="tasks completed" />
       {/if}
-      <TaskCounts {stats} {config} />
+      <TaskCounts {stats} />
     </div>
 
     {#if config}

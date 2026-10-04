@@ -270,6 +270,19 @@ export interface GameStats {
   pentanomial?: [number, number, number, number, number];
   /** Game pairs only: how many pairs diverged. A diagnostic, not the sample. */
   divergent_pairs?: number;
+  /**
+   * Game pairs only: the match score over the games of the pairs that
+   * diverged, where the two configs played differently. A diagnostic beside
+   * the full score.
+   */
+  divergent?: {
+    wins: number;
+    losses: number;
+    draws: number;
+    p1_score_mean: number | null;
+    p2_score_mean: number | null;
+    spread_mean: number | null;
+  };
   min_units: number;
   max_units: number;
   win_pct: number;

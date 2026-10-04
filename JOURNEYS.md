@@ -134,23 +134,22 @@ Open "dev game pairs (first divergences saved)".
 - [ ] **Expect** the job's name as the title with "Game pairs" beside it, then
   "CSW24 · classic · static, by equity vs static, by score".
 - [ ] **Expect** a full-width Status card: the badge ("active") and beside it
-  "Workers are being offered its tasks: it gets 25% of the claims the active
-  jobs share." and "Its SPRT is running (see the SPRT card)." (Inactive:
-  "Paused: no worker is offered its tasks …".)
+  "Workers are being offered its tasks." and "Its SPRT is running (see the
+  SPRT card)." -- nothing about its allocation, which has its own card.
+  (Inactive: "Paused: no worker is offered its tasks until it is activated
+  again.")
 - [ ] **Expect** under it three cards in a row: Allocation, Tasks completed and
   Estimated time left.
 - [ ] **Expect** a Progress card: a bar of "pairs completed", then **Tasks**
-  saying a task is one batch handed to a worker ("1 pair") and that tasks are
-  made as workers ask, with Waiting to be reissued / In progress / Done counts,
-  each explained under it; then "Created by dev, <date>" and "requires MAGPIE ≥ …".
+  with Waiting to be reissued / In progress / Done counts and no explanation
+  under them; then "Created by dev, <date>" and "requires MAGPIE ≥ …".
 - [ ] **Expect** a **Job settings** card showing its key rows: the job's type
   "Game pairs", variant, letter distribution, board, bingo bonus 50, cap
   100,000, SPRT "Elo -10 → 10" and records positions "first divergences",
   and a **Download every setting as JSON** link.
 - [ ] **Expect** after it a **Player settings** card: the players side by side,
   headed "Player 1" and "Player 2" with each name linking to its config's
-  page, its search under it ("static, by equity" / "static, by score") and an
-  **Open config →** link: lexicon, leaves, plies, plays considered, sort,
+  page, and nothing else under it: lexicon, leaves, plies, plays considered, sort,
   recorder and plays recorded, the rows they differ in (sort) bold. On a job
   that records no positions ("tester no test", A-7), plays recorded is in
   grey: it never reads it.
@@ -182,12 +181,15 @@ Open "dev game pairs (first divergences saved)".
 
 On the same job:
 
-- [ ] **Expect**, after the settings, a **Match score** card: a table with a
-  column per player (`static-equity`, `static-score`) and rows Wins, Draws,
-  Score (a draw counting half), Score %, Average score and Average spread
-  (signed, "+3.2" and "-3.2"); in each row the higher value green and the lower
-  red, equal values (Draws) neither; no chart. Under it "Over N games, both
-  games of every pair." The figures count games, not pairs.
+- [ ] **Expect**, after the settings, a **Match score** card with two tables,
+  **All games** and **Games that diverged**, each a column per player
+  (`static-equity`, `static-score`) and rows Wins, Losses (each player's are
+  the other's wins), Draws, Average score and Average spread (signed, "+3.2"
+  and "-3.2"); in each row the better value green and the worse red -- the
+  fewer losses green -- equal values (Draws) neither; no chart. Under the
+  first "Over N games, both games of every pair.", under the second "Over M
+  games: both games of the K pairs whose games did not play identically …".
+  The figures count games, not pairs.
 - [ ] **Expect** after it an SPRT card: "running — LLR …, bounds [a, b]. SPRT
   is not acted on until 50,000 pairs are complete", a bar from "fails at a"
   to "passes at b" marking the LLR, and no W/L/D line of its own.
@@ -199,8 +201,9 @@ On the same job:
   "Won both", "Won one, drew one", "Even", each cell "count (share%)", the
   higher of a row green and the lower red, "Even" the same for both; and a
   line on how many pairs diverged.
-- [ ] On "dev games (positions saved)", **expect** the same score and test cards, the explanation
-  per game (0, ½ or 1), no "both games of every pair" note, and no pair-outcome table.
+- [ ] On "dev games (positions saved)", **expect** one match-score table (no
+  divergent one), the explanation per game (0, ½ or 1), no "both games of
+  every pair" note, and no pair-outcome table.
 - [ ] On a job an admin has deactivated (A-8), **expect** "paused while the job
   is inactive: no pairs are being played, so the test is not moving".
 - [ ] On "tester no test" (A-7), **expect** the Match score card and no SPRT
@@ -273,26 +276,27 @@ Open "dev game pairs (first divergences saved)".
   them."
   **Do** follow **Sign in**, as `dev-contributor-1`. **Expect** to land back on
   this job.
+- [ ] On a job just activated that has saved nothing yet, **expect** "No
+  positions saved yet: one appears here as soon as the job has saved one.",
+  and a position to appear by itself, without a reload, once one is saved.
 - [ ] Signed in, **expect** one turn of a game pair: "Turn T of a game pair,
-  where the players first chose differently: rack … · after MOVE (score) · the
-  player to move has X, the other Y", then **one** board -- premium squares
-  (TW, DW, TL, DL and a star on the centre), its tiles each with a letter and
-  a score (a blank a red lower-case letter with none), the tiles MOVE placed
-  outlined, and no racks under it -- with each player's move drawn on the
-  empty squares it fills, as dashed green-tinted tiles, outlined green for
-  player 1's and purple for player 2's, and a legend naming "previous move"
-  and "PLAYER played …" for each. Where the two plays share a square,
-  **expect** "The two plays share a square. Showing:" and a button per player,
-  one at a time on the board. Beside the board, "Game 1 of the pair · PLAYER
-  to move" and "Game 2 of the pair · PLAYER to move" -- `static-equity` in
-  one, `static-score` in the other -- each with "rack … · after MOVE (score) ·
-  played PLAY (score) · N moves ranked by static equity", the PLAY underlined
-  in its player's colour, and its ranked moves, the one played tinted and
-  marked **played**. No CGP text anywhere. The moves at the top of the two
-  lists differ. (A pairs job saving every turn shows two boards side by side
-  at a turn where the games have diverged, each with its own racks under it,
-  and a turn one game never reached alone says the other game has no position
-  at that turn; a simmer's turns add a **Win %** column.)
+  where the players first chose differently", then "Showing:" and a button
+  per player ("static-equity's move", "static-score's move", each with its
+  colour dot), the first pressed. Under them one game: "Game 1 of the pair ·
+  PLAYER to move", "rack … · after MOVE (score) · played PLAY (score) · N
+  moves ranked by static equity", the PLAY underlined in its player's colour;
+  its board -- premium squares (TW, DW, TL, DL and a star on the centre),
+  tiles each with a letter and a score (a blank a red lower-case letter with
+  none), the tiles MOVE placed outlined, the tiles PLAY puts down drawn
+  dashed in its player's colour, both racks and scores with **to move** on the
+  player whose rack it is, and no CGP text -- and its ranked moves, the one
+  played tinted and marked **played**. **Do** press the other button.
+  **Expect** "Game 2 of the pair · OTHER PLAYER to move", the same board and
+  rack, the other player's move drawn instead, and its own ranked moves, the
+  top differing from the first's. (A pairs job saving every turn toggles the
+  same way; a turn one game never reached alone has no buttons and says the
+  other game has no position at that turn; a simmer's turns add a **Win %**
+  column.)
 - [ ] On "dev games (positions saved)", **expect** one game's position: its
   board with the previous move outlined and the move played drawn dashed in
   green, both racks and scores under it, "played PLAY (score)" in the summary,

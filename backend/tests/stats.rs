@@ -106,14 +106,19 @@ async fn scored_result(
     let (task, claim) = claim(db, job, owner, "completed", 0).await;
     let (wins, losses, ties) = tally;
     let divergent = divergent.map(|(w, l, t)| vec![w + l + t, w, l, t]);
+    // The divergent games' means: ten points apart from the batch's, so a
+    // read that took the batch's for them would show.
     sqlx::query(
         "INSERT INTO game_results
              (task_claim_id, task_id, job_id, games, wins, losses, ties,
               p1_score_mean, p1_score_sd, p2_score_mean, p2_score_sd,
               pent_0, pent_1, pent_2, pent_3, pent_4,
-              divergent_games, divergent_wins, divergent_losses, divergent_ties)
+              divergent_games, divergent_wins, divergent_losses, divergent_ties,
+              divergent_p1_score_mean, divergent_p2_score_mean)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $10, 60, $11, 58,
-                 $8[1], $8[2], $8[3], $8[4], $8[5], $9[1], $9[2], $9[3], $9[4])",
+                 $8[1], $8[2], $8[3], $8[4], $8[5], $9[1], $9[2], $9[3], $9[4],
+                 CASE WHEN $9 IS NULL THEN NULL ELSE $10 + 10 END,
+                 CASE WHEN $9 IS NULL THEN NULL ELSE $11 - 10 END)",
     )
     .bind(claim)
     .bind(task)
@@ -270,6 +275,14 @@ async fn divergent_pairs_are_reported_but_not_tested() {
     let games = game_stats(&db, job).await;
     let test = games.sprt.expect("an SPRT job");
     assert_eq!(games.divergent_pairs, Some(7), "fourteen divergent games");
+    // And their own match score, a diagnostic beside the full one: the
+    // divergent games' tally and means, not the batches'.
+    let divergent = games.divergent.as_ref().expect("a pairs job reports its divergent games");
+    assert_eq!((divergent.wins, divergent.losses, divergent.draws), (11, 3, 0));
+    let full = (games.p1_score_mean.unwrap(), games.p2_score_mean.unwrap());
+    close(divergent.p1_score_mean.unwrap(), full.0 + 10.0);
+    close(divergent.p2_score_mean.unwrap(), full.1 - 10.0);
+    close(divergent.spread_mean.unwrap(), full.0 - full.1 + 20.0);
     let over_pairs =
         sprt::llr(&Sample::from_pentanomial(&Pentanomial { counts: [1, 3, 7, 3, 2] }), -10.0, 10.0);
     let over_divergent =

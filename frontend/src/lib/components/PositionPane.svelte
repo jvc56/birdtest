@@ -2,9 +2,8 @@
   /**
    * One saved position: what it is, the board -- the previous move outlined,
    * the move played from here drawn where it goes -- and the moves the player
-   * to move ranked, the one played marked. Beside the moves on a wide screen,
-   * or above them when `stacked`; without the board when `showBoard` is off,
-   * as each of a game pair's two positions is when they share one board.
+   * to move ranked, the one played marked: the board beside the moves on a
+   * wide screen, above them on a narrow one.
    */
   import type { BoardData, SavedPosition } from '$lib/api';
   import { parseCgp, seatToMove } from '$lib/cgp';
@@ -18,10 +17,7 @@
   export let place = '';
   /** A heading naming the position among others, e.g. "Game 1 of the pair". */
   export let heading = '';
-  export let stacked = false;
-  /** Off where the page draws the board itself, shared with another position. */
-  export let showBoard = true;
-  /** The colour the move played from here is drawn in, on this board or a shared one. */
+  /** The colour the move played from here is drawn in: its player's. */
   export let playedColor: string = PLAYED_COLORS[0];
 
   const ANALYSIS: Record<SavedPosition['analysis'], string> = {
@@ -63,23 +59,21 @@
       <span data-testid="position-analysis">{ANALYSIS[position.analysis]}</span></span
     >
   </p>
-  <div class={stacked || !showBoard ? 'grid gap-4' : 'grid gap-4 lg:grid-cols-2'}>
-    {#if showBoard}
-      <div class="min-w-0 space-y-2">
-        {#if board && parsed}
-          <Board
-            {board}
-            position={parsed}
-            previousMove={position.previous_move}
-            played={position.played_move
-              ? [{ move: position.played_move, label: 'played here', color: playedColor }]
-              : []}
-            {toMove}
-            {players}
-          />
-        {/if}
-      </div>
-    {/if}
+  <div class="grid gap-4 lg:grid-cols-2">
+    <div class="min-w-0 space-y-2">
+      {#if board && parsed}
+        <Board
+          {board}
+          position={parsed}
+          previousMove={position.previous_move}
+          played={position.played_move
+            ? [{ move: position.played_move, label: 'played here', color: playedColor }]
+            : []}
+          {toMove}
+          {players}
+        />
+      {/if}
+    </div>
     <div class="min-w-0 overflow-x-auto">
       <table class="table text-xs">
         <thead>

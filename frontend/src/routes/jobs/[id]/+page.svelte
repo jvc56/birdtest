@@ -138,7 +138,7 @@
           label="tasks completed"
         />
       {/if}
-      <TaskCounts {stats} {config} />
+      <TaskCounts {stats} />
       <p class="text-xs text-muted-foreground">
         Created by <span class="break-all">{stats.job.created_by ?? 'unknown'}</span>, {datetime(
           stats.job.created_at
@@ -163,6 +163,7 @@
           players={config.players.map((p) => p.name)}
           paired={config.job.job_type === 'game_pairs'}
           firstDivergence={config.games.capture_first_divergence}
+          progress={stats.games?.units_completed ?? 0}
         />
       {:else if $session === null}
         <div class="card space-y-1">

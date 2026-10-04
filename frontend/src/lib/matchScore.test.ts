@@ -5,22 +5,17 @@ const played = { p1_score_mean: 432.14, p2_score_mean: 418.76, spread_mean: 13.3
 const row = (rows: ReturnType<typeof matchRows>, label: string) => rows.find((r) => r.label === label)!;
 
 describe('F-MATCH-1 matchRows', () => {
-  it("gives each player its own column: player 2's wins are player 1's losses", () => {
+  it("has wins, losses, draws, average score and average spread, a column per player", () => {
     const rows = matchRows({ wins: 12, losses: 8, draws: 1, ...played });
-    expect(rows.map((r) => r.label)).toEqual([
-      'Wins', 'Draws', 'Score', 'Score %', 'Average score', 'Average spread'
-    ]);
-    expect(row(rows, 'Wins').values).toEqual(['12', '8']);
-    expect(row(rows, 'Draws').values).toEqual(['1', '1']);
+    expect(rows.map((r) => r.label)).toEqual(['Wins', 'Losses', 'Draws', 'Average score', 'Average spread']);
     expect(gamesPlayed({ wins: 12, losses: 8, draws: 1, ...played })).toBe(21);
   });
 
-  it('scores a win a point and a draw half of one, and its share of the games', () => {
+  it("gives player 2 player 1's losses as wins and its wins as losses, fewer losses better", () => {
     const rows = matchRows({ wins: 12, losses: 8, draws: 1, ...played });
-    expect(row(rows, 'Score').values).toEqual(['12.5', '8.5']);
-    expect(row(rows, 'Score %').values).toEqual(['59.5%', '40.5%']);
-    // A whole score has no ".0".
-    expect(row(matchRows({ wins: 3, losses: 1, draws: 2, ...played }), 'Score').values).toEqual(['4', '2']);
+    expect(row(rows, 'Wins').values).toEqual(['12', '8']);
+    expect(row(rows, 'Losses')).toMatchObject({ values: ['8', '12'], numbers: [8, 12], better: 'lower' });
+    expect(row(rows, 'Draws').values).toEqual(['1', '1']);
   });
 
   it("gives the average scores to a decimal place, and the spread signed from each player's side", () => {
@@ -38,8 +33,8 @@ describe('F-MATCH-1 matchRows', () => {
     const rows = matchRows({
       wins: 0, losses: 0, draws: 0, p1_score_mean: null, p2_score_mean: null, spread_mean: null
     });
-    expect(row(rows, 'Score').values).toEqual(['0', '0']);
-    for (const label of ['Score %', 'Average score', 'Average spread']) {
+    expect(row(rows, 'Wins').values).toEqual(['0', '0']);
+    for (const label of ['Average score', 'Average spread']) {
       expect(row(rows, label).values).toEqual(['—', '—']);
       expect(row(rows, label).numbers).toEqual([null, null]);
     }

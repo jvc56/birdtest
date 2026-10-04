@@ -42,14 +42,14 @@ test('E-8: a finished game-pairs job shows its labelled pentanomial and SPRT ver
   const pentanomial: number[] = stats.games.pentanomial;
   const pairs: number = stats.games.units_completed;
   expect(pentanomial.reduce((a, b) => a + b, 0)).toBe(pairs);
-  // Matched from the start: a marked cell also says "(higher)" or "(lower)"
+  // Matched from the start: a marked cell also says "(better)" or "(worse)"
   // to a screen reader.
   const cell = (n: number) =>
     new RegExp(`^${n.toLocaleString('en-US')} \\(${((100 * n) / pairs).toFixed(1)}%\\)`);
   await expect(rows.locator('td:nth-child(2)')).toHaveText([4, 3, 2].map((b) => cell(pentanomial[b])));
   await expect(rows.locator('td:nth-child(3)')).toHaveText([0, 1, 2].map((b) => cell(pentanomial[b])));
   // The higher of a row is marked, the even row never.
-  const standing = (n: number, m: number) => (n === m ? 'even' : n > m ? 'higher' : 'lower');
+  const standing = (n: number, m: number) => (n === m ? 'even' : n > m ? 'better' : 'worse');
   await expect(rows.nth(0).locator('td:nth-child(2)')).toHaveAttribute(
     'data-standing',
     standing(pentanomial[4], pentanomial[0])
@@ -61,13 +61,26 @@ test('E-8: a finished game-pairs job shows its labelled pentanomial and SPRT ver
   // test, a column per player, counted in games; the SPRT card keeps only the test.
   const score = page.locator('.card', { has: page.getByRole('heading', { name: 'Match score' }) });
   const { wins, losses, draws } = stats.games;
-  const scoreRows = score.getByTestId('player-compare').locator('tbody tr');
-  await expect(scoreRows.nth(0).locator('td')).toHaveText([
-    'Wins',
-    new RegExp(`^${wins.toLocaleString('en-US')}\\b`),
-    new RegExp(`^${losses.toLocaleString('en-US')}\\b`)
+  const scoreRows = score.getByTestId('match-all').getByTestId('player-compare').locator('tbody tr');
+  await expect(scoreRows.locator('td:first-child')).toHaveText([
+    'Wins', 'Losses', 'Draws', 'Average score', 'Average spread'
   ]);
-  await expect(scoreRows.nth(1).locator('td')).toHaveText(['Draws', ...[draws, draws].map((n: number) => n.toLocaleString('en-US'))]);
+  const count = (n: number) => new RegExp(`^${n.toLocaleString('en-US')}\\b`);
+  await expect(scoreRows.nth(0).locator('td')).toHaveText(['Wins', count(wins), count(losses)]);
+  // Each player's losses are the other's wins, and fewer is better.
+  await expect(scoreRows.nth(1).locator('td')).toHaveText(['Losses', count(losses), count(wins)]);
+  if (wins !== losses) {
+    await expect(scoreRows.nth(1).locator('td:nth-child(2)')).toHaveAttribute(
+      'data-standing',
+      losses < wins ? 'better' : 'worse'
+    );
+  }
+  await expect(scoreRows.nth(2).locator('td')).toHaveText(['Draws', count(draws), count(draws)]);
   await expect(score.getByTestId('match-games')).toContainText(`Over ${(wins + losses + draws).toLocaleString('en-US')} games`);
+  // And a second table over the games of the pairs that diverged.
+  const divergent = stats.games.divergent;
+  const divergentRows = score.getByTestId('match-divergent').getByTestId('player-compare').locator('tbody tr');
+  await expect(score.getByTestId('match-divergent')).toContainText('Games that diverged');
+  await expect(divergentRows.nth(0).locator('td')).toHaveText(['Wins', count(divergent.wins), count(divergent.losses)]);
   await expect(sprt.getByText(/^Player 1:/)).toHaveCount(0);
 });

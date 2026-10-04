@@ -6,9 +6,10 @@ test.use({ storageState: ADMIN_STATE });
 
 /**
  * E-17: a game-pairs job made through the form keeping only where each pair
- * first diverges shows a signed-in user the two games' positions of one pair
- * on one board: the same turn, the same rack, each player to move in one of
- * them, each player's move drawn where it goes and marked in its list. The fake workers synthesize first divergences the way MAGPIE keeps
+ * first diverges shows a signed-in user the two games' positions of one pair,
+ * one player's at a time with a toggle between them: the same turn, the same
+ * rack, each player to move in one of them, its move drawn where it goes and
+ * marked in its list. The fake workers synthesize first divergences the way MAGPIE keeps
  * them: one position per game, the second from the other seat.
  */
 let api: AdminApi;
@@ -57,7 +58,7 @@ test.afterAll(async () => {
   await api.dispose();
 });
 
-test("E-17: a pairs job shows each pair's first divergence as two players' answers on one board", async ({ page }) => {
+test("E-17: a pairs job shows each pair's first divergence, one player's answer at a time", async ({ page }) => {
   await page.goto(`/jobs/${jobId}`);
   await expect(page.getByText('first divergences').first()).toBeVisible();
   await expect(page.getByText('the turn where its two games first diverged')).toBeVisible();
@@ -65,36 +66,42 @@ test("E-17: a pairs job shows each pair's first divergence as two players' answe
   const pair = page.getByTestId('saved-pair');
   await expect(pair).toBeVisible();
   await expect(pair).toContainText('where the players first chose differently');
-  const games = pair.getByTestId('saved-position');
-  await expect(games).toHaveCount(2);
-  await expect(games.nth(0).getByTestId('position-heading')).toContainText('Game 1 of the pair');
-  await expect(games.nth(1).getByTestId('position-heading')).toContainText('Game 2 of the pair');
+  // One player's answer at a time: one board, its move drawn on it, its
+  // ranked moves; a toggle switches to the other game's.
+  const shown = pair.getByTestId('saved-position');
+  const toggles = pair.getByTestId('pair-toggle');
+  await expect(shown).toHaveCount(1);
+  await expect(toggles).toHaveCount(2);
+  await expect(pair.getByTestId('board')).toHaveCount(1);
+  await expect(toggles.nth(0)).toHaveAttribute('aria-pressed', 'true');
+  const read = async () => ({
+    heading: (await shown.getByTestId('position-heading').innerText()).trim(),
+    rack: (await shown.getByTestId('position-rack').innerText()).trim(),
+    played: (await shown.getByTestId('played-move').innerText()).trim(),
+    moves: await shown.locator('tbody tr').count()
+  });
+  const first = await read();
+  expect(first.heading).toContain('Game 1 of the pair');
+  await toggles.nth(1).click();
+  await expect(toggles.nth(1)).toHaveAttribute('aria-pressed', 'true');
+  await expect(shown.getByTestId('position-heading')).toContainText('Game 2 of the pair');
+  const second = await read();
+  await expect(pair.getByTestId('board')).toHaveCount(1);
   // One position from two seats: the same rack to play, a different player
-  // to move in each game.
-  const rack = (await games.nth(0).getByTestId('position-rack').innerText()).trim();
-  await expect(games.nth(1).getByTestId('position-rack')).toHaveText(rack);
-  const movers = await Promise.all(
-    [0, 1].map(async (i) => (await games.nth(i).getByTestId('position-heading').innerText()).trim())
-  );
+  // to move in each game, each with its own move played and list.
+  expect(second.rack).toBe(first.rack);
+  const movers = [first.heading, second.heading];
   expect(movers.some((m) => m.includes(`${names[0]} to move`)), movers.join(' | ')).toBe(true);
   expect(movers.some((m) => m.includes(`${names[1]} to move`)), movers.join(' | ')).toBe(true);
-  expect(await games.nth(0).locator('tbody tr').count()).toBeGreaterThan(0);
-  expect(await games.nth(1).locator('tbody tr').count()).toBeGreaterThan(0);
-
-  // One board for the two: the same position, with each player's move drawn
-  // on it (or one at a time where they share a square), and no CGP text.
-  await expect(pair).toHaveAttribute('data-shared-board', '');
-  await expect(pair.getByTestId('board')).toHaveCount(1);
-  for (const i of [0, 1]) {
-    const played = (await games.nth(i).getByTestId('played-move').innerText()).trim();
-    expect(played.length).toBeGreaterThan(0);
-  }
+  expect(first.played.length && second.played.length).toBeGreaterThan(0);
+  expect(first.moves).toBeGreaterThan(0);
+  expect(second.moves).toBeGreaterThan(0);
   await expect(pair.locator('[title="CGP"]')).toHaveCount(0);
-  await expect(pair.getByTestId('board-legend')).toContainText('played');
+  const rack = first.rack;
 
   // The rack finds the pair once, both games of it.
   await page.getByLabel('Rack').fill(rack);
   await page.getByRole('button', { name: 'Search' }).click();
   await expect(page.getByText(`Position 1 with the rack ${rack}`)).toBeVisible();
-  await expect(pair.getByTestId('saved-position')).toHaveCount(2);
+  await expect(pair.getByTestId('pair-toggle')).toHaveCount(2);
 });

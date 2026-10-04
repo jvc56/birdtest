@@ -109,9 +109,10 @@ test('E-4: an admin creates configs and a job, activates it, and watches it fill
     sprt.getByText(/^(running — LLR|Completed: passed \(H1 accepted\), LLR) -?\d+\.\d{3}/)
   ).toBeVisible();
   const score = page.locator('.card', { has: page.getByRole('heading', { name: 'Match score' }) });
-  await expect(score.getByTestId('player-compare').locator('tbody td:first-child')).toHaveText([
-    'Wins', 'Draws', 'Score', 'Score %', 'Average score', 'Average spread'
+  await expect(score.getByTestId('match-all').locator('tbody td:first-child')).toHaveText([
+    'Wins', 'Losses', 'Draws', 'Average score', 'Average spread'
   ]);
+  await expect(score.getByTestId('match-divergent')).toContainText('Games that diverged');
   await expect(page.getByText('No contributions yet.')).toHaveCount(0);
   await expect(
     page.locator('.card', { has: page.getByRole('heading', { name: 'Contributors' }) }).getByText(/^Anonymous · /).first()
