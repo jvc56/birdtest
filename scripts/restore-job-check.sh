@@ -83,7 +83,10 @@ digest() {
                           WHERE r.job_id = '$job'") "
   out+="plies:$(val "$db" "SELECT count(*) || '/' || coalesce(md5(string_agg(p::text, '|' ORDER BY p::text)), '-')
                           FROM position_analysis_plies p JOIN position_analysis_moves m ON m.id = p.move_id
-                          JOIN position_analysis_records r ON r.id = m.record_id WHERE r.job_id = '$job'")"
+                          JOIN position_analysis_records r ON r.id = m.record_id WHERE r.job_id = '$job'") "
+  out+="inference:$(val "$db" "SELECT count(*) || '/' || coalesce(md5(string_agg(i::text, '|' ORDER BY i::text)), '-')
+                          FROM position_analysis_inference i JOIN position_analysis_records r ON r.id = i.record_id
+                          WHERE r.job_id = '$job'")"
   echo "$out"
 }
 
@@ -127,6 +130,9 @@ INSERT INTO position_analysis_moves (record_id, rank, move, score, equity)
 SELECT r.id, k, 'H8 RETAINS', 70 + k, 40.5 + k FROM position_analysis_records r, generate_series(1, 3) k;
 INSERT INTO position_analysis_plies (move_id, ply, bingo_percentage, average_score)
 SELECT m.id, p, 12.5, 30.25 FROM position_analysis_moves m, generate_series(1, 2) p;
+INSERT INTO position_analysis_inference (record_id, num_leaves, total_draws, average_equity, leaves)
+SELECT r.id, 40, 900, 12.5, '[{"leave": "EIR", "draws": 120, "equity": 18.25}]'::jsonb
+FROM position_analysis_records r;
 INSERT INTO leave_rack_progress (job_id, generation, rack, occurrence_count)
 SELECT '00000000-0000-0000-0000-00000000000b', 1, 'R' || lpad(i::text, 5, '0'), i % 7
 FROM generate_series(1, 250) i;
@@ -152,7 +158,7 @@ SELECT '00000000-0000-0000-0000-00000000000d', 'games', 'active', 100, 'classic'
        (SELECT id FROM input_data WHERE role = 'letterdist'), (SELECT id FROM input_data WHERE role = 'layout'),
        (SELECT id FROM users), 50, 0.1;
 INSERT INTO job_game_config (job_id, player1_config_id, player2_config_id, games_per_batch,
-                             sprt_enabled, min_games, max_games)
+                             test_enabled, min_games, max_games)
 VALUES ('00000000-0000-0000-0000-00000000000d', '00000000-0000-0000-0000-0000000000f1',
         '00000000-0000-0000-0000-0000000000f1', 10, true, 100, 1000);
 -- A rating pool whose newest run has seen its evidence: a restore must leave it

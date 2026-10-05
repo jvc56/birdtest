@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { analysesPerRack, rackConsensus } from './consensus';
+import { analysesPerRack, consensusProblem, rackConsensus } from './consensus';
 
 describe('F-CONS-1 analysesPerRack', () => {
   it('says one for a job wanting one analysis per rack, and the range and share otherwise', () => {
@@ -30,5 +30,28 @@ describe('F-CONS-2 rackConsensus', () => {
   it('names the alphabetically first move of a tie, and nothing for no analyses', () => {
     expect(rackConsensus([...ranked(1, '8H ZA'), ...ranked(2, '8G WUZ')])?.top).toBe('8G WUZ');
     expect(rackConsensus([])).toBeNull();
+  });
+});
+
+describe('F-CONS-3 consensusProblem', () => {
+  const settings = (min: number, max: number, pct: number) => ({
+    min_results_per_rack: min,
+    max_results_per_rack: max,
+    consensus_pct: pct
+  });
+  it('accepts what the server accepts', () => {
+    expect(consensusProblem(settings(1, 1, 100))).toBeNull();
+    // One analysis per rack seeks no agreement, so its share is not checked.
+    expect(consensusProblem(settings(1, 1, 10))).toBeNull();
+    expect(consensusProblem(settings(2, 5, 80))).toBeNull();
+    expect(consensusProblem(settings(3, 3, 100))).toBeNull();
+  });
+  it('refuses what the server refuses', () => {
+    expect(consensusProblem(settings(0, 1, 80))).toMatch(/fewest/);
+    expect(consensusProblem(settings(1.5, 2, 80))).toMatch(/fewest/);
+    expect(consensusProblem(settings(3, 2, 80))).toMatch(/most/);
+    expect(consensusProblem(settings(1, 101, 80))).toMatch(/most/);
+    expect(consensusProblem(settings(2, 3, 50))).toMatch(/share/);
+    expect(consensusProblem(settings(2, 3, 100.5))).toMatch(/share/);
   });
 });

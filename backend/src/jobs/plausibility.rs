@@ -13,7 +13,7 @@
 //! same depth return the same evaluation, so disagreement is proof. birdtest
 //! has no such ground truth. Workers are handed *different* seeds, so no two
 //! workers ever play the same games, and the only cross-worker statistic
-//! available is the win rate — which is exactly what SPRT is measuring. A test
+//! available is the win rate — which is exactly what the match test is measuring. A test
 //! on it cannot separate "this worker is broken" from "these seeds favoured
 //! player 2", so it would flag honest contributors at its own alpha rate while
 //! missing an attacker biasing results by a percent. See PLAN.md, "Worker
@@ -25,7 +25,7 @@
 //! count that cannot correspond to any game, a truncated batch reported as
 //! complete.
 
-use super::handler::{Analysis, GameAggregate, MoveEntry, PlyStats, RackOccurrence};
+use super::handler::{Analysis, GameAggregate, InferenceSummary, MoveEntry, PlyStats, RackOccurrence};
 use crate::error::{AppError, AppResult};
 
 /// Tiles on a rack. Matches MAGPIE's `RACK_SIZE`; a submission naming more is
@@ -172,6 +172,67 @@ pub fn check_rack(rack: &str, context: &str) -> AppResult<()> {
     Ok(())
 }
 
+/// The most inferred leaves a position keeps (MAGPIE's
+/// `AUTOPLAY_CAPTURED_INFERENCE_LEAVES`).
+pub const MAX_INFERRED_LEAVES: usize = 10;
+
+/// What a position says was inferred of the opponent's leave: only for a
+/// simulated position with a previous move to infer from (MAGPIE infers for a
+/// simulation, from the opponent's last move); at most ten leaves, most drawn
+/// first, none drawn more often than all of them together, each a leave --
+/// at most a rack less the tile played -- and no more of them listed than
+/// were found; figures that are figures.
+pub fn check_inference(
+    inference: &InferenceSummary,
+    analysis: Analysis,
+    turn_number: i16,
+    has_previous_move: bool,
+    context: &str,
+) -> AppResult<()> {
+    let refuse = |why: String| Err(AppError::bad_request(format!("{context}: {why}")));
+    if analysis != Analysis::Sim {
+        return refuse(format!("an inference comes with a simulation, not a {} analysis", analysis.as_str()));
+    }
+    if turn_number == 0 || !has_previous_move {
+        return refuse("an inference needs the opponent's previous move to infer from".into());
+    }
+    if inference.leaves.len() > MAX_INFERRED_LEAVES {
+        return refuse(format!(
+            "an inference lists at most {MAX_INFERRED_LEAVES} leaves, not {}",
+            inference.leaves.len()
+        ));
+    }
+    if inference.num_leaves < inference.leaves.len() as i64 || inference.total_draws < 0 {
+        return refuse(format!(
+            "an inference that found {} leaves in {} draws cannot list {}",
+            inference.num_leaves,
+            inference.total_draws,
+            inference.leaves.len()
+        ));
+    }
+    if !inference.average_equity.is_finite() || inference.average_equity.abs() > MAX_ABS_EQUITY {
+        return refuse(format!("an inferred average equity of {} is not one", inference.average_equity));
+    }
+    let mut previous = i64::MAX;
+    for leave in &inference.leaves {
+        let tiles = rack_tiles(&leave.leave);
+        if tiles.is_none_or(|tiles| tiles >= MAX_RACK_TILES) {
+            return refuse(format!("{:?} is not a leave", leave.leave));
+        }
+        if leave.draws < 1 || leave.draws > inference.total_draws || leave.draws > previous {
+            return refuse(format!(
+                "inferred leave {:?} drawn {} times, out of order or out of {} draws",
+                leave.leave, leave.draws, inference.total_draws
+            ));
+        }
+        if !leave.equity.is_finite() || leave.equity.abs() > MAX_ABS_EQUITY {
+            return refuse(format!("inferred leave {:?} has an equity of {}", leave.leave, leave.equity));
+        }
+        previous = leave.draws;
+    }
+    Ok(())
+}
+
 /// A play as written: bounded in length.
 pub fn check_play_text(play: &str, context: &str) -> AppResult<()> {
     if play.chars().count() > MAX_PLAY_CHARS {
@@ -274,6 +335,12 @@ pub fn check_moves(moves: &[MoveEntry], num_moves: Option<i32>, context: &str) -
             return Err(AppError::bad_request(format!(
                 "{context}: play {:?} has an implausible equity {}",
                 entry.play, entry.equity
+            )));
+        }
+        if entry.iterations.is_some_and(|n| n < 0) {
+            return Err(AppError::bad_request(format!(
+                "{context}: play {:?} was simulated a negative number of times",
+                entry.play
             )));
         }
         // Both are probabilities MAGPIE reports on a 0-100 and 0-1 scale
@@ -600,6 +667,7 @@ mod tests {
             play: "8D WORD".into(),
             score,
             equity,
+            iterations: None,
             win_percentage: None,
             blended_utility: None,
             mean_spread: None,
@@ -824,7 +892,7 @@ mod fixture_tests {
     use super::super::opening_rack::OpeningRackHandler;
     use super::{check_batch_size, check_rack_occurrence_total, games_dispatched};
     use crate::error::{AppError, AppResult};
-    use crate::stats::sprt::Pentanomial;
+    use crate::stats::outcomes::Pentanomial;
     use serde_json::Value;
 
     const GAMES: &str = include_str!("testdata/fake_worker_games.json");

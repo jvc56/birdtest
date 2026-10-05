@@ -451,6 +451,307 @@ async fn a_consensus_job_reissues_its_unsettled_racks_until_each_settles() {
     assert_eq!(analyses, [1, 2, 3], "{page}");
 }
 
+/// A PATCH of an opening-rack job's consensus settings, as an admin.
+async fn patch_consensus(
+    app: &axum::Router,
+    headers: &[(String, String)],
+    job: Uuid,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let mut builder = axum::http::Request::patch(format!("/api/admin/jobs/{job}/consensus"))
+        .header("content-type", "application/json");
+    for (name, value) in headers {
+        builder = builder.header(name.as_str(), value.as_str());
+    }
+    send(app, builder.body(axum::body::Body::from(body.to_string())).unwrap()).await
+}
+
+/// An opening-rack job over four racks, two to a task, with these consensus
+/// settings, analysed by a simulating player (job creation and the edit
+/// refuse a consensus to a static one).
+async fn consensus_job(db: &TestDb, admin: Uuid, pct: f64, min: i32, max: i32) -> Uuid {
+    let player = db.sim_player(&format!("simmer{}", Uuid::new_v4().simple()), admin).await;
+    let job = db.bare_job("opening_rack", admin).await;
+    sqlx::query(
+        "INSERT INTO job_opening_rack_config
+             (job_id, player_config_id, racks_per_batch, rack_size, total_racks,
+              consensus_pct, min_results_per_rack, max_results_per_rack)
+         VALUES ($1, $2, 2, 7, 4, $3, $4, $5)",
+    )
+    .bind(job)
+    .bind(player)
+    .bind(pct)
+    .bind(min)
+    .bind(max)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    job
+}
+
+/// I-OR-EDIT-1: an opening-rack job's consensus settings change after
+/// creation, and the job starts and stops to match. A job wanting one
+/// analysis per rack keeps a progress row per rack all the same, so raising
+/// its settings after it completed reopens it and reissues every rack from
+/// those rows; lowering them while a reissue is in flight settles every rack,
+/// and that reissue's submission completes the job without counting its racks
+/// a second time. Raising what is already satisfied leaves it completed.
+#[tokio::test]
+async fn an_opening_rack_jobs_consensus_can_change_and_the_job_follows() {
+    let db = TestDb::new().await;
+    let admin = db.user("admin", true).await;
+    let job = consensus_job(&db, admin, 100.0, 1, 1).await;
+    let state = db.state().await;
+    let headers = admin_headers(&state.cfg, admin);
+    let app = birdtest::app(state);
+
+    let racks_of = |assignment: &serde_json::Value| -> Vec<String> {
+        assignment["task_request"]["racks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r.as_str().unwrap().to_string())
+            .collect()
+    };
+    let submit = |assignment: serde_json::Value, uuid: String, play: &'static str| {
+        let app = app.clone();
+        async move {
+            let racks: Vec<String> = assignment["task_request"]["racks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r.as_str().unwrap().to_string())
+                .collect();
+            let result = json!({ "racks": racks.iter().map(|rack| json!({
+                "rack": rack, "num_moves": 1,
+                "moves": [{ "move": play, "score": 30, "equity": 32.5 }],
+            })).collect::<Vec<_>>() });
+            let token = assignment["claim_token"].as_str().unwrap().to_string();
+            let (status, body) = submit_as(&app, &uuid, &token, result).await;
+            assert_eq!((status, &body), (StatusCode::OK, &json!({ "accepted": true })));
+        }
+    };
+    let counters = || async {
+        sqlx::query_as::<_, (i64, i64, i64, String)>(
+            "SELECT racks_analyzed, racks_settled, racks_without_consensus, status::text
+             FROM jobs WHERE id = $1",
+        )
+        .bind(job)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+    };
+    let pool = &db.pool;
+    let audit = |after: i64| async move {
+        sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<String>)>(
+            "SELECT action, old_status, new_status, reason FROM audit_log
+             WHERE job_id = $1 AND id > $2 ORDER BY id",
+        )
+        .bind(job)
+        .bind(after)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    };
+    let last_audit = || async {
+        sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(id) FROM audit_log")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap()
+            .unwrap_or(0)
+    };
+
+    // One analysis per rack: the first pass settles every rack, and the job
+    // completes -- with a progress row per rack all the same.
+    let (a, uuid_a) = first_claim(&app).await;
+    let (b, uuid_b) = first_claim(&app).await;
+    submit(a, uuid_a.clone(), "8G WUZ").await;
+    submit(b, uuid_b.clone(), "8G WUZ").await;
+    assert_eq!(counters().await, (4, 4, 0, "completed".into()));
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM opening_rack_progress WHERE job_id = $1")
+        .bind(job)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 4, "a job wanting one analysis per rack keeps its rows");
+    // Its final export, which reopening it makes a snapshot.
+    sqlx::query("INSERT INTO job_exports (job_id, state, is_final) VALUES ($1, 'ready', TRUE)")
+        .bind(job)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    // Two agreeing analyses a rack now, three at most: every rack is
+    // unsettled, and the completed job is active again at its allocation.
+    let before = last_audit().await;
+    let (status, body) =
+        patch_consensus(&app, &headers, job, json!({ "min_results_per_rack": 2, "max_results_per_rack": 3 })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["reopened"], json!(true));
+    assert_eq!(body["reopened_inactive_reason"], json!(null));
+    assert_eq!(body["unsettled_racks"], json!(4));
+    assert_eq!(body["job"]["status"], json!("active"));
+    assert_eq!(
+        (body["config"]["min_results_per_rack"].clone(), body["config"]["max_results_per_rack"].clone()),
+        (json!(2), json!(3))
+    );
+    assert_eq!(counters().await, (4, 0, 0, "active".into()));
+    assert_eq!(
+        audit(before).await,
+        vec![
+            ("job.consensus_changed".into(), None, None, Some("min 1 -> 2, max 1 -> 3; 4 racks unsettled".into())),
+            ("job.activated".into(), Some("completed".into()), Some("active".into()), None),
+        ]
+    );
+    let finals: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM job_exports WHERE job_id = $1 AND is_final")
+        .bind(job)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(finals, 0, "the old final export is a snapshot now");
+
+    // The reissues start from the rows: the racks the other worker analysed.
+    let (status, again_a) = claim_as(&app, &uuid_a).await;
+    assert_eq!(status, StatusCode::OK, "{again_a}");
+    assert_eq!(again_a["task_request"]["seed"], json!("4"));
+    let (status, again_b) = claim_as(&app, &uuid_b).await;
+    assert_eq!(status, StatusCode::OK, "{again_b}");
+    assert_eq!(racks_of(&again_a).len() + racks_of(&again_b).len(), 4);
+    submit(again_a, uuid_a.clone(), "8G WUZ").await;
+    assert_eq!(counters().await, (4, 2, 0, "active".into()), "two racks agree twice");
+
+    // One analysis is enough again while B's reissue is in flight: every
+    // rack settles, and the job waits for that reissue rather than
+    // completing under it.
+    let (status, body) =
+        patch_consensus(&app, &headers, job, json!({ "min_results_per_rack": 1, "max_results_per_rack": 1 })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!((body["unsettled_racks"].clone(), body["reopened"].clone()), (json!(0), json!(false)));
+    assert_eq!(counters().await, (4, 4, 0, "active".into()));
+    // Its racks were analysed before, so they are not counted again; their
+    // two analyses now disagree, which at one analysis a rack at most
+    // settles them without a consensus.
+    submit(again_b, uuid_b.clone(), "8G ZOA").await;
+    assert_eq!(counters().await, (4, 4, 2, "completed".into()));
+
+    // Asking for what every rack already has leaves it completed.
+    let (status, body) = patch_consensus(&app, &headers, job, json!({ "consensus_pct": 60 })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!((body["reopened"].clone(), body["job"]["status"].clone()), (json!(false), json!("completed")));
+}
+
+/// I-OR-EDIT-2: the edit refuses what creation refuses, and only for an
+/// opening-rack job; a change that changes nothing writes nothing; and a
+/// completed job reopened where the other active jobs leave no room for its
+/// allocation comes back inactive, saying why.
+#[tokio::test]
+async fn a_consensus_edit_is_checked_and_reopens_inactive_without_room() {
+    let db = TestDb::new().await;
+    let admin = db.user("admin", true).await;
+    let job = consensus_job(&db, admin, 100.0, 1, 1).await;
+    let state = db.state().await;
+    let headers = admin_headers(&state.cfg, admin);
+    let app = birdtest::app(state);
+    let fields = |body: &serde_json::Value| -> Vec<String> {
+        body["fields"].as_array().map_or(Vec::new(), |f| {
+            f.iter().map(|e| e["field"].as_str().unwrap().to_string()).collect()
+        })
+    };
+
+    for (body, field) in [
+        (json!({ "consensus_pct": 50 }), "consensus_pct"),
+        (json!({ "min_results_per_rack": 0 }), "min_results_per_rack"),
+        (json!({ "min_results_per_rack": 3, "max_results_per_rack": 2 }), "max_results_per_rack"),
+        (json!({ "max_results_per_rack": 101 }), "max_results_per_rack"),
+    ] {
+        let (status, response) = patch_consensus(&app, &headers, job, body.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {response}");
+        assert_eq!(fields(&response), vec![field.to_string()], "{body}: {response}");
+    }
+
+    // A static player's analyses always agree.
+    let static_job = db.bare_job("opening_rack", admin).await;
+    let analyst = db.static_player("analyst", admin).await;
+    // Ranking every play, as a static opening-rack player must.
+    sqlx::query("UPDATE player_configs SET recorder_type = 'all' WHERE id = $1")
+        .bind(analyst)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO job_opening_rack_config
+             (job_id, player_config_id, racks_per_batch, rack_size, total_racks)
+         VALUES ($1, $2, 2, 7, 4)",
+    )
+    .bind(static_job)
+    .bind(analyst)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let (status, response) =
+        patch_consensus(&app, &headers, static_job, json!({ "max_results_per_rack": 2 })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+    assert_eq!(fields(&response), vec!["max_results_per_rack".to_string()]);
+
+    // Only an opening-rack job has the settings.
+    let games = db.games_job(2).await;
+    let (status, response) = patch_consensus(&app, &headers, games, json!({ "consensus_pct": 80 })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+
+    // Nothing that differs: no audit row.
+    let audited = || async {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM audit_log WHERE job_id = $1")
+            .bind(job)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap()
+    };
+    let rows = audited().await;
+    let (status, response) = patch_consensus(&app, &headers, job, json!({ "consensus_pct": 100 })).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(audited().await, rows);
+
+    // Completed with a rack analysed once, while the games job takes 50% and
+    // another job 10%: its 50% no longer fits. The others are inactive while
+    // it is claimed from, so the claim is its.
+    sqlx::query("UPDATE jobs SET status = 'inactive' WHERE id <> $1")
+        .bind(job)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let (a, uuid) = first_claim(&app).await;
+    let racks: Vec<String> =
+        a["task_request"]["racks"].as_array().unwrap().iter().map(|r| r.as_str().unwrap().into()).collect();
+    let result = json!({ "racks": racks.iter().map(|rack| json!({
+        "rack": rack, "num_moves": 1, "moves": [{ "move": "8G WUZ", "score": 30, "equity": 32.5 }],
+    })).collect::<Vec<_>>() });
+    let (status, _) = submit_as(&app, &uuid, a["claim_token"].as_str().unwrap(), result).await;
+    assert_eq!(status, StatusCode::OK);
+    sqlx::query("UPDATE jobs SET status = 'completed' WHERE id = $1")
+        .bind(job)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE jobs SET status = 'active' WHERE id = $1")
+        .bind(games)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let other = db.bare_job("games", admin).await;
+    sqlx::query("UPDATE jobs SET allocation = 10 WHERE id = $1")
+        .bind(other)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let (status, response) =
+        patch_consensus(&app, &headers, job, json!({ "min_results_per_rack": 2, "max_results_per_rack": 2 })).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["reopened"], json!(true));
+    assert_eq!(response["job"]["status"], json!("inactive"));
+    let reason = response["reopened_inactive_reason"].as_str().unwrap();
+    assert!(reason.contains("60%") && reason.contains("50%"), "{reason}");
+}
+
 /// Bug: any error claiming from one job failed the whole claim, so a single
 /// job that could not dispatch -- here, one whose config row is missing --
 /// answered every worker with a 500 for as long as it led the candidate list.
@@ -1275,7 +1576,7 @@ async fn a_claim_racing_a_jobs_completion_hands_nothing_out() {
 /// `max_pairs`. Nothing those tasks played could change the verdict, and a
 /// busy fleet generated one per worker until the debounced finish check ran.
 #[tokio::test]
-async fn sprt_jobs_hand_out_nothing_past_their_cap() {
+async fn games_jobs_hand_out_nothing_past_their_cap() {
     let db = TestDb::new().await;
     let games = db.games_job(2).await;
     sqlx::query("UPDATE job_game_config SET max_games = 3 WHERE job_id = $1")

@@ -366,8 +366,8 @@ states a cutoff is refused (`I-JOB-14f`). The column stays `NOT NULL`.
 **The problem.** [`jobs.sim_cutoff`](backend/migrations/0001_initial.sql#L426)
 is `NOT NULL` for every job. However, the leave-generation request has no
 `sim_cutoff`, and MAGPIE's leave path doesn't read one (`config.c:9665`,
-`states_cutoff=false`). The job page still lists "Sim cutoff" under
-"All settings" for a leave job.
+`states_cutoff=false`). The job page still listed "Sim cutoff" among a leave
+job's settings.
 
 **The fix.** Hide the row for leave jobs; the list below already does this.
 You could also make the column nullable with
@@ -377,8 +377,8 @@ adds a migration for little gain.
 ### Fix 4 (optional addition): bingo bonus and sim cutoff can't be set
 
 **Status: implemented** -- both are optional fields of a job, validated as
-below, on the job form beside the board, and bingo bonus is a key row
-(`A-ADMIN-27`, `I-JOB-14f`). A negative bonus is refused.
+below, on the job form beside the board, and bingo bonus is a row of the
+job's settings next to Board (`A-ADMIN-27`, `I-JOB-14f`). A negative bonus is refused.
 
 **The situation.** Both columns exist, and every request states them. However,
 [`CreateJobBody`](backend/src/routes/admin.rs#L1164) has no field for either,
@@ -397,8 +397,8 @@ change them.
 4. Add both inputs to the job form under its advanced settings.
 5. Leave out `sim_cutoff` for leave jobs (see Fix 3).
 
-If bingo bonus becomes settable, promote it to a key row in the job list
-below, next to Board.
+If bingo bonus becomes settable, list it in the job list below, next to
+Board.
 
 ### Lower-priority notes
 
@@ -432,47 +432,52 @@ These are limits rather than bugs. None of them needs a change today.
 
 This is one ordered list for every job type, and the job page shows it so
 ([`jobSettings`](frontend/src/lib/jobSettings.ts)). A job shows only the rows
-that apply to it. **Rows 1–12 are the key rows** and are shown by default.
-Rows 14–20 appear after clicking **All settings**.
+that apply to it, every one of them: the Job settings card has no "All
+settings" toggle. Every label is in Title Case, and the job creation form uses
+the same names.
 
 | # | Setting | Shown for | Column(s) | MAGPIE argument |
 |---:|---|---|---|---|
-| 1 | Type | all | `jobs.job_type` | `autoplay` / `gp` / `leavegen` / rack analysis |
+| 1 | Type ("Opening Rack Analysis", "Games", "Game Pairs", "Leave Generation") | all | `jobs.job_type` | `autoplay` / `gp` / `leavegen` / rack analysis |
 | 2 | Variant | all | `jobs.variant` | `var` |
-| 3 | Letter distribution | all | `jobs.letterdist_id` | `ld` |
+| 3 | Letter Distribution | all | `jobs.letterdist_id` | `ld` |
 | 4 | Board | all | `jobs.layout_id` | `bdn` |
-| 5 | Bingo bonus | all | `jobs.bingo_bonus` | `bb` |
-| 6 | Games to play / Pairs to play (with SPRT: Cap) | games, pairs | `max_games` / `max_pairs` | `autoplay` total |
-| 7 | SPRT ("none", or "Elo H0 → H1") | games, pairs | `sprt_enabled`, `elo_low`, `elo_high` | n/a |
-| 8 | Records positions ("yes", "no", or "first divergences") | games, pairs | `capture_positions`, `capture_first_divergence` | `autoplay` recorder `positions`, or `divergentpositions` |
-| 9 | Racks in all | opening racks | `total_racks` | `rack` (the space) |
-| 10 | Rack size | opening racks | `rack_size` | `rack` |
-| 11 | Analyses per rack ("1", or "3 to 7, until 80% agree on the best move") | opening racks | `min_results_per_rack`, `max_results_per_rack`, `consensus_pct` | n/a (birdtest reissues the racks) |
+| 5 | Bingo Bonus | all | `jobs.bingo_bonus` | `bb` |
+| 6 | Games To Play / Pairs To Play (with the significance test: Maximum Games / Maximum Pairs) | games, pairs | `max_games` / `max_pairs` | `autoplay` total |
+| 7 | Significance Test ("no", or "yes (95%)" with its confidence) | games, pairs | `test_enabled`, `confidence_pct` | n/a |
+| 8 | Position Recorder ("yes", "no", or "yes (first divergences)") | games, pairs | `capture_positions`, `capture_first_divergence` | `autoplay` recorder `positions`, or `divergentpositions` |
+| 9 | Minimum Analyses Per Rack | opening racks | `min_results_per_rack` | n/a (birdtest reissues the racks) |
+| 10 | Maximum Analyses Per Rack | opening racks | `max_results_per_rack` | n/a |
+| 11 | Consensus % ("—" at a maximum of 1) | opening racks | `consensus_pct` | n/a |
 | 12 | Generations | leave | `cardinality(target_rack_counts)` | `leavegen` |
-| 13 | Target per rack | leave | `target_rack_counts` | `leavegen` targets |
-| 14 | Sim cutoff | games, pairs, opening racks | `jobs.sim_cutoff` | `cutoff` |
-| 15 | Fewest games / pairs before the test acts | games, pairs with SPRT on | `min_games` / `min_pairs` | n/a |
-| 16 | SPRT α | games, pairs with SPRT on | `sprt_alpha` | n/a |
-| 17 | SPRT β | games, pairs with SPRT on | `sprt_beta` | n/a |
-| 18 | Games per task / Pairs per task | games, pairs, leave | `games_per_batch` / `pairs_per_batch` / `num_iterations` | `autoplay <num_games>`; leave: game cap per task |
-| 19 | Racks per task | opening racks, leave | `racks_per_batch` / `racks_per_task` | `rack` batch; `leave_requests.forced_racks` |
-| 20 | Oldest MAGPIE | all | `jobs.min_magpie_*` | `version` (compared at claim) |
+| 13 | Target Per Rack | leave | `target_rack_counts` | `leavegen` targets |
+| 14 | Sim Cutoff | games, pairs, opening racks | `jobs.sim_cutoff` | `cutoff` |
+| 15 | Minimum Games / Minimum Pairs | games, pairs with the test on | `min_games` / `min_pairs` | n/a |
+| 16 | Games Per Task / Pairs Per Task | games, pairs, leave | `games_per_batch` / `pairs_per_batch` / `num_iterations` | `autoplay <num_games>`; leave: game cap per task |
+| 17 | Racks Per Task | opening racks, leave | `racks_per_batch` / `racks_per_task` | `rack` batch; `leave_requests.forced_racks` |
+| 18 | Oldest MAGPIE | all | `jobs.min_magpie_*` | `version` (compared at claim) |
 
-With these key rows, a games job and an opening-rack job show 8 rows by
-default, and a leave job shows 7.
+So a games job without a test and an opening-rack job show 11 rows (a games
+job with one, 12), and a leave job shows 10. An
+opening-rack job's rack space and rack size (`total_racks`, `rack_size`) are
+stored and sent, but no longer shown. Its three consensus rows are the only settings a job can change after
+it is created (`PATCH /api/admin/jobs/:id/consensus`, the admin page's
+Consensus card).
 
 Compared with the groups the page showed before, this order made five
 changes:
 
-- **Bingo bonus became a key row**, next to Board, once Fix 4 made it
+- **Bingo Bonus joined the rules**, next to Board, once Fix 4 made it
   settable: it is a rule of every game the job plays.
-- **Records positions became a key row.** It decides what data the job
-  produces, and whether "Plays recorded" means anything (Fix 1).
-- **Elo H0 and Elo H1 became one SPRT row.** One row says whether the test
-  runs and between which bounds.
-- **A leave job's "Games per task" moved to row 17.** It shares that row with
-  the games batch size, which is the same kind of setting.
-- **A leave job no longer shows Sim cutoff** (Fix 3).
+- **Position Recorder joined how much the job plays.** It decides what data
+  the job produces, and whether "Moves Recorded" means anything (Fix 1).
+- **The significance test is one row.** Significance Test says whether the
+  test runs and at what confidence ("yes (95%)"). It replaced an SPRT row
+  ("Elo H0 → H1") and its α and β rows when the match test replaced the SPRT,
+  and a separate Confidence % row after that.
+- **A leave job's "Games Per Task" shares row 16** with the games batch size,
+  which is the same kind of setting.
+- **A leave job no longer shows Sim Cutoff** (Fix 3).
 
 Allocation and status are not on this list. They are the job's state rather
 than its settings, and the page header already shows them.
@@ -483,44 +488,46 @@ This is one ordered list, and the player tables show it so
 ([`PLAYER_ROWS`](frontend/src/lib/jobSettings.ts)). The table has one value
 column per player: one for an opening-rack or leave job, two side by side for
 a games or pairs job.
-**Rows 1–13 are the key rows.** Rows 14–33 appear after clicking
-**All settings**.
+**Rows 1–9 are the key rows**, shown for every player whether or not it
+simulates or solves. Rows 10–33 appear after clicking **All settings**.
+Every label is in Title Case, and the player-config form uses the same names, with the MAGPIE argument beside each ("Move Recorder
+(-r)", "Sorted By (-s)", "PEG Schedule (-pegtopk1)").
 
 | # | Setting | Column | MAGPIE argument | Never read by |
 |---:|---|---|---|---|
 | 1 | Lexicon | `kwg_id` | `l1`/`l2` (`lex`) | n/a |
 | 2 | Leaves | `klv_id` | `k1`/`k2` (`leaves`) | leave jobs |
-| 3 | Plies (0 = static) | `num_plies` | `pl1`/`pl2` (`plies`) | n/a |
-| 4 | Plays considered | `num_plays` | `np1`/`np2` (`numplays`) | n/a |
-| 5 | Sort | `sort_strategy` | `s1`/`s2` | n/a |
-| 6 | Win % model | `winpct_id` | `winpct` | static players |
-| 7 | Iterations (most) | `max_iterations` | `i1`/`i2` (`iterations`) | static players |
-| 8 | Stopping % | `stopping_pct` | `sc1`/`sc2` (`scondition`) | static players |
-| 9 | Inference | `use_inference` | `si1`/`si2` (`sinfer`) | static players, opening-rack jobs (Fix 2) |
-| 10 | Recorder | `recorder_type` | `r1`/`r2` | leave jobs |
-| 11 | Plays recorded | `num_plays_recorded` | `maxnumdplays` | leave jobs; games/pairs jobs without capture (Fix 1) |
-| 12 | Endgame ("6-ply endgame" or "off") | `endgame_plies` | `eplies1`/`eplies2` | opening-rack jobs; leave jobs (they refuse a player that solves) |
-| 13 | Pre-endgame ("bag ≤ 2" or "off"; off without the endgame) | `peg_max_bag` | `pegbag1`/`pegbag2` | opening-rack jobs; leave jobs |
-| 14 | Plies recorded | `num_plies_recorded` | `shplies` | leave jobs; games/pairs jobs without capture (Fix 1) |
-| 15 | Iterations per play (fewest) | `min_play_iterations` | `mi1`/`mi2` (`minplayiterations`) | static players |
-| 16 | Threshold | `threshold` | `th1`/`th2` (`threshold`) | static players |
-| 17 | Sampling rule | `sampling_rule` | `sa1`/`sa2` (`sr`) | static players |
-| 18 | Inference margin | `inference_margin` | `im1`/`im2` (`imargin`) | static players, opening-rack jobs (Fix 2) |
-| 19 | Utility weight: win % | `utility_w_winpct` | `uwin1`/`uwin2` (`uwin`) | static players |
-| 20 | Utility weight: spread | `utility_w_spread` | `uspread1`/`uspread2` (`uspread`) | static players |
-| 21 | Utility spread scale | `utility_spread_scale` | `uspreadscale1`/`uspreadscale2` (`uspreadscale`) | static players |
-| 22 | Time limit (s) | `time_limit_secs` | `tl1`/`tl2` (`tlim`) | static players (always 0 for a simmer) |
-| 23 | Move-gen margin | `movegen_margin` | `mmargin` | leave jobs |
-| 24 | PEG schedule | `peg_stage_top_k` | `pegtopk1`/`pegtopk2` | players without the pre-endgame; opening-rack and leave jobs |
-| 25 | PEG stride | `peg_scenario_stride` | `pegstride1`/`pegstride2` | the same |
-| 26 | PEG opponent | `peg_opp_model` | `pegpess1`/`pegpess2` | the same |
-| 27 | Nested lookahead | `peg_nested` | `pegnested1`/`pegnested2` | the same |
-| 28 | Nested caps | `peg_nested_cand_caps` | `pegncaps` | the same, and players without nested lookahead |
-| 29 | Nested depth | `peg_nested_max_depth` | `pegndepth` | the same |
-| 30 | Nested strides | `peg_nested_strides` | `pegnstrides` | the same |
+| 3 | Sorted By | `sort_strategy` | `s1`/`s2` | n/a |
+| 4 | Move Recorder | `recorder_type` | `r1`/`r2` | leave jobs |
+| 5 | Moves Generated | `num_plays` | `np1`/`np2` (`numplays`) | n/a |
+| 6 | Plies (0 = static) | `num_plies` | `pl1`/`pl2` (`plies`) | n/a |
+| 7 | Uses Inference ("—" for a static player) | `use_inference` | `si1`/`si2` (`sinfer`) | static players, opening-rack jobs (Fix 2) |
+| 8 | Uses Preendgame ("yes (bag ≤ 2)" or "no"; no without the endgame) | `peg_max_bag` | `pegbag1`/`pegbag2` | opening-rack jobs; leave jobs |
+| 9 | Uses Endgame ("yes (6 plies)" or "no") | `endgame_plies` | `eplies1`/`eplies2` | opening-rack jobs; leave jobs (they refuse a player that solves) |
+| 10 | Win % Model | `winpct_id` | `winpct` | static players |
+| 11 | Maximum Total Iterations | `max_iterations` | `i1`/`i2` (`iterations`) | static players |
+| 12 | Stopping % | `stopping_pct` | `sc1`/`sc2` (`scondition`) | static players |
+| 13 | Moves Recorded | `num_plays_recorded` | `maxnumdplays` | leave jobs; games/pairs jobs without capture (Fix 1) |
+| 14 | Plies Recorded ("—" for a static player) | `num_plies_recorded` | `shplies` | leave jobs; games/pairs jobs without capture (Fix 1) |
+| 15 | Minimum Iterations per Play | `min_play_iterations` | `mi1`/`mi2` (`minplayiterations`) | static players |
+| 16 | Stopping Threshold Rule | `threshold` | `th1`/`th2` (`threshold`) | static players |
+| 17 | Sampling Rule | `sampling_rule` | `sa1`/`sa2` (`sr`) | static players |
+| 18 | Inference Margin | `inference_margin` | `im1`/`im2` (`imargin`) | static players, opening-rack jobs (Fix 2) |
+| 19 | Win % Utility Weight | `utility_w_winpct` | `uwin1`/`uwin2` (`uwin`) | static players |
+| 20 | Spread Utility Weight | `utility_w_spread` | `uspread1`/`uspread2` (`uspread`) | static players |
+| 21 | Spread Utility Scale | `utility_spread_scale` | `uspreadscale1`/`uspreadscale2` (`uspreadscale`) | static players |
+| 22 | Time Limit (Seconds) | `time_limit_secs` | `tl1`/`tl2` (`tlim`) | static players (always 0 for a simmer) |
+| 23 | Movegen Margin ("—" unless the recorder is `equity`) | `movegen_margin` | `mmargin` | leave jobs |
+| 24 | PEG Schedule | `peg_stage_top_k` | `pegtopk1`/`pegtopk2` | players without the pre-endgame; opening-rack and leave jobs |
+| 25 | PEG Stride | `peg_scenario_stride` | `pegstride1`/`pegstride2` | the same |
+| 26 | PEG Opponent | `peg_opp_model` | `pegpess1`/`pegpess2` | the same |
+| 27 | Nested Lookahead | `peg_nested` | `pegnested1`/`pegnested2` | the same |
+| 28 | Nested Caps | `peg_nested_cand_caps` | `pegncaps` | the same, and players without nested lookahead |
+| 29 | Nested Depth | `peg_nested_max_depth` | `pegndepth` | the same |
+| 30 | Nested Strides | `peg_nested_strides` | `pegnstrides` | the same |
 | 31 | Wordmap | `use_wordmap` | `w1`/`w2` (`wmp`) | n/a |
-| 32 | Rack info table | `use_rit` | `rit1`/`rit2` (`rit`) | n/a (leave jobs refuse it) |
-| 33 | Word info table | `use_wit` | `wit1`/`wit2` (`wit`) | n/a |
+| 32 | Rack Info Table | `use_rit` | `rit1`/`rit2` (`rit`) | n/a (leave jobs refuse it) |
+| 33 | Word Info Table | `use_wit` | `wit1`/`wit2` (`wit`) | n/a |
 
 How the "Never read by" column affects the display:
 
@@ -528,13 +535,17 @@ How the "Never read by" column affects the display:
   ([`unusedPlayerSettings`](frontend/src/lib/jobSettings.ts)): a leave job's
   set, an opening-rack job's, and a games or pairs job's plays and plies
   recorded when it records no positions.
-- A simulation-only row (6–9 and 15–22) shows "—" for a static player, and a
-  pre-endgame row (24–30) shows "—" for a player that does not run it.
-- When every player in the table is static, the simulation rows are left out
-  instead of showing columns of dashes. The Endgame and Pre-endgame key rows
-  appear only when a player solves.
+- A simulation-only row (7, 10–12 and 15–22) shows "—" for a static player, and a
+  pre-endgame row (24–30) shows "—" for a player that does not run it. So do
+  Plies Recorded for a static player, which records no plies, and Movegen
+  Margin unless the recorder keeps every move within the equity margin, the
+  only recorder it bounds.
+- When every player in the table is static, the simulation rows under All
+  settings are left out instead of showing columns of dashes; Uses Inference,
+  a key row, stays and shows "—". The key rows are shown for every player: a
+  player that does not solve shows "no" for Uses Preendgame and Uses Endgame.
 
-There is no "Search" summary row: it repeated rows 3, 7–9, 12 and 13. The
+There is no "Search" summary row: it repeated rows 6–9, 11 and 12. The
 search in a few words heads the table instead -- under each player's name in
 a job's table, beside the name on a config's page, and in `playersLine` on
 the job page -- leaving out what the job never reads.
@@ -556,12 +567,12 @@ type:
 | `ld` | Job 3 |
 | `bdn` | Job 4 |
 | `bb` | Job 5 |
-| `cutoff` | Job 13 |
+| `cutoff` | Job 15 |
 | `gp` | Job 1 (job type `game_pairs`) |
-| `autoplay` | Job 1, 6, 8, 17 |
-| `leavegen` | Job 1, 11, 12, 17, 18 |
+| `autoplay` | Job 1, 6, 9, 17 |
+| `leavegen` | Job 1, 13, 14, 17, 18 |
 | `generate`, `simulate` | Job 1 (job type `opening_rack`); `simulate` also needs Player 3 > 0 |
-| `rack` | Job 9, 10, 18 |
+| `rack` | Job 18 (the space and the rack size, `total_racks` and `rack_size`, are stored but not shown) |
 | `l1`, `l2`, `lex` | Player 1 |
 | `k1`, `k2`, `leaves` | Player 2 |
 | `pl1`, `pl2`, `plies` | Player 3 |

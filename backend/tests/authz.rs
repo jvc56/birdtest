@@ -205,6 +205,7 @@ const ROUTES: &[(&str, &str, Access, &str)] = &[
     ("POST", "/api/admin/jobs/:id/activate", Admin, r#"{"allocation":50}"#),
     ("POST", "/api/admin/jobs/:id/deactivate", Admin, ""),
     ("POST", "/api/admin/jobs/:id/complete", Admin, ""),
+    ("PATCH", "/api/admin/jobs/:id/consensus", Admin, r#"{"consensus_pct":80}"#),
     ("POST", "/api/admin/jobs/:id/purge", Admin, ""),
     ("DELETE", "/api/admin/jobs/:id", Admin, ""),
     ("DELETE", "/api/admin/users/:id", Admin, ""),
@@ -451,8 +452,8 @@ async fn every_cookie_backed_write_requires_the_csrf_pair() {
         }
         checked += 1;
     }
-    // 25 admin writes, 3 account writes, logout and sign-out-everywhere.
-    assert_eq!(checked, 30);
+    // 26 admin writes, 3 account writes, logout and sign-out-everywhere.
+    assert_eq!(checked, 31);
 
     // Nothing was done under any of them: the admin is still signed in, and
     // the audit log is empty.

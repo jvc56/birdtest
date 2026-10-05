@@ -3,6 +3,7 @@
   import { goto } from '$app/navigation';
   import { api, errorText, type InputData, type JobType, type PlayerConfig } from '$lib/api';
   import { blankFields, jobTypeLabel, leavePlayerConflict, parseTargetRackCounts, targetsText, unchosenText } from '$lib/format';
+  import { consensusProblem as checkConsensus } from '$lib/consensus';
 
   let configs: PlayerConfig[] = [];
   let files: InputData[] = [];
@@ -41,14 +42,13 @@
   let batchSize = 1;
   // Off by default: without a test the job plays its games and stops, and the
   // test's settings are not sent (the server refuses them without the flag).
-  let sprtEnabled = false;
+  let testEnabled = false;
   let minUnits = 1000;
   let maxUnits = 40000;
-  let sprtAlpha = 0.05;
-  let sprtBeta = 0.05;
-  let eloLow = -10;
-  let eloHigh = 10;
+  let confidencePct = 95;
   // Keep every position the games analyse, searchable on the job's page.
+  // What a games or pairs job's counts are of, for its labels.
+  $: units = jobType === 'games' ? 'Games' : 'Pairs';
   let capturePositions = false;
   // Game pairs, with positions saved: only each pair's first divergence.
   let captureFirstDivergence = false;
@@ -76,11 +76,11 @@
   $: consensusProblem =
     jobType !== 'opening_rack' || selectedStatic || maxResults <= 1
       ? null
-      : !(minResults >= 1 && maxResults >= minResults && maxResults <= 100)
-        ? 'The most analyses must be at least the fewest, and at most 100.'
-        : !(consensusPct > 50 && consensusPct <= 100)
-          ? 'The share that must agree must be above 50% and at most 100%.'
-          : null;
+      : checkConsensus({
+          min_results_per_rack: minResults,
+          max_results_per_rack: maxResults,
+          consensus_pct: consensusPct
+        });
   $: openingRackConflict =
     jobType !== 'opening_rack' || !selectedConfig
       ? null
@@ -130,15 +130,9 @@
       ...(jobType === 'leave_generation' ? {} : { sim_cutoff: simCutoff }),
       ...(minMagpieVersion ? { min_magpie_version: minMagpieVersion } : {})
     };
-    const sprt = sprtEnabled
-      ? {
-          sprt_enabled: true,
-          sprt_alpha: sprtAlpha,
-          sprt_beta: sprtBeta,
-          elo_low: eloLow,
-          elo_high: eloHigh
-        }
-      : { sprt_enabled: false };
+    const test = testEnabled
+      ? { test_enabled: true, confidence_pct: confidencePct }
+      : { test_enabled: false };
     switch (jobType) {
       case 'opening_rack':
         return {
@@ -157,16 +151,16 @@
         return {
           ...common,
           player1_config_id: player1, player2_config_id: player2,
-          games_per_batch: batchSize, max_games: maxUnits, ...sprt,
-          ...(sprtEnabled ? { min_games: minUnits } : {}),
+          games_per_batch: batchSize, max_games: maxUnits, ...test,
+          ...(testEnabled ? { min_games: minUnits } : {}),
           capture_positions: capturePositions
         };
       case 'game_pairs':
         return {
           ...common,
           player1_config_id: player1, player2_config_id: player2,
-          pairs_per_batch: batchSize, max_pairs: maxUnits, ...sprt,
-          ...(sprtEnabled ? { min_pairs: minUnits } : {}),
+          pairs_per_batch: batchSize, max_pairs: maxUnits, ...test,
+          ...(testEnabled ? { min_pairs: minUnits } : {}),
           capture_positions: capturePositions,
           capture_first_divergence: capturePositions && captureFirstDivergence
         };
@@ -237,7 +231,7 @@
      reaches submit(), which is where it was cleared, so it lingered. -->
 <form class="card max-w-2xl space-y-4" on:submit|preventDefault={submit} on:input={() => { if (fromSubmit) { error = ''; fromSubmit = false; } }}>
   <div>
-    <label class="label" for="name">Job name</label>
+    <label class="label" for="name">Job Name</label>
     <input
       id="name"
       class="input"
@@ -248,7 +242,7 @@
     />
   </div>
   <div>
-    <label class="label" for="type">Job type</label>
+    <label class="label" for="type">Job Type</label>
     <select
       id="type"
       class="input"
@@ -264,7 +258,7 @@
 
   <div class="grid grid-cols-2 gap-3">
     <div>
-      <label class="label" for="magpie">Min MAGPIE version</label>
+      <label class="label" for="magpie">Oldest MAGPIE</label>
       <input id="magpie" class="input" bind:value={minMagpieVersion} placeholder="1.4.0" />
       <p class="mt-1 text-xs text-muted-foreground">
         Server-wide floor: {serverFloor || '—'}. Workers below this are never offered the job;
@@ -282,14 +276,14 @@
       </select>
     </div>
     <div>
-      <label class="label" for="ld">Letter distribution</label>
+      <label class="label" for="ld">Letter Distribution</label>
       <select id="ld" class="input" bind:value={letterdistId} required>
         <option value="" disabled selected>Choose…</option>
         {#each letterdists as file}<option value={file.id}>{label(file)}</option>{/each}
       </select>
     </div>
     <div>
-      <label class="label" for="layout">Board layout</label>
+      <label class="label" for="layout">Board</label>
       <select id="layout" class="input" bind:value={layoutId} required>
         <option value="" disabled selected>Choose…</option>
         {#each layouts as file}<option value={file.id}>{label(file)}</option>{/each}
@@ -303,12 +297,12 @@
 
   <div class="grid grid-cols-2 gap-3">
     <div>
-      <label class="label" for="bingo">Bingo bonus (-bb)</label>
+      <label class="label" for="bingo">Bingo Bonus (-bb)</label>
       <input id="bingo" type="number" min="0" step="1" required class="input" bind:value={bingoBonus} />
     </div>
     {#if jobType !== 'leave_generation'}
       <div>
-        <label class="label" for="cutoff">Sim cutoff (-cutoff)</label>
+        <label class="label" for="cutoff">Sim Cutoff (-cutoff)</label>
         <input id="cutoff" type="number" min="0" max="100" step="any" required class="input" bind:value={simCutoff} />
         <p class="mt-1 text-xs text-muted-foreground">
           How close to 0% or 100% two plays' win percentages must be for a simulation to treat
@@ -322,7 +316,7 @@
     <!-- One player, in both cases: an opening-rack job's analyses every rack,
          a leave job's plays both seats of every game. -->
     <div>
-      <label class="label" for="pc">Player config</label>
+      <label class="label" for="pc">Player Config</label>
       <select id="pc" class="input" bind:value={playerConfigId} required>
         {#each configs as config}
           <option value={config.id}>
@@ -351,7 +345,7 @@
       </p>
     {/if}
     <fieldset class="space-y-2" data-testid="consensus">
-      <legend class="label">Analyses per rack</legend>
+      <legend class="label">Analyses Per Rack</legend>
       {#if selectedStatic}
         <p class="text-xs text-muted-foreground">
           One: {selectedConfig?.name} is static, so every analysis of a rack ranks it the same
@@ -361,11 +355,11 @@
       {:else}
         <div class="grid grid-cols-3 gap-3">
           <div>
-            <label class="label" for="minres">At least</label>
+            <label class="label" for="minres">Minimum Analyses Per Rack</label>
             <input id="minres" type="number" min="1" max="100" class="input" bind:value={minResults} />
           </div>
           <div>
-            <label class="label" for="maxres">At most</label>
+            <label class="label" for="maxres">Maximum Analyses Per Rack</label>
             <input id="maxres" type="number" min="1" max="100" class="input" bind:value={maxResults} />
           </div>
           <div>
@@ -385,7 +379,7 @@
         {#if consensusProblem}<p class="field-error">{consensusProblem}</p>{/if}
         <p class="text-xs text-muted-foreground">
           {#if maxResults <= 1}
-            One analysis per rack. Raise <strong>At most</strong> to analyse a rack until its
+            One analysis per rack. Raise <strong>Maximum Analyses Per Rack</strong> to analyse a rack until its
             analyses agree.
           {:else}
             Each rack is analysed at least {minResults} time{minResults === 1 ? '' : 's'}, and again
@@ -419,10 +413,10 @@
         </select>
       </div>
     </div>
-    <div class="grid {sprtEnabled ? 'grid-cols-3' : 'grid-cols-2'} gap-3">
+    <div class="grid {testEnabled ? 'grid-cols-3' : 'grid-cols-2'} gap-3">
       <div>
         <label class="label" for="batch">
-          {jobType === 'games' ? 'Games' : 'Pairs'} per batch
+          {units} Per Task
         </label>
         <input
           id="batch"
@@ -440,46 +434,60 @@
           </p>
         {/if}
       </div>
-      {#if sprtEnabled}
+      {#if testEnabled}
         <div>
-          <label class="label" for="min">Min before SPRT</label>
-          <input id="min" type="number" min="0" class="input" bind:value={minUnits} />
+          <label class="label" for="min">Minimum {units}</label>
+          <input id="min" type="number" min="1" max={maxUnits} class="input" bind:value={minUnits} />
         </div>
       {/if}
       <div>
         <label class="label" for="max">
-          {sprtEnabled ? 'Hard cap' : jobType === 'games' ? 'Games to play' : 'Pairs to play'}
+          {testEnabled ? `Maximum ${units}` : `${units} To Play`}
         </label>
         <input id="max" type="number" min="1" class="input" bind:value={maxUnits} />
       </div>
     </div>
     <div>
       <label class="flex items-center gap-2">
-        <input type="checkbox" bind:checked={sprtEnabled} />
-        <span class="label mb-0">Run an SPRT</span>
+        <input type="checkbox" bind:checked={testEnabled} />
+        <span class="label mb-0">Significance Test</span>
       </label>
       <p class="mt-1 text-xs text-muted-foreground">
-        {#if sprtEnabled}
-          The job stops as soon as the test decides between the two Elo hypotheses (once the
-          minimum is played), or at the hard cap if it never does.
+        {#if testEnabled}
+          The job stops as soon as one player is shown to be better at the confidence below (once
+          the minimum is played), or at its maximum if neither is. The test keeps an interval
+          around player 1's score that stays valid however often it is checked.
         {:else}
           Without a test the job plays every {jobType === 'games' ? 'game' : 'pair'} it is set
           to, and its result is the match score.
         {/if}
       </p>
     </div>
-    {#if sprtEnabled}
-      <div class="grid grid-cols-4 gap-3">
-        <div><label class="label" for="alpha">α</label><input id="alpha" type="number" step="any" min="0.000001" max="0.999999" class="input" bind:value={sprtAlpha} /></div>
-        <div><label class="label" for="beta">β</label><input id="beta" type="number" step="any" min="0.000001" max="0.999999" class="input" bind:value={sprtBeta} /></div>
-        <div><label class="label" for="lo">Elo low (H0)</label><input id="lo" type="number" step="any" min="-1000" max="1000" class="input" bind:value={eloLow} /></div>
-        <div><label class="label" for="hi">Elo high (H1)</label><input id="hi" type="number" step="any" min="-1000" max="1000" class="input" bind:value={eloHigh} /></div>
+    {#if testEnabled}
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="label" for="confidence">Confidence %</label>
+          <input
+            id="confidence"
+            type="number"
+            step="any"
+            min="50.1"
+            max="99.99"
+            class="input"
+            bind:value={confidencePct}
+          />
+          <p class="mt-1 text-xs text-muted-foreground">
+            The chance of naming a winner between two equal players is at most about
+            {Math.round((100 - confidencePct) * 100) / 100}%. Higher takes more {units.toLowerCase()}
+            to decide.
+          </p>
+        </div>
       </div>
     {/if}
     <div>
       <label class="flex items-center gap-2">
         <input type="checkbox" bind:checked={capturePositions} />
-        <span class="label mb-0">Save the positions played</span>
+        <span class="label mb-0">Position Recorder</span>
       </label>
       <p class="mt-1 text-xs text-muted-foreground">
         Keeps the position analysed on every turn of every game, with its ranked moves, for
@@ -490,7 +498,7 @@
       {#if jobType === 'game_pairs' && capturePositions}
         <label class="mt-2 flex items-center gap-2">
           <input type="checkbox" bind:checked={captureFirstDivergence} />
-          <span class="label mb-0">Only where each pair first diverges</span>
+          <span class="label mb-0">Only Where Each Pair First Diverges</span>
         </label>
         <p class="mt-1 text-xs text-muted-foreground">
           A pair's two games are one game with the seats swapped until the players choose
@@ -510,16 +518,16 @@
     </p>
     <div class="grid grid-cols-2 gap-3">
       <div>
-        <label class="label" for="iters">Games per task</label>
+        <label class="label" for="iters">Games Per Task</label>
         <input id="iters" type="number" min="1" class="input" bind:value={numIterations} />
       </div>
       <div>
-        <label class="label" for="rpt">Racks per task</label>
+        <label class="label" for="rpt">Racks Per Task</label>
         <input id="rpt" type="number" min="1" max="10000" class="input" bind:value={racksPerTask} />
       </div>
     </div>
     <div>
-      <label class="label" for="targets">Occurrences per rack, per generation</label>
+      <label class="label" for="targets">Target Per Rack, Per Generation</label>
       <input
         id="targets"
         class="input"

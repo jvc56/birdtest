@@ -853,7 +853,7 @@ async fn submit_result(
                              racks_without_consensus = racks_without_consensus + $6,
                              last_completed_at = now()
              WHERE id = $1
-               AND ($2 <> 0 OR $3 <> 0 OR $4 <> 0 OR $5 <> 0
+               AND ($2 <> 0 OR $3 <> 0 OR $4 <> 0 OR $5 <> 0 OR $6 <> 0
                     OR last_completed_at IS NULL
                     OR last_completed_at < now() - interval '1 minute')",
         )
@@ -902,7 +902,7 @@ async fn submit_result(
 /// Everything that has to happen after a result lands, split by whether the
 /// submitting worker has to wait for it.
 ///
-/// **Inline:** the finish conditions. SPRT gates whether the job keeps
+/// **Inline:** the finish conditions. The match test gates whether the job keeps
 /// dispatching, so it is evaluated on every submission and the aggregates it
 /// needs are read once, here.
 ///
@@ -1093,8 +1093,8 @@ const MIN_STATS_PUSH_INTERVAL: std::time::Duration = std::time::Duration::from_s
 /// Whether this submission is the one that evaluates the job's finish
 /// conditions.
 ///
-/// Every `SPRT_CHECK_EVERY`th, which bounds how much work a job can do past its
-/// stopping point at `SPRT_CHECK_EVERY - 1` tasks — see the constant for why
+/// Every `TEST_CHECK_EVERY`th, which bounds how much work a job can do past its
+/// stopping point at `TEST_CHECK_EVERY - 1` tasks — see the constant for why
 /// the first several of those cost nothing.
 ///
 /// **Plus, unconditionally, when this job has nothing left in flight.** The
@@ -1120,24 +1120,25 @@ async fn should_check_finish(state: &AppState, job_id: Uuid) -> AppResult<bool> 
     .await?)
 }
 
-/// Whether the job is done: for a games or pairs job with an SPRT, its
-/// significance (only after `min_units`) or the hard cap; for one without, its
+/// Whether the job is done: for a games or pairs job with a match test, its
+/// decision (only after `min_units`) or the hard cap; for one without, its
 /// target of `max_units` played; for opening racks, an exhausted and fully
 /// completed rack space.
 ///
 /// `None` while the job goes on. `Some` when it is done, saying what on --
-/// for an SPRT job the verdict and the units it had, which the completion
-/// stores: later results move the live LLR, but not what was decided.
+/// for a job with a test the verdict and the units it had, which the
+/// completion stores: later results move the live interval, but not what was
+/// decided.
 async fn finish_condition_met(state: &AppState, job: &Job) -> AppResult<Option<crate::jobs::Finish>> {
     use crate::jobs::Finish;
     Ok(match job.job_type {
         JobType::Games | JobType::GamePairs => {
-            jobstats::game_stats(&state.pool, job).await?.and_then(|games| match games.sprt {
-                Some(sprt) => {
-                    sprt.status.is_finished().then_some(Finish::Sprt(sprt, games.units_completed))
+            jobstats::game_stats(&state.pool, job).await?.and_then(|games| match games.test {
+                Some(test) => {
+                    test.status.is_finished().then_some(Finish::Test(test, games.units_completed))
                 }
-                // The same count the cap gates on for an SPRT job, so a job
-                // stops at the same point with the test on or off.
+                // The same count the cap gates on for a job with a test, so a
+                // job stops at the same point with the test on or off.
                 None => (games.units_completed >= games.max_units as u64)
                     .then_some(Finish::ReachedTarget),
             })
@@ -1253,6 +1254,10 @@ mod contract_fixtures {
     const RESULT_GAMES: &str = include_str!("../../../contract-fixtures/result-games.json");
     const RESULT_GAME_PAIRS: &str =
         include_str!("../../../contract-fixtures/result-game-pairs.json");
+    // Written by hand in MAGPIE's key layout, which MAGPIE's own test checks
+    // its output against (see contract-fixtures/README.md).
+    const RESULT_GAMES_INFERENCE: &str =
+        include_str!("../../../contract-fixtures/result-games-inference.json");
     const RESULT_OPENING_RACK: &str =
         include_str!("../../../contract-fixtures/result-opening-rack.json");
     const RESULT_LEAVE_GENERATION: &str =
@@ -1448,6 +1453,24 @@ mod contract_fixtures {
         assert!(record.pentanomial.is_none());
         assert!(!record.positions.is_empty(), "result-games.json captured no positions");
         assert!(record.positions.iter().all(|p| p.position.is_some() && !p.moves.is_empty()));
+    }
+
+    /// C-3b: a games result from simming players that infer: a first-turn
+    /// position with no inference, and a later one with what was inferred of
+    /// the opponent's leave, kept with the position.
+    #[test]
+    fn the_inferring_games_result_is_accepted_and_keeps_its_inference() {
+        let (_, record) = submitted::<crate::jobs::game::GameHandler>(
+            RESULT_GAMES_INFERENCE,
+            "result-games-inference.json",
+        );
+        let first = record.positions.iter().find(|p| p.turn_number == Some(0)).unwrap();
+        assert!(first.inference.is_none(), "nothing to infer from on a game's first turn");
+        let later = record.positions.iter().find(|p| p.inference.is_some()).unwrap();
+        let inference = later.inference.as_ref().unwrap();
+        assert!(inference.num_leaves >= inference.leaves.len() as i64);
+        assert!(!inference.leaves.is_empty());
+        assert!(later.moves.iter().all(|m| m.win_percentage.is_some() && !m.plies.is_empty()));
     }
 
     /// C-4: a pairs result carries the pentanomial, and both of its

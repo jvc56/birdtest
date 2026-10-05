@@ -11,7 +11,8 @@ pub mod registry;
 use crate::error::AppResult;
 use crate::models::job::NamedPlayerConfig;
 use handler::{
-    GameRequest, GameResultsRecord, MoveEntry, PlayerSpec, PlyStats, PositionAnalysis,
+    GameRequest, GameResultsRecord, InferenceSummary, MoveEntry, PlayerSpec, PlyStats,
+    PositionAnalysis,
 };
 use racks::LetterDistribution;
 use sqlx::{PgConnection, Row};
@@ -299,8 +300,8 @@ pub(crate) async fn try_lock_job_dispatch_now(
 /// is `DispatchHolds::claims_holds_taken` compared with a count read before
 /// the check read anything.
 ///
-/// `finish` is what the check completed the job on. An SPRT verdict is
-/// stored with the completion (`jobs.sprt_decided_*`), and it or
+/// `finish` is what the check completed the job on. A match-test verdict is
+/// stored with the completion (`jobs.test_decided_*`), and it or
 /// `reached_target` is the audit row's reason.
 pub async fn complete_unless_purged(
     pool: &sqlx::PgPool,
@@ -310,20 +311,22 @@ pub async fn complete_unless_purged(
     purged_since: impl Fn() -> bool,
 ) -> AppResult<bool> {
     let decided = match finish {
-        Finish::Sprt(sprt, units) => Some((sprt, units)),
+        Finish::Test(test, units) => Some((test, units)),
         Finish::ReachedTarget | Finish::RacksAnalysed => None,
     };
-    let status = decided.map(|(sprt, _)| sprt.status.as_str());
+    let status = decided.map(|(test, _)| test.status.as_str());
     let mut tx = pool.begin().await?;
     let completed = sqlx::query(
         "UPDATE jobs SET status = 'completed',
-                         sprt_decided_status = $3, sprt_decided_llr = $4, sprt_decided_units = $5
+                         test_decided_status = $3, test_decided_lower = $4,
+                         test_decided_upper = $5, test_decided_units = $6
          WHERE id = $1 AND status = 'active' AND claims_issued >= $2",
     )
     .bind(job_id)
     .bind(observed_claims_issued)
     .bind(status)
-    .bind(decided.map(|(sprt, _)| sprt.llr))
+    .bind(decided.map(|(test, _)| test.lower))
+    .bind(decided.map(|(test, _)| test.upper))
     .bind(decided.map(|(_, units)| units as i64))
     .execute(&mut *tx)
     .await?
@@ -346,13 +349,14 @@ pub async fn complete_unless_purged(
 /// What a job's own finish condition completed it on.
 #[derive(Debug, Clone, Copy)]
 pub enum Finish {
-    /// A games or pairs job's SPRT verdict, and the units it had then. Kept
-    /// with the job (`jobs.sprt_decided_*`): results still in flight move the
-    /// live LLR afterwards, and this is the decision that stands.
-    Sprt(crate::stats::sprt::SprtResult, u64),
-    /// A games or pairs job that runs no SPRT played its `max_units`. There is
-    /// no verdict to keep, so `sprt_decided_*` stay NULL and the audit row's
-    /// reason is what says why it stopped.
+    /// A games or pairs job's match-test verdict, and the units it had then.
+    /// Kept with the job (`jobs.test_decided_*`): results still in flight
+    /// move the live interval afterwards, and this is the decision that
+    /// stands.
+    Test(crate::stats::match_test::TestResult, u64),
+    /// A games or pairs job that runs no test played its `max_units`. There
+    /// is no verdict to keep, so `test_decided_*` stay NULL and the audit
+    /// row's reason is what says why it stopped.
     ReachedTarget,
     /// An opening-rack job's racks were all handed out and analysed.
     RacksAnalysed,
@@ -364,7 +368,7 @@ impl Finish {
     /// way to finish.
     pub fn reason(self) -> Option<&'static str> {
         match self {
-            Finish::Sprt(sprt, _) => Some(sprt.status.as_str()),
+            Finish::Test(test, _) => Some(test.status.as_str()),
             Finish::ReachedTarget => Some("reached_target"),
             Finish::RacksAnalysed => None,
         }
@@ -611,7 +615,7 @@ pub(crate) async fn insert_position_analyses(
     for chunk in pending.chunks(MOVE_ROWS_PER_STATEMENT) {
         let mut builder = sqlx::QueryBuilder::new(
             "INSERT INTO position_analysis_moves
-                 (record_id, rank, move, score, equity, win_percentage,
+                 (record_id, rank, move, score, equity, iterations, win_percentage,
                   blended_utility, mean_spread, fidelity_plies) ",
         );
         builder.push_values(chunk.iter(), |mut b, (record_id, rank, entry)| {
@@ -620,6 +624,7 @@ pub(crate) async fn insert_position_analyses(
                 .push_bind(entry.play.clone())
                 .push_bind(entry.score)
                 .push_bind(entry.equity)
+                .push_bind(entry.iterations)
                 // NULL for a static player, which simulates nothing.
                 .push_bind(entry.win_percentage)
                 .push_bind(entry.blended_utility)
@@ -667,14 +672,39 @@ pub(crate) async fn insert_position_analyses(
         builder.push(" ON CONFLICT (move_id, ply) DO NOTHING");
         builder.build().execute(&mut *conn).await?;
     }
+
+    // What a simming player inferred of the opponent's leave, one row per
+    // position that has it; the leaves are at most ten, kept as they came
+    // (checked in `plausibility::check_inference`), most drawn first.
+    let inferences: Vec<(i64, &InferenceSummary)> = positions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, position)| Some((record_ids[index]?, position.inference.as_ref()?)))
+        .collect();
+    for chunk in inferences.chunks(INFERENCE_ROWS_PER_STATEMENT) {
+        let mut builder = sqlx::QueryBuilder::new(
+            "INSERT INTO position_analysis_inference
+                 (record_id, num_leaves, total_draws, average_equity, leaves) ",
+        );
+        builder.push_values(chunk.iter(), |mut b, (record_id, inference)| {
+            b.push_bind(*record_id)
+                .push_bind(inference.num_leaves)
+                .push_bind(inference.total_draws)
+                .push_bind(inference.average_equity)
+                .push_bind(sqlx::types::Json(&inference.leaves));
+        });
+        builder.push(" ON CONFLICT (record_id) DO NOTHING");
+        builder.build().execute(&mut *conn).await?;
+    }
     Ok(())
 }
 
 /// Rows per multi-row insert, keeping each statement well under Postgres's
-/// 65,535-parameter ceiling (11, 9 and 4 binds per row respectively).
+/// 65,535-parameter ceiling (13, 10, 4 and 5 binds per row respectively).
 const RECORD_ROWS_PER_STATEMENT: usize = 2_000;
 const MOVE_ROWS_PER_STATEMENT: usize = 4_000;
 const PLY_ROWS_PER_STATEMENT: usize = 8_000;
+const INFERENCE_ROWS_PER_STATEMENT: usize = 4_000;
 
 pub(crate) async fn insert_game_results(
     conn: &mut PgConnection,

@@ -1,6 +1,6 @@
 # birdtest
 
-Crowdsourced word game analysis, modelled after Fishnet. Admins define jobs;
+Crowdsourced crossword game analysis, modelled after Fishnet. Admins define jobs;
 contributors run [MAGPIE](https://github.com/jvc56/MAGPIE) itself — `magpie
 contribute` claims tasks, executes them locally, and submits results. The site
 aggregates everything onto a live dashboard.
@@ -23,7 +23,7 @@ swallows the rest of the paste.
 
 | Path | What it is |
 |---|---|
-| `backend/` | Axum + SQLx server. Owns scheduling, validation, SPRT, ratings and aggregation. |
+| `backend/` | Axum + SQLx server. Owns scheduling, validation, the match test, ratings and aggregation. |
 | `frontend/` | SvelteKit SPA (dark mode only), built statically and served by Nginx in production. |
 | `worker/` | `fake_worker.py`, a synthetic client used by the **end-to-end suite only** — see [TESTING.md](TESTING.md). Local development uses real MAGPIE; the contributor client is MAGPIE itself, see [Worker Client](PLAN.md#worker-client-1). |
 | `infra/` | Terraform: VPC, ALB, ECS Fargate, RDS Postgres, S3, SES, SSM, backups. |
@@ -54,7 +54,7 @@ reused, when an active job of its name is already running -- and they stack:
 | Flag | The job |
 |---|---|
 | `--leavegen-job` | "dev leave generation": six generations, targets 100, 200, 500, 1,000, 1,000 and 1,000 occurrences per rack, played by `static-equity-no-rit` |
-| `--opening-rack-job` | "dev opening racks": every rack, 500 to a task, every play ranked by `static-equity-all` |
+| `--opening-rack-job` | "dev opening racks": every rack, 20 to a task, every play ranked by the 2-ply simmer `sim-2ply-rack`; each rack is analysed until 80% of its analyses agree on the best move, 2 to 5 analyses |
 | `--games-job` | "dev games (positions saved)": `static-equity` against `static-score`, saving every position played |
 | `--pairs-job` | "dev game pairs (first divergences saved)": the same two players in pairs, saving the positions where each pair first diverges |
 | `--sim-games-job` | "dev sim games (positions saved)": `sim-2ply` against `sim-1ply` (10 plays considered, an iteration budget of 200), two games to a task, saving every position played |
@@ -285,7 +285,10 @@ one progress row per full 7-tile rack — 3,199,724 rows for a real English bag 
 when its first claim finds the universe missing (seeded off the claim path, so
 that claim is answered at once). Worth knowing before you create one by hand.
 Opening-rack jobs only *count* their rack space (3,199,724 racks for English)
-and address it by range, so they are cheap to create.
+and address it by range, so they are cheap to create. As racks are analysed,
+each gets a progress row (`opening_rack_progress`), whatever the job's
+consensus settings, so those settings can be changed later from the job's
+admin page.
 
 ### Contributing with MAGPIE
 

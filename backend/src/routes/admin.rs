@@ -4,12 +4,12 @@ use crate::backups::{self, BackupStatus};
 use crate::extract::ApiJson;
 use crate::error::{AppError, AppResult};
 use crate::jobs::registry;
-use crate::models::job::{Job, JobStatus, JobType, PlayerConfig};
+use crate::models::job::{ConsensusSettings, Job, JobStatus, JobType, OpeningRackConfig, PlayerConfig};
 use crate::state::AppState;
 use crate::extract::{ApiPath as Path, ApiQuery as Query};
 use axum::extract::State;
 use axum::http::{HeaderMap, Method, StatusCode};
-use axum::routing::{delete, get, post, put};
+use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use axum_extra::extract::CookieJar;
 use serde::{Deserialize, Serialize};
@@ -24,6 +24,7 @@ pub fn router() -> Router<AppState> {
         .route("/jobs/:id/activate", post(activate_job))
         .route("/jobs/:id/deactivate", post(deactivate_job))
         .route("/jobs/:id/complete", post(complete_job))
+        .route("/jobs/:id/consensus", patch(update_consensus))
         .route("/jobs/:id/purge", post(purge_job))
         .route("/jobs/:id", delete(delete_job))
         .route("/users/:id", delete(delete_user))
@@ -1253,12 +1254,12 @@ enum JobTypeConfig {
         /// With the test off, the job plays this many games and stops; with it
         /// on, it stops here at the latest.
         max_games: i32,
-        /// The fewest games before the test is acted on: an SPRT setting,
-        /// required with one and refused without.
+        /// The fewest games before the test is acted on: a setting of the
+        /// match test, required with one and refused without.
         #[serde(default)]
         min_games: Option<i32>,
         #[serde(flatten)]
-        sprt: SprtRequest,
+        test: TestRequest,
         #[serde(default)]
         capture_positions: bool,
         /// Refused: a games job has no pairs to diverge. Read so that it is
@@ -1274,12 +1275,12 @@ enum JobTypeConfig {
         /// With the test off, the job plays this many pairs and stops; with it
         /// on, it stops here at the latest.
         max_pairs: i32,
-        /// The fewest pairs before the test is acted on: an SPRT setting,
-        /// required with one and refused without.
+        /// The fewest pairs before the test is acted on: a setting of the
+        /// match test, required with one and refused without.
         #[serde(default)]
         min_pairs: Option<i32>,
         #[serde(flatten)]
-        sprt: SprtRequest,
+        test: TestRequest,
         #[serde(default)]
         capture_positions: bool,
         /// Of the captured positions, keep only each pair's first divergence.
@@ -1288,58 +1289,35 @@ enum JobTypeConfig {
     },
 }
 
-/// A games or pairs job's test, as the request states it.
+/// A games or pairs job's match test (`stats::match_test`), as the request
+/// states it.
 ///
-/// Off unless `sprt_enabled` says otherwise, and then every other setting here
-/// is refused (see [`validate_job_body`]). On, a setting left out takes the
-/// schema's default, as it always has.
+/// Off unless `test_enabled` says otherwise, and then its settings are
+/// refused (see [`validate_job_body`]). On, a confidence left out is 95%.
 #[derive(Deserialize)]
-struct SprtRequest {
+struct TestRequest {
     #[serde(default)]
-    sprt_enabled: bool,
+    test_enabled: bool,
     #[serde(default)]
-    sprt_alpha: Option<f64>,
-    #[serde(default)]
-    sprt_beta: Option<f64>,
-    #[serde(default)]
-    elo_low: Option<f64>,
-    #[serde(default)]
-    elo_high: Option<f64>,
+    confidence_pct: Option<f64>,
 }
 
-/// The test as a config row stores it. A job without one stores the defaults
-/// and a floor of 0, which nothing reads: `SprtParams::enabled` gates them all.
-struct SprtSettings {
+/// The test as a config row stores it. A job without one stores the default
+/// confidence and a floor of 0, which nothing reads: `TestParams::enabled`
+/// gates them all.
+struct TestSettings {
     enabled: bool,
     min_units: i32,
-    alpha: f64,
-    beta: f64,
-    elo_low: f64,
-    elo_high: f64,
+    confidence_pct: f64,
 }
 
-impl SprtRequest {
-    fn settings(&self, min_units: Option<i32>) -> SprtSettings {
-        SprtSettings {
-            enabled: self.sprt_enabled,
+impl TestRequest {
+    fn settings(&self, min_units: Option<i32>) -> TestSettings {
+        TestSettings {
+            enabled: self.test_enabled,
             min_units: min_units.unwrap_or(0),
-            alpha: self.sprt_alpha.unwrap_or(0.05),
-            beta: self.sprt_beta.unwrap_or(0.05),
-            elo_low: self.elo_low.unwrap_or(-10.0),
-            elo_high: self.elo_high.unwrap_or(10.0),
+            confidence_pct: self.confidence_pct.unwrap_or(95.0),
         }
-    }
-
-    /// The test's settings the request states, by field name.
-    fn stated(&self) -> impl Iterator<Item = &'static str> + '_ {
-        [
-            ("sprt_alpha", self.sprt_alpha.is_some()),
-            ("sprt_beta", self.sprt_beta.is_some()),
-            ("elo_low", self.elo_low.is_some()),
-            ("elo_high", self.elo_high.is_some()),
-        ]
-        .into_iter()
-        .filter_map(|(field, stated)| stated.then_some(field))
     }
 }
 
@@ -1516,9 +1494,8 @@ fn games_batch_field(mut err: AppError, unit: &str, games_per_unit: i32, batch: 
 /// Each of these used to be accepted and fail later, far from the admin who
 /// typed it: a `games_per_batch` of 0 makes every claim generate the seed the
 /// previous claim already took, so the job retries a unique-index violation
-/// forever and dispatches nothing; an `elo_low` above `elo_high` inverts the
-/// LLR's sign, so SPRT confidently accepts the wrong hypothesis; an `alpha` of
-/// 0 or 1 puts a logarithm of zero or infinity in the bounds. Every problem is
+/// forever and dispatches nothing; a confidence of 100% puts a logarithm of
+/// zero in the test's interval, which then never closes. Every problem is
 /// reported at once, like registration does.
 /// The longest job name, in characters (the column's check).
 const MAX_JOB_NAME_CHARS: usize = 100;
@@ -1526,6 +1503,29 @@ const MAX_JOB_NAME_CHARS: usize = 100;
 /// The job's name as stored: trimmed, empty when none was given.
 fn job_name(body: &CreateJobBody) -> String {
     body.name.as_deref().unwrap_or("").trim().to_string()
+}
+
+/// An opening-rack job's consensus settings, checked alike at creation and
+/// when an admin changes them (`update_consensus`): each problem is a field
+/// error added to `err`.
+fn consensus_problems(mut err: AppError, consensus_pct: f64, min: i32, max: i32) -> AppError {
+    // Above half: at or below it two moves could each hold the consensus, and
+    // a tie would settle a rack on whichever sorted first.
+    if !(consensus_pct.is_finite() && consensus_pct > 50.0 && consensus_pct <= 100.0) {
+        err = err.with_field("consensus_pct", "must be above 50 and at most 100");
+    }
+    if !(1..=MAX_RESULTS_PER_RACK).contains(&min) {
+        err = err.with_field(
+            "min_results_per_rack",
+            format!("must be between 1 and {MAX_RESULTS_PER_RACK}"),
+        );
+    } else if !(min..=MAX_RESULTS_PER_RACK).contains(&max) {
+        err = err.with_field(
+            "max_results_per_rack",
+            format!("must be between min_results_per_rack ({min}) and {MAX_RESULTS_PER_RACK}"),
+        );
+    }
+    err
 }
 
 fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
@@ -1565,12 +1565,12 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
         }
     }
 
-    let sprt = |mut err: AppError,
-                unit: &str,
-                batch: i32,
-                min_units: Option<i32>,
-                max_units: i32,
-                test: &SprtRequest| {
+    let match_test = |mut err: AppError,
+                      unit: &str,
+                      batch: i32,
+                      min_units: Option<i32>,
+                      max_units: i32,
+                      test: &TestRequest| {
         if batch < 1 {
             err = err.with_field(format!("{unit}s_per_batch"), "must be at least 1");
         }
@@ -1578,49 +1578,39 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
             err = err.with_field(format!("max_{unit}s"), "must be at least 1");
         }
         let min_field = format!("min_{unit}s");
-        // Refused rather than ignored. The test was once always on, so a
-        // request that sets it up without turning it on is most likely a
-        // script written then: ignored, its job would play to its cap with no
-        // test, and nothing would say so until it finished.
-        if !test.sprt_enabled {
-            let stated = min_units.is_some().then_some(min_field);
-            for field in stated.into_iter().chain(test.stated().map(String::from)) {
+        // Refused rather than ignored: a request that sets the test up
+        // without turning it on would, ignored, play to its cap with no test,
+        // and nothing would say so until it finished.
+        if !test.test_enabled {
+            let stated = [
+                min_units.is_some().then_some(min_field),
+                test.confidence_pct.is_some().then(|| "confidence_pct".to_string()),
+            ];
+            for field in stated.into_iter().flatten() {
                 err = err.with_field(
                     field,
-                    "is an SPRT setting: send sprt_enabled: true to run the test, or leave it out",
+                    "is a setting of the match test: send test_enabled: true to run it, or leave \
+                     it out",
                 );
             }
             return err;
         }
+        // The test's interval is asymptotic: it holds once enough units are
+        // in for their mean to be close to normal, which is what the floor
+        // is for. Above the cap it would never be reached.
         match min_units {
-            None => err = err.with_field(min_field, "is required when the job runs an SPRT"),
-            Some(min_units) if min_units < 0 => {
-                err = err.with_field(min_field, "must not be negative")
+            None => err = err.with_field(min_field, "is required when the job runs the match test"),
+            Some(min_units) if min_units < 1 => err = err.with_field(min_field, "must be at least 1"),
+            Some(min_units) if min_units > max_units && max_units >= 1 => {
+                err = err.with_field(min_field, format!("must be at most max_{unit}s ({max_units})"))
             }
             Some(_) => {}
         }
-        let SprtSettings { alpha, beta, elo_low, elo_high, .. } = test.settings(min_units);
-        // Not merely above 0: a subnormal alpha made the upper bound
-        // infinite, serialised as `null`, and the public job page threw on it.
-        for (field, value) in [("sprt_alpha", alpha), ("sprt_beta", beta)] {
-            if !(1e-6..1.0).contains(&value) {
-                err = err.with_field(field, "must be at least 0.000001 and below 1");
-            }
-        }
-        if alpha + beta >= 1.0 {
-            err = err.with_field("sprt_beta", "sprt_alpha + sprt_beta must be below 1");
-        }
-        if !(elo_low.is_finite() && elo_high.is_finite() && elo_low < elo_high) {
-            err = err.with_field("elo_high", "must be a finite number greater than elo_low");
-        }
-        // A bound on what a hypothesis may say: far enough out, both are an
-        // expected score of 1 to the last bit (from about 6,400 Elo), the LLR
-        // is always 0 and the job runs to its cap. Past a thousand no job
-        // between two word-game players means anything.
-        for (field, value) in [("elo_low", elo_low), ("elo_high", elo_high)] {
-            if value.is_finite() && value.abs() > 1000.0 {
-                err = err.with_field(field, "must be between -1000 and 1000");
-            }
+        // Not 100: the interval's logarithm of 1 - confidence is then
+        // infinite, and it never closes. At or below half it is no test.
+        let confidence = test.settings(min_units).confidence_pct;
+        if !(confidence.is_finite() && confidence > 50.0 && confidence < 100.0) {
+            err = err.with_field("confidence_pct", "must be above 50 and below 100");
         }
         err
     };
@@ -1639,33 +1629,13 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
             if !(1..=7).contains(rack_size) {
                 err = err.with_field("rack_size", "must be between 1 and 7");
             }
-            // Above half: at or below it two moves could each hold the
-            // consensus, and a tie would settle a rack on whichever sorted
-            // first.
-            if !(consensus_pct.is_finite() && *consensus_pct > 50.0 && *consensus_pct <= 100.0) {
-                err = err.with_field("consensus_pct", "must be above 50 and at most 100");
-            }
-            if !(1..=MAX_RESULTS_PER_RACK).contains(min_results_per_rack) {
-                err = err.with_field(
-                    "min_results_per_rack",
-                    format!("must be between 1 and {MAX_RESULTS_PER_RACK}"),
-                );
-            } else if !(*min_results_per_rack..=MAX_RESULTS_PER_RACK).contains(max_results_per_rack) {
-                err = err.with_field(
-                    "max_results_per_rack",
-                    format!(
-                        "must be between min_results_per_rack ({min_results_per_rack}) and \
-                         {MAX_RESULTS_PER_RACK}"
-                    ),
-                );
-            }
-            err
+            consensus_problems(err, *consensus_pct, *min_results_per_rack, *max_results_per_rack)
         }
         JobTypeConfig::Game {
-            games_per_batch, min_games, max_games, sprt: test, capture_positions,
+            games_per_batch, min_games, max_games, test, capture_positions,
             capture_first_divergence, ..
         } => {
-            let mut err = sprt(err, "game", *games_per_batch, *min_games, *max_games, test);
+            let mut err = match_test(err, "game", *games_per_batch, *min_games, *max_games, test);
             err = games_batch_field(err, "game", 1, *games_per_batch, *capture_positions);
             if *capture_first_divergence {
                 err = err.with_field(
@@ -1675,7 +1645,7 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
             }
             // MAGPIE alternates the first mover within one run, from player 1,
             // and every task is a run of its own: at a batch of 1 player 1
-            // moved first in every game of the job, and SPRT passed two
+            // moved first in every game of the job, and the SPRT then in use passed two
             // identical players on the first move alone (+42 Elo; the audit's
             // pass 18). An even batch gives each player the first move equally
             // in every task. Game pairs swap it within each pair already.
@@ -1688,10 +1658,10 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
             err
         }
         JobTypeConfig::GamePair {
-            pairs_per_batch, min_pairs, max_pairs, sprt: test, capture_positions,
+            pairs_per_batch, min_pairs, max_pairs, test, capture_positions,
             capture_first_divergence, ..
         } => {
-            let mut err = sprt(err, "pair", *pairs_per_batch, *min_pairs, *max_pairs, test);
+            let mut err = match_test(err, "pair", *pairs_per_batch, *min_pairs, *max_pairs, test);
             if *capture_first_divergence && !*capture_positions {
                 err = err.with_field(
                     "capture_first_divergence",
@@ -2140,7 +2110,7 @@ async fn insert_job_config(
             JobType::Games,
             JobTypeConfig::Game {
                 player1_config_id, player2_config_id, games_per_batch,
-                min_games, max_games, sprt, capture_positions, ..
+                min_games, max_games, test, capture_positions, ..
             },
         ) => {
             validate_shared_player_options(&mut *conn, *player1_config_id, *player2_config_id)
@@ -2155,18 +2125,18 @@ async fn insert_job_config(
                 validate_capture_play_cap(&mut *conn, *player1_config_id, *player2_config_id)
                     .await?;
             }
-            let test = sprt.settings(*min_games);
+            let test = test.settings(*min_games);
             sqlx::query(
                 "INSERT INTO job_game_config
                      (job_id, player1_config_id,
-                      player2_config_id, games_per_batch, sprt_enabled, min_games, max_games,
-                      sprt_alpha, sprt_beta, elo_low, elo_high, capture_positions)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
+                      player2_config_id, games_per_batch, test_enabled, min_games, max_games,
+                      confidence_pct, capture_positions)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
             )
             .bind(job.id)
             .bind(player1_config_id).bind(player2_config_id)
             .bind(games_per_batch).bind(test.enabled).bind(test.min_units).bind(max_games)
-            .bind(test.alpha).bind(test.beta).bind(test.elo_low).bind(test.elo_high)
+            .bind(test.confidence_pct)
             .bind(capture_positions)
             .execute(conn)
             .await?;
@@ -2175,7 +2145,7 @@ async fn insert_job_config(
             JobType::GamePairs,
             JobTypeConfig::GamePair {
                 player1_config_id, player2_config_id, pairs_per_batch,
-                min_pairs, max_pairs, sprt, capture_positions, capture_first_divergence,
+                min_pairs, max_pairs, test, capture_positions, capture_first_divergence,
             },
         ) => {
             validate_shared_player_options(&mut *conn, *player1_config_id, *player2_config_id)
@@ -2190,19 +2160,18 @@ async fn insert_job_config(
                 validate_capture_play_cap(&mut *conn, *player1_config_id, *player2_config_id)
                     .await?;
             }
-            let test = sprt.settings(*min_pairs);
+            let test = test.settings(*min_pairs);
             sqlx::query(
                 "INSERT INTO job_game_pair_config
                      (job_id, player1_config_id,
-                      player2_config_id, pairs_per_batch, sprt_enabled, min_pairs, max_pairs,
-                      sprt_alpha, sprt_beta, elo_low, elo_high, capture_positions,
-                      capture_first_divergence)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
+                      player2_config_id, pairs_per_batch, test_enabled, min_pairs, max_pairs,
+                      confidence_pct, capture_positions, capture_first_divergence)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
             )
             .bind(job.id)
             .bind(player1_config_id).bind(player2_config_id)
             .bind(pairs_per_batch).bind(test.enabled).bind(test.min_units).bind(max_pairs)
-            .bind(test.alpha).bind(test.beta).bind(test.elo_low).bind(test.elo_high)
+            .bind(test.confidence_pct)
             .bind(capture_positions)
             .bind(capture_first_divergence)
             .execute(conn)
@@ -2651,6 +2620,225 @@ async fn complete_job(
     Ok(Json(job))
 }
 
+#[derive(Deserialize)]
+struct ConsensusBody {
+    consensus_pct: Option<f64>,
+    min_results_per_rack: Option<i32>,
+    max_results_per_rack: Option<i32>,
+}
+
+#[derive(Serialize)]
+struct ConsensusResult {
+    /// The job as it now stands: reopened, when the change unsettled racks of
+    /// a completed job; completed, when it settled the last of an active one's.
+    job: Job,
+    /// Its opening-rack settings as they now stand.
+    config: OpeningRackConfig,
+    /// How many of its racks the settings leave unsettled.
+    unsettled_racks: i64,
+    /// Whether the change took a completed job back out of completed.
+    reopened: bool,
+    /// Why a reopened job is inactive rather than active: the other active
+    /// jobs leave no room for its allocation.
+    reopened_inactive_reason: Option<String>,
+}
+
+/// Changes an opening-rack job's consensus settings -- the fewest and most
+/// analyses a rack gets, and the share of them that must agree on its best
+/// move -- and restates every rack under them (`opening_rack::restate_racks`).
+/// The only part of a job's configuration that changes after creation. Only
+/// the fields given change; none that differ is a `200` that writes nothing.
+///
+/// The job then starts or stops to match. A completed job the change leaves
+/// with unsettled racks is reopened: active at its allocation if the other
+/// active jobs leave room for it, inactive otherwise (the admin then makes
+/// room and activates it), and its final exports become snapshots, since the
+/// job will have a new final corpus once it completes again. An active job
+/// the change leaves with every rack settled completes now, or with its last
+/// in-flight claim's submission. An inactive job keeps its status, and
+/// completes when next activated if there is nothing left for it to do.
+///
+/// Under the locks a purge takes, in its order: the job's dispatch lock, so
+/// no claim is issued under the old settings; every open claim, so no
+/// submission is storing analyses while the racks are restated (a submission
+/// takes its claim first, so one already storing is waited for, and one that
+/// starts after reads the new settings once this commits); then the job's
+/// row. Claims and submissions read the settings fresh rather than from the
+/// job's cached template, which keeps them as the job was created.
+async fn update_consensus(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    Path(id): Path<Uuid>,
+    method: Method,
+    headers: HeaderMap,
+    jar: CookieJar,
+    ApiJson(body): ApiJson<ConsensusBody>,
+) -> AppResult<Json<ConsensusResult>> {
+    csrf::verify(&method, &headers, &jar)?;
+    let purges = refuse_while_purging(&state, id)?;
+
+    let mut tx = state.pool.begin().await?;
+    crate::jobs::lock_job_dispatch(&mut tx, id).await?;
+    lock_open_claims(&mut tx, id).await?;
+    let job = load_job_for_update(&mut tx, id).await?;
+    refuse_if_purged_since(&state, id, purges)?;
+    if job.job_type != JobType::OpeningRack {
+        return Err(AppError::bad_request("only an opening-rack job has consensus settings"));
+    }
+    let before = sqlx::query_as::<_, OpeningRackConfig>(
+        "SELECT * FROM job_opening_rack_config WHERE job_id = $1 FOR UPDATE",
+    )
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await?;
+    let old = before.consensus();
+    let new = ConsensusSettings {
+        consensus_pct: body.consensus_pct.unwrap_or(old.consensus_pct),
+        min_results_per_rack: body.min_results_per_rack.unwrap_or(old.min_results_per_rack),
+        max_results_per_rack: body.max_results_per_rack.unwrap_or(old.max_results_per_rack),
+    };
+    let err = consensus_problems(
+        AppError::bad_request("consensus settings are invalid"),
+        new.consensus_pct,
+        new.min_results_per_rack,
+        new.max_results_per_rack,
+    );
+    if !err.fields.is_empty() {
+        return Err(err);
+    }
+    validate_opening_rack_player(&mut tx, before.player_config_id, new.max_results_per_rack).await?;
+
+    if new == old {
+        let unsettled: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM opening_rack_progress WHERE job_id = $1 AND NOT settled",
+        )
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+        return Ok(Json(ConsensusResult {
+            job,
+            config: before,
+            unsettled_racks: unsettled,
+            reopened: false,
+            reopened_inactive_reason: None,
+        }));
+    }
+
+    let config = sqlx::query_as::<_, OpeningRackConfig>(
+        "UPDATE job_opening_rack_config
+         SET consensus_pct = $2, min_results_per_rack = $3, max_results_per_rack = $4
+         WHERE job_id = $1 RETURNING *",
+    )
+    .bind(id)
+    .bind(new.consensus_pct)
+    .bind(new.min_results_per_rack)
+    .bind(new.max_results_per_rack)
+    .fetch_one(&mut *tx)
+    .await?;
+    let unsettled = crate::jobs::opening_rack::restate_racks(&mut tx, id, &new).await?;
+
+    let mut changes = Vec::new();
+    if new.min_results_per_rack != old.min_results_per_rack {
+        changes.push(format!("min {} -> {}", old.min_results_per_rack, new.min_results_per_rack));
+    }
+    if new.max_results_per_rack != old.max_results_per_rack {
+        changes.push(format!("max {} -> {}", old.max_results_per_rack, new.max_results_per_rack));
+    }
+    if new.consensus_pct != old.consensus_pct {
+        changes.push(format!("consensus {}% -> {}%", old.consensus_pct, new.consensus_pct));
+    }
+    audit::log_detail(
+        &mut tx,
+        "job.consensus_changed",
+        admin.0.id,
+        "job",
+        id.to_string(),
+        Some(id),
+        format!("{}; {unsettled} racks unsettled", changes.join(", ")),
+    )
+    .await?;
+
+    // A completed job with racks to analyse again goes back to work. The
+    // first pass is covered (a job completes only once every rack is
+    // settled), so what it hands out now are the unsettled racks.
+    let mut reopened_inactive_reason = None;
+    let reopened = job.status == JobStatus::Completed && unsettled > 0;
+    if reopened {
+        // Serialized with activations, which check the same sum.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext('birdtest.activate'))")
+            .execute(&mut *tx)
+            .await?;
+        let others = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT SUM(allocation) FROM jobs WHERE status = 'active' AND id <> $1",
+        )
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?
+        .unwrap_or(0);
+        // A job never activated has no allocation, and one at 0% is offered to
+        // nobody: either way it comes back inactive, for the admin to give
+        // it one.
+        let allocation = job.allocation.unwrap_or(0);
+        let fits = allocation > 0 && others + i64::from(allocation) <= 100;
+        if fits {
+            sqlx::query("UPDATE jobs SET status = 'active', activated_at = now() WHERE id = $1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            crate::scheduler::join_at_parity(&mut tx, id, state.cfg.heartbeat_timeout).await?;
+        } else {
+            sqlx::query("UPDATE jobs SET status = 'inactive' WHERE id = $1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            reopened_inactive_reason = Some(if allocation == 0 {
+                "it has no allocation: activate it with one".to_string()
+            } else {
+                format!(
+                    "the other active jobs allocate {others}%, which leaves no room for its \
+                     {allocation}%: free some and activate it"
+                )
+            });
+        }
+        audit::log_status_change(
+            &mut tx,
+            if fits { "job.activated" } else { "job.deactivated" },
+            admin.0.id,
+            id,
+            "completed",
+            if fits { "active" } else { "inactive" },
+        )
+        .await?;
+        crate::exports::unfinalize(&mut tx, id).await?;
+    }
+    let job = sqlx::query_as::<_, Job>("SELECT * FROM jobs WHERE id = $1")
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+    tx.commit().await?;
+
+    if job.status == JobStatus::Active {
+        if reopened {
+            // As activation does: the builder may have moved since the job
+            // last dispatched.
+            request_derived_data(&state, id).await?;
+        }
+        // A check paced out under the old settings must not delay the one
+        // that can now complete it -- or wait on racks they unsettled.
+        state.finish_checks.rearm_idle(id);
+        if unsettled == 0 {
+            // Every rack is settled: complete it now if nothing is in flight.
+            // With claims out, the last one's submission completes it.
+            if let Err(err) = super::worker::finish_idle_job(&state, id).await {
+                tracing::error!(job_id = %id, error = %err.message, "finish check after a consensus change failed");
+            }
+        }
+    }
+    super::worker::push_after_change(&state, id);
+    let job = crate::jobstats::load_job(&state.pool, id).await?;
+    Ok(Json(ConsensusResult { job, config, unsettled_racks: unsettled, reopened, reopened_inactive_reason }))
+}
+
 /// What a job is about to lose, as a single line for `audit_log.reason`.
 ///
 /// Counted inside the same transaction as the deletion that follows, so it
@@ -3022,8 +3210,8 @@ async fn purge_body(
         "UPDATE jobs SET claims_issued = 0, games_completed = 0, racks_analyzed = 0,
                          racks_settled = 0, racks_without_consensus = 0,
                          tasks_total = 0, tasks_completed = 0, last_completed_at = NULL,
-                         sprt_decided_status = NULL, sprt_decided_llr = NULL,
-                         sprt_decided_units = NULL,
+                         test_decided_status = NULL, test_decided_lower = NULL,
+                         test_decided_upper = NULL, test_decided_units = NULL,
                          status = CASE WHEN status = 'completed' THEN 'inactive'::job_status
                                        ELSE status END
          WHERE id = $1",
@@ -4028,7 +4216,7 @@ mod tests {
             "job_type": "game_pairs",
             "player1_config_id": Uuid::nil(),
             "player2_config_id": Uuid::nil(),
-            "sprt_enabled": true,
+            "test_enabled": true,
             "min_pairs": 100,
             "max_pairs": 1000,
         });
@@ -4048,7 +4236,7 @@ mod tests {
     /// A games or pairs job without a word about the test runs none: it
     /// needs only its target, and stores the defaults, which nothing reads.
     #[test]
-    fn a_job_runs_no_sprt_unless_it_asks_for_one() {
+    fn a_job_runs_no_test_unless_it_asks_for_one() {
         let target_only = |job_type: &str, target: &str| {
             let mut config = serde_json::json!({
                 "job_type": job_type,
@@ -4061,32 +4249,26 @@ mod tests {
         for (job_type, target) in [("games", "max_games"), ("game_pairs", "max_pairs")] {
             let body = target_only(job_type, target);
             assert!(validate_job_body(&body).is_ok(), "{job_type}");
-            let (JobTypeConfig::Game { min_games: min, sprt, .. }
-            | JobTypeConfig::GamePair { min_pairs: min, sprt, .. }) = &body.config
+            let (JobTypeConfig::Game { min_games: min, test, .. }
+            | JobTypeConfig::GamePair { min_pairs: min, test, .. }) = &body.config
             else {
                 panic!("{job_type} read as another job type");
             };
-            let stored = sprt.settings(*min);
+            let stored = test.settings(*min);
             assert!(!stored.enabled, "{job_type}");
-            assert_eq!(
-                (stored.min_units, stored.alpha, stored.beta, stored.elo_low, stored.elo_high),
-                (0, 0.05, 0.05, -10.0, 10.0)
-            );
+            assert_eq!((stored.min_units, stored.confidence_pct), (0, 95.0));
         }
     }
 
     /// Settings for a test that is off are refused, each by name, rather than
-    /// dropped: a script from before the test was optional would otherwise
-    /// get a job that plays to its cap with no test and no word said.
+    /// dropped: the job would otherwise play to its cap with no test and no
+    /// word said.
     #[test]
-    fn sprt_settings_without_the_test_are_refused() {
+    fn test_settings_without_the_test_are_refused() {
         let off = serde_json::json!({
-            "sprt_enabled": false, "min_pairs": 100, "sprt_alpha": 0.05, "elo_high": 5.0
+            "test_enabled": false, "min_pairs": 100, "confidence_pct": 99.0
         });
-        assert_eq!(
-            fields(validate_job_body(&game_pairs(off))),
-            ["min_pairs", "sprt_alpha", "elo_high"]
-        );
+        assert_eq!(fields(validate_job_body(&game_pairs(off))), ["min_pairs", "confidence_pct"]);
         // Left out, the flag is off too: a pre-flag script's body.
         let unflagged = body(serde_json::json!({
             "job_type": "game_pairs",
@@ -4098,19 +4280,23 @@ mod tests {
         assert_eq!(fields(validate_job_body(&unflagged)), ["min_pairs"]);
     }
 
-    /// With the test on, its floor is stated: a floor of 0 lets an early
-    /// streak end the job, which is a choice to make, not a default.
+    /// With the test on, its floor is stated, at least 1 and at most the cap:
+    /// the interval is asymptotic, and holds once enough units are in.
     #[test]
-    fn an_sprt_needs_its_floor() {
+    fn the_test_needs_its_floor() {
         let mut config = serde_json::json!({
             "job_type": "game_pairs",
             "player1_config_id": Uuid::nil(),
             "player2_config_id": Uuid::nil(),
-            "sprt_enabled": true,
+            "test_enabled": true,
             "max_pairs": 1000,
         });
         assert_eq!(fields(validate_job_body(&body(config.clone()))), ["min_pairs"]);
         config["min_pairs"] = serde_json::json!(0);
+        assert_eq!(fields(validate_job_body(&body(config.clone()))), ["min_pairs"]);
+        config["min_pairs"] = serde_json::json!(1001);
+        assert_eq!(fields(validate_job_body(&body(config.clone()))), ["min_pairs"]);
+        config["min_pairs"] = serde_json::json!(1000);
         assert!(validate_job_body(&body(config)).is_ok());
     }
 
@@ -4133,7 +4319,7 @@ mod tests {
                 "job_type": "games",
                 "player1_config_id": Uuid::nil(),
                 "player2_config_id": Uuid::nil(),
-                "sprt_enabled": true,
+                "test_enabled": true,
                 "min_games": 100,
                 "max_games": 1000,
             });
@@ -4161,7 +4347,7 @@ mod tests {
                 "job_type": "games",
                 "player1_config_id": Uuid::nil(),
                 "player2_config_id": Uuid::nil(),
-                "sprt_enabled": true,
+                "test_enabled": true,
                 "min_games": 100,
                 "max_games": 100_000,
                 "games_per_batch": batch,
@@ -4182,39 +4368,28 @@ mod tests {
         assert_eq!(fields(validate_job_body(&pairs(5_001, false))), ["pairs_per_batch"]);
     }
 
-    /// Past a thousand Elo both hypotheses are an expected score of 1: the
-    /// LLR is always 0 and the job runs to its cap without a verdict.
+    /// A confidence of 100% never closes the interval, and one of half or
+    /// less is no test; everything strictly between is a test.
     #[test]
-    fn elo_hypotheses_past_a_thousand_are_refused() {
-        assert_eq!(
-            fields(validate_job_body(&game_pairs(
-                serde_json::json!({ "elo_low": 7000.0, "elo_high": 8000.0 })
-            ))),
-            ["elo_low", "elo_high"]
-        );
-        assert!(validate_job_body(&game_pairs(
-            serde_json::json!({ "elo_low": -1000.0, "elo_high": 1000.0 })
-        ))
-        .is_ok());
-    }
-
-    /// Inverted hypotheses flip the LLR's sign: SPRT would accept the wrong one.
-    #[test]
-    fn inverted_elo_hypotheses_are_rejected() {
-        assert_eq!(
-            fields(validate_job_body(&game_pairs(
-                serde_json::json!({ "elo_low": 10.0, "elo_high": -10.0 })
-            ))),
-            ["elo_high"]
-        );
+    fn a_confidence_outside_half_to_all_is_refused() {
+        for bad in [100.0, 50.0, 0.0, -5.0, 101.0] {
+            assert_eq!(
+                fields(validate_job_body(&game_pairs(serde_json::json!({ "confidence_pct": bad })))),
+                ["confidence_pct"],
+                "{bad}"
+            );
+        }
+        for good in [50.5, 80.0, 95.0, 99.9] {
+            assert!(validate_job_body(&game_pairs(serde_json::json!({ "confidence_pct": good }))).is_ok());
+        }
     }
 
     #[test]
-    fn degenerate_error_rates_are_rejected_and_every_problem_is_reported() {
+    fn every_problem_is_reported() {
         let got = fields(validate_job_body(&game_pairs(serde_json::json!({
-            "sprt_alpha": 0.0, "sprt_beta": 1.0, "max_pairs": 0
+            "confidence_pct": 100.0, "max_pairs": 0, "pairs_per_batch": 0
         }))));
-        for expected in ["sprt_alpha", "sprt_beta", "max_pairs"] {
+        for expected in ["confidence_pct", "max_pairs", "pairs_per_batch"] {
             assert!(got.iter().any(|f| f == expected), "missing {expected} in {got:?}");
         }
     }

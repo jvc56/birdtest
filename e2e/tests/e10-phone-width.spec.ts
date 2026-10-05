@@ -50,7 +50,7 @@ test('E-10: a visitor on a phone reads the job list, a job page and the rankings
   expect(page.viewportSize()!.width).toBeLessThan(400);
 
   await page.goto('/');
-  await expect(page.getByRole('heading', { name: 'Crowdsourced word game analysis' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Crowdsourced Crossword Game Analysis' })).toBeVisible();
   await expectNoSidewaysScroll(page);
 
   await page.getByRole('link', { name: 'Browse jobs' }).tap();
@@ -59,8 +59,8 @@ test('E-10: a visitor on a phone reads the job list, a job page and the rankings
   await expectNoSidewaysScroll(page);
 
   await page.locator(`a[href="/jobs/${job.id}"]`).tap();
-  await expect(page.getByRole('heading', { name: 'Game pairs' })).toBeVisible();
-  await expect(page.getByRole('heading', { name: 'SPRT' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Game Pairs' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Significance Test' })).toBeVisible();
   await expectNoSidewaysScroll(page);
 
   // The three headline figures stack in one column rather than squeezing
@@ -81,11 +81,10 @@ test('E-10: a visitor on a phone reads the job list, a job page and the rankings
   // Every setting, the players' side by side: the tables wrap, or scroll
   // inside their card, but never widen the page.
   const jobSettings = page.locator('.card', { has: page.getByRole('heading', { name: 'Job settings' }) });
-  await jobSettings.getByRole('button', { name: 'All settings' }).tap();
   await expect(jobSettings.getByText('Oldest MAGPIE')).toBeVisible();
   const settings = page.locator('.card', { has: page.getByRole('heading', { name: 'Player settings' }) });
   await settings.getByRole('button', { name: 'All settings' }).tap();
-  await expect(settings.getByText('Move-gen margin')).toBeVisible();
+  await expect(settings.getByText('Movegen Margin')).toBeVisible();
   await expectNoSidewaysScroll(page);
 
   // The same page with the widest name as its creator and as a contributor:

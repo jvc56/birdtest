@@ -42,7 +42,7 @@ test.beforeAll(async ({ playwright }) => {
   const pairs = {
     job_type: 'game_pairs',
     pairs_per_batch: 10,
-    sprt_enabled: true,
+    test_enabled: true,
     min_pairs: 100,
     max_pairs: 300
   };

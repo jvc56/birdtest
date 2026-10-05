@@ -5,16 +5,16 @@
     active: 'bg-success/15 text-success border-success/30',
     inactive: 'bg-muted text-muted-foreground border-border',
     completed: 'bg-primary/15 text-primary border-primary/30',
-    passed: 'bg-success/15 text-success border-success/30',
-    failed: 'bg-destructive/15 text-destructive border-destructive/30',
+    player1_better: 'bg-success/15 text-success border-success/30',
+    player2_better: 'bg-success/15 text-success border-success/30',
     running: 'bg-warning/15 text-warning border-warning/30',
     paused: 'bg-muted text-muted-foreground border-border',
     undecided: 'bg-muted text-muted-foreground border-border',
-    terminated_at_max: 'bg-muted text-muted-foreground border-border'
+    inconclusive: 'bg-muted text-muted-foreground border-border'
   };
-  // A games or pairs job's cap is not always games.
   const labels: Record<string, string> = {
-    terminated_at_max: 'at its cap',
+    player1_better: 'player 1 better',
+    player2_better: 'player 2 better',
     undecided: 'not decided'
   };
   // Own keys only: a plain lookup of `constructor` would find a function.

@@ -4,7 +4,7 @@ use super::racks::{LetterDistribution, RackIndex};
 use super::JobData;
 use crate::auth::WorkerIdentity;
 use crate::error::{AppError, AppResult};
-use crate::models::job::OpeningRackConfig;
+use crate::models::job::{ConsensusSettings, OpeningRackConfig};
 use sqlx::{PgConnection, Row};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
@@ -226,7 +226,9 @@ fn task_racks(index: &RackIndex, row: &sqlx::postgres::PgRow) -> Vec<String> {
 /// is covered, so for it the space ending is the end.
 ///
 /// `index` is the job's rack space and `player` its analysing player, both from
-/// the job's template: the one read here is the seed cursor.
+/// the job's template. Read here are the seed cursor and the consensus
+/// settings, which an admin may have changed since the template was cached:
+/// under the dispatch lock, which the edit holds while it writes them.
 #[allow(clippy::too_many_arguments)]
 pub async fn next_request(
     conn: &mut PgConnection,
@@ -250,7 +252,7 @@ pub async fn next_request(
         // The final batch of a job comes up short: the range runs off the end
         // of the space and yields only what exists.
         index.racks_in_range(next_start as u64, config.racks_per_batch as u64)
-    } else if config.seeks_consensus() {
+    } else if ConsensusSettings::load(conn, job_id).await?.reissues() {
         next_reissue(conn, job_id, config, identity).await?
     } else {
         Vec::new()
@@ -367,7 +369,10 @@ pub async fn insert_request(
 
 /// What an accepted batch of analyses adds to a job's rack totals: racks
 /// analysed for the first time, racks that need no more analysis, and those
-/// of them settled at their most analyses without a consensus.
+/// of them settled at their most analyses without a consensus. The last two
+/// are changes, which can be negative: under settings an admin changed while
+/// a rack's reissue was out, a rack already settled can come back settled
+/// without a consensus, or with one.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct RackTally {
     pub analysed: i64,
@@ -388,7 +393,8 @@ pub struct RackStanding {
 }
 
 /// A rack's standing from how many of its analyses ranked each move first.
-pub fn standing(config: &OpeningRackConfig, firsts: &HashMap<String, i32>) -> Option<RackStanding> {
+/// [`restate_racks`] is the same rule in SQL.
+pub fn standing(config: &ConsensusSettings, firsts: &HashMap<String, i32>) -> Option<RackStanding> {
     let results: i32 = firsts.values().sum();
     let (top_move, top_count) = firsts
         .iter()
@@ -420,26 +426,28 @@ struct StandingColumns {
 /// and returns what it adds to the job's rack totals. Runs after the batch's
 /// analyses are stored, in the same transaction, so they count.
 ///
-/// A job wanting one analysis per rack settles every rack at its first, and a
-/// batch never repeats a rack another covered, so it keeps no per-rack rows:
-/// every rack is new and settled. Otherwise each rack's standing is recomputed
-/// from its analyses' rank-1 moves -- at most `max_results_per_rack` of them a
-/// rack, through the `(job_id, rack)` index -- and written to
-/// `opening_rack_progress`.
+/// Each rack's standing is recomputed from its analyses' rank-1 moves -- at
+/// most `max_results_per_rack` of them a rack, through the `(job_id, rack)`
+/// index -- and written to `opening_rack_progress`. Every job keeps these
+/// rows, even one wanting a single analysis per rack, whose racks all settle
+/// at their first: its settings may be changed to seek a consensus later
+/// ([`restate_racks`]), and then its reissues start from them, and a job
+/// changed back to one analysis counts reissues still in flight against them
+/// rather than as racks new to the job.
+///
+/// The settings are read here, not taken from the job's template: the
+/// submission holds its claim's lock, which an edit of them takes first, so
+/// this reads them as they stand once any edit has committed.
 pub async fn record_consensus(
     conn: &mut PgConnection,
     job_id: Uuid,
-    config: &OpeningRackConfig,
     racks: &[String],
 ) -> AppResult<RackTally> {
-    if !config.seeks_consensus() {
-        let n = racks.len() as i64;
-        return Ok(RackTally { analysed: n, settled: n, without_consensus: 0 });
-    }
+    let config = ConsensusSettings::load(conn, job_id).await?;
     // Locked: a rack is analysed by one task at a time (`next_reissue`), so
     // nothing else should be writing these rows, and this makes sure of it.
-    let before: HashMap<String, bool> = sqlx::query_as::<_, (String, bool)>(
-        "SELECT rack, settled FROM opening_rack_progress
+    let before: HashMap<String, (bool, bool)> = sqlx::query_as::<_, (String, bool, bool)>(
+        "SELECT rack, settled, without_consensus FROM opening_rack_progress
          WHERE job_id = $1 AND rack = ANY($2) FOR UPDATE",
     )
     .bind(job_id)
@@ -447,6 +455,7 @@ pub async fn record_consensus(
     .fetch_all(&mut *conn)
     .await?
     .into_iter()
+    .map(|(rack, settled, without)| (rack, (settled, without)))
     .collect();
 
     let mut firsts: HashMap<String, HashMap<String, i32>> = HashMap::new();
@@ -469,19 +478,18 @@ pub async fn record_consensus(
     let mut rows = StandingColumns::default();
     let unique: HashSet<&String> = racks.iter().collect();
     for rack in unique {
-        let Some(now) = firsts.get(rack).and_then(|f| standing(config, f)) else {
+        let Some(now) = firsts.get(rack).and_then(|f| standing(&config, f)) else {
             return Err(AppError::internal(format!("rack {rack} has no stored analysis")));
         };
-        let was_settled = before.get(rack);
-        if was_settled.is_none() {
-            tally.analysed += 1;
-        }
-        if now.settled && was_settled != Some(&true) {
-            tally.settled += 1;
-            if now.without_consensus {
-                tally.without_consensus += 1;
+        let (was_settled, was_without) = match before.get(rack) {
+            Some(&was) => was,
+            None => {
+                tally.analysed += 1;
+                (false, false)
             }
-        }
+        };
+        tally.settled += i64::from(now.settled) - i64::from(was_settled);
+        tally.without_consensus += i64::from(now.without_consensus) - i64::from(was_without);
         rows.racks.push(rack.clone());
         rows.results.push(now.results);
         rows.top_moves.push(now.top_move);
@@ -508,6 +516,60 @@ pub async fn record_consensus(
     .execute(&mut *conn)
     .await?;
     Ok(tally)
+}
+
+/// A job's racks restated under new consensus settings, and its rack totals
+/// with them: raising the fewest or most analyses, or the share that must
+/// agree, unsettles racks, and lowering them settles racks. One statement
+/// over the job's progress rows -- [`standing`]'s rule on the counts they
+/// keep, writing only the rows whose standing changes -- then the totals
+/// counted from them. `racks_analyzed` is untouched: no rack gains or loses an
+/// analysis.
+///
+/// In the edit's transaction, under the locks that keep every claim and
+/// submission of the job out (see `update_consensus` in routes/admin.rs).
+/// Returns how many racks are now unsettled.
+pub async fn restate_racks(
+    conn: &mut PgConnection,
+    job_id: Uuid,
+    config: &ConsensusSettings,
+) -> AppResult<i64> {
+    sqlx::query(
+        "WITH s AS (
+             SELECT rack,
+                    results >= $2 AND top_count::float8 * 100.0 >= $3 * results::float8 AS agreed,
+                    results >= $4 AS at_most
+             FROM opening_rack_progress WHERE job_id = $1
+         )
+         UPDATE opening_rack_progress p
+         SET settled = s.agreed OR s.at_most,
+             without_consensus = s.at_most AND NOT s.agreed
+         FROM s
+         WHERE p.job_id = $1 AND p.rack = s.rack
+           AND (p.settled, p.without_consensus)
+               IS DISTINCT FROM (s.agreed OR s.at_most, s.at_most AND NOT s.agreed)",
+    )
+    .bind(job_id)
+    .bind(config.min_results_per_rack)
+    .bind(config.consensus_pct)
+    .bind(config.max_results_per_rack)
+    .execute(&mut *conn)
+    .await?;
+    let (settled, without_consensus, unsettled): (i64, i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*) FILTER (WHERE settled), COUNT(*) FILTER (WHERE without_consensus),
+                COUNT(*) FILTER (WHERE NOT settled)
+         FROM opening_rack_progress WHERE job_id = $1",
+    )
+    .bind(job_id)
+    .fetch_one(&mut *conn)
+    .await?;
+    sqlx::query("UPDATE jobs SET racks_settled = $2, racks_without_consensus = $3 WHERE id = $1")
+        .bind(job_id)
+        .bind(settled)
+        .bind(without_consensus)
+        .execute(&mut *conn)
+        .await?;
+    Ok(unsettled)
 }
 
 #[cfg(test)]
@@ -554,17 +616,8 @@ mod tests {
         assert!(process(vec![analysis("AEINRST", 5, Some(2))]).is_err());
     }
 
-    fn consensus(pct: f64, min: i32, max: i32) -> OpeningRackConfig {
-        OpeningRackConfig {
-            job_id: Uuid::nil(),
-            player_config_id: Uuid::nil(),
-            racks_per_batch: 2,
-            rack_size: 7,
-            total_racks: 10,
-            consensus_pct: pct,
-            min_results_per_rack: min,
-            max_results_per_rack: max,
-        }
+    fn consensus(pct: f64, min: i32, max: i32) -> ConsensusSettings {
+        ConsensusSettings { consensus_pct: pct, min_results_per_rack: min, max_results_per_rack: max }
     }
 
     fn firsts(counts: &[(&str, i32)]) -> HashMap<String, i32> {
@@ -612,7 +665,7 @@ mod tests {
     #[test]
     fn one_analysis_per_rack_settles_at_the_first() {
         let config = consensus(100.0, 1, 1);
-        assert!(!config.seeks_consensus());
+        assert!(!config.reissues());
         let one = standing(&config, &firsts(&[("8D AA", 1)])).unwrap();
         assert!(one.settled && !one.without_consensus);
     }

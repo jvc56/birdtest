@@ -4,7 +4,7 @@
    * figure of each row green and the worse red. A pairs job has a second
    * table beside it, over only the games of the pairs that diverged -- where
    * the two configs actually played differently. On the public and admin job
-   * pages alike, after the settings and before the SPRT card -- for a job that
+   * pages alike, after the settings and before the Significance Test card -- for a job that
    * runs no test, this is its result.
    */
   import type { GameStats } from '$lib/api';
@@ -39,8 +39,7 @@
         <PlayerCompareTable players={names} rows={matchRows(divergent)} />
         <p class="text-xs text-muted-foreground">
           Over {plural(divergentPlayed, 'game')}: both games of the {plural(divergentPlayed / 2, 'pair')}
-          whose games did not play identically. A pair played identically comes out even, so leaving
-          those out shows where the players actually differ.
+          whose games did not play identically.
         </p>
       </div>
     {/if}

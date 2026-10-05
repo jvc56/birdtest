@@ -2,11 +2,15 @@
   /**
    * One saved position: what it is, the board -- the previous move outlined,
    * the move played from here drawn where it goes -- and the moves the player
-   * to move ranked, the one played marked: the board beside the moves on a
-   * wide screen, above them on a narrow one.
+   * to move ranked, the one played marked, each with its win percentage and
+   * its first two plies' statistics when it was simulated: the board beside
+   * the moves on a wide screen, above them on a narrow one. Under the moves,
+   * what the player inferred of the opponent's leave before simulating, when
+   * it did.
    */
   import type { BoardData, SavedPosition } from '$lib/api';
   import { parseCgp, seatToMove } from '$lib/cgp';
+  import { drawShare, inferenceSummary, plyAt, plyColumns, plyHeaders, showsIterations } from '$lib/moveList';
   import Board, { PLAYED_COLORS } from './Board.svelte';
 
   export let position: SavedPosition;
@@ -32,6 +36,9 @@
   $: mover = toMove === null ? '' : (players[toMove] ?? '');
   $: showWinPct = position.moves.some((m) => m.win_percentage !== null);
   $: solved = position.analysis === 'peg' || position.analysis === 'endgame';
+  $: plies = plyColumns(position.moves);
+  $: showIters = showsIterations(position.moves);
+  $: headers = plyHeaders(plies);
 </script>
 
 <div class="min-w-0 space-y-3" data-testid="saved-position" data-game-index={position.game_index}>
@@ -59,7 +66,11 @@
       <span data-testid="position-analysis">{ANALYSIS[position.analysis]}</span></span
     >
   </p>
-  <div class="grid gap-4 lg:grid-cols-2">
+  <!-- On a wide screen the board has a column of a fixed width, so it is the
+       same size whatever position it shows, and the moves start right beside
+       it, in what is left -- room for every column of a simulated position's
+       list. Narrower, the moves go under the board. -->
+  <div class="grid gap-4 xl:grid-cols-[27rem_minmax(0,1fr)]">
     <div class="min-w-0 space-y-2">
       {#if board && parsed}
         <Board
@@ -75,14 +86,16 @@
       {/if}
     </div>
     <div class="min-w-0 overflow-x-auto">
-      <table class="table text-xs">
+      <table class="moves table w-auto text-xs" data-testid="position-moves">
         <thead>
           <tr>
             <th>#</th><th>Move</th><th class="text-right">Score</th><th class="text-right">Equity</th>
             {#if showWinPct}<th class="text-right">Win %</th>{/if}
+            {#if showIters}<th class="text-right" title="How often the simulation played the move out">Iters</th>{/if}
+            {#each headers as header}<th class="text-right" title={header.title}>{header.label}</th>{/each}
             {#if solved}
               <th class="text-right" title="The mover's projected final spread">Spread</th>
-              <th class="text-right" title="The endgame depth the move was ranked at">Plies</th>
+              <th class="text-right" title="The endgame depth the move was ranked at">Solved Plies</th>
             {/if}
           </tr>
         </thead>
@@ -104,6 +117,14 @@
                   {move.win_percentage === null ? '—' : move.win_percentage.toFixed(1)}
                 </td>
               {/if}
+              {#if showIters}
+                <td class="text-right tabular-nums">{move.iterations ? move.iterations.toLocaleString() : '—'}</td>
+              {/if}
+              {#each Array(plies) as _, i}
+                {@const stats = plyAt(move.plies, i)}
+                <td class="text-right tabular-nums">{stats ? stats.average_score.toFixed(1) : '—'}</td>
+                <td class="text-right tabular-nums">{stats ? `${stats.bingo_percentage.toFixed(1)}%` : '—'}</td>
+              {/each}
               {#if solved}
                 <td class="text-right tabular-nums">
                   {move.mean_spread === null ? '—' : move.mean_spread.toFixed(1)}
@@ -114,11 +135,46 @@
           {/each}
         </tbody>
       </table>
+      {#if position.inference}
+        {@const inference = position.inference}
+        <div class="mt-3 space-y-1" data-testid="position-inference">
+          <p class="text-xs">{inferenceSummary(inference, position.previous_move)}.</p>
+          {#if inference.leaves.length}
+            <table class="moves table w-full text-xs">
+              <thead>
+                <tr>
+                  <th title="What the opponent kept">Leave</th>
+                  <th class="text-right">Draws</th>
+                  <th class="text-right">Equity</th>
+                </tr>
+              </thead>
+              <tbody>
+                {#each inference.leaves as leave}
+                  <tr>
+                    <td class="font-mono">{leave.leave || '—'}</td>
+                    <td class="text-right tabular-nums">
+                      {leave.draws.toLocaleString()} ({drawShare(leave.draws, inference.total_draws)})
+                    </td>
+                    <td class="text-right tabular-nums">{leave.equity.toFixed(1)}</td>
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          {/if}
+        </div>
+      {/if}
     </div>
   </div>
 </div>
 
 <style>
+  /* One line a cell, and room for nine columns beside the board. */
+  .moves :global(th),
+  .moves :global(td) {
+    white-space: nowrap;
+    padding-left: 0.3rem;
+    padding-right: 0.3rem;
+  }
   .played-row {
     background: hsl(140 45% 50% / 0.12);
   }

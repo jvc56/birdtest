@@ -18,9 +18,10 @@
   import TaskCounts from '$lib/components/TaskCounts.svelte';
   import DerivedDataStatus from '$lib/components/DerivedDataStatus.svelte';
   import JobSettings from '$lib/components/JobSettings.svelte';
+  import ConsensusEditor from '$lib/components/ConsensusEditor.svelte';
   import MatchScore from '$lib/components/MatchScore.svelte';
   import ProgressBar from '$lib/components/ProgressBar.svelte';
-  import SprtCard from '$lib/components/SprtCard.svelte';
+  import MatchTestCard from '$lib/components/MatchTestCard.svelte';
   import WorkerTable from '$lib/components/WorkerTable.svelte';
 
   // The [id] route only matches when the param is present.
@@ -43,8 +44,9 @@
   //   one shows as that and not as an empty answer, and failed reads are
   //   tried again on the next live payload and every five seconds.
   let stats: JobStats | null = null;
-  // Fixed once the job exists, so read until one read succeeds; the page
-  // shows without it, as the public page does.
+  // Read until one read succeeds; the page shows without it, as the public
+  // page does. Fixed once the job exists but for an opening-rack job's
+  // consensus, which the Consensus card changes and then reads again.
   let config: JobConfig | null = null;
   // null until read: shown as "could not load", never as "none".
   let gaps: DataGap[] | null = null;
@@ -632,13 +634,29 @@
       <TaskCounts {stats} />
     </div>
 
+    {#if config?.opening_racks}
+      <ConsensusEditor
+        {jobId}
+        {config}
+        disabled={busy || gone}
+        on:saved={() => {
+          // The settings changed: read them again with the job. In place, so
+          // the card -- and the notice it shows -- stays up meanwhile.
+          api
+            .jobConfig(jobId)
+            .then((value) => (config = value))
+            .catch(() => {});
+          reload();
+        }}
+      />
+    {/if}
     {#if config}
       <JobSettings {config} />
     {/if}
     {#if stats.games}
       <MatchScore games={stats.games} players={config?.players.map((p) => p.name) ?? []} />
     {/if}
-    <SprtCard {stats} {config} players={config?.players.map((p) => p.name) ?? []} />
+    <MatchTestCard {stats} players={config?.players.map((p) => p.name) ?? []} />
 
     <div class="card">
       <h2 class="mb-1 text-lg font-medium">Data gaps</h2>

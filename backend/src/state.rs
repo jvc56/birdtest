@@ -20,24 +20,24 @@ pub const MAX_CONCURRENT_RESULT_STREAMS: usize = 2;
 
 /// How many submissions a job takes between finish-condition checks.
 ///
-/// The check reads the job's results to compute the SPRT statistic — one row
+/// The check reads the job's results to compute the match test — one row
 /// per task, summed — so it grows with the job's whole history and sits on the
 /// path a worker waits on before it can ask for its next task. Running it on
 /// every submission is what PLAN.md specified and measured; this spreads it
-/// over `SPRT_CHECK_EVERY` of them instead.
+/// over `TEST_CHECK_EVERY` of them instead.
 ///
 /// **A debounced check is late, never wrong.** It still reads the rows, so
 /// nothing here trades correctness for cost — which is the whole reason this is
 /// acceptable where a counter-based stopping rule would not be.
 ///
-/// Overshoot is bounded at `SPRT_CHECK_EVERY - 1` tasks, and the first several
-/// of those are free. When the LLR crosses, the job flips to `completed`, but
+/// Overshoot is bounded at `TEST_CHECK_EVERY - 1` tasks, and the first several
+/// of those are free. When the test decides, the job flips to `completed`, but
 /// every task already claimed across the fleet is still played and still
 /// accepted — the submit path validates the claim, not the job's status. So a
 /// value at or below the number of tasks typically in flight wastes nothing
 /// that was not already going to be wasted. Eight is well under any fleet worth
 /// having, and cuts the read rate by the same factor.
-pub const SPRT_CHECK_EVERY: u64 = 8;
+pub const TEST_CHECK_EVERY: u64 = 8;
 
 /// Submissions seen per job since that job's last finish-condition check, and
 /// when each job was last checked on a claim that found nothing.
@@ -63,7 +63,7 @@ impl FinishCheckCounters {
         let mut counters = self.submissions.lock().expect("finish-check counters poisoned");
         let count = counters.entry(job_id).or_insert(0);
         *count += 1;
-        if *count >= SPRT_CHECK_EVERY {
+        if *count >= TEST_CHECK_EVERY {
             *count = 0;
             true
         } else {
@@ -176,7 +176,7 @@ pub struct AppState {
     /// mid-scan releases it just as one that reads to the end does.
     pub result_streams: Arc<Semaphore>,
     /// Debounces the per-submission finish-condition check; see
-    /// [`SPRT_CHECK_EVERY`].
+    /// [`TEST_CHECK_EVERY`].
     pub finish_checks: FinishCheckCounters,
     /// The built wordmap and rack-info-table hashes of every job this process
     /// has found dispatchable, so the claim path asks the database once per

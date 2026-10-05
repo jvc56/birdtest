@@ -169,9 +169,9 @@ async fn each_job_type_stores_every_setting_it_was_created_with() {
             "job_type": "games", "variant": "wordsmog",
             "letterdist_id": ld, "layout_id": layout, "min_magpie_version": "1.2.3",
             "player1_config_id": p1, "player2_config_id": p2, "games_per_batch": 4,
-            "sprt_enabled": true,
-            "min_games": 100, "max_games": 2000, "sprt_alpha": 0.07, "sprt_beta": 0.03,
-            "elo_low": -5.0, "elo_high": 15.0, "capture_positions": true,
+            "test_enabled": true,
+            "min_games": 100, "max_games": 2000, "confidence_pct": 97.5,
+            "capture_positions": true,
         }))
         .await;
     assert_eq!(status, StatusCode::CREATED, "{created}");
@@ -182,9 +182,8 @@ async fn each_job_type_stores_every_setting_it_was_created_with() {
         &row,
         &json!({
             "job_id": games, "player1_config_id": p1, "player2_config_id": p2,
-            "games_per_batch": 4, "sprt_enabled": true, "min_games": 100, "max_games": 2000,
-            "sprt_alpha": 0.07,
-            "sprt_beta": 0.03, "elo_low": -5.0, "elo_high": 15.0, "capture_positions": true,
+            "games_per_batch": 4, "test_enabled": true, "min_games": 100, "max_games": 2000,
+            "confidence_pct": 97.5, "capture_positions": true,
         }),
     );
     let job = job_row(&db, games).await;
@@ -209,9 +208,9 @@ async fn each_job_type_stores_every_setting_it_was_created_with() {
             "job_type": "game_pairs", "variant": "classic",
             "letterdist_id": ld, "layout_id": layout,
             "player1_config_id": p2, "player2_config_id": p1, "pairs_per_batch": 3,
-            "sprt_enabled": true,
-            "min_pairs": 10, "max_pairs": 500, "sprt_alpha": 0.02, "sprt_beta": 0.08,
-            "elo_low": -3.5, "elo_high": 6.5, "capture_positions": true,
+            "test_enabled": true,
+            "min_pairs": 10, "max_pairs": 500, "confidence_pct": 90.0,
+            "capture_positions": true,
             "capture_first_divergence": true,
         }))
         .await;
@@ -223,9 +222,8 @@ async fn each_job_type_stores_every_setting_it_was_created_with() {
         &row,
         &json!({
             "job_id": pairs, "player1_config_id": p2, "player2_config_id": p1,
-            "pairs_per_batch": 3, "sprt_enabled": true, "min_pairs": 10, "max_pairs": 500,
-            "sprt_alpha": 0.02,
-            "sprt_beta": 0.08, "elo_low": -3.5, "elo_high": 6.5, "capture_positions": true,
+            "pairs_per_batch": 3, "test_enabled": true, "min_pairs": 10, "max_pairs": 500,
+            "confidence_pct": 90.0, "capture_positions": true,
             "capture_first_divergence": true,
         }),
     );
@@ -243,9 +241,8 @@ async fn each_job_type_stores_every_setting_it_was_created_with() {
         &row,
         &json!({
             "job_id": plain, "player1_config_id": p1, "player2_config_id": p2,
-            "games_per_batch": 2, "sprt_enabled": false, "min_games": 0, "max_games": 10,
-            "sprt_alpha": 0.05, "sprt_beta": 0.05, "elo_low": -10.0, "elo_high": 10.0,
-            "capture_positions": false,
+            "games_per_batch": 2, "test_enabled": false, "min_games": 0, "max_games": 10,
+            "confidence_pct": 95.0, "capture_positions": false,
         }),
     );
 

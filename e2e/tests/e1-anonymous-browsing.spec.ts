@@ -16,7 +16,7 @@ test('E-1: an anonymous visitor browses the landing page, jobs, a job and the le
   await waitForResults(request, job.id);
 
   await page.goto('/');
-  await expect(page.getByRole('heading', { name: 'Crowdsourced word game analysis' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Crowdsourced Crossword Game Analysis' })).toBeVisible();
   // Signed out: the header offers an account, and no admin link.
   await expect(page.getByRole('link', { name: 'Sign in' })).toBeVisible();
   await expect(page.getByRole('link', { name: 'Admin', exact: true })).toHaveCount(0);
@@ -25,19 +25,24 @@ test('E-1: an anonymous visitor browses the landing page, jobs, a job and the le
   await expect(page).toHaveURL(/\/jobs$/);
   await expect(page.getByRole('heading', { name: 'Jobs' })).toBeVisible();
   const row = page.locator('tr', { has: page.locator(`a[href="/jobs/${job.id}"]`) });
-  await expect(row).toContainText('Game pairs');
+  await expect(row).toContainText('Game Pairs');
   // Progress in the job's own unit (the list said `units` until the
   // fourteenth audit).
   await expect(row).toContainText(/\d[\d,]* \/ [\d,]+ pairs/);
 
-  await row.getByRole('link', { name: 'Game pairs' }).click();
+  await row.getByRole('link', { name: 'Game Pairs' }).click();
   await expect(page).toHaveURL(new RegExp(`/jobs/${job.id}$`));
-  await expect(page.getByRole('heading', { name: 'Game pairs' })).toBeVisible();
-  await expect(page.getByRole('heading', { name: 'SPRT' })).toBeVisible();
-  // The status on a row of its own, saying what it means for this job, then
-  // the headline figures.
-  await expect(page.getByTestId('job-status')).toContainText(/\b(active|inactive|completed)\b/);
-  await expect(page.getByTestId('job-status-context')).toContainText(/offered|Paused|Finished/);
+  await expect(page.getByRole('heading', { name: 'Game Pairs' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Significance Test' })).toBeVisible();
+  // The status on a row of its own, saying what it means for this job unless
+  // it is active (the badge says that plainly), then the headline figures.
+  const status = page.getByTestId('job-status');
+  await expect(status).toContainText(/\b(active|inactive|completed)\b/);
+  if (/\bactive\b/.test(await status.innerText())) {
+    await expect(page.getByTestId('job-status-context')).toHaveCount(0);
+  } else {
+    await expect(page.getByTestId('job-status-context')).toContainText(/Paused|Finished/);
+  }
   await expect(page.locator('.grid > .card > p:first-child')).toHaveText([
     'Allocation', 'Tasks completed', 'Estimated time left'
   ]);

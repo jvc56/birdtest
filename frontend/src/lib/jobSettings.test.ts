@@ -31,19 +31,24 @@ const config: JobConfig = {
     layout: 'standard15', bingo_bonus: 50, sim_cutoff: 0, min_magpie_version: '0.1.1'
   },
   games: {
-    unit: 'pair', per_batch: 1, sprt_enabled: true, min_units: 100, max_units: 5000,
-    sprt_alpha: 0.05, sprt_beta: 0.05, elo_low: -10, elo_high: 10, capture_positions: false,
+    unit: 'pair', per_batch: 1, test_enabled: true, min_units: 100, max_units: 5000,
+    confidence_pct: 95, capture_positions: false,
     capture_first_divergence: false
   },
   players: [staticPlayer, simPlayer]
 };
 
 const labels = (rows: { label: string }[]) => rows.map((r) => r.label);
-const keyLabels = (rows: { label: string; key: boolean }[]) => rows.filter((r) => r.key).map((r) => r.label);
 const muted = (rows: { label: string; unused?: true }[]) => rows.filter((r) => r.unused).map((r) => r.label);
-const SOLVER_ROWS = [
-  'Endgame', 'Pre-endgame', 'PEG schedule', 'PEG stride', 'PEG opponent', 'Nested lookahead',
-  'Nested caps', 'Nested depth', 'Nested strides'
+const byLabel = <T extends { label: string }>(rows: T[], label: string): T => rows.find((r) => r.label === label)!;
+/** The player settings always shown, in order. */
+const KEY_LABELS = [
+  'Lexicon', 'Leaves', 'Sorted By', 'Move Recorder', 'Moves Generated', 'Plies', 'Uses Inference',
+  'Uses Preendgame', 'Uses Endgame'
+];
+const SOLVER_LABELS = [
+  'Uses Endgame', 'Uses Preendgame', 'PEG Schedule', 'PEG Stride', 'PEG Opponent', 'Nested Lookahead',
+  'Nested Caps', 'Nested Depth', 'Nested Strides'
 ];
 const opening: JobConfig = {
   job: { ...config.job, job_type: 'opening_rack' },
@@ -72,60 +77,67 @@ describe('F-SET-1 job settings', () => {
   it('shows blanks, flags and numbers plainly', () => {
     expect(show(null)).toBe('—');
     expect(show(true)).toBe('yes');
+    expect(show(false)).toBe('no');
     expect(show(5000)).toBe((5000).toLocaleString());
   });
 
-  it("lists a games job's settings in one order, the key rows first", () => {
+  it("lists every one of a games job's settings in one order, in Title Case", () => {
     const rows = jobSettings(config);
     expect(labels(rows)).toEqual([
-      'Type', 'Variant', 'Letter distribution', 'Board', 'Bingo bonus', 'Cap (pairs)', 'SPRT',
-      'Records positions', 'Sim cutoff', 'Fewest pairs before the test is acted on', 'SPRT α', 'SPRT β',
-      'Pairs per task', 'Oldest MAGPIE'
+      'Type', 'Variant', 'Letter Distribution', 'Board', 'Bingo Bonus', 'Maximum Pairs',
+      'Significance Test', 'Position Recorder', 'Sim Cutoff', 'Minimum Pairs', 'Pairs Per Task',
+      'Oldest MAGPIE'
     ]);
-    expect(keyLabels(rows)).toEqual([
-      'Type', 'Variant', 'Letter distribution', 'Board', 'Bingo bonus', 'Cap (pairs)', 'SPRT',
-      'Records positions'
-    ]);
-    expect(rows[0].value).toBe('Game pairs');
-    expect(rows).toContainEqual({ label: 'SPRT', value: 'Elo -10 → 10', key: true });
-    expect(rows).toContainEqual({ label: 'Bingo bonus', value: '50', key: true });
+    expect(rows[0].value).toBe('Game Pairs');
+    // The test and its confidence in one row.
+    expect(byLabel(rows, 'Significance Test').value).toBe('yes (95%)');
+    expect(byLabel(rows, 'Bingo Bonus')).toEqual({ id: 'bingo_bonus', label: 'Bingo Bonus', value: '50' });
+    // A games job counts games.
+    const games = jobSettings({ ...config, games: { ...config.games!, unit: 'game' } });
+    expect(labels(games)).toEqual(expect.arrayContaining(['Maximum Games', 'Minimum Games', 'Games Per Task']));
   });
 
-  it('says when a pairs job keeps only first divergences', () => {
+  it('capitalises every job type', () => {
+    const type = (job_type: JobConfig['job']['job_type']) => jobSettings({ ...config, job: { ...config.job, job_type } })[0].value;
+    expect(type('opening_rack')).toBe('Opening Rack Analysis');
+    expect(type('games')).toBe('Games');
+    expect(type('game_pairs')).toBe('Game Pairs');
+    expect(type('leave_generation')).toBe('Leave Generation');
+  });
+
+  it('says yes or no to recording positions, and when a pairs job keeps only first divergences', () => {
     const value = (games: Partial<NonNullable<JobConfig['games']>>) =>
-      jobSettings({ ...config, games: { ...config.games!, ...games } }).find(
-        (r) => r.label === 'Records positions'
-      )!.value;
+      byLabel(jobSettings({ ...config, games: { ...config.games!, ...games } }), 'Position Recorder').value;
     expect(value({})).toBe('no');
     expect(value({ capture_positions: true })).toBe('yes');
-    expect(value({ capture_positions: true, capture_first_divergence: true })).toBe('first divergences');
+    expect(value({ capture_positions: true, capture_first_divergence: true })).toBe('yes (first divergences)');
   });
 
   it('shows a job without a test its target, and none of the test it does not run', () => {
-    const rows = jobSettings({ ...config, games: { ...config.games!, sprt_enabled: false } });
-    expect(rows).toContainEqual({ label: 'Pairs to play', value: (5000).toLocaleString(), key: true });
-    expect(rows).toContainEqual({ label: 'SPRT', value: 'none', key: true });
-    for (const hidden of ['SPRT α', 'SPRT β', 'Cap (pairs)']) expect(labels(rows)).not.toContain(hidden);
-    expect(labels(rows).some((label) => label.startsWith('Fewest'))).toBe(false);
+    const rows = jobSettings({ ...config, games: { ...config.games!, test_enabled: false } });
+    expect(byLabel(rows, 'Pairs To Play').value).toBe((5000).toLocaleString());
+    expect(byLabel(rows, 'Significance Test').value).toBe('no');
+    for (const hidden of ['Maximum Pairs', 'Minimum Pairs']) expect(labels(rows)).not.toContain(hidden);
   });
 
-  it("lists an opening-rack job's racks, and a leave job's generations and no sim cutoff", () => {
+  it("lists an opening-rack job's analyses per rack, and a leave job's generations and no sim cutoff", () => {
     expect(labels(jobSettings(opening))).toEqual([
-      'Type', 'Variant', 'Letter distribution', 'Board', 'Bingo bonus', 'Racks in all', 'Rack size',
-      'Analyses per rack', 'Sim cutoff', 'Racks per task', 'Oldest MAGPIE'
+      'Type', 'Variant', 'Letter Distribution', 'Board', 'Bingo Bonus', 'Minimum Analyses Per Rack',
+      'Maximum Analyses Per Rack', 'Consensus %', 'Sim Cutoff', 'Racks Per Task', 'Oldest MAGPIE'
     ]);
-    expect(jobSettings(opening)).toContainEqual({
-      label: 'Analyses per rack', value: '3 to 7, until 80% agree on the best move', key: true
-    });
+    const value = (label: string, o: Partial<NonNullable<JobConfig['opening_racks']>> = {}) =>
+      byLabel(jobSettings({ ...opening, opening_racks: { ...opening.opening_racks!, ...o } }), label).value;
+    expect(value('Minimum Analyses Per Rack')).toBe('3');
+    expect(value('Maximum Analyses Per Rack')).toBe('7');
+    expect(value('Consensus %')).toBe('80%');
+    // One analysis per rack seeks no agreement.
+    expect(value('Consensus %', { min_results_per_rack: 1, max_results_per_rack: 1 })).toBe('—');
     const rows = jobSettings(leave);
     expect(labels(rows)).toEqual([
-      'Type', 'Variant', 'Letter distribution', 'Board', 'Bingo bonus', 'Generations', 'Target per rack',
-      'Games per task', 'Racks per task', 'Oldest MAGPIE'
+      'Type', 'Variant', 'Letter Distribution', 'Board', 'Bingo Bonus', 'Generations', 'Target Per Rack',
+      'Games Per Task', 'Racks Per Task', 'Oldest MAGPIE'
     ]);
-    expect(keyLabels(rows)).toEqual([
-      'Type', 'Variant', 'Letter distribution', 'Board', 'Bingo bonus', 'Generations', 'Target per rack'
-    ]);
-    expect(rows).toContainEqual({ label: 'Target per rack', value: `100 → 200 → ${(5000).toLocaleString()}`, key: true });
+    expect(byLabel(rows, 'Target Per Rack').value).toBe(`100 → 200 → ${(5000).toLocaleString()}`);
     // The lexicon and wordmap are the player's rows, not the job's.
     expect(labels(rows)).not.toContain('Lexicon');
     expect(labels(playerRows(leave.players))).toEqual(expect.arrayContaining(['Lexicon', 'Wordmap']));
@@ -133,68 +145,76 @@ describe('F-SET-1 job settings', () => {
 
   it('marks the player settings each job never reads', () => {
     expect(muted(playerRows([staticPlayer], unusedPlayerSettings(leave)))).toEqual([
-      'Leaves', 'Recorder', 'Plays recorded', 'Endgame', 'Pre-endgame', 'Plies recorded',
-      'Move-gen margin', ...SOLVER_ROWS.slice(2)
+      'Leaves', 'Move Recorder', 'Uses Preendgame', 'Uses Endgame', 'Moves Recorded', 'Plies Recorded',
+      'Movegen Margin', ...SOLVER_LABELS.slice(2)
     ]);
     // A leave job's simmer would show its win% model muted too (job creation
     // refuses one, but the set names it).
-    expect(unusedPlayerSettings(leave).has('Win % model')).toBe(true);
+    expect(unusedPlayerSettings(leave).has('win_pct')).toBe(true);
     // What it plays with is not muted.
-    for (const used of ['Lexicon', 'Plies', 'Sort', 'Wordmap']) {
-      expect(playerRows([staticPlayer], unusedPlayerSettings(leave)).find((r) => r.label === used)!.unused).toBeUndefined();
+    for (const used of ['Lexicon', 'Plies', 'Sorted By', 'Wordmap']) {
+      expect(byLabel(playerRows([staticPlayer], unusedPlayerSettings(leave)), used).unused).toBeUndefined();
     }
     // An opening rack infers nothing and never reaches the end of a game.
     expect(muted(playerRows([simPlayer], unusedPlayerSettings(opening)))).toEqual([
-      'Inference', 'Endgame', 'Pre-endgame', 'Inference margin', ...SOLVER_ROWS.slice(2)
+      'Uses Inference', 'Uses Preendgame', 'Uses Endgame', 'Inference Margin', ...SOLVER_LABELS.slice(2)
     ]);
     // A games job reads what is recorded only when it records positions.
-    expect(muted(playerRows([staticPlayer], unusedPlayerSettings(config)))).toEqual(['Plays recorded', 'Plies recorded']);
+    expect(muted(playerRows([staticPlayer], unusedPlayerSettings(config)))).toEqual(['Moves Recorded', 'Plies Recorded']);
     const capturing = { ...config, games: { ...config.games!, capture_positions: true } };
     expect(muted(playerRows([staticPlayer], unusedPlayerSettings(capturing)))).toEqual([]);
-    // Every label named is a row of the full table, so none is silently unmatched.
-    const every = labels(playerRows([simPlayer, solvingPlayer]));
+    // Every id named is a row of the full table, so none is silently unmatched.
+    const every = playerRows([simPlayer, solvingPlayer]).map((r) => r.id);
     for (const job of [leave, opening, config]) {
-      for (const label of unusedPlayerSettings(job)) expect(every).toContain(label);
+      for (const id of unusedPlayerSettings(job)) expect(every).toContain(id);
     }
   });
 
-  it('lists every player setting in one order, the key rows first', () => {
+  it('lists every player setting in one order, the key rows first, in Title Case', () => {
     expect(labels(playerRows([simPlayer, solvingPlayer]))).toEqual([
-      'Lexicon', 'Leaves', 'Plies', 'Plays considered', 'Sort', 'Win % model', 'Iterations (most)',
-      'Stopping %', 'Inference', 'Recorder', 'Plays recorded', 'Endgame', 'Pre-endgame', 'Plies recorded',
-      'Iterations per play (fewest)', 'Threshold', 'Sampling rule', 'Inference margin',
-      'Utility weight: win %', 'Utility weight: spread', 'Utility spread scale', 'Time limit (s)',
-      'Move-gen margin', ...SOLVER_ROWS.slice(2), 'Wordmap', 'Rack info table', 'Word info table'
+      ...KEY_LABELS, 'Win % Model', 'Maximum Total Iterations', 'Stopping %', 'Moves Recorded',
+      'Plies Recorded', 'Minimum Iterations per Play', 'Stopping Threshold Rule', 'Sampling Rule',
+      'Inference Margin', 'Win % Utility Weight', 'Spread Utility Weight', 'Spread Utility Scale',
+      'Time Limit (Seconds)', 'Movegen Margin', ...SOLVER_LABELS.slice(2), 'Wordmap', 'Rack Info Table',
+      'Word Info Table'
     ]);
-    expect(labels(keySettings([simPlayer, solvingPlayer]))).toEqual([
-      'Lexicon', 'Leaves', 'Plies', 'Plays considered', 'Sort', 'Win % model', 'Iterations (most)',
-      'Stopping %', 'Inference', 'Recorder', 'Plays recorded', 'Endgame', 'Pre-endgame'
-    ]);
+    expect(labels(keySettings([simPlayer, solvingPlayer]))).toEqual(KEY_LABELS);
     // Every key row is a row of the full table too, or toggling would drop it.
     const every = labels(playerRows([simPlayer]));
     for (const label of labels(keySettings([simPlayer]))) expect(every).toContain(label);
   });
 
-  it('leaves out the simulation rows when nobody simulates, and the solving ones from the key rows when nobody solves', () => {
+  it('leaves out the simulation rows when nobody simulates, and always shows the key rows', () => {
     const rows = labels(playerRows([staticPlayer]));
-    for (const sim of ['Win % model', 'Iterations (most)', 'Threshold', 'Time limit (s)', 'Inference margin']) {
+    for (const sim of ['Win % Model', 'Maximum Total Iterations', 'Stopping Threshold Rule', 'Time Limit (Seconds)', 'Inference Margin']) {
       expect(rows).not.toContain(sim);
     }
-    // The endgame rows stay in the full table, "off".
-    expect(playerRows([staticPlayer]).find((r) => r.label === 'Endgame')!.values).toEqual(['off']);
-    expect(labels(keySettings([staticPlayer]))).toEqual([
-      'Lexicon', 'Leaves', 'Plies', 'Plays considered', 'Sort', 'Recorder', 'Plays recorded'
-    ]);
+    // The key rows whatever the player: a static one infers nothing ("—")
+    // and solves nothing ("no").
+    expect(labels(keySettings([staticPlayer]))).toEqual(KEY_LABELS);
+    expect(byLabel(keySettings([staticPlayer]), 'Uses Inference').values).toEqual(['—']);
+    expect(byLabel(keySettings([staticPlayer]), 'Uses Endgame').values).toEqual(['no']);
     // Beside a simmer, a static player shows a dash in them.
-    expect(playerRows([staticPlayer, simPlayer]).find((r) => r.label === 'Win % model')).toEqual({
-      label: 'Win % model', values: ['—', 'winpct'], differs: true
+    expect(byLabel(playerRows([staticPlayer, simPlayer]), 'Win % Model')).toEqual({
+      id: 'win_pct', label: 'Win % Model', values: ['—', 'winpct'], differs: true
     });
+  });
+
+  it('shows a dash where a setting does not apply to the player', () => {
+    // A static player records no plies, whatever its config says.
+    expect(byLabel(playerRows([staticPlayer, simPlayer]), 'Plies Recorded').values).toEqual(['—', '2']);
+    // The margin bounds only a recorder that keeps moves by equity.
+    const margin = (recorder_type: string) =>
+      byLabel(playerRows([{ ...staticPlayer, recorder_type }]), 'Movegen Margin').values;
+    expect(margin('best')).toEqual(['—']);
+    expect(margin('all')).toEqual(['—']);
+    expect(margin('equity')).toEqual(['5']);
   });
 
   it('puts the players side by side and marks what they differ in', () => {
     const rows = playerRows(config.players);
-    expect(rows.find((r) => r.label === 'Plies')).toEqual({ label: 'Plies', values: ['0', '4'], differs: true });
-    expect(rows.find((r) => r.label === 'Lexicon')!.differs).toBe(false);
+    expect(byLabel(rows, 'Plies')).toEqual({ id: 'num_plies', label: 'Plies', values: ['0', '4'], differs: true });
+    expect(byLabel(rows, 'Lexicon').differs).toBe(false);
   });
 
   it('shows how a player solves the end of the game, where the job reaches it', () => {
@@ -203,16 +223,16 @@ describe('F-SET-1 job settings', () => {
     // Where the job never reaches the end of a game, the summary leaves it out.
     expect(playerSummary(solvingPlayer, unusedPlayerSettings(opening))).toBe('static, by equity');
     const rows = playerRows([staticPlayer, solvingPlayer]);
-    const value = (label: string) => rows.find((r) => r.label === label)!;
-    expect(value('Endgame')).toEqual({ label: 'Endgame', values: ['off', '6-ply endgame'], differs: true });
-    expect(value('Pre-endgame').values).toEqual(['off', 'bag ≤ 2']);
-    expect(value('PEG schedule').values).toEqual(['—', '32, 16, 8, 4, 2']);
-    expect(value('Nested strides').values).toEqual(['—', '1, 1, 5, 7']);
+    expect(byLabel(rows, 'Uses Endgame')).toEqual({
+      id: 'endgame', label: 'Uses Endgame', values: ['no', 'yes (6 plies)'], differs: true
+    });
+    expect(byLabel(rows, 'Uses Preendgame').values).toEqual(['no', 'yes (bag ≤ 2)']);
+    expect(byLabel(rows, 'PEG Schedule').values).toEqual(['—', '32, 16, 8, 4, 2']);
+    expect(byLabel(rows, 'Nested Strides').values).toEqual(['—', '1, 1, 5, 7']);
     // The pre-endgame is off without the endgame, whatever its bag says.
-    expect(playerRows([{ ...solvingPlayer, endgame_plies: 0 }]).find((r) => r.label === 'Pre-endgame')!.values)
-      .toEqual(['off']);
+    expect(byLabel(playerRows([{ ...solvingPlayer, endgame_plies: 0 }]), 'Uses Preendgame').values).toEqual(['no']);
     expect(keySettings([staticPlayer, solvingPlayer])).toContainEqual({
-      label: 'Pre-endgame', values: ['off', 'bag ≤ 2'], differs: true
+      id: 'pre_endgame', label: 'Uses Preendgame', values: ['no', 'yes (bag ≤ 2)'], differs: true
     });
   });
 });

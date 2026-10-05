@@ -146,13 +146,60 @@ export interface SavedPosition {
     move: string;
     score: number;
     equity: number;
+    /** How often a simulation played the move out; 0 or null when nothing simulated it. */
+    iterations: number | null;
     /** A simulation's or a pre-endgame solve's; null for static and endgame. */
     win_percentage: number | null;
     /** A solve's projected final spread for the mover, in points; null unless solved. */
     mean_spread: number | null;
     /** The endgame depth a solve ranked the move at; null unless solved. */
     fidelity_plies: number | null;
+    /** A simulation's first two plies, in order; empty for a move nothing simulated. */
+    plies: PlyStats[];
   }[];
+  /**
+   * What the simmer inferred of the opponent's leave from their previous
+   * move, before it simmed: null when it did not infer (a static or solved
+   * position, a game's first turn, a pass before it, or a player that does not
+   * infer).
+   */
+  inference: Inference | null;
+}
+
+/** One ply of a move's simulation: ply 0 is the reply to it (shown as P1). */
+export interface PlyStats {
+  ply: number;
+  bingo_percentage: number;
+  average_score: number;
+}
+
+/**
+ * An inference of the opponent's leave: how many distinct leaves it found,
+ * how many it drew in all, their mean equity, and the most drawn of them (at
+ * most ten), most drawn first.
+ */
+export interface Inference {
+  num_leaves: number;
+  total_draws: number;
+  average_equity: number;
+  leaves: { leave: string; draws: number; equity: number }[];
+}
+
+/**
+ * One move of an opening rack's lookup: `analysis` numbers the rack's analyses
+ * from 1 (a job seeking a consensus analyses a rack more than once).
+ */
+export interface RackLookupRow {
+  analysis: number;
+  rank: number;
+  move: string;
+  score: number;
+  equity: number;
+  /** How often the simulation played the move out; 0 or null when nothing simulated it. */
+  iterations: number | null;
+  /** A simulation's; null for a static analysis. */
+  win_percentage: number | null;
+  plies: PlyStats[];
 }
 
 /** Static equity, a simulation, a pre-endgame solve or an endgame solve. */
@@ -238,11 +285,19 @@ export interface JobRow {
   created_at: string;
 }
 
-export interface SprtResult {
-  llr: number;
-  lower_bound: number;
-  upper_bound: number;
-  status: 'running' | 'passed' | 'failed' | 'terminated_at_max';
+/**
+ * A games or pairs job's significance test: a confidence interval for player 1's
+ * score per game (1 a win, ½ a draw) that stays valid however often it is
+ * checked. The job stops once it excludes an even score -- one player is
+ * better -- or at its cap, inconclusive.
+ */
+export interface TestResult {
+  /** Player 1's score per game, ½ before anything is played. */
+  mean: number;
+  lower: number;
+  upper: number;
+  confidence_pct: number;
+  status: 'running' | 'player1_better' | 'player2_better' | 'inconclusive';
 }
 
 export interface GameStats {
@@ -261,7 +316,7 @@ export interface GameStats {
   p2_score_mean: number | null;
   spread_mean: number | null;
   /**
-   * Game pairs only: the five pair outcomes the LLR is computed from, indexed
+   * Game pairs only: the five pair outcomes the test is computed from, indexed
    * by player 1's half-point score across the pair (0 = lost both, 4 = won
    * both). Every completed pair is in here, including the ones that played
    * identically — they are 1-1 ties in bucket 2, and they are what makes a
@@ -289,22 +344,22 @@ export interface GameStats {
   loss_pct: number;
   draw_pct: number;
   /**
-   * The test over every accepted result, recomputed on each read; null for a
-   * job that runs none, which plays `max_units` and stops.
+   * The significance test over every accepted result, recomputed on each read; null
+   * for a job that runs none, which plays `max_units` and stops.
    */
-  sprt: SprtResult | null;
+  test: TestResult | null;
   /**
-   * What a completed job stopped on, when the finish check completed it. Results
-   * in flight at that moment still land, so `sprt` can move afterwards; this is
-   * the decision that stands.
+   * What a completed job stopped on, when the finish check completed it, with
+   * player 1's interval then. Results in flight at that moment still land, so
+   * `test` can move afterwards; this is the decision that stands.
    */
-  decided?: { status: SprtResult['status']; llr: number; units: number };
+  decided?: { status: TestResult['status']; lower: number; upper: number; units: number };
 }
 
 /**
  * How a job was completed. `forced` is an admin's force-complete; otherwise
- * `reason` is the server's: the SPRT verdict (`passed`, `failed`,
- * `terminated_at_max`), `reached_target` for a games or pairs job without a
+ * `reason` is the server's: the significance test's verdict (`player1_better`,
+ * `player2_better`, `inconclusive`), `reached_target` for a games or pairs job without a
  * test, `last generation built`, or none for an opening-rack job whose racks
  * were all analysed.
  */
@@ -680,6 +735,9 @@ export const api = {
         Object.entries(params).map(([k, v]) => [k, String(v)])
       )}`
     ),
+  /** One rack's ranked moves in an opening-rack job, every analysis of it, in one page. */
+  rackLookup: (id: string, rack: string) =>
+    get<CursorPage<RackLookupRow>>(`/api/jobs/${id}/results?${new URLSearchParams({ rack })}`),
   /** Signed-in users only: a games or pairs job's captured positions with one rack, newest first. */
   jobPositions: (id: string, rack: string, params: { per_page?: number; cursor?: string } = {}) =>
     get<CursorPage<SavedPosition>>(
@@ -779,6 +837,22 @@ export const api = {
   setAllocations: (rows: { job_id: string; allocation: number }[]) =>
     put<{ jobs: JobRow[] }>('/api/admin/jobs/allocations', { allocations: rows }),
   completeJob: (id: string) => post<JobRow>(`/api/admin/jobs/${id}/complete`),
+  /**
+   * An opening-rack job's consensus settings, changed: only the fields given.
+   * The job follows -- a completed one with racks unsettled again reopens
+   * (inactive, with the reason, when its allocation no longer fits), and an
+   * active one with every rack settled completes.
+   */
+  updateConsensus: (
+    id: string,
+    body: { min_results_per_rack?: number; max_results_per_rack?: number; consensus_pct?: number }
+  ) =>
+    patch<{
+      job: JobRow;
+      unsettled_racks: number;
+      reopened: boolean;
+      reopened_inactive_reason: string | null;
+    }>(`/api/admin/jobs/${id}/consensus`, body),
   purgeJob: (id: string) => post<{ tasks_reset: number }>(`/api/admin/jobs/${id}/purge`),
   deleteJob: (id: string) => del<void>(`/api/admin/jobs/${id}`),
   deleteUser: (id: string) => del<void>(`/api/admin/users/${id}`),

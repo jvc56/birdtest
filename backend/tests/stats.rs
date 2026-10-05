@@ -1,5 +1,5 @@
 //! Dashboard statistics against a real database (`jobstats`): what a job's
-//! stats sum and what SPRT is run over, leave-generation progress, who
+//! stats sum and what the match test is run over, leave-generation progress, who
 //! contributed, the ETA, and the finish check a submission runs.
 //!
 //! Results are written with plain SQL -- a task, a claim and its result -- for
@@ -9,7 +9,8 @@ mod common;
 
 use axum::http::StatusCode;
 use birdtest::jobstats;
-use birdtest::stats::sprt::{self, Pentanomial, Sample, SprtStatus, Tally};
+use birdtest::stats::match_test::{self, TestStatus, Unit};
+use birdtest::stats::outcomes::{Pentanomial, Sample, Tally};
 use common::*;
 use serde_json::json;
 use uuid::Uuid;
@@ -144,7 +145,9 @@ async fn pair_result(db: &TestDb, job: Uuid, pent: [i32; 5], divergent: (i32, i3
     result(db, job, tally, Some(pent), Some(divergent)).await;
 }
 
-/// An active `game_pairs` job at the schema's default SPRT settings.
+/// An active `game_pairs` job running the match test at the schema's default
+/// confidence, 95%, acted on from 10 pairs and capped at 1,000 (so tightest
+/// at 100).
 async fn pairs_job(db: &TestDb) -> Uuid {
     let admin = db.user(&format!("admin{}", Uuid::new_v4().simple()), true).await;
     let p1 = db.static_player("p1", admin).await;
@@ -152,9 +155,9 @@ async fn pairs_job(db: &TestDb) -> Uuid {
     let job = db.bare_job("game_pairs", admin).await;
     sqlx::query(
         "INSERT INTO job_game_pair_config
-             (job_id, player1_config_id, player2_config_id, pairs_per_batch, sprt_enabled,
+             (job_id, player1_config_id, player2_config_id, pairs_per_batch, test_enabled,
               min_pairs, max_pairs)
-         VALUES ($1, $2, $3, 8, TRUE, 1000000, 1000000)",
+         VALUES ($1, $2, $3, 8, TRUE, 10, 1000)",
     )
     .bind(job)
     .bind(p1)
@@ -181,40 +184,46 @@ async fn stats(db: &TestDb, job: Uuid) -> jobstats::JobStats {
 }
 
 // ---------------------------------------------------------------------------
-// What the stats sum, and what SPRT reads
+// What the stats sum, and what the match test reads
 // ---------------------------------------------------------------------------
 
-/// I-STATS-1: a `games` job's stats sum every task's result, and SPRT runs
-/// over those games -- one observation each, at the job's own bounds.
+/// I-STATS-1: a `games` job's stats sum every task's result, and the match
+/// test runs over those games -- one observation each, at the job's own
+/// gates and confidence.
 #[tokio::test]
 async fn a_games_jobs_stats_sum_every_result_and_test_the_games() {
     let db = TestDb::new().await;
     let job = db.games_job(10).await;
+    sqlx::query("UPDATE job_game_config SET min_games = 31, max_games = 1000 WHERE job_id = $1")
+        .bind(job)
+        .execute(&db.pool)
+        .await
+        .unwrap();
     result(&db, job, (7, 2, 1), None, None).await;
     result(&db, job, (4, 5, 1), None, None).await;
     result(&db, job, (10, 0, 0), None, None).await;
 
     let games = game_stats(&db, job).await;
-    let test = games.sprt.expect("an SPRT job");
+    let test = games.test.expect("a job with a test");
     assert_eq!(games.unit, "game");
     assert_eq!((games.wins, games.losses, games.draws), (21, 7, 2));
     assert_eq!(games.units_completed, 30);
     assert_eq!((games.pentanomial, games.divergent_pairs), (None, None));
-    assert_eq!((games.min_units, games.max_units), (1_000_000, 1_000_000));
+    assert_eq!((games.min_units, games.max_units), (31, 1000));
     assert_eq!(games.win_pct, 70.0);
 
     let tally = Tally { wins: 21, losses: 7, draws: 2 };
-    let expected = sprt::llr(&Sample::from_games(&tally), -10.0, 10.0);
-    assert!(expected > 0.0, "a lopsided sample has something to say");
-    assert_eq!(test.llr, expected);
-    assert_eq!((test.lower_bound, test.upper_bound), sprt::bounds(0.05, 0.05));
-    assert_eq!(test.status, SprtStatus::Running, "below min_games");
-    // And the numbers themselves, computed outside the code from PLAN.md's
-    // formulas, so a job that read the right rows through the wrong maths
-    // fails here too.
-    close(test.llr, 1.125_953_543_425_981_8);
-    close(test.upper_bound, 2.944_438_979_166_440_5);
-    close(test.lower_bound, -2.944_438_979_166_440_5);
+    let expected = match_test::evaluate(&Sample::from_games(&tally), Unit::Game, 30, 95.0, 31, 1000);
+    assert_eq!((test.mean, test.lower, test.upper), (expected.mean, expected.lower, expected.upper));
+    assert_eq!(test.confidence_pct, 95.0);
+    assert_eq!(test.status, TestStatus::Running, "below min_games");
+    // And the numbers themselves, computed outside the code from the
+    // module's formula (tightest at √(31·1000) ≈ 176 games), so a job that
+    // read the right rows through the wrong maths fails here too: from
+    // 0.448979658299148811… to past a score of 1, clipped there.
+    close(test.mean, 11.0 / 15.0);
+    close(test.lower, 0.448_979_658_299_148_8);
+    assert_eq!(test.upper, 1.0);
 }
 
 /// I-STATS-1b: each player's average score, and the spread, are the batches'
@@ -265,15 +274,15 @@ async fn a_pairs_jobs_stats_sum_the_pentanomial_and_count_every_pair() {
 }
 
 /// I-STATS-3: the divergent pairs are reported, and are not the sample: the
-/// LLR is the pentanomial's, which differs from what the divergent games alone
-/// would give.
+/// interval is the pentanomial's, which differs from what the divergent games
+/// alone would give.
 #[tokio::test]
 async fn divergent_pairs_are_reported_but_not_tested() {
     let db = TestDb::new().await;
     let job = two_paired_batches(&db).await;
 
     let games = game_stats(&db, job).await;
-    let test = games.sprt.expect("an SPRT job");
+    let test = games.test.expect("a job with a test");
     assert_eq!(games.divergent_pairs, Some(7), "fourteen divergent games");
     // And their own match score, a diagnostic beside the full one: the
     // divergent games' tally and means, not the batches'.
@@ -283,33 +292,48 @@ async fn divergent_pairs_are_reported_but_not_tested() {
     close(divergent.p1_score_mean.unwrap(), full.0 + 10.0);
     close(divergent.p2_score_mean.unwrap(), full.1 - 10.0);
     close(divergent.spread_mean.unwrap(), full.0 - full.1 + 20.0);
-    let over_pairs =
-        sprt::llr(&Sample::from_pentanomial(&Pentanomial { counts: [1, 3, 7, 3, 2] }), -10.0, 10.0);
-    let over_divergent =
-        sprt::llr(&Sample::from_games(&Tally { wins: 11, losses: 3, draws: 0 }), -10.0, 10.0);
-    assert_eq!(test.llr, over_pairs);
-    assert!(
-        (over_pairs - over_divergent).abs() > 0.1,
-        "the two samples must disagree for this to prove anything: {over_pairs} vs {over_divergent}"
+    let over_pairs = match_test::evaluate(
+        &Sample::from_pentanomial(&Pentanomial { counts: [1, 3, 7, 3, 2] }),
+        Unit::Pair,
+        16,
+        95.0,
+        10,
+        1000,
     );
-    // Computed outside the code: the 16 pairs scored i/4 give 0.2074996702…,
-    // the 14 divergent games alone would have given 0.6836092355…
-    close(test.llr, 0.207_499_670_225_107_38);
-    close(over_divergent, 0.683_609_235_523_814_9);
+    let over_divergent = match_test::evaluate(
+        &Sample::from_games(&Tally { wins: 11, losses: 3, draws: 0 }),
+        Unit::Game,
+        14,
+        95.0,
+        10,
+        1000,
+    );
+    assert_eq!((test.mean, test.lower, test.upper), (over_pairs.mean, over_pairs.lower, over_pairs.upper));
+    assert!(
+        (over_pairs.mean - over_divergent.mean).abs() > 0.1,
+        "the two samples must disagree for this to prove anything: {over_pairs:?} vs {over_divergent:?}"
+    );
+    // Computed outside the code: the 16 pairs scored i/4 give 17/32 with an
+    // interval from 0.305619000581122662… to 0.756880999418877337…; the 14
+    // divergent games alone would have said 11/14, from 0.356707397364196796….
+    close(test.mean, 17.0 / 32.0);
+    close(test.lower, 0.305_619_000_581_122_6);
+    close(test.upper, 0.756_880_999_418_877_3);
+    close(over_divergent.lower, 0.356_707_397_364_196_8);
 }
 
-/// I-STATS-4: a job with no results reports zeros and an LLR of 0 -- finite,
-/// with every percentage 0 -- for both job types, and the whole payload
-/// serializes, rather than an error or a NaN.
+/// I-STATS-4: a job with no results reports zeros and an even score whose
+/// interval is every score -- finite, with every percentage 0 -- for both
+/// job types, and the whole payload serializes, rather than an error or a NaN.
 #[tokio::test]
 async fn a_job_with_no_results_reports_zeros_not_nan() {
     let db = TestDb::new().await;
     for job in [db.games_job(10).await, pairs_job(&db).await] {
         let games = game_stats(&db, job).await;
-        let test = games.sprt.expect("an SPRT job");
+        let test = games.test.expect("a job with a test");
         assert_eq!((games.wins, games.losses, games.draws, games.units_completed), (0, 0, 0, 0));
-        assert_eq!(test.llr, 0.0);
-        assert_eq!(test.status, SprtStatus::Running);
+        assert_eq!((test.mean, test.lower, test.upper), (0.5, 0.0, 1.0));
+        assert_eq!(test.status, TestStatus::Running);
         for pct in [games.win_pct, games.loss_pct, games.draw_pct] {
             assert_eq!(pct, 0.0);
         }
@@ -323,7 +347,8 @@ async fn a_job_with_no_results_reports_zeros_not_nan() {
         assert_eq!(means, (None, None, None));
 
         let payload = serde_json::to_value(stats(&db, job).await).unwrap();
-        assert_eq!(payload["games"]["sprt"]["llr"], json!(0.0), "{payload}");
+        assert_eq!(payload["games"]["test"]["mean"], json!(0.5), "{payload}");
+        assert_eq!(payload["games"]["test"]["upper"], json!(1.0), "{payload}");
         assert_eq!(payload["games"]["spread_mean"], json!(null), "{payload}");
         assert_eq!(payload["games"]["win_pct"], json!(0.0), "{payload}");
         assert_eq!(payload["tasks_total"], 0);
@@ -648,118 +673,122 @@ async fn job_status(db: &TestDb, job: Uuid) -> String {
         .unwrap()
 }
 
-/// I-STATS-9 (significance): at `min_games`, a 90-10 batch crosses the upper
-/// bound, and the submission that brought it there completes the job.
+/// I-STATS-9 (significance): at `min_games`, a 90-10 batch puts player 1's
+/// interval above an even score, and the submission that brought it there
+/// completes the job.
 #[tokio::test]
-async fn a_job_completes_when_its_llr_crosses_at_min_games() {
+async fn a_job_completes_when_its_test_decides_at_min_games() {
     let db = TestDb::new().await;
-    let job = gated_games_job(&db, 100, 1_000_000).await;
+    let job = gated_games_job(&db, 100, 10_000).await;
     let app = birdtest::app(db.state().await);
 
     play_batch(&app, 90).await;
-    assert_eq!(game_stats(&db, job).await.sprt.unwrap().status, SprtStatus::Passed);
+    assert_eq!(game_stats(&db, job).await.test.unwrap().status, TestStatus::Player1Better);
     assert_eq!(job_status(&db, job).await, "completed");
 }
 
 /// I-STATS-9 (hard cap): an even batch that reaches `max_games` completes the
-/// job with no verdict either way.
+/// job inconclusive, its interval still around an even score.
 #[tokio::test]
-async fn a_job_completes_at_its_hard_cap_without_a_verdict() {
+async fn a_job_completes_at_its_hard_cap_inconclusive() {
     let db = TestDb::new().await;
     let job = gated_games_job(&db, 100, 100).await;
     let app = birdtest::app(db.state().await);
 
     play_batch(&app, 50).await;
     let games = game_stats(&db, job).await;
-    let test = games.sprt.expect("an SPRT job");
-    assert_eq!(test.status, SprtStatus::TerminatedAtMax);
-    assert!(test.llr < test.upper_bound && test.llr > test.lower_bound);
+    let test = games.test.expect("a job with a test");
+    assert_eq!(test.status, TestStatus::Inconclusive);
+    assert!(test.lower < 0.5 && test.upper > 0.5, "{test:?}");
     assert_eq!(job_status(&db, job).await, "completed");
 }
 
-/// I-STATS-9 (the floor): the same 90-10 batch below `min_games` crosses the
-/// upper bound and still does not complete the job -- the floor is what stops
-/// an early streak from ending it.
+/// I-STATS-9 (the floor): the same 90-10 batch below `min_games` puts the
+/// interval above an even score and still does not complete the job -- the
+/// floor is what stops an early streak from ending it.
 #[tokio::test]
-async fn a_crossed_llr_below_min_games_does_not_complete_the_job() {
+async fn a_decided_interval_below_min_games_does_not_complete_the_job() {
     let db = TestDb::new().await;
-    let job = gated_games_job(&db, 1000, 1_000_000).await;
+    let job = gated_games_job(&db, 1000, 10_000).await;
     let app = birdtest::app(db.state().await);
 
     play_batch(&app, 90).await;
     let games = game_stats(&db, job).await;
-    let test = games.sprt.expect("an SPRT job");
-    assert!(test.llr > test.upper_bound, "the LLR has crossed: {test:?}");
-    assert_eq!(test.status, SprtStatus::Running);
+    let test = games.test.expect("a job with a test");
+    assert!(test.lower > 0.5, "the interval is past an even score: {test:?}");
+    assert_eq!(test.status, TestStatus::Running);
     assert_eq!(job_status(&db, job).await, "active");
 }
 
 /// I-STATS-9 (at the bound): the job completes on the submission that takes
-/// its LLR past the upper bound, and not on one that leaves it just short.
-/// 71-29 over 100 games is 2.9347 against a bound of 2.9444: at `min_games`,
-/// checked, and still running. Another 54-46 makes 125-75 over 200, 3.0693:
-/// past it, and the job completes. (Both computed outside the code.)
+/// its interval past an even score, and not on one that leaves it just short.
+/// With a floor of 100 and a cap of 10,000, 68-32 over 100 games puts the
+/// lower bound at 0.4937: at `min_games`, checked, and still running. Another
+/// 56-44 makes 124-76 over 200, from 0.5035 to 0.7365: past it, and the job
+/// completes. (Both computed outside the code.)
 #[tokio::test]
-async fn a_job_completes_on_the_batch_that_crosses_the_bound_and_not_before() {
+async fn a_job_completes_on_the_batch_that_decides_and_not_before() {
     let db = TestDb::new().await;
-    let job = gated_games_job(&db, 100, 1_000_000).await;
+    let job = gated_games_job(&db, 100, 10_000).await;
     let app = birdtest::app(db.state().await);
 
-    play_batch(&app, 71).await;
+    play_batch(&app, 68).await;
     let games = game_stats(&db, job).await;
-    let test = games.sprt.expect("an SPRT job");
-    close(test.llr, 2.934_734_021_233_334_5);
-    assert_eq!(test.status, SprtStatus::Running, "just inside the bound");
+    let test = games.test.expect("a job with a test");
+    close(test.lower, 0.493_697_659_814_164);
+    assert_eq!(test.status, TestStatus::Running, "just short of an even score");
     assert_eq!(job_status(&db, job).await, "active");
 
-    play_batch(&app, 54).await;
+    play_batch(&app, 56).await;
     let games = game_stats(&db, job).await;
-    let test = games.sprt.expect("an SPRT job");
-    assert_eq!((games.wins, games.losses), (125, 75));
-    close(test.llr, 3.069_265_955_413_046_7);
-    assert_eq!(test.status, SprtStatus::Passed);
+    let test = games.test.expect("a job with a test");
+    assert_eq!((games.wins, games.losses), (124, 76));
+    close(test.lower, 0.503_491_908_543_934_4);
+    close(test.upper, 0.736_508_091_456_065_5);
+    assert_eq!(test.status, TestStatus::Player1Better);
     assert_eq!(job_status(&db, job).await, "completed");
 
     // I-STATS-9b: the verdict it completed on is stored with the completion,
     // beside the live figures that results still in flight can go on moving.
     let (_, body) = send(&app, get_request(&format!("/api/jobs/{job}"), &[])).await;
     let decided = &body["games"]["decided"];
-    assert_eq!(decided["status"], json!("passed"), "{body}");
+    assert_eq!(decided["status"], json!("player1_better"), "{body}");
     assert_eq!(decided["units"], json!(200), "{body}");
-    close(decided["llr"].as_f64().unwrap(), 3.069_265_955_413_046_7);
+    close(decided["lower"].as_f64().unwrap(), 0.503_491_908_543_934_4);
+    close(decided["upper"].as_f64().unwrap(), 0.736_508_091_456_065_5);
 }
 
-/// I-STATS-9 (H0): a job whose player 1 is losing completes too, with its
-/// verdict failed (H0 accepted) rather than passed. 28-72 over 100 games is
-/// an LLR of -3.1401, past the lower bound of -2.9444 (computed outside the
-/// code).
+/// I-STATS-9 (player 2): a job whose player 1 is losing completes too, with
+/// player 2 found better. 28-72 over 100 games puts the upper bound at
+/// 0.4631, below an even score (computed outside the code).
 #[tokio::test]
-async fn a_job_driven_to_h0_completes_with_its_sprt_failed() {
+async fn a_job_whose_player_2_is_better_completes_saying_so() {
     let db = TestDb::new().await;
-    let job = gated_games_job(&db, 100, 1_000_000).await;
+    let job = gated_games_job(&db, 100, 10_000).await;
     let app = birdtest::app(db.state().await);
 
     play_batch(&app, 28).await;
     let games = game_stats(&db, job).await;
-    let test = games.sprt.expect("an SPRT job");
-    close(test.llr, -3.140_060_036_229_865_5);
-    assert_eq!(test.status, SprtStatus::Failed);
+    let test = games.test.expect("a job with a test");
+    close(test.upper, 0.463_052_797_111_100_7);
+    assert_eq!(test.status, TestStatus::Player2Better);
     assert_eq!(job_status(&db, job).await, "completed");
 
     let (_, body) = send(&app, get_request(&format!("/api/jobs/{job}"), &[])).await;
-    assert_eq!(body["games"]["sprt"]["status"], json!("failed"), "{body}");
-    assert_eq!(body["games"]["decided"]["status"], json!("failed"), "{body}");
+    assert_eq!(body["games"]["test"]["status"], json!("player2_better"), "{body}");
+    assert_eq!(body["games"]["decided"]["status"], json!("player2_better"), "{body}");
+    assert_eq!(body["completion"]["reason"], json!("player2_better"), "{body}");
 }
 
-/// I-STATS-9h (no SPRT): a job that runs no test plays to its target. A
-/// 90-10 batch past its floor -- one that completes an SPRT job, above -- is
-/// just games played, and the batch that reaches `max_games` completes it,
-/// with no verdict stored and none reported.
+/// I-STATS-9h (no test): a job that runs no test plays to its target. A
+/// 90-10 batch past its floor -- one that completes a job with a test, above
+/// -- is just games played, and the batch that reaches `max_games` completes
+/// it, with no verdict stored and none reported.
 #[tokio::test]
-async fn a_job_without_an_sprt_completes_at_its_target_and_not_before() {
+async fn a_job_without_a_test_completes_at_its_target_and_not_before() {
     let db = TestDb::new().await;
     let job = gated_games_job(&db, 100, 200).await;
-    sqlx::query("UPDATE job_game_config SET sprt_enabled = FALSE WHERE job_id = $1")
+    sqlx::query("UPDATE job_game_config SET test_enabled = FALSE WHERE job_id = $1")
         .bind(job)
         .execute(&db.pool)
         .await
@@ -768,14 +797,14 @@ async fn a_job_without_an_sprt_completes_at_its_target_and_not_before() {
 
     play_batch(&app, 90).await;
     let games = game_stats(&db, job).await;
-    assert!(games.sprt.is_none(), "no test to report: {:?}", games.sprt);
+    assert!(games.test.is_none(), "no test to report: {:?}", games.test);
     assert_eq!(games.units_completed, 100);
     assert_eq!(job_status(&db, job).await, "active");
 
     play_batch(&app, 90).await;
     assert_eq!(job_status(&db, job).await, "completed");
     let (_, body) = send(&app, get_request(&format!("/api/jobs/{job}"), &[])).await;
-    assert_eq!(body["games"]["sprt"], json!(null), "{body}");
+    assert_eq!(body["games"]["test"], json!(null), "{body}");
     assert!(body["games"].get("decided").is_none(), "{body}");
     assert_eq!(body["games"]["units_completed"], json!(200), "{body}");
     assert_eq!(body["completion"]["reason"], json!("reached_target"), "{body}");

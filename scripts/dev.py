@@ -616,7 +616,9 @@ def stop_contributors(processes: list) -> None:
 DEV_JOBS = (
     ("--leavegen-job", "leave_generation",
      "a leave-generation job of six generations, targets 100, 200, 500, 1000, 1000, 1000"),
-    ("--opening-rack-job", "opening_rack", "an opening-rack job, every play of every rack ranked"),
+    ("--opening-rack-job", "opening_rack",
+     "an opening-rack job, a 2-ply simmer ranking every rack's plays, each rack analysed until "
+     "80% agree (2 to 5 analyses)"),
     ("--games-job", "games",
      "a games job, static equity against static score, saving every position"),
     ("--pairs-job", "game_pairs",

@@ -52,4 +52,7 @@ test('E-13: an opening-rack job offers analysed racks to look up', async ({ page
   await expect(page.getByLabel('Look up a rack')).toHaveValue(rack);
   const panel = page.locator('.card', { has: page.getByRole('heading', { name: 'Opening racks' }) });
   await expect(panel.locator('tbody tr').first()).toBeVisible();
+  // The fake workers simulate every rack: each move's win percentage and its
+  // first two plies' statistics beside it.
+  await expect(panel.locator('thead th')).toContainText(['Win %', 'P1-S', 'P1-BP', 'P2-S', 'P2-BP']);
 });

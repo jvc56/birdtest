@@ -77,6 +77,15 @@ pub(super) fn validate_positions(
             ))
         })?;
         super::plausibility::check_analysis(analysis, &position.moves, "captured position")?;
+        if let Some(inference) = &position.inference {
+            super::plausibility::check_inference(
+                inference,
+                analysis,
+                position.turn_number,
+                position.previous_move.is_some(),
+                "captured position",
+            )?;
+        }
         out.push(PositionAnalysis {
             analysis,
             rack: position.rack,
@@ -89,6 +98,7 @@ pub(super) fn validate_positions(
             played_move_score: Some(position.played_move_score),
             num_moves: position.num_moves,
             moves: position.moves,
+            inference: position.inference,
         });
     }
     Ok(out)

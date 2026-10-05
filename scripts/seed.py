@@ -394,12 +394,12 @@ def job_config(job_type: str, players: list, args) -> dict:
                 "rack_size": args.rack_size}
     if job_type == "games":
         return {"player1_config_id": players[0], "player2_config_id": players[1],
-                "games_per_batch": args.batch, "sprt_enabled": True,
+                "games_per_batch": args.batch, "test_enabled": True,
                 "min_games": 100 if args.min_units is None else args.min_units,
                 "max_games": args.max_units}
     if job_type == "game_pairs":
         return {"player1_config_id": players[0], "player2_config_id": players[1],
-                "pairs_per_batch": args.batch, "sprt_enabled": True,
+                "pairs_per_batch": args.batch, "test_enabled": True,
                 "min_pairs": 50000 if args.min_units is None else args.min_units,
                 "max_pairs": args.max_units}
     if job_type == "leave_generation":
@@ -564,18 +564,25 @@ def create_dev_jobs(client: Client, args, data: dict) -> None:
             # a table would cache. A generation closes once every rack has
             # been seen its target number of times -- minutes for the eight
             # english_ab racks, far longer for english's millions.
-            name = "static-equity" if on_small else "static-equity-no-rit"
-            return job_data, [player(name, "equity", rit=False)], {
+            # Named apart from the other jobs' static-equity, which has one.
+            return job_data, [player("static-equity-no-rit", "equity", rit=False)], {
                 "num_iterations": 1000, "racks_per_task": 50,
                 "target_rack_counts": [100, 200, 500, 1000, 1000, 1000]}
         if job_type == "opening_rack":
-            # Every play ranked: english_ab's eight racks two to a task,
-            # english's millions at the server's default batch.
-            return job_data, [player("static-equity-all", "equity", recorder="all")], {
-                "racks_per_batch": 2 if on_small else 500, "rack_size": 7}
-        # english_ab's players share the leave job's config, which has no
-        # rack info table: one on eight racks saves nothing.
-        rit = args.rit and not on_small
+            # A 2-ply simmer ranks every rack's plays, and each rack is
+            # analysed until 80% of its analyses agree on the best move (2 to
+            # 5 of them). A sim per rack is slow, so a task is 20 racks
+            # (english_ab's eight, two to a task). english_ab brings no win%
+            # model, so its simmer uses the main data's.
+            if not data["winpct"]:
+                raise SeedError(f"{dev_job_name(job)} needs a win% model, and the imported "
+                                "data has none")
+            return job_data, [player("sim-2ply-rack", "equity", recorder="all", sim={
+                "winpct_id": data["winpct"], "num_plies": 2, "num_plays": 10,
+                "max_iterations": 200, "time_limit_secs": 0})], {
+                "racks_per_batch": 2 if on_small else 20, "rack_size": 7,
+                "min_results_per_rack": 2, "max_results_per_rack": 5, "consensus_pct": 80}
+        rit = args.rit
         if DEV_JOB_KINDS[dev_job_kind(job)][1]:
             # A simmer must sort on equity, so the two differ in depth
             # instead. They consider at least the ten plays a captured
@@ -681,7 +688,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch", type=int, default=10,
                         help="games or pairs per task (default: %(default)s)")
     parser.add_argument("--min-units", type=int, default=None,
-                        help="games/pairs before SPRT is acted on (default: 100 games, "
+                        help="games/pairs before the match test is acted on (default: 100 games, "
                              "50000 pairs)")
     parser.add_argument("--max-units", type=int, default=100000,
                         help="hard cap on games/pairs (default: %(default)s)")

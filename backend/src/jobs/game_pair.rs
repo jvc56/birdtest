@@ -2,7 +2,7 @@ use super::dispatch::JobTemplate;
 use super::handler::*;
 use super::JobData;
 use crate::error::{AppError, AppResult};
-use crate::stats::sprt::Pentanomial;
+use crate::stats::outcomes::Pentanomial;
 use crate::models::job::GamePairConfig;
 use sqlx::PgConnection;
 use uuid::Uuid;
@@ -260,6 +260,7 @@ mod tests {
             num_moves: 1,
             analysis: Analysis::Static,
             moves: Vec::new(),
+            inference: None,
         }
     }
 
@@ -312,7 +313,7 @@ mod tests {
     /// A pentanomial that agrees with its tally only by overflowing. Summed as
     /// u64, `i64::MAX + 2` pairs doubled wrap round to exactly the 2 games
     /// reported, and the half-points (2 x 2) match two wins -- so a release
-    /// build accepted it and stored a bucket of 2^63 pairs for SPRT to read,
+    /// build accepted it and stored a bucket of 2^63 pairs for the match test to read,
     /// while a debug build panicked. No bucket can exceed the games played.
     #[test]
     fn a_pentanomial_that_only_agrees_by_overflowing_is_rejected() {

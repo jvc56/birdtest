@@ -63,10 +63,10 @@ function lookup(table: Record<string, string>, key: string): string {
 }
 
 const JOB_TYPE_LABELS: Record<string, string> = {
-  opening_rack: 'Opening rack analysis',
+  opening_rack: 'Opening Rack Analysis',
   games: 'Games',
-  game_pairs: 'Game pairs',
-  leave_generation: 'Leave generation'
+  game_pairs: 'Game Pairs',
+  leave_generation: 'Leave Generation'
 };
 
 export function jobTypeLabel(type: string): string {
@@ -84,37 +84,43 @@ export function derivedKind(role: string): string {
   return lookup(DERIVED_KIND_LABELS, role);
 }
 
-const SPRT_LABELS: Record<string, string> = {
+const TEST_LABELS: Record<string, string> = {
   running: 'running',
   paused: 'paused while the job is inactive',
   undecided: 'not decided: the job was completed before the test was',
-  passed: 'passed (H1 accepted)',
-  failed: 'failed (H0 accepted)',
-  terminated_at_max: 'stopped at its cap',
+  player1_better: 'decided: player 1 is better',
+  player2_better: 'decided: player 2 is better',
+  inconclusive: 'inconclusive: the job reached its cap first',
   off: 'not run: the job plays to its target'
 };
 
-export function sprtLabel(status: string): string {
-  return lookup(SPRT_LABELS, status);
+export function testLabel(status: string): string {
+  return lookup(TEST_LABELS, status);
 }
 
 /**
- * Where a games or pairs job's test stands, for its badge and label. The test
- * itself says `running` whenever it has not crossed a bound, which read as
- * work going on while the job was inactive and nothing was being played:
- * the job's status comes first. A completed job shows the decision it was
- * completed on, or `undecided` when it was completed without one (an admin's
- * force-complete). A job that runs no test is `off` whatever its status.
+ * Where a games or pairs job's significance test stands, for its badge and label.
+ * The test itself says `running` whenever its interval has not left an even
+ * score behind, which read as work going on while the job was inactive and
+ * nothing was being played: the job's status comes first. A completed job
+ * shows the decision it was completed on, or `undecided` when it was
+ * completed without one (an admin's force-complete). A job that runs no test
+ * is `off` whatever its status.
  */
-export function sprtState(
+export function testState(
   jobStatus: string,
-  games: { sprt: { status: string } | null; decided?: { status: string } }
+  games: { test: { status: string } | null; decided?: { status: string } }
 ): string {
-  if (!games.sprt) return 'off';
+  if (!games.test) return 'off';
   if (games.decided) return games.decided.status;
   if (jobStatus === 'inactive') return 'paused';
   if (jobStatus === 'completed') return 'undecided';
-  return games.sprt.status;
+  return games.test.status;
+}
+
+/** A score per game as a percentage, to a tenth: 0.5312 is "53.1%". */
+export function scorePct(score: number): string {
+  return `${(score * 100).toFixed(1)}%`;
 }
 
 /**
@@ -186,29 +192,30 @@ export function completionText(stats: {
   games?: {
     unit: string;
     max_units: number;
-    sprt: { lower_bound: number; upper_bound: number } | null;
-    decided?: { status: string; llr: number; units: number };
+    test: { confidence_pct: number } | null;
+    decided?: { status: string; lower: number; upper: number; units: number };
   };
 }): string {
   const completion = stats.completion;
   const games = stats.games;
   const units = (n: number, unit: string) => `${n.toLocaleString()} ${unit}${n === 1 ? '' : 's'}`;
   if (completion?.forced) {
-    return games?.sprt && !games.decided
+    return games?.test && !games.decided
       ? 'an admin force-completed it before its test decided'
       : 'an admin force-completed it';
   }
   const decided = games?.decided;
-  const sprt = games?.sprt;
-  if (games && decided && sprt) {
-    const llr = decided.llr.toFixed(3);
+  const test = games?.test;
+  if (games && decided && test) {
+    const interval = `player 1 scored ${scorePct(decided.lower)} to ${scorePct(decided.upper)} per game`;
+    const at = `at ${test.confidence_pct}% confidence after ${units(decided.units, games.unit)}`;
     switch (decided.status) {
-      case 'passed':
-        return `the SPRT passed (H1 accepted) after ${units(decided.units, games.unit)}: LLR ${llr} reached the upper bound ${sprt.upper_bound.toFixed(2)}`;
-      case 'failed':
-        return `the SPRT failed (H0 accepted) after ${units(decided.units, games.unit)}: LLR ${llr} reached the lower bound ${sprt.lower_bound.toFixed(2)}`;
-      case 'terminated_at_max':
-        return `it reached its cap of ${units(games.max_units, games.unit)} before the SPRT decided (LLR ${llr}, bounds [${sprt.lower_bound.toFixed(2)}, ${sprt.upper_bound.toFixed(2)}])`;
+      case 'player1_better':
+        return `its significance test found player 1 better ${at}: ${interval}`;
+      case 'player2_better':
+        return `its significance test found player 2 better ${at}: ${interval}`;
+      case 'inconclusive':
+        return `it reached its cap of ${units(games.max_units, games.unit)} before its significance test decided: ${interval}, at ${test.confidence_pct}% confidence`;
     }
   }
   // A job without a test has only its target to reach.

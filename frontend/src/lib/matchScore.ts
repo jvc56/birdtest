@@ -4,8 +4,8 @@
  * other's wins, and fewer is better), draws, average score per game, and
  * average spread.
  *
- * Every figure counts games, for a pairs job too: pairs are the SPRT's unit,
- * and their outcomes are the pair-outcome table in the SPRT card. For a job
+ * Every figure counts games, for a pairs job too: pairs are the significance test's
+ * unit, and their outcomes are the pair-outcome table in the Significance Test card. For a job
  * that runs no test, this is the job's result.
  */
 import type { CompareRow } from './compare';

@@ -24,22 +24,22 @@ test.beforeAll(async ({ browser, playwright }) => {
   const admin = await browser.newContext({ storageState: ADMIN_STATE });
   const form = await admin.newPage();
   await form.goto('/admin/jobs/new');
-  await form.getByLabel('Job name').fill(`e12 saved positions ${suffix}`);
-  await form.getByLabel('Job type').selectOption({ label: 'Games' });
-  const letterdist = form.getByLabel('Letter distribution');
+  await form.getByLabel('Job Name').fill(`e12 saved positions ${suffix}`);
+  await form.getByLabel('Job Type').selectOption({ label: 'Games' });
+  const letterdist = form.getByLabel('Letter Distribution');
   const fixtureBag = letterdist.locator('option', { hasText: `english_fixture (${SEEDED_DATA},` });
   await letterdist.selectOption((await fixtureBag.getAttribute('value'))!);
-  const layout = form.getByLabel('Board layout');
+  const layout = form.getByLabel('Board', { exact: true });
   const board = layout.locator('option', { hasText: `standard15 (${SEEDED_DATA},` });
   await layout.selectOption((await board.getAttribute('value'))!);
   await form.getByLabel('Player 1').selectOption({ label: a });
   await form.getByLabel('Player 2').selectOption({ label: b });
-  await form.getByLabel('Games per batch').fill('2');
-  // No SPRT, the form's default: the job plays its four games and stops.
-  await expect(form.getByLabel('Run an SPRT')).not.toBeChecked();
-  await expect(form.getByLabel('Min before SPRT')).toHaveCount(0);
-  await form.getByLabel('Games to play').fill('4');
-  await form.getByLabel('Save the positions played').check();
+  await form.getByLabel('Games Per Task').fill('2');
+  // No match test, the form's default: the job plays its four games and stops.
+  await expect(form.getByLabel('Significance Test')).not.toBeChecked();
+  await expect(form.getByLabel('Minimum Games')).toHaveCount(0);
+  await form.getByLabel('Games To Play').fill('4');
+  await form.getByLabel('Position Recorder').check();
   await form.getByRole('button', { name: 'Create job' }).click();
   await expect(form).toHaveURL(/\/admin\/jobs\/[0-9a-f-]{36}$/);
   jobId = form.url().split('/').pop()!;
@@ -87,7 +87,11 @@ test('E-12: a signed-in user draws saved positions at random and searches them b
   await expect(shown.getByTestId('rack')).toHaveCount(2);
   await expect(shown.getByTestId('score')).toHaveCount(2);
   await expect(shown.getByText('to move', { exact: true })).toHaveCount(1);
-  expect(await shown.locator('tbody tr').count()).toBeGreaterThan(0);
+  const moves = shown.getByTestId('position-moves');
+  expect(await moves.locator('tbody tr').count()).toBeGreaterThan(0);
+  // The fake workers simulate: each move's win percentage and its first two
+  // plies' statistics, the reply's first.
+  await expect(moves.locator('thead th')).toContainText(['Win %', 'P1-S', 'P1-BP', 'P2-S', 'P2-BP']);
   // The move played from here: named, marked in the list, and -- unless it
   // was a pass or an exchange -- drawn where it goes, apart from the tiles
   // already down. No CGP text under the board.

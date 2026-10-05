@@ -1429,37 +1429,33 @@ async fn a_config_or_job_no_worker_can_run_is_refused() {
     .fetch_one(&db.pool)
     .await
     .unwrap();
-    let job_with = |layout_id: uuid::Uuid, alpha: f64, beta: f64| {
+    let job_with = |layout_id: uuid::Uuid, confidence: f64| {
         json!({
             "job_type": "games", "variant": "classic",
             "letterdist_id": letterdist, "layout_id": layout_id,
             "player1_config_id": player["id"], "player2_config_id": player["id"],
-            "sprt_enabled": true, "min_games": 1, "max_games": 10,
-            "sprt_alpha": alpha, "sprt_beta": beta,
+            "test_enabled": true, "min_games": 1, "max_games": 10,
+            "confidence_pct": confidence,
         })
     };
-    let job = |layout_id: uuid::Uuid, alpha: f64| job_with(layout_id, alpha, 0.05);
-    let (status, body) = send(&app, post_json("/api/admin/jobs", &headers, job(super21, 0.05))).await;
+    let job = |layout_id: uuid::Uuid| job_with(layout_id, 95.0);
+    let (status, body) = send(&app, post_json("/api/admin/jobs", &headers, job(super21))).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(body["fields"][0]["field"], "layout_id", "{body}");
 
-    // A subnormal alpha made the SPRT's upper bound infinite, which the job
-    // page could not print; beta keeps the same floor for symmetry.
-    for (alpha, beta, field) in [
-        (1e-309, 0.05, "sprt_alpha"),
-        (0.000_000_9, 0.05, "sprt_alpha"),
-        (0.05, 0.000_000_9, "sprt_beta"),
-    ] {
+    // A confidence of 100% put a logarithm of zero in the match test's
+    // interval, which then never closes; one just short of it is a test.
+    for confidence in [100.0, 100.000_000_1] {
         let (status, body) =
-            send(&app, post_json("/api/admin/jobs", &headers, job_with(layout, alpha, beta))).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{alpha} {beta}: {body}");
-        assert_eq!(body["fields"][0]["field"], field, "{body}");
+            send(&app, post_json("/api/admin/jobs", &headers, job_with(layout, confidence))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{confidence}: {body}");
+        assert_eq!(body["fields"][0]["field"], "confidence_pct", "{body}");
     }
     let (status, body) =
-        send(&app, post_json("/api/admin/jobs", &headers, job_with(layout, 0.000_001, 0.000_001))).await;
-    assert_eq!(status, StatusCode::CREATED, "at the floor: {body}");
+        send(&app, post_json("/api/admin/jobs", &headers, job_with(layout, 99.999))).await;
+    assert_eq!(status, StatusCode::CREATED, "just short of all: {body}");
 
-    let (status, body) = send(&app, post_json("/api/admin/jobs", &headers, job(layout, 0.05))).await;
+    let (status, body) = send(&app, post_json("/api/admin/jobs", &headers, job(layout))).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
 }
 
@@ -1870,8 +1866,9 @@ async fn purging_a_completed_job_returns_it_to_inactive() {
     let app = birdtest::app(state.clone());
     with_history(&app).await;
     sqlx::query(
-        "UPDATE jobs SET status = 'completed', sprt_decided_status = 'passed',
-                         sprt_decided_llr = 3.1, sprt_decided_units = 200
+        "UPDATE jobs SET status = 'completed', test_decided_status = 'player1_better',
+                         test_decided_lower = 0.51, test_decided_upper = 0.6,
+                         test_decided_units = 200
          WHERE id = $1",
     )
     .bind(job)
@@ -1885,7 +1882,7 @@ async fn purging_a_completed_job_returns_it_to_inactive() {
         send(&app, request("POST", &format!("/api/admin/jobs/{job}/purge"), &headers)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let (job_status, verdict): (String, Option<String>) =
-        sqlx::query_as("SELECT status::text, sprt_decided_status FROM jobs WHERE id = $1")
+        sqlx::query_as("SELECT status::text, test_decided_status FROM jobs WHERE id = $1")
             .bind(job)
             .fetch_one(&db.pool)
             .await

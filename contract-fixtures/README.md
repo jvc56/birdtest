@@ -26,6 +26,7 @@ other then fails a test rather than a contributor's run.
 | `expected-data.json` | server → client | The `expected_data` digest list of an assignment, input files and a derived wordmap |
 | `heartbeat.json` | client → server | A heartbeat |
 | `result-games.json` | client → server | A games result with `capture_positions` on, from two players that solve their endgames and small pre-endgames: the tally and every captured position, each with its `analysis` (`static`, `peg`, `endgame`) and a solved one's spreads and depths |
+| `result-games-inference.json` | client → server | A games result from simming players that infer: a first-turn position with no inference, and a later one with its `inference` (leaves found, draws, mean equity, the most drawn leaves), each move with its win% and per-ply statistics. Written by hand in MAGPIE's key layout; MAGPIE's test checks its own output carries every key |
 | `result-game-pairs.json` | client → server | A pairs result: the tally, the pentanomial, the divergent subset, and each diverging pair's two positions at its first divergence |
 | `result-opening-rack.json` | client → server | A simulating player's rack analyses, with win%, blended utility and per-ply statistics |
 | `result-leave-generation.json` | client → server | Every rack a leave-generation task saw, on MAGPIE's two-letter test distribution |
@@ -35,8 +36,8 @@ stops matching what an import produces is itself a signal.
 
 ## Capturing
 
-The first nine were written by hand. The rest were **captured from a real
-exchange**: `scripts/capture_contract.py` is a recording proxy that sits
+The first nine, and `result-games-inference.json`, were written by hand. The
+rest were **captured from a real exchange**: `scripts/capture_contract.py` is a recording proxy that sits
 between `magpie contribute` and the backend, forwards everything unchanged, and
 writes the first body of each message type here. Nothing is normalised --
 tokens, ids and timings are the ones that crossed the wire, so a recapture

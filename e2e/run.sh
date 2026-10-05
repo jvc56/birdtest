@@ -116,7 +116,7 @@ wait_for "$E2E_API_URL/health" 180
 wait_for "$E2E_BASE_URL/health" 60
 
 # A confirmed admin, the fixture data, two static player configs and an active
-# game-pairs job, through the real API. Small enough to reach its SPRT verdict
+# game-pairs job, through the real API. Small enough to reach its match-test verdict
 # (or its cap) within the first minute or two of fake-worker results, so the
 # job-page journeys see a finished pentanomial and the ratings journey has
 # fixed evidence.

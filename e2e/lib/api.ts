@@ -62,8 +62,42 @@ export class AdminApi {
       kwg: find('kwg', 'NWL23'),
       klv: find('klv', 'NWL23'),
       letterdist: find('letterdist', 'english_fixture'),
-      layout: find('layout', 'standard15')
+      layout: find('layout', 'standard15'),
+      winpct: () => find('winpct', 'winpct')
     };
+  }
+
+  /** A 2-ply simmer on the seeded data, ranking ten plays and recording them all. */
+  async createSimConfig(name: string) {
+    const data = await this.seededData();
+    const created = await this.post<{ id: string }>('/api/admin/player-configs', {
+      name,
+      recorder_type: 'all',
+      kwg_id: data.kwg,
+      klv_id: data.klv,
+      winpct_id: data.winpct(),
+      num_plies: 2,
+      num_plays: 10,
+      max_iterations: 100,
+      time_limit_secs: 0,
+      num_plays_recorded: 10,
+      use_wordmap: false,
+      use_rit: false,
+      use_wit: false
+    });
+    return created.id;
+  }
+
+  /** Creates a job on the seeded data and leaves it inactive; returns its id. */
+  async inactiveJob(config: Record<string, unknown>): Promise<string> {
+    const data = await this.seededData();
+    const created = await this.post<{ job: { id: string } }>('/api/admin/jobs', {
+      variant: 'classic',
+      letterdist_id: data.letterdist,
+      layout_id: data.layout,
+      ...config
+    });
+    return created.job.id;
   }
 
   async playerConfigId(name: string): Promise<string> {
@@ -92,7 +126,7 @@ export class AdminApi {
 
   /**
    * Creates and activates a job on the seeded data; returns its id. A games
-   * or pairs job runs an SPRT only when `config` says `sprt_enabled: true`,
+   * or pairs job runs the match test only when `config` says `test_enabled: true`,
    * and the server refuses a floor or test setting sent without it.
    */
   async activeJob(config: Record<string, unknown>, allocation: number): Promise<string> {

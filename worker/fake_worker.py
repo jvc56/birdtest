@@ -4,7 +4,7 @@
 **Test tooling only.** The one production client is MAGPIE itself (`magpie
 contribute`). This script submits *invented* results, and the server cannot
 tell them from real ones: pointed at a production server, every result it
-submits is recorded as a genuine contribution, feeds SPRT verdicts and rating
+submits is recorded as a genuine contribution, feeds match-test verdicts and rating
 fits, and has to be found and deleted by hand. Never run it against anything
 but a disposable test stack.
 
@@ -14,7 +14,7 @@ interesting server property is about something else:
 
   * scheduling — deficit-based allocation
   * the claim lifecycle — heartbeat timeouts, stale tokens, reclamation
-  * SPRT and ratings — which need a *chosen* win rate to reach a known verdict
+  * match tests and ratings — which need a *chosen* win rate to reach a known verdict
   * submission validation and the plausibility checks — which need a client
     that misbehaves deliberately
 
@@ -83,7 +83,7 @@ def _aggregate(rng: random.Random, games: int, p1_win_probability: float) -> dic
     """One synthetic `autoplay` summary — the shape MAGPIE actually reports.
 
     Draws each game's outcome so the counts have realistic sampling noise
-    rather than being the exact expectation, which is what makes SPRT runs
+    rather than being the exact expectation, which is what makes match-test runs
     interesting.
     """
     wins = losses = ties = 0
@@ -303,6 +303,9 @@ def _synthetic_position(game: "_SyntheticGame", rng: random.Random, game_index: 
                 "move": move["move"],
                 "score": move["score"],
                 "equity": move["equity"],
+                # How often the simulation played this move out: most for
+                # the leaders.
+                "iterations": rng.randint(20, 400),
                 # Absent for a static player, which simulates nothing.
                 "win_percentage": round(rng.uniform(20, 80), 3),
                 # Same nullability as win_percentage: the win%+spread
@@ -324,11 +327,36 @@ def _synthetic_position(game: "_SyntheticGame", rng: random.Random, game_index: 
     if previous is not None:
         position["previous_move"] = previous["move"]
         position["previous_move_score"] = previous["score"]
+        # What the simmer inferred the opponent kept, from that move: MAGPIE
+        # infers only from a move, so never on a game's first turn or after
+        # a pass.
+        if previous["score"] or "exch" in previous["move"]:
+            position["inference"] = _synthetic_inference(rng)
     # The move played from here: the top of the ranking, which is what the
     # synthetic game plays.
     position["played_move"] = ranked[0]["move"]
     position["played_move_score"] = ranked[0]["score"]
     return position
+
+
+def _synthetic_inference(rng: random.Random) -> dict:
+    """An inference as MAGPIE reports it: how many distinct leaves it found, how
+    many it drew, their mean equity, and the most drawn (at most ten), most
+    drawn first."""
+    found = rng.randint(1, 300)
+    total = rng.randint(found, found * 40)
+    leaves = []
+    draws = total
+    for _ in range(min(10, found)):
+        draws = rng.randint(1, max(1, min(draws, total // 3 or 1)))
+        tiles = rng.randint(0, 6)
+        leaves.append({
+            "leave": "".join(sorted(rng.choice("AEINORSTLD?") for _ in range(tiles))),
+            "draws": draws,
+            "equity": round(rng.uniform(-10, 30), 3),
+        })
+    return {"num_leaves": found, "total_draws": total,
+            "average_equity": round(rng.uniform(0, 20), 3), "leaves": leaves}
 
 
 def _add_first_divergences(result: dict, request: dict, rng: random.Random,
@@ -497,6 +525,11 @@ def _result_for(request: dict, rng: random.Random, p1_win_probability: float) ->
                         "move": f"8{chr(ord('D') + i)} {rack[:tiles]}",
                         "score": rng.randint(12, 90),
                         "equity": round(equity, 3),
+                        # A simulation's, as the plies below are: the server
+                        # stores a rack with them as a simulated analysis.
+                        "iterations": rng.randint(20, 400),
+                        "win_percentage": round(rng.uniform(20, 80), 3),
+                        "blended_utility": round(rng.uniform(0, 1), 3),
                         "plies": [
                             {
                                 "ply": p,
@@ -883,7 +916,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--p1-win-rate", type=float, default=0.5,
-        help="bias player 1's results, to drive SPRT to a chosen verdict",
+        help="bias player 1's results, to drive the match test to a chosen verdict",
     )
     parser.add_argument("--seed", default="birdtest", help="makes a run reproducible")
     parser.add_argument("--delay", type=float, default=0.0, help="seconds between tasks")

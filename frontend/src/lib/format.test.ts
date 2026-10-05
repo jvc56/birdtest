@@ -14,8 +14,9 @@ import {
   targetsText,
   MAX_LEAVE_GENERATIONS,
   MAX_TARGET_RACK_COUNT,
-  sprtLabel,
-  sprtState,
+  testLabel,
+  testState,
+  scorePct,
   completionText,
   exportSummary,
   jobTitle,
@@ -115,10 +116,10 @@ describe('F-FMT-3 datetime', () => {
 
 describe('F-FMT-4 jobTypeLabel', () => {
   it('covers all four job types', () => {
-    expect(jobTypeLabel('opening_rack')).toBe('Opening rack analysis');
+    expect(jobTypeLabel('opening_rack')).toBe('Opening Rack Analysis');
     expect(jobTypeLabel('games')).toBe('Games');
-    expect(jobTypeLabel('game_pairs')).toBe('Game pairs');
-    expect(jobTypeLabel('leave_generation')).toBe('Leave generation');
+    expect(jobTypeLabel('game_pairs')).toBe('Game Pairs');
+    expect(jobTypeLabel('leave_generation')).toBe('Leave Generation');
   });
 
   it('falls back to the raw string for an unknown type', () => {
@@ -139,44 +140,49 @@ describe('derivedKind', () => {
   });
 });
 
-describe('F-FMT-5b sprtState', () => {
-  const running = { sprt: { status: 'running' } };
+describe('F-FMT-5b testState', () => {
+  const running = { test: { status: 'running' } };
   it("says paused, not running, while the job is inactive", () => {
-    expect(sprtState('inactive', running)).toBe('paused');
-    expect(sprtLabel(sprtState('inactive', running))).toBe('paused while the job is inactive');
+    expect(testState('inactive', running)).toBe('paused');
+    expect(testLabel(testState('inactive', running))).toBe('paused while the job is inactive');
   });
   it('is the test while the job is active', () => {
-    expect(sprtState('active', running)).toBe('running');
-    expect(sprtState('active', { sprt: { status: 'passed' } })).toBe('passed');
+    expect(testState('active', running)).toBe('running');
+    expect(testState('active', { test: { status: 'player1_better' } })).toBe('player1_better');
   });
   it('is the decision a completed job stopped on, or undecided without one', () => {
-    expect(sprtState('completed', { ...running, decided: { status: 'terminated_at_max' } })).toBe(
-      'terminated_at_max'
-    );
-    expect(sprtState('completed', running)).toBe('undecided');
+    expect(testState('completed', { ...running, decided: { status: 'inconclusive' } })).toBe('inconclusive');
+    expect(testState('completed', running)).toBe('undecided');
     // A purged job that had a decision keeps none: the purge clears it.
-    expect(sprtState('inactive', { sprt: { status: 'failed' } })).toBe('paused');
+    expect(testState('inactive', { test: { status: 'player2_better' } })).toBe('paused');
   });
   it('is off, whatever the job is doing, for a job that runs no test', () => {
     for (const status of ['active', 'inactive', 'completed']) {
-      expect(sprtState(status, { sprt: null })).toBe('off');
+      expect(testState(status, { test: null })).toBe('off');
     }
-    expect(sprtLabel('off')).toBe('not run: the job plays to its target');
+    expect(testLabel('off')).toBe('not run: the job plays to its target');
   });
 });
 
-describe('F-FMT-5 sprtLabel', () => {
-  it('covers all four statuses', () => {
-    expect(sprtLabel('running')).toBe('running');
-    expect(sprtLabel('passed')).toBe('passed (H1 accepted)');
-    expect(sprtLabel('failed')).toBe('failed (H0 accepted)');
-    // Games and pairs jobs both have a cap; it is not always games.
-    expect(sprtLabel('terminated_at_max')).toBe('stopped at its cap');
+describe('F-FMT-5 testLabel', () => {
+  it('covers every status', () => {
+    expect(testLabel('running')).toBe('running');
+    expect(testLabel('player1_better')).toBe('decided: player 1 is better');
+    expect(testLabel('player2_better')).toBe('decided: player 2 is better');
+    expect(testLabel('inconclusive')).toBe('inconclusive: the job reached its cap first');
   });
 
   it('falls back to the raw status for an unknown one', () => {
-    expect(sprtLabel('abandoned')).toBe('abandoned');
-    expect(sprtLabel('constructor')).toBe('constructor');
+    expect(testLabel('abandoned')).toBe('abandoned');
+    expect(testLabel('constructor')).toBe('constructor');
+  });
+});
+
+describe('F-FMT-5c scores', () => {
+  it('shows a score per game as a percentage to a tenth', () => {
+    expect(scorePct(0.53125)).toBe('53.1%');
+    expect(scorePct(0.5)).toBe('50.0%');
+    expect(scorePct(1)).toBe('100.0%');
   });
 });
 
@@ -219,29 +225,42 @@ describe('F-FMT-6 form numbers', () => {
 });
 
 describe('F-FMT-12 completionText', () => {
-  const games = (decided?: { status: string; llr: number; units: number }) => ({
+  const games = (decided?: { status: string; lower: number; upper: number; units: number }) => ({
     unit: 'pair',
     max_units: 5000,
-    sprt: { lower_bound: -2.94, upper_bound: 2.94 } as { lower_bound: number; upper_bound: number } | null,
+    test: { confidence_pct: 95 } as { confidence_pct: number } | null,
     decided
   });
-  const untested = { ...games(), sprt: null };
+  const untested = { ...games(), test: null };
   const pairs = { job_type: 'game_pairs' };
   it('tells a test that decided from a cap that was reached', () => {
     expect(
       completionText({
         job: pairs,
-        completion: { forced: false, reason: 'passed' },
-        games: games({ status: 'passed', llr: 2.95, units: 1200 })
+        completion: { forced: false, reason: 'player1_better' },
+        games: games({ status: 'player1_better', lower: 0.5012, upper: 0.5523, units: 1200 })
       })
-    ).toBe('the SPRT passed (H1 accepted) after 1,200 pairs: LLR 2.950 reached the upper bound 2.94');
+    ).toBe(
+      'its significance test found player 1 better at 95% confidence after 1,200 pairs: player 1 scored 50.1% to 55.2% per game'
+    );
     expect(
       completionText({
         job: pairs,
-        completion: { forced: false, reason: 'terminated_at_max' },
-        games: games({ status: 'terminated_at_max', llr: 0.5, units: 5000 })
+        completion: { forced: false, reason: 'player2_better' },
+        games: games({ status: 'player2_better', lower: 0.41, upper: 0.4987, units: 900 })
       })
-    ).toBe('it reached its cap of 5,000 pairs before the SPRT decided (LLR 0.500, bounds [-2.94, 2.94])');
+    ).toBe(
+      'its significance test found player 2 better at 95% confidence after 900 pairs: player 1 scored 41.0% to 49.9% per game'
+    );
+    expect(
+      completionText({
+        job: pairs,
+        completion: { forced: false, reason: 'inconclusive' },
+        games: games({ status: 'inconclusive', lower: 0.495, upper: 0.507, units: 5000 })
+      })
+    ).toBe(
+      'it reached its cap of 5,000 pairs before its significance test decided: player 1 scored 49.5% to 50.7% per game, at 95% confidence'
+    );
   });
   it('says when an admin forced it', () => {
     expect(completionText({ job: pairs, completion: { forced: true, reason: null }, games: games() })).toBe(
@@ -273,7 +292,7 @@ describe('F-FMT-12 completionText', () => {
 describe('F-FMT-13 jobTitle', () => {
   it("is the job's name, or its type for one given none", () => {
     expect(jobTitle({ name: 'equity vs static', job_type: 'game_pairs' })).toBe('equity vs static');
-    expect(jobTitle({ name: '', job_type: 'game_pairs' })).toBe('Game pairs');
+    expect(jobTitle({ name: '', job_type: 'game_pairs' })).toBe('Game Pairs');
     expect(jobTitle({ name: '   ', job_type: 'games' })).toBe(jobTitle({ name: '', job_type: 'games' }));
   });
 });

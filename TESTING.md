@@ -68,20 +68,20 @@ at tier 5 names a symptom.
 
 | Tier | Tests | Where |
 |---|---|---|
-| 1 Unit | 234 | `#[cfg(test)]` in `jobs::plausibility` (26), `inputdata` (30), `jobs::racks` (16), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (15), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (5), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (7), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (8), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `board`, `exports`, `jobs`, `jobs::leave_gen`, `routes` (1 each); `jobs::game_pair` (2) |
-| 1F Frontend unit | 187 | Vitest, `frontend/src/lib/`: `format.test.ts` (44), `jobSettings.test.ts` (11), `matchScore.test.ts` (4), `compare.test.ts` (2), `consensus.test.ts` (3), `cgp.test.ts` (16), `api.test.ts` (17), `auth.test.ts` (9), `accountRules.test.ts` (9), `sse.test.ts` (12), `importWatch.test.ts` (10), `poller.test.ts` (7), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (2), and `charts/`: `ratingDotPlot.test.ts` (19), `labels.test.ts` (2), `residuals.test.ts` (11), `pentanomial.test.ts` (5) |
+| 1 Unit | 238 | `#[cfg(test)]` in `jobs::plausibility` (26), `inputdata` (30), `jobs::racks` (16), `stats::bradley_terry` (30), `stats::match_test` (10), `stats::outcomes` (7), `error` (8), `config` (7), `extract` (7), `routes::admin` (14), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (5), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (7), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (8), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `board`, `exports`, `jobs`, `jobs::leave_gen`, `routes` (1 each); `jobs::game_pair` (2) |
+| 1F Frontend unit | 203 | Vitest, `frontend/src/lib/`: `format.test.ts` (46), `jobSettings.test.ts` (13), `matchScore.test.ts` (4), `matchTest.test.ts` (4), `moveList.test.ts` (5), `compare.test.ts` (3), `consensus.test.ts` (5), `cgp.test.ts` (16), `api.test.ts` (17), `auth.test.ts` (9), `accountRules.test.ts` (9), `sse.test.ts` (12), `importWatch.test.ts` (10), `poller.test.ts` (7), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (2), and `charts/`: `ratingDotPlot.test.ts` (19), `labels.test.ts` (2), `residuals.test.ts` (11), `pentanomial.test.ts` (5) |
 | 2 Integration | 177 | `backend/tests/`: `leave_gen.rs` (33), `ratings.rs` (31), `scheduler.rs` (18), `jobs.rs` (18), `stats.rs` (19), `input_data.rs` (14), `derived.rs` (9), `leave_generation.rs` (8), `exports.rs` (13), `submissions.rs` (6), `artifacts.rs` (5), `audit.rs` (3) |
-| 3 API | 236 | `backend/tests/`: `worker_api.rs` (45), `admin_api.rs` (59), `auth_routes.rs` (28), `worker_routes.rs` (23), `boundaries.rs` (18), `public_api.rs` (21), `admin_routes.rs` (12), `authz.rs` (7), `account.rs` (10), `auth_api.rs` (5), `finish.rs` (7), `fake_worker.rs` (1) |
-| 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
-| 5 End-to-end | 20 | Playwright journeys `E-1`..`E-17` (`E-11` in three tests, `E-12` in two) in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
-| 6 MAGPIE smoke | 14 cases + 16 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-15` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 16 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (6), `magpie_leave.rs` (7), `magpie_routes.rs` (3) |
+| 3 API | 239 | `backend/tests/`: `worker_api.rs` (47), `admin_api.rs` (59), `auth_routes.rs` (28), `worker_routes.rs` (23), `boundaries.rs` (18), `public_api.rs` (22), `admin_routes.rs` (12), `authz.rs` (7), `account.rs` (10), `auth_api.rs` (5), `finish.rs` (7), `fake_worker.rs` (1) |
+| 4 Contract | 15 | `routes::worker::contract_fixtures`, over 17 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
+| 5 End-to-end | 21 | Playwright journeys `E-1`..`E-18` (`E-11` in three tests, `E-12` in two) in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
+| 6 MAGPIE smoke | 15 cases + 16 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-16` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 16 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (6), `magpie_leave.rs` (7), `magpie_routes.rs` (3) |
 
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
 directly to assert one. With the tier-6 tests selected, `cargo nextest run
---run-ignored all` runs 677 backend tests (the per-tier counts above are
+--run-ignored all` runs 685 backend tests (the per-tier counts above are
 from `cargo nextest list --run-ignored all` and `vitest`, after October 2026's
-feature batch).
+third feature batch).
 
 Tier 2 was the largest gap and the highest value.
 `sqlx::query` is checked at runtime, so the compiler sees opaque text. Two bugs
@@ -104,7 +104,7 @@ incidentally by higher tiers.
 
 | File | Owning tier | Status |
 |---|---|---|
-| `stats/sprt.rs` | 1 | Covered — values pinned to independently computed numbers (`U-STATS-*`) |
+| `stats/match_test.rs`, `stats/outcomes.rs` | 1 | Covered — values pinned to independently computed numbers, and the match test's error rate and power simulated (`U-STATS-*`) |
 | `stats/bradley_terry.rs` | 1 | Covered |
 | `version.rs` | 1 | Covered |
 | `compat.rs` | 1 | Covered |
@@ -178,7 +178,7 @@ come from `include_bytes!`; anything that needs a path uses a `tempdir`.
 
 ### Covered before the list
 
-`stats::sprt`, `stats::bradley_terry`, `version`, `compat`, `backups`,
+`stats::sprt` (since replaced by `stats::match_test`), `stats::bradley_terry`, `version`, `compat`, `backups`,
 `derived`, `magpie`, `clientip`, `routes::admin`'s settings validation, and the
 first rules of `jobs::plausibility` and the `inputdata` archive walk had tests
 before the entries below were written; the entries were what was missing, and
@@ -433,9 +433,10 @@ process environment, so no test mutates `std::env` under another.
   Postgres enum representation with the same strings. *(Covered:
   `job::tests::job_types_have_one_name_on_the_wire_and_in_postgres`,
   `job::tests::job_statuses_have_one_name_on_the_wire_and_in_postgres`.)*
-- `U-WIRE-7` `SprtParams::from` reads the same alpha/beta/elo values out of a
-  `GameConfig` and a `GamePairConfig`, so the two job types cannot diverge.
-  *(Covered: `job::tests::sprt_params_read_the_same_settings_from_games_and_pairs`.)*
+- `U-WIRE-7` `TestParams::from` reads the same match-test settings (on or
+  off, floor, cap, confidence) out of a `GameConfig` and a `GamePairConfig`,
+  so the two job types cannot diverge.
+  *(Covered: `job::tests::test_params_read_the_same_settings_from_games_and_pairs`.)*
 
 ### `U-DISPATCH-*` — the job template cache (`jobs/dispatch.rs`)
 
@@ -485,23 +486,46 @@ The two that were missing:
   `plausibility::tests::a_worker_cannot_report_more_moves_than_it_generated`,
   `plausibility::tests::per_ply_statistics_are_statistics`.)* (Eleventh audit.)
 
-### `U-STATS-*` — pinned numbers (`stats/sprt.rs`, `stats/bradley_terry.rs`)
+### `U-STATS-*` — pinned numbers (`stats/match_test.rs`, `stats/outcomes.rs`, `stats/bradley_terry.rs`)
 
 Every other statistics test checks a property (monotone, symmetric, order-free),
 which a formula wrong by a constant factor passes. These compare against values
 computed outside the code, in 40-digit decimal from PLAN.md's formulas.
 
-- `U-STATS-1` The bounds at the default α = β = 0.05 are ln(0.05/0.95) and
-  ln(0.95/0.05), ±2.944438979…. *(Covered:
-  `sprt::tests::the_default_bounds_are_the_documented_logarithms`.)*
-- `U-STATS-2` A games tally, W21 L7 D2 at ±10 Elo, scores LLR 1.125953543…; a
-  pentanomial [1, 3, 7, 3, 2] scores 0.207499670…. *(Covered:
-  `sprt::tests::a_games_tally_scores_the_documented_llr`,
-  `sprt::tests::a_pentanomial_scores_the_documented_llr`.)*
-- `U-STATS-3` A losing tally reaches H0: 28-72 over 100 games is −3.1400…,
-  past the lower bound; 29-71 is −2.9347…, just inside and still running; the
-  mirror images pass and run. *(Covered:
-  `sprt::tests::a_losing_tally_reaches_h0_and_one_game_short_does_not`.)*
+- `U-STATS-1` The match test's half-width is the documented boundary: n =
+  1,000, σ² = 1/16, α = 0.05, tuned at 1,000 units of variance ¼, is
+  0.025806505…, and nothing played is an infinite half-width. A games tally,
+  W21 L7 D2 (mean 11/15, variance 161/900), at 95% with a floor of 10 and a
+  cap of 1,000 gets the interval 0.476214864… to 0.990451801…, still running;
+  a wider one is clipped to 1. *(Covered:
+  `match_test::tests::the_half_width_is_the_documented_boundary`,
+  `match_test::tests::a_games_tally_gets_the_documented_interval`,
+  `outcomes::tests::a_games_tally_has_the_documented_mean_and_variance`.)*
+- `U-STATS-2` A pentanomial [1, 3, 7, 3, 2] is 16 pairs scored i/4 (mean
+  17/32, variance 71/1024); at 90%, floor and cap 16, its half-width is
+  0.181952165…, and it is inconclusive at its cap. *(Covered:
+  `match_test::tests::a_pentanomial_gets_the_documented_interval`,
+  `outcomes::tests::a_pentanomial_has_the_documented_mean_and_variance`.)*
+- `U-STATS-3` Over 1,000 games without a draw at 95% (floor 100, cap 10,000),
+  548 wins is the fewest that decide for player 1 (lower bound 0.500229941…)
+  and 547 runs on (0.499220820…); the mirror images decide for player 2 and
+  run. Every pair split is no evidence either way: 10,000 of them end
+  inconclusive, the interval still around ½. The floor holds the decision
+  back while the interval is reported, and a cap below the floor ends the job
+  inconclusive. *(Covered:
+  `match_test::tests::the_fewest_wins_that_decide_and_one_short`,
+  `match_test::tests::identical_pairs_alone_never_decide`,
+  `match_test::tests::the_floor_holds_until_it_does_not_and_the_cap_applies_below_it`,
+  `match_test::tests::nothing_played_is_an_even_score_with_every_score_possible`,
+  `match_test::tests::elo_is_the_logistic_inverse_within_its_bounds`.)*
+- `U-STATS-3b` **The error rate and the power, simulated.** Pairs drawn from a
+  pentanomial, the test checked after every batch of 50 from a floor of 500 to
+  a cap of 10,000 at 95%, as the finish check does: between equal players
+  (three pairs in five split) at most α + 0.02 of 1,000 runs name a winner;
+  a player scoring 53.5% per game (about +24 Elo) is found better in at least
+  90% of 200 runs, and never the wrong way round. *(Covered:
+  `match_test::tests::equal_players_rarely_get_a_winner_however_often_it_is_checked`,
+  `match_test::tests::a_better_player_is_found`.)*
 - `U-STATS-4` A Bradley-Terry standard error equals the analytic
   (400/ln 10)/√(n·p·(1−p)): 49.1348… Elo for an even 50 games, a tenth of that
   at 5,000, and 1.2687… for 75% over 100,000. *(Covered:
@@ -714,16 +738,23 @@ Each entry's tests are the `describe` block named for its id.
 - `F-FMT-3` `datetime` renders `null` as a dash and a valid ISO string as a
   local time; an unparseable string does not throw. *(Covered:
   `format.test.ts`.)*
-- `F-FMT-4` `jobTypeLabel` covers all four job types, and an unknown type falls
+- `F-FMT-4` `jobTypeLabel` covers all four job types, in Title Case ("Opening
+  Rack Analysis", "Games", "Game Pairs", "Leave Generation"), and an unknown type falls
   back to the raw string rather than "undefined" — including a name like
   `toString` that an object literal answers. *(Covered: `format.test.ts`.)*
-- `F-FMT-5b` `sprtState`: a games or pairs job's test reads `paused` while the
-  job is inactive and `undecided` when it was completed without a decision,
-  never `running` with nothing being played; a completed job shows the
-  decision it stopped on; a job without a test is `off` whatever its status.
-  *(Covered: `format.test.ts`, `F-FMT-5b sprtState`.)*
-- `F-FMT-5` `sprtLabel` covers all four statuses. *(Covered:
+- `F-FMT-5b` `testState`: a games or pairs job's match test reads `paused`
+  while the job is inactive and `undecided` when it was completed without a
+  decision, never `running` with nothing being played; a completed job shows
+  the decision it stopped on (`player1_better`, `player2_better`,
+  `inconclusive`); a job without a test is `off` whatever its status.
+  *(Covered: `format.test.ts`, `F-FMT-5b testState`.)*
+- `F-FMT-5` `testLabel` covers every status ("decided: player 1 is better",
+  "inconclusive: the job reached its cap first", …). *(Covered:
   `format.test.ts`.)*
+- `F-FMT-5c` `scorePct` shows a score per game as a percentage to a tenth
+  (0.5312 is "53.1%"), and `signedElo` signs and rounds an Elo difference
+  ("+22", "−8", and "0", never "+0" or "−0"). *(Covered: `format.test.ts`,
+  `F-FMT-5c scores and Elo`.)*
 - `F-MATCH-1` The match score table's rows, a column per player: wins,
   losses (player 2's wins and losses are player 1's losses and wins, and
   fewer losses are better), draws, the average scores to a decimal place and
@@ -735,20 +766,28 @@ Each entry's tests are the `describe` block named for its id.
   fewer is better (losses) -- and neither when they are equal or one is
   missing. *(Covered: `compare.test.ts`.)*
 - `F-SET-1` The settings tables (`lib/jobSettings.ts`), in SETTINGS_COMPARISON.md's
-  orders. A job's settings are one ordered list, the key rows first (type,
+  orders. A job's settings are one ordered list, every row shown (type,
   variant, letter distribution, board, bingo bonus; a games job's target or
-  cap, its SPRT as "none" or "Elo H0 → H1", and whether it records positions;
-  an opening-rack job's racks and their size; a leave job's generations and
-  each one's target) and the rest after (sim cutoff, the test's minimum and
-  error rates, batch sizes, the oldest MAGPIE); a job without a
-  test shows none of the test's settings, and a leave job has no sim cutoff
-  and no lexicon or wordmap row of its own. A player's settings are one
-  ordered list too, key rows first (lexicon, leaves, plies, plays considered,
-  sort, win% model, iterations, stopping %, inference, recorder, plays
-  recorded, endgame, pre-endgame) and every key row also a row of the full
-  table; players side by side, a row they differ in marked; the simulation
-  rows only when one of them simulates, and the endgame's among the key rows
-  only when one of them solves. Marked unused: what a leave job never reads
+  maximum, its Significance Test as one row, "no" or "yes (95%)", and its
+  Position Recorder as yes, no or "yes (first divergences)"; an
+  opening-rack job's minimum and maximum analyses per rack and its consensus
+  share, "—" at a maximum of 1; a leave job's generations and each one's
+  target; then sim cutoff, the test's minimum, batch sizes, the oldest
+  MAGPIE); a job without a test shows none of the test's settings but its
+  "no", and a leave job has no sim cutoff and no lexicon or wordmap row of
+  its own. Every label is in Title Case, and every job type capitalised. A
+  player's settings are one ordered list too, key rows first (Lexicon,
+  Leaves, Sorted By, Move Recorder, Moves Generated, Plies, Uses Inference,
+  Uses Preendgame, Uses Endgame), shown for every player whether or not it
+  simulates or solves, and every key row also a row of the full table; Uses
+  Inference is "—" for a static player; the endgame and pre-endgame read
+  "yes (6 plies)", "yes (bag ≤ 2)" or "no"; Plies Recorded is "—" for a
+  static player, and Movegen Margin "—" unless the recorder keeps moves
+  within an equity margin; players side by side, a row they differ in
+  marked; the simulation rows of the full table only when one of them
+  simulates. Rows
+  are keyed on a stable id, not their label, so the wording can change
+  without the rules that mark rows. Marked unused: what a leave job never reads
   (leaves, win% model, recorder, plays and plies recorded, move-gen margin,
   the endgame and pre-endgame rows); an opening-rack job's inference and
   inference margin and endgame and pre-endgame rows; a games or pairs job's
@@ -756,6 +795,13 @@ Each entry's tests are the `describe` block named for its id.
   does. A player's search in a few words leaves out what the job never reads
   (an opening-rack player's inference, the solving where the job never
   reaches the end of a game). *(Covered: `jobSettings.test.ts`.)*
+- `F-FMT-12` `completionText` says how a job finished: a match test that
+  decided, with the confidence, the units and player 1's interval ("its
+  significance test found player 1 better at 95% confidence after 1,200
+  pairs: player 1 scored 50.1% to 55.2% per game"); a cap reached before it decided, with the
+  interval; an admin's force-complete, "before its test decided" only when
+  there was a test; a job without a test playing what it was set to; and the
+  other job types' own ends. *(Covered: `format.test.ts`.)*
 - `F-FMT-6` A blank optional number is `null`, never 0 (Svelte binds a cleared
   number box as `null`, and `Number(null)` is 0, which the player-config form
   wrote into configs that cannot be edited), and a request's blank required
@@ -790,13 +836,41 @@ Each entry's tests are the `describe` block named for its id.
 
 ### `F-CONS-*` — `lib/consensus.ts`
 
-- `F-CONS-1` `analysesPerRack` states an opening-rack job's consensus as its
-  settings table shows it: "1" for one analysis per rack, otherwise the range
-  and the share ("3 to 7, until 80% agree on the best move"). *(Covered:
-  `consensus.test.ts`.)*
+- `F-CONS-1` `analysesPerRack` states an opening-rack job's consensus as the
+  job page's explanation of it reads: "1" for one analysis per rack, otherwise
+  the range and the share ("3 to 7, until 80% agree on the best move").
+  *(Covered: `consensus.test.ts`.)*
 - `F-CONS-2` `rackConsensus` counts each analysis's best move in a rack lookup
   and names the most common (the alphabetically first of a tie), with its
   count and share; nothing for no analyses. *(Covered: `consensus.test.ts`.)*
+- `F-CONS-3` `consensusProblem` refuses what the server refuses of consensus
+  settings, before a job is created with them (the job form) or they are
+  changed on one (the admin page's Consensus card): a fewest outside 1–100, a
+  most below the fewest or above 100, and, past one analysis per rack, a
+  share at or below 50% or above 100%; it accepts the rest. *(Covered:
+  `consensus.test.ts`.)*
+
+### `F-TEST-*` — `lib/matchTest.ts`
+
+- `F-TEST-1` `testBar` scales the match test's bar to the interval and an
+  even score, with a margin of a tenth of that span either side (at least a
+  point), and keeps a wide interval within the scores that exist. *(Covered:
+  `matchTest.test.ts`.)*
+- `F-TEST-2` `testSentence` states player 1's score per game with its range,
+  named for the players and with nothing in Elo ("… scores 53.1% per game (95%
+  interval 51.2% to 55.0%)."), then names the better player
+  once it is decided, or says neither is when it ended inconclusive.
+  *(Covered: `matchTest.test.ts`.)*
+
+### `F-MOVES-*` — `lib/moveList.ts`
+
+- `F-MOVES-1` A move list shows as many plies of statistics as its moves
+  carry, up to two (none for a static player), headed P1-S, P1-BP, P2-S,
+  P2-BP, P1 the reply; a ply is found by its number, not its place in the
+  list. *(Covered: `moveList.test.ts`.)*
+- `F-MOVES-2` An inference reads as a line -- how many leaves it found, from
+  which previous move, and their mean equity -- and each leave's draws as a
+  share of all it drew. *(Covered: `moveList.test.ts`.)*
 
 ### `F-CGP-*` — `lib/cgp.ts`
 
@@ -966,9 +1040,9 @@ server refuses. Each rule mirrors one in `routes/auth.rs`, with its wording.
   a key only from an `apikey` line in `contribute.txt`), and the account page
   shows that line for a freshly created key, under the test ids E-2 reads it
   by; and none puts `contribute.txt` beside the binary (MAGPIE reads it from its
-  working directory); and a second process is run on a file of its own in the
-  same directory (`./bin/magpie contribute second.txt`), never "in a directory
-  of its own", where MAGPIE cannot load its board. The pages' text, read as
+  working directory); and none sends a second process "to a directory of its
+  own", where MAGPIE cannot load its board (the README covers running one, on
+  a settings file of its own in the same directory). The pages' text, read as
   source. *(Covered: `contributeDocs.test.ts`.)* (Thirty-first audit: the
   account page said `--api-key`, which MAGPIE rejects; thirty-second: the home
   page's second-process advice could not start.)
@@ -1379,24 +1453,28 @@ job creation touches needs one caller here.
 
 - `I-JOB-1` Creating each of the four job types inserts its config row with
   every column populated, and reads back identical; a games job created with
-  only its target runs no SPRT, and stores the test's defaults and a floor of
-  0. *(Covered:
+  only its target runs no match test, and stores the test's default
+  confidence (95%) and a floor of 0. *(Covered:
   `jobs::each_job_type_stores_every_setting_it_was_created_with`,
   `jobs::a_leave_generation_job_stores_every_setting_it_was_created_with`.)*
-- `I-JOB-1b` A `games` job's batch is even (default 2), and a games or
-  game-pairs job's Elo hypotheses lie within ±1000: MAGPIE gives player 1 the first move in each
-  task's first game, so at a batch of 1 player 1 moved first in every game and
-  SPRT passed two identical players (thirty-second audit, pass 18). *(Covered:
+- `I-JOB-1b` A `games` job's batch is even (default 2): MAGPIE gives player 1
+  the first move in each task's first game, so at a batch of 1 player 1 moved
+  first in every game and the SPRT the match test replaced passed two
+  identical players (thirty-second audit, pass 18). A games or game-pairs
+  job's confidence is strictly between 50% and 100%: at 100% the interval
+  never closes, and at half or less it is no test. *(Covered:
   `routes::admin::tests::a_games_batch_must_be_even`,
-  `routes::admin::tests::elo_hypotheses_past_a_thousand_are_refused`.)*
-- `I-JOB-1c` **The SPRT is off unless asked for.** A games or pairs body
-  without `sprt_enabled` runs no test and needs no `min_*`; with the flag off,
-  `min_*`, `sprt_alpha`, `sprt_beta`, `elo_low` and `elo_high` are each refused
-  by name rather than dropped (a script from when the test was always on would
-  otherwise get a job with none); with it on, `min_*` is required. *(Covered:
-  `routes::admin::tests::a_job_runs_no_sprt_unless_it_asks_for_one`,
-  `routes::admin::tests::sprt_settings_without_the_test_are_refused`,
-  `routes::admin::tests::an_sprt_needs_its_floor`.)*
+  `routes::admin::tests::a_confidence_outside_half_to_all_is_refused`,
+  `routes::admin::tests::every_problem_is_reported`.)*
+- `I-JOB-1c` **The match test is off unless asked for.** A games or pairs body
+  without `test_enabled` runs no test and needs no `min_*`; with the flag off,
+  `min_*` and `confidence_pct` are each refused by name rather than dropped
+  (the job would otherwise play to its cap with no test, and nothing would
+  say so); with it on, `min_*` is required, at least 1 and at most the cap.
+  *(Covered:
+  `routes::admin::tests::a_job_runs_no_test_unless_it_asks_for_one`,
+  `routes::admin::tests::test_settings_without_the_test_are_refused`,
+  `routes::admin::tests::the_test_needs_its_floor`.)*
 - `I-JOB-1d` A leave job lists one occurrence target per generation
   (`target_rack_counts`, MAGPIE's `leavegen 100,200,500,…`): between 1 and 100
   of them, each between 1 and 1,000,000; an empty list, a zero, a negative, one
@@ -1412,6 +1490,25 @@ job creation touches needs one caller here.
   above 100, and any consensus for a static player, whose analyses always
   agree. *(Covered:
   `jobs::an_opening_rack_jobs_consensus_is_stored_and_refused_where_it_cannot_work`.)*
+- `I-OR-EDIT-1` **An opening-rack job's consensus changes after creation, and
+  the job follows** (`PATCH /api/admin/jobs/:id/consensus`). A job wanting one
+  analysis per rack still keeps a progress row per rack, so raising its
+  minimum and maximum after it completed restates every rack unsettled,
+  reopens it active at its allocation (`job.consensus_changed`, "min 1 -> 2,
+  max 1 -> 3; 4 racks unsettled", then `job.activated`), demotes its final
+  export to a snapshot, and reissues the racks from those rows; lowering them
+  again while a reissue is in flight settles every rack, and that reissue's
+  submission completes the job without counting its racks a second time.
+  Asking for what every rack already has leaves a completed job completed.
+  *(Covered:
+  `worker_api::an_opening_rack_jobs_consensus_can_change_and_the_job_follows`.)*
+- `I-OR-EDIT-2` The edit refuses by name what creation refuses (a share at
+  or below 50%, no analyses, a most below the fewest or above 100, any
+  consensus for a static player), and refuses any job but an opening-rack
+  one; a change that changes nothing writes no audit row; and a completed job
+  reopened where the other active jobs leave no room for its allocation comes
+  back inactive, with the reason in the response. *(Covered:
+  `worker_api::a_consensus_edit_is_checked_and_reopens_inactive_without_room`.)*
 - `I-JOB-2` **`validate_shared_player_options` runs against real rows.** Two
   configs with different `winpct_id` are rejected; two with the same are
   accepted; two with different `movegen_margin` are rejected. The regression
@@ -1789,14 +1886,15 @@ permanent.
 
 ### `I-STATS-*` — dashboard aggregates (`jobstats.rs`)
 
-- `I-STATS-1` A `games` job's stats sum every result and compute SPRT over
-  games. *(Covered:
+- `I-STATS-1` A `games` job's stats sum every result and run the match test
+  over games. *(Covered:
   `stats::a_games_jobs_stats_sum_every_result_and_test_the_games`, with the
-  LLR checked against `U-STATS-2`'s independently computed value.)*
+  interval checked against `U-STATS-1`'s independently computed value.)*
 - `I-STATS-2` A `game_pairs` job's stats sum the pentanomial, and
   `units_completed` equals the pair count — **not** the divergent count.
   *(Covered: `stats::a_pairs_jobs_stats_sum_the_pentanomial_and_count_every_pair`.)*
-- `I-STATS-3` `divergent_pairs` is reported and is not what SPRT consumed.
+- `I-STATS-3` `divergent_pairs` is reported and is not what the match test
+  consumed.
   The divergent games also get a match score of their own -- their wins,
   losses and draws, and each player's mean score weighted by the divergent
   games, from the means MAGPIE reports for the subset (`game_results.
@@ -1807,8 +1905,9 @@ permanent.
   400-380 and 30 at 440-450 are 430-432.5, spread -2.5; unweighted, 420-415).
   *(Covered: `stats::average_scores_weight_each_batch_by_its_games`; how the
   match score table prints them, `matchScore.test.ts`, `F-MATCH-1`.)*
-- `I-STATS-4` A job with no results reports zeros and an LLR of 0, not an error
-  or a NaN, and no average score (null, not 0). *(Covered:
+- `I-STATS-4` A job with no results reports zeros and an even score whose
+  interval is every score (0 to 1), not an error or a NaN, and no average
+  score (null, not 0). *(Covered:
   `stats::a_job_with_no_results_reports_zeros_not_nan`.)*
 - `I-STATS-5` Opening-rack stats count analysed racks against `total_racks`, from
   the running `jobs.racks_analyzed` total. *(Covered:
@@ -1852,26 +1951,29 @@ permanent.
   average read six times the real time left. *(Covered:
   `stats::a_new_jobs_eta_is_measured_since_it_was_activated`.)* (Twenty-second
   audit.)
-- `I-STATS-9` **The finish check** completes a job at SPRT significance and at
-  the hard cap, and does **not** complete below `min_units` even with a crossed
-  LLR. There is no `finish_if_done`, as this entry first named it: the check is
+- `I-STATS-9` **The finish check** completes a job once its match test
+  decides and at the hard cap (inconclusive), and does **not** complete below
+  `min_units` even with an interval clear of an even score. There is no
+  `finish_if_done`, as this entry first named it: the check is
   `after_submission` in `routes/worker.rs`, which a submission runs on every
-  `SPRT_CHECK_EVERY`th (8) result for a job, or whenever it leaves the job
+  `TEST_CHECK_EVERY`th (8) result for a job, or whenever it leaves the job
   nothing in flight — so it is tested through the worker API. *(Covered:
-  `stats::a_job_completes_when_its_llr_crosses_at_min_games`,
-  `stats::a_job_completes_at_its_hard_cap_without_a_verdict`,
-  `stats::a_crossed_llr_below_min_games_does_not_complete_the_job`; the
-  bounds themselves by `U-STATS-1`, `-3`.)*
+  `stats::a_job_completes_when_its_test_decides_at_min_games`,
+  `stats::a_job_completes_at_its_hard_cap_inconclusive`,
+  `stats::a_decided_interval_below_min_games_does_not_complete_the_job`; the
+  interval itself by `U-STATS-1`, `-3`, and its error rate under repeated
+  checks by `U-STATS-3b`.)*
 - `I-STATS-9e` The verdict a job completed on is stored with the completion —
-  status, LLR and units — and reported beside the live figures; a result in
-  flight at completion lands and moves the live LLR, and the stored verdict
-  stays. *(Covered:
-  `stats::a_job_completes_on_the_batch_that_crosses_the_bound_and_not_before`,
-  `stats::a_job_driven_to_h0_completes_with_its_sprt_failed`,
+  status, player 1's interval (lower and upper) and units — and reported
+  beside the live figures; a result in flight at completion lands and moves
+  the live interval, and the stored verdict stays. *(Covered:
+  `stats::a_job_completes_on_the_batch_that_decides_and_not_before`,
+  `stats::a_job_whose_player_2_is_better_completes_saying_so`,
   `finish::under_steady_load_the_finish_check_runs_on_every_nth_submission`.)*
   (Eleventh audit; the in-flight half, twelfth.)
 - `I-STATS-9f` A completed job's stats say how it was completed (`completion`:
-  when, whether an admin forced it, and the server's reason — the SPRT verdict,
+  when, whether an admin forced it, and the server's reason — the match
+  test's verdict (`player1_better`, `player2_better`, `inconclusive`),
   `reached_target` for a games or pairs job without a test, `last generation
   built`, or none when an opening-rack job's racks ran out),
   from its `job.completed` audit row; a job not completed has none. The job
@@ -1881,15 +1983,17 @@ permanent.
   `finish::a_forced_completion_is_reported_as_forced`; the sentences,
   `format.test.ts` `F-FMT-12`.)*
 - `I-STATS-9a` **Debounced under load.** With a claim held open the whole time,
-  so the job is never idle, the check runs on the `SPRT_CHECK_EVERY`th
+  so the job is never idle, the check runs on the `TEST_CHECK_EVERY`th
   submission and not before, and the open claim's result is still accepted
   after completion. *(Covered:
   `finish::under_steady_load_the_finish_check_runs_on_every_nth_submission`.)*
-- `I-STATS-9b` **At the bound, not before, and at H0.** 71-29 over 100 games
-  (LLR 2.9347 against 2.9444) leaves the job active; another 54-46 (3.0693)
-  completes it; 28-72 completes it with its verdict failed. *(Covered:
-  `stats::a_job_completes_on_the_batch_that_crosses_the_bound_and_not_before`,
-  `stats::a_job_driven_to_h0_completes_with_its_sprt_failed`.)*
+- `I-STATS-9b` **When it decides, not before, and for player 2.** With a
+  floor of 100 and a cap of 10,000, 68-32 over 100 games (lower bound 0.4937)
+  leaves the job active; another 56-44 (124-76 over 200, 0.5035 to 0.7365)
+  completes it; 28-72 (upper bound 0.4631) completes it with player 2 found
+  better. *(Covered:
+  `stats::a_job_completes_on_the_batch_that_decides_and_not_before`,
+  `stats::a_job_whose_player_2_is_better_completes_saying_so`.)*
 - `I-STATS-9c` **An opening-rack job completes** once its rack space is handed
   out and every task accepted, and a declined task keeps it active until that
   task is done. *(Covered:
@@ -1898,9 +2002,9 @@ permanent.
 - `I-STATS-9d` A finish check overtaken by a purge does not complete the job
   -- by either witness: the claim counter below what was observed, or a purge
   counted meanwhile however many claims followed it (nineteenth audit) -- and
-  an SPRT job hands out nothing past its cap. *(Covered:
+  a games or game-pairs job hands out nothing past its cap. *(Covered:
   `admin_api::a_finish_check_overtaken_by_a_purge_does_not_complete_the_job`,
-  `worker_api::sprt_jobs_hand_out_nothing_past_their_cap`.)*
+  `worker_api::games_jobs_hand_out_nothing_past_their_cap`.)*
 - `I-STATS-9f` **A job with nothing left to hand out and nothing in flight
   completes on the next claim.** An opening-rack job, and a games job at its
   cap, deactivated while their last tasks were out: the results land with no
@@ -1910,13 +2014,13 @@ permanent.
   `finish::a_job_whose_last_results_landed_while_inactive_completes_once_reactivated`,
   `finish::a_games_job_at_its_cap_whose_results_landed_while_inactive_completes`.)*
   (Thirty-second audit.)
-- `I-STATS-9g` **A job without an SPRT plays to its target.** A 90-10 batch
-  past its floor, which completes an SPRT job, leaves it active and reports no
-  test (`games.sprt` null); the batch that reaches `max_games` completes it with
+- `I-STATS-9g` **A job without a match test plays to its target.** A 90-10
+  batch past its floor, which completes a job with a test, leaves it active
+  and reports no test (`games.test` null); the batch that reaches `max_games` completes it with
   no verdict stored and `reached_target` as the reason, on a submission and on
   the idle path alike. A config row that says nothing of the test runs none.
-  *(Covered: `stats::a_job_without_an_sprt_completes_at_its_target_and_not_before`,
-  `finish::a_games_job_without_an_sprt_completes_at_its_target_once_reactivated`,
+  *(Covered: `stats::a_job_without_a_test_completes_at_its_target_and_not_before`,
+  `finish::a_games_job_without_a_test_completes_at_its_target_once_reactivated`,
   `public_api::job_detail_carries_the_stats_block_of_its_type`.)*
 - `I-STATS-10` A stats build takes one connection from its pool, not one per
   statement (eight): on a saturated display pool a build waited out the
@@ -2007,7 +2111,8 @@ import can be watched) and a per-test MinIO bucket.
   an anchor move that brings a new member in, which writes that addition too.
   The entry first said "exactly one row"; the census is the second on purpose.
   *(Covered: `audit::every_destructive_admin_action_writes_exactly_its_record`,
-  across deactivate, complete, purge and delete of a job, user delete, ban,
+  across deactivate, complete, a consensus change, purge and delete of a job,
+  user delete, ban,
   unban, input-file delete, player-config delete, pool-member removal, an
   anchor move and a pool delete. Deleting an input file or a player config
   wrote nothing.)*
@@ -2659,9 +2764,9 @@ below.
   .646 refused, either margin), `num_plays` past 200,000, `num_plays_recorded`
   past 32,767, and a board layout MAGPIE's loader would refuse — every worker
   failed every task of such a job, and `magpie contribute` stops after five
-  failures in a row; and an SPRT `alpha` below 0.000001, whose infinite upper
-  bound the job page could not print (and `beta`, for symmetry), each checked
-  just below the floor and at it. The layout check never accepts
+  failures in a row; and a match-test confidence of 100% (or just past it),
+  whose logarithm of zero leaves the interval never closing, with 99.999%
+  accepted. The layout check never accepts
   what MAGPIE's loader refuses, and agrees with it on CRLF files, blank lines,
   trailing whitespace, row widths, unknown squares and start squares (it is
   stricter only on parser quirks). *(Covered:
@@ -2784,7 +2889,7 @@ below.
   audit: nothing tested it.)
 - `A-PUBLIC-1c` A job's full configuration is public (`GET /api/jobs/:id/config`):
   the job's settings with files by name, its type's (a games job's batch, cap
-  and test, or its target and `sprt_enabled` false without one), and every
+  and test, or its target and `test_enabled` false without one), and every
   setting of each player config, in role order (a leave job's one player
   too, which carries its lexicon and wordmap), with the
   config's id to link to; it names no creator and carries no user id; an
@@ -2826,7 +2931,9 @@ below.
   its whole ranked list. A rack with no analysis yet is a `200` with an empty
   list, not a 404 as this entry first said — the rack is a valid question
   about a job that exists, and "nothing yet" is its answer; only an unknown job
-  is a 404. *(Covered: `public_api::rack_lookup_finds_an_analysed_rack`.)*
+  is a 404. Each ranked move carries its win percentage and its first two
+  plies' statistics (`null` and `[]` for a static analysis). *(Covered:
+  `public_api::rack_lookup_finds_an_analysed_rack`.)*
 - `A-PUBLIC-4b` A games job's captured positions (`/api/jobs/:id/positions`)
   with one rack page newest first with their ranked moves, the rack however
   it is typed -- blank first, lower case -- spelt as MAGPIE spells one; a rack
@@ -2839,6 +2946,15 @@ below.
   is `null` for a job with no task, or none returned; signed out is a `401`,
   an opening-rack job a `400`, an unknown job a `404`. *(Covered:
   `public_api::a_random_position_is_drawn_from_the_tasks_that_have_one`.)*
+- `A-PUBLIC-4g` A simulated position's moves carry their win percentage and their
+  first two plies' statistics however many more the job recorded (four
+  stored, two returned), and the position what its player inferred of the
+  opponent's leave (`inference`: leaves found, draws, mean equity, the ten
+  most drawn), `null` where it has none. A position that
+  claims an inference it cannot have -- on a static analysis, on a game's
+  first turn, with eleven leaves, or leaves out of order -- is refused at
+  submission (`plausibility::check_inference`). *(Covered:
+  `public_api::a_simulated_position_shows_its_plies_and_its_inference`.)*
 - `A-PUBLIC-4f` A game-pairs job keeping first divergences takes from each
   diverging pair both games' positions at one turn and nothing else (a lone
   position, two at different turns, or fewer pairs than `divergent_games`
@@ -3009,12 +3125,14 @@ request. Server→client fixtures are compared by **field structure, not bytes**
 so fields stay free to move before the first release while a renamed or dropped
 field still fails.
 
-Sixteen fixtures exist, and the set is complete: every message has one. The
+Seventeen fixtures exist, and the set is complete: every message has one. The
 first eight — an assignment of each original request shape (games, opening
 racks, leave generation), a claim, a decline, and each of the three shutdown
-reasons — were written by hand; `C-2`..`C-9` were **captured from a real
-exchange**. MAGPIE's `test/birdtest_contract/` carries a byte-identical copy of
-all sixteen, and CI's `magpie-contract` job runs MAGPIE's tests against this
+reasons — were written by hand, and so was `result-games-inference.json`
+(`C-3b`), in MAGPIE's key layout, MAGPIE's own test checking its output
+carries every key; `C-2`..`C-9` were **captured from a real exchange**.
+MAGPIE's `test/birdtest_contract/` carries a byte-identical copy of all
+seventeen, and CI's `magpie-contract` job runs MAGPIE's tests against this
 branch's copy.
 
 - `C-1` `assignment-opening-rack.json` — exists, and MAGPIE's
@@ -3027,6 +3145,12 @@ branch's copy.
   `U-WIRE-2` reads it.)*
 - `C-3` `result-games.json`, with `capture_positions` on. *(Covered:
   `contract_fixtures::the_games_result_is_accepted_as_a_submission`.)*
+- `C-3b` `result-games-inference.json`, from simming players that infer: a
+  first-turn position with no inference, and a later one whose `inference`
+  (leaves found, draws, mean equity, the most drawn leaves) is accepted and
+  kept with the position. *(Covered:
+  `contract_fixtures::the_inferring_games_result_is_accepted_and_keeps_its_inference`;
+  MAGPIE's `test_inferring_players_report_their_inference`.)*
 - `C-4` `result-game-pairs.json`, carrying the pentanomial — the most important
   one: it is the newest message and the one MAGPIE and birdtest most recently
   disagreed about. *(Covered:
@@ -3076,6 +3200,12 @@ otherwise take from whatever was loaded last. `test_an_abandoned_temporary_is_re
 (fourteenth audit): a write's `<name>.<pid>.tmp` sibling untouched for an hour
 — a killed writer's, up to 1.9 GB for a rack info table — is removed by the
 next write of the name, and a fresh one or another name's is not.
+`test_inferring_players_report_their_inference`: a simming player that infers
+reports, on each captured position past the first turn whose previous move was
+not a pass, how many leaves its inference found, how many it drew, their mean
+equity and up to ten of the most drawn, most drawn first; a first-turn
+position reports none, and a player that does not infer reports none anywhere.
+It also checks `result-games-inference.json` holds no key that output lacks.
 
 **Capture** is `scripts/capture_contract.py`, a recording proxy that sits
 between `magpie contribute` and the backend, forwards everything unchanged, and
@@ -3124,7 +3254,8 @@ try is a failure this tier exists to report. `admin.setup.ts` signs the seeded
 admin in once and the admin journeys reuse its storage state.
 
 - `E-1` An anonymous visitor browses the landing page, job list, a job detail
-  page — its four headline cards, status first — and the contributor
+  page — its four headline cards, status first, with no description beside
+  an active status and "Paused …" or "Finished …" beside any other — and the contributor
   leaderboard, ranked by compute time and re-ranked by tasks at a click.
   *(Covered:
   `e1-anonymous-browsing.spec.ts`.)*
@@ -3134,10 +3265,11 @@ admin in once and the admin journeys reuse its storage state.
   `e2-register-and-api-key.spec.ts`, reading its code from the outbox.)*
 - `E-3` An admin imports input data, reviews the staged diff, and confirms it.
   *(Covered: `e3-input-data-import.spec.ts`, against the fixture tarballs.)*
-- `E-4` An admin creates two player configs and a game-pairs job with **Run
-  an SPRT** ticked, activates it with an allocation, and watches the dashboard
+- `E-4` An admin creates two player configs and a game-pairs job with
+  **Significance Test** ticked, activates it with an allocation, and watches the dashboard
   update live over SSE as fake workers contribute; its admin page has the
-  match score and SPRT cards. **The journey that justifies the tier**: the only place
+  match score and Significance Test cards, the latter's sentence giving player 1's
+  score per game. **The journey that justifies the tier**: the only place
   SSE, the built Svelte app, the scheduler and a worker are exercised together.
   *(Covered: `e4-live-dashboard.spec.ts`.)*
 - `E-5` An admin bans a worker and that worker can no longer claim. *(Covered:
@@ -3151,14 +3283,18 @@ admin in once and the admin journeys reuse its storage state.
   the fit and the moved ratings go through the pool's page.
   *(Covered: `e7-ratings.spec.ts`.)*
 - `E-8` A job detail page renders the pentanomial table with the five buckets
-  labelled, and the SPRT status text, and player 1's record in the match score
-  card, not the SPRT card. *(Covered: `e8-pentanomial.spec.ts`.)*
+  labelled, the significance test's verdict in words ("Completed: decided: player 1
+  is better, player 1 at … to … after … pairs", or inconclusive at the cap),
+  its sentence (player 1's score per game and its 95% interval) and its
+  folded explanation, and player 1's record in the match score card, not the
+  Significance Test card. *(Covered: `e8-pentanomial.spec.ts`.)*
 - `E-9` The password reset flow end to end, `a@b` refused under the field
   first. *(Covered:
   `e9-password-reset.spec.ts`, reading its link from the outbox.)*
 - `E-10` A page renders correctly at phone width — one journey, not all of them.
   *(Covered: `e10-phone-width.spec.ts`: a Pixel 5 viewport, the job list, a
-  job page (its Settings card opened to every setting, the players side by
+  job page (every job setting, which its card shows without a toggle, and
+  the Player settings card opened to every setting, the players side by
   side) and both rankings, nothing wider than the screen and each ranking's
   own column inside its box — a pseudonym's sixteen characters pushed it out,
   thirty-second audit. The contributors' list is measured with a row in it;
@@ -3189,18 +3325,20 @@ admin in once and the admin journeys reuse its storage state.
   the held read carried the old status; and a delete through the API.)* The reads ran one after another: the page said
   "No worker has declined this job", showed 100, and Activate sent it
   (thirty-second audit, pass 16).
-- `E-12` A games job made through the form with "Save the positions played"
-  ticked shows a signed-out visitor a prompt to sign in, and a signed-in user
+- `E-12` A games job made through the form with "Position Recorder" ticked
+  (and no significance test, the form's default) shows a signed-out visitor a prompt to sign in, and a signed-in user
   one position at a time on its board: **Random position** until one follows
   a play, whose tiles are down with the play's outlined, both racks and
-  scores with the player to move marked, and its ranked moves; a rack search
+  scores with the player to move marked, and its ranked moves, each with its
+  Win % and P1-S, P1-BP, P2-S and P2-BP (the fake workers simulate); a rack search
   for that rack typed backwards in lower case shows a position holding it
   (with **Next** and **Previous** when there are more); a rack nothing has is
   said to be. `E-12b`: at phone width the board fits the screen and nothing
   scrolls sideways. *(Covered: `e12-saved-positions.spec.ts`, two tests; the
   fake workers play synthetic games whose positions are real boards.)*
 - `E-13` An opening-rack job's page offers ten racks it has analysed under the
-  search, and clicking one looks it up. *(Covered:
+  search, and clicking one looks it up, its moves with their Win % and P1-S,
+  P1-BP, P2-S and P2-BP. *(Covered:
   `e13-opening-rack-samples.spec.ts`.)*
 - `E-14` A signed-out visitor reaches the player configs from the nav, opens
   one, reads how it searches beside its name and its key settings in a table
@@ -3214,16 +3352,23 @@ admin in once and the admin journeys reuse its storage state.
   is on, and turning the endgame off turns it off too; a schedule list that is
   not whole numbers is named and not sent; and a config made to solve both
   shows it on its page: "static, by equity · 6-ply endgame · PEG ≤2" beside
-  its name, Endgame and Pre-endgame rows, and under All settings the schedule
-  MAGPIE defaults to. *(Covered: `e16-solving-player-config.spec.ts`.)*
-- `E-17` A game-pairs job made through the form with "Save the positions
-  played" and then "Only where each pair first diverges" ticked (offered only
-  once saving is) says "first divergences" in its settings and shows a
+  its name, Uses Endgame "yes (6 plies)" and Uses Preendgame "yes (bag ≤ 2)",
+  and under All settings the PEG Schedule MAGPIE defaults to. *(Covered: `e16-solving-player-config.spec.ts`.)*
+- `E-17` A game-pairs job made through the form with "Position Recorder" and
+  then "Only Where Each Pair First Diverges" ticked (offered only once saving
+  is) says "yes (first divergences)" in its settings and shows a
   signed-in user a pair's two games side by side at one turn: "Game 1 of the
   pair" and "Game 2 of the pair", the same rack, each player to move in one,
   each with ranked moves; a search for that rack finds the pair once, both
   games of it. *(Covered: `e17-pair-divergences.spec.ts`, against the fake
   workers' synthetic first divergences.)*
+- `E-18` An admin changes an inactive opening-rack job's consensus from its
+  admin page's Consensus card: it starts at 1 and 1 with Consensus % and
+  Save disabled, a maximum below the minimum is named under the inputs, and 2,
+  3 and 80% save with "Saved: 0 racks unsettled."; the public page's settings
+  then read Minimum Analyses Per Rack 2, Maximum Analyses Per Rack 3 and
+  Consensus % 80%. *(Covered: `e18-opening-rack-consensus.spec.ts`; the
+  reopening and completing it drives are tier 3's, `I-OR-EDIT-1`, `-2`.)*
 
 ### Reading confirmation codes
 
@@ -3415,6 +3560,12 @@ surfacing the mismatch as a red build rather than as a dead job in production.
   the space, and completes with every rack settled after at least two
   analyses. *(Covered: `case_consensus`, one task a run until the job
   completes.)*
+- `M-16` A games job between two real 2-ply simmers that infer, capturing
+  positions: every position past a game's first turn keeps its inference
+  (none on a first turn), with at most ten leaves listed, no more than were
+  found, most drawn first, and draws exactly when leaves were found -- an
+  inference can find no leave at all, at the default margin of 0, and is kept
+  saying so. *(Covered: `case_inference`, one task.)*
 - `M-13` A job with `use_wit` dispatches only once its word info table is
   built; a worker whose table does not match the recorded hash declines with
   `derived_mismatch` and both digests reach `worker_data_gaps`; with the right
@@ -3496,7 +3647,8 @@ CloudWatch metrics when `AWS_S3_ENDPOINT` points at a stand-in object store
   batches smaller than a line;
   the job's merge lock held while it loads; every rating pool left to refit
   on the restored rows;
-  position analyses back through their parents' ids; a row production holds under a restored
+  position analyses (their moves, plies and inference) back through their
+  parents' ids; a row production holds under a restored
   row's key with other contents stops the run with that batch not loaded and
   another job untouched; the same run, after §2.0, finishes what the stopped one
   began; a job loaded in several batches comes back row for row, and again
@@ -3827,8 +3979,8 @@ it calls the same `seed.py`. `--help` lists the rest; README has the table.
 
 **Both scripts exist and are exercised.** `dev.py` has been run end to end
 against real MAGPIE contributors: results land, the pentanomial's two
-invariants hold on real games, and SPRT reads all pairs rather than a filtered
-subset.
+invariants hold on real games, and the test (then the SPRT, now the match
+test) reads all pairs rather than a filtered subset.
 
 **Workers are always real `magpie contribute` clients.** There is no fake-worker
 mode. `fake_worker.py` belongs to tier 5 and nowhere else: it exists so a browser

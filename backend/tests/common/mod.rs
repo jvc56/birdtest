@@ -403,6 +403,27 @@ impl TestDb {
         .unwrap()
     }
 
+    /// A simulating player: [`Self::static_player`] made a 2-ply simmer, with
+    /// every simulation setting the schema requires of one.
+    pub async fn sim_player(&self, name: &str, created_by: Uuid) -> Uuid {
+        let player = self.static_player(name, created_by).await;
+        let winpct = self.input_data("winpct", &format!("winpct{name}")).await;
+        sqlx::query(
+            "UPDATE player_configs
+             SET num_plies = 2, winpct_id = $2, max_iterations = 1000, stopping_pct = 99,
+                 use_inference = false, time_limit_secs = 0, min_play_iterations = 100,
+                 threshold = 'none', sampling_rule = 'round_robin', inference_margin = 0,
+                 utility_w_winpct = 1, utility_w_spread = 0, utility_spread_scale = 1
+             WHERE id = $1",
+        )
+        .bind(player)
+        .bind(winpct)
+        .execute(&self.pool)
+        .await
+        .unwrap();
+        player
+    }
+
     /// A leave job's player on `kwg`: static, sorting on equity, no rack info
     /// table, as job creation requires. Its leaves are a row of their own,
     /// which the job must never pin -- leave generation plays the server's KLV.
@@ -428,7 +449,7 @@ impl TestDb {
     }
 
     /// An active `games` job at 50% allocation, with its config row. It runs
-    /// an SPRT at the schema's defaults, which the stats and finish tests read;
+    /// the match test at the schema's default confidence, which the stats and finish tests read;
     /// at a floor and cap of a million games it never decides anything else.
     pub async fn games_job(&self, games_per_batch: i32) -> Uuid {
         let admin = self.user(&format!("admin{}", Uuid::new_v4().simple()), true).await;
@@ -437,7 +458,7 @@ impl TestDb {
         let job = self.bare_job("games", admin).await;
         sqlx::query(
             "INSERT INTO job_game_config
-                 (job_id, player1_config_id, player2_config_id, games_per_batch, sprt_enabled,
+                 (job_id, player1_config_id, player2_config_id, games_per_batch, test_enabled,
                   min_games, max_games)
              VALUES ($1, $2, $3, $4, TRUE, 1000000, 1000000)",
         )

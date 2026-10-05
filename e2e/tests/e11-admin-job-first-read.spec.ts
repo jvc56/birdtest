@@ -23,7 +23,7 @@ test('E-11: an admin job page whose first read fails shows only what the server 
       player1_config_id: a,
       player2_config_id: b,
       pairs_per_batch: 1,
-      sprt_enabled: true,
+      test_enabled: true,
       min_pairs: 100000,
       max_pairs: 200000
     },
@@ -107,7 +107,7 @@ test('E-11b: a slow read does not undo what the stream has since said', async ({
       player1_config_id: a,
       player2_config_id: b,
       pairs_per_batch: 1,
-      sprt_enabled: true,
+      test_enabled: true,
       min_pairs: 100000,
       max_pairs: 200000
     },
@@ -178,7 +178,7 @@ test('E-11c: a job deleted while its page is open offers nothing more', async ({
       player1_config_id: a,
       player2_config_id: b,
       pairs_per_batch: 1,
-      sprt_enabled: true,
+      test_enabled: true,
       min_pairs: 100000,
       max_pairs: 200000
     },

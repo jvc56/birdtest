@@ -5,12 +5,17 @@
 //! player config per player (a three-way join each) and `expected_data` (a
 //! union over six tables) -- five or six round trips per claim, every one of
 //! them time no other worker could be claiming from that job, and the submit
-//! path re-read some of the same rows inside the task's row lock. None of it
-//! can change: a job's config rows have no update path, player configs are
-//! immutable once created, and an `input_data` row cannot be deleted while a
-//! job or a player config pins it (the foreign keys refuse). The only thing a
-//! job's lifecycle changes is its status, allocation and counters, all of which
-//! live on the `jobs` row that every claim still reads.
+//! path re-read some of the same rows inside the task's row lock. Almost none
+//! of it can change: player configs are immutable once created, an
+//! `input_data` row cannot be deleted while a job or a player config pins it
+//! (the foreign keys refuse), and a job's config rows have no update path but
+//! one -- an opening-rack job's consensus settings, which an admin may change
+//! (`update_consensus` in routes/admin.rs). The cached `OpeningRackConfig`
+//! keeps them as the job was created, and nothing reads them from it: what
+//! acts on them reads [`crate::models::job::ConsensusSettings::load`] under a
+//! lock the edit holds. The rest of a job's lifecycle changes its status,
+//! allocation and counters, all of which live on the `jobs` row that every
+//! claim still reads.
 //!
 //! So the template is read the first time a process dispatches from or accepts
 //! for a job and kept for the life of the process, like the derived-file

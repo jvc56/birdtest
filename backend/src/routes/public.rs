@@ -64,7 +64,7 @@ struct JobListItem {
     created_at: chrono::DateTime<chrono::Utc>,
     tasks_total: i64,
     tasks_completed: i64,
-    /// For on-demand SPRT jobs the meaningful denominator is `max_games` /
+    /// For on-demand games and pairs jobs the meaningful denominator is `max_games` /
     /// `max_pairs`, not a task count that grows as work is handed out.
     units_completed: Option<i64>,
     max_units: Option<i64>,
@@ -243,13 +243,10 @@ struct GamesSettings {
     per_batch: i32,
     /// Off, the job plays `max_units` and stops, and the test's settings
     /// below are stored defaults it never reads.
-    sprt_enabled: bool,
+    test_enabled: bool,
     min_units: i32,
     max_units: i32,
-    sprt_alpha: f64,
-    sprt_beta: f64,
-    elo_low: f64,
-    elo_high: f64,
+    confidence_pct: f64,
     capture_positions: bool,
     /// Game pairs: of the captured positions, only each pair's first
     /// divergence is kept. Always `false` for a games job.
@@ -436,13 +433,10 @@ async fn job_config(
             games = Some(GamesSettings {
                 unit: "game",
                 per_batch: c.games_per_batch,
-                sprt_enabled: c.sprt_enabled,
+                test_enabled: c.test_enabled,
                 min_units: c.min_games,
                 max_units: c.max_games,
-                sprt_alpha: c.sprt_alpha,
-                sprt_beta: c.sprt_beta,
-                elo_low: c.elo_low,
-                elo_high: c.elo_high,
+                confidence_pct: c.confidence_pct,
                 capture_positions: c.capture_positions,
                 capture_first_divergence: false,
             });
@@ -457,13 +451,10 @@ async fn job_config(
             games = Some(GamesSettings {
                 unit: "pair",
                 per_batch: c.pairs_per_batch,
-                sprt_enabled: c.sprt_enabled,
+                test_enabled: c.test_enabled,
                 min_units: c.min_pairs,
                 max_units: c.max_pairs,
-                sprt_alpha: c.sprt_alpha,
-                sprt_beta: c.sprt_beta,
-                elo_low: c.elo_low,
-                elo_high: c.elo_high,
+                confidence_pct: c.confidence_pct,
                 capture_positions: c.capture_positions,
                 capture_first_divergence: c.capture_first_divergence,
             });
@@ -1029,7 +1020,22 @@ fn micros_to_time(raw: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     chrono::DateTime::from_timestamp_micros(raw.parse().ok()?)
 }
 
-/// The full ranked move list for one rack, from `position_analysis_moves`.
+/// A move's first two plies of simulation statistics, as a JSON array column
+/// `plies` of `{ply, bingo_percentage, average_score}` in ply order, for a
+/// query over `position_analysis_moves m`: what a move list shows beside each
+/// move (P1-S, P1-BP, P2-S, P2-BP). Empty for a move nothing simulated, and
+/// fewer for a job that recorded fewer. A probe of `(move_id, ply)` per move.
+const FIRST_PLIES: &str = "COALESCE((
+        SELECT jsonb_agg(jsonb_build_object('ply', p.ply,
+                                            'bingo_percentage', p.bingo_percentage,
+                                            'average_score', p.average_score)
+                         ORDER BY p.ply)
+        FROM position_analysis_plies p WHERE p.move_id = m.id AND p.ply < 2
+    ), '[]'::jsonb) AS plies";
+
+/// The full ranked move list for one rack, from `position_analysis_moves`,
+/// each move with its win percentage and its first two plies' statistics when
+/// the rack was simulated.
 async fn rack_lookup(
     state: &AppState,
     job_id: Uuid,
@@ -1053,14 +1059,14 @@ async fn rack_lookup(
     // every move twice.
     // `analysis` numbers the rack's analyses from 1, so a page can tell them
     // apart and read their consensus.
-    let rows = sqlx::query(
+    let rows = sqlx::query(&format!(
         "SELECT dense_rank() OVER (ORDER BY r.id)::int AS analysis,
-                m.rank, m.move, m.score, m.equity
+                m.rank, m.move, m.score, m.equity, m.iterations, m.win_percentage, {FIRST_PLIES}
          FROM position_analysis_records r
          JOIN position_analysis_moves m ON m.record_id = r.id
          WHERE r.job_id = $1 AND r.rack = $2 AND r.game_index IS NULL
-         ORDER BY r.id ASC, m.rank ASC",
-    )
+         ORDER BY r.id ASC, m.rank ASC"
+    ))
     .bind(job_id)
     .bind(&canonical)
     .fetch_all(&state.read_pool)
@@ -1075,6 +1081,9 @@ async fn rack_lookup(
                 "move": r.get::<String, _>("move"),
                 "score": r.get::<i32, _>("score"),
                 "equity": r.get::<f64, _>("equity"),
+                "iterations": r.get::<Option<i64>, _>("iterations"),
+                "win_percentage": r.get::<Option<f64>, _>("win_percentage"),
+                "plies": r.get::<serde_json::Value, _>("plies"),
             })
         })
         .collect();
@@ -1125,20 +1134,23 @@ async fn job_letters(state: &AppState, job: &Job) -> AppResult<LetterDistributio
 }
 
 /// Rows of [`POSITION_COLUMNS`] as the API shows a saved position, each with
-/// its ranked moves, which come in one read of `(record_id, rank)`.
+/// its ranked moves, which come in one read of `(record_id, rank)` -- each
+/// with its first two plies' statistics ([`FIRST_PLIES`]) -- and what was
+/// inferred of the opponent's leave first, when anything was (`null`
+/// otherwise), in one primary-key read of `position_analysis_inference`.
 async fn saved_positions(
     state: &AppState,
     rows: Vec<sqlx::postgres::PgRow>,
 ) -> AppResult<Vec<serde_json::Value>> {
     let ids: Vec<i64> = rows.iter().map(|r| r.get("id")).collect();
     let mut moves: HashMap<i64, Vec<serde_json::Value>> = HashMap::new();
-    for m in sqlx::query(
-        "SELECT record_id, rank, move, score, equity, win_percentage, mean_spread,
-                fidelity_plies
-         FROM position_analysis_moves
-         WHERE record_id = ANY($1)
-         ORDER BY record_id, rank",
-    )
+    for m in sqlx::query(&format!(
+        "SELECT m.record_id, m.rank, m.move, m.score, m.equity, m.iterations, m.win_percentage,
+                m.mean_spread, m.fidelity_plies, {FIRST_PLIES}
+         FROM position_analysis_moves m
+         WHERE m.record_id = ANY($1)
+         ORDER BY m.record_id, m.rank"
+    ))
     .bind(&ids)
     .fetch_all(&state.read_pool)
     .await?
@@ -1148,10 +1160,31 @@ async fn saved_positions(
             "move": m.get::<String, _>("move"),
             "score": m.get::<i32, _>("score"),
             "equity": m.get::<f64, _>("equity"),
+            "iterations": m.get::<Option<i64>, _>("iterations"),
             "win_percentage": m.get::<Option<f64>, _>("win_percentage"),
             "mean_spread": m.get::<Option<f64>, _>("mean_spread"),
             "fidelity_plies": m.get::<Option<i16>, _>("fidelity_plies"),
+            "plies": m.get::<serde_json::Value, _>("plies"),
         }));
+    }
+    let mut inferences: HashMap<i64, serde_json::Value> = HashMap::new();
+    for i in sqlx::query(
+        "SELECT record_id, num_leaves, total_draws, average_equity, leaves
+         FROM position_analysis_inference WHERE record_id = ANY($1)",
+    )
+    .bind(&ids)
+    .fetch_all(&state.read_pool)
+    .await?
+    {
+        inferences.insert(
+            i.get("record_id"),
+            serde_json::json!({
+                "num_leaves": i.get::<i64, _>("num_leaves"),
+                "total_draws": i.get::<i64, _>("total_draws"),
+                "average_equity": i.get::<f64, _>("average_equity"),
+                "leaves": i.get::<serde_json::Value, _>("leaves"),
+            }),
+        );
     }
 
     Ok(rows
@@ -1172,6 +1205,7 @@ async fn saved_positions(
                 "analysis": r.get::<String, _>("analysis"),
                 "submitted_at": r.get::<chrono::DateTime<chrono::Utc>, _>("submitted_at"),
                 "moves": moves.remove(&record).unwrap_or_default(),
+                "inference": inferences.remove(&record).unwrap_or(serde_json::Value::Null),
             })
         })
         .collect())

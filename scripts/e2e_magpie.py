@@ -551,7 +551,7 @@ def solving_player(ctx: Context) -> str:
 
 
 def games_body(players: dict, batch: int, **extra) -> dict:
-    return {"job_type": "games", **players, "games_per_batch": batch, "sprt_enabled": True,
+    return {"job_type": "games", **players, "games_per_batch": batch, "test_enabled": True,
             "min_games": 1_000_000, "max_games": 1_000_000, **extra}
 
 
@@ -630,7 +630,7 @@ def case_pairs(ctx: Context) -> None:
                f"pentanomial {penta} does not count every pair: {stats['games']}")
 
     run_job(ctx, ctx.data, {"job_type": "game_pairs", **static_players(ctx),
-                            "pairs_per_batch": 2, "sprt_enabled": True,
+                            "pairs_per_batch": 2, "test_enabled": True,
                             "min_pairs": 1000, "max_pairs": 1000},
             pairs_counted)
 
@@ -870,6 +870,58 @@ def case_positions(ctx: Context) -> None:
         worker.remove()
 
 
+def case_inference(ctx: Context) -> None:
+    """M-16: a simmer that infers reports what it inferred on each position it
+    captures past a game's first turn, and the server keeps it beside the
+    position: a leave count, draws, a mean equity and at most ten leaves, most
+    drawn first -- and none on a first turn."""
+    deactivate_everything(ctx)
+    inferring = {
+        "recorder_type": "all", "winpct_id": ctx.winpct, "num_plies": 2, "num_plays": 5,
+        "num_plies_recorded": 2, "num_plays_recorded": 5, "max_iterations": 20,
+        "stopping_pct": 99, "time_limit_secs": 0, "use_inference": True,
+        "use_wordmap": False, "use_rit": False,
+    }
+    players = {
+        "player1_config_id": create_player(ctx, ctx.data, "e2e-inferring-1", inferring),
+        "player2_config_id": create_player(ctx, ctx.data, "e2e-inferring-2", inferring),
+    }
+    job_id = create_and_activate(ctx, ctx.data, games_body(players, 2, capture_positions=True))
+    worker = Worker(ctx, "m16")
+    try:
+        worker.run(tasks=1)
+        rows = ctx.psql(
+            "SELECT r.turn_number, i.num_leaves, i.total_draws, "
+            "       jsonb_array_length(i.leaves), "
+            "       (SELECT COUNT(*) FROM jsonb_array_elements(i.leaves) WITH ORDINALITY a(l, n) "
+            "        JOIN jsonb_array_elements(i.leaves) WITH ORDINALITY b(l, n) ON b.n = a.n + 1 "
+            "        WHERE (b.l->>'draws')::bigint > (a.l->>'draws')::bigint) "
+            "FROM position_analysis_records r "
+            "JOIN position_analysis_inference i ON i.record_id = r.id "
+            f"WHERE r.job_id = '{job_id}'")
+        inferred = [line.split("|") for line in rows.split("\n")] if rows else []
+        expect(inferred, "no captured position kept an inference")
+        # An inference can find no leave at all: at the default margin of 0, a
+        # simmer's move is often one no rack makes the static best. It is
+        # kept, saying so, with nothing listed.
+        with_leaves = 0
+        for turn, found, draws, listed, out_of_order in inferred:
+            expect(int(turn) > 0, f"an inference on turn {turn}")
+            expect(int(listed) <= 10 and int(found) >= int(listed)
+                   and (int(listed) > 0) == (int(found) > 0),
+                   f"{listed} leaves listed of {found} found")
+            expect((int(draws) > 0) == (int(found) > 0) and int(out_of_order) == 0,
+                   f"draws {draws} for {found} leaves, {out_of_order} leaves out of order")
+            with_leaves += int(found) > 0
+        positions = int(ctx.psql(f"SELECT COUNT(*) FROM position_analysis_records "
+                                 f"WHERE job_id = '{job_id}' AND turn_number > 0"))
+        log(f"M-16: {len(inferred)} of {positions} positions past a first turn kept an "
+            f"inference, {with_leaves} of them with leaves")
+    finally:
+        delete_job(ctx, job_id)
+        worker.remove()
+
+
 def case_first_divergences(ctx: Context) -> None:
     """M-14: a game-pairs job keeping first divergences stores, from each pair
     that diverged, both games' positions at one turn of one position, each
@@ -879,7 +931,7 @@ def case_first_divergences(ctx: Context) -> None:
     # tasks of five pairs.
     job_id = create_and_activate(ctx, ctx.data, {
         "job_type": "game_pairs", **static_players(ctx), "pairs_per_batch": 5,
-        "sprt_enabled": True, "min_pairs": 1_000_000, "max_pairs": 1_000_000,
+        "test_enabled": True, "min_pairs": 1_000_000, "max_pairs": 1_000_000,
         "capture_positions": True, "capture_first_divergence": True})
     worker = Worker(ctx, "m14")
     try:
@@ -1242,7 +1294,7 @@ def case_capture(ctx: Context) -> None:
         # first divergences kept, so the result carries a pair's two positions.
         # Equity against score: the pairs diverge.
         one({"job_type": "game_pairs", **wordmap_players(ctx), "pairs_per_batch": 2,
-             "sprt_enabled": True, "min_pairs": 1_000_000, "max_pairs": 1_000_000,
+             "test_enabled": True, "min_pairs": 1_000_000, "max_pairs": 1_000_000,
              "capture_positions": True, "capture_first_divergence": True}, ctx.data,
             needs_build=True)
         one({"job_type": "opening_rack", "player_config_id": simming_player(ctx),
@@ -1302,6 +1354,7 @@ CASES = {
     "M-13": case_word_info_table,
     "M-14": case_first_divergences,
     "M-15": case_consensus,
+    "M-16": case_inference,
     "capture": case_capture,
 }
 DEFAULT_CASES = [name for name in CASES if name.startswith("M-")]

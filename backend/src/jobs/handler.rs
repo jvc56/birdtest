@@ -322,6 +322,11 @@ pub struct MoveEntry {
     pub play: String,
     pub score: i32,
     pub equity: f64,
+    /// How many times the simulation played the move out: its own iterations,
+    /// which a simulation spends unevenly, most on the leaders. 0 for a move
+    /// nothing simulated; absent from a client that does not send it.
+    #[serde(default)]
+    pub iterations: Option<i64>,
     /// The simulated win percentage. Absent for a static player, which ranks on
     /// equity alone and simulates nothing.
     #[serde(default)]
@@ -397,6 +402,28 @@ impl GameAggregate {
     }
 }
 
+/// One of the leaves an inference found the opponent most likely kept, with
+/// how often it was drawn and its equity.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct InferredLeave {
+    pub leave: String,
+    pub draws: i64,
+    pub equity: f64,
+}
+
+/// What a simming player inferred the opponent kept from their previous move,
+/// before it simmed the position: how many distinct leaves, how many draws in
+/// all, their mean equity, and the most drawn of them (at most ten), most
+/// drawn first.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct InferenceSummary {
+    pub num_leaves: i64,
+    pub total_draws: i64,
+    pub average_equity: f64,
+    #[serde(default)]
+    pub leaves: Vec<InferredLeave>,
+}
+
 /// Shared by games and game pairs.
 /// One position analysed during a game, when capture is on.
 #[derive(Debug, Clone, Deserialize)]
@@ -424,6 +451,11 @@ pub struct CapturedPosition {
     /// `endgame` ([`Analysis`]).
     pub analysis: String,
     pub moves: Vec<MoveEntry>,
+    /// What the player inferred of the opponent's leave before simming, when
+    /// it did: a simmed position past a game's first turn whose opponent did
+    /// not pass. Absent otherwise.
+    #[serde(default)]
+    pub inference: Option<InferenceSummary>,
 }
 
 /// How a position's move was chosen, which decides what its moves carry:
@@ -528,6 +560,9 @@ pub struct PositionAnalysis {
     /// Truncated by the caller to the job's cap. The best move is simply the
     /// first of these, so it is not carried separately.
     pub moves: Vec<MoveEntry>,
+    /// In-game simmed positions only: what was inferred of the opponent's
+    /// leave first. `None` for an opening rack, which has no opponent move.
+    pub inference: Option<InferenceSummary>,
 }
 
 impl PositionAnalysis {
@@ -557,6 +592,7 @@ impl PositionAnalysis {
             played_move_score: None,
             num_moves: num_moves.unwrap_or(moves.len() as i32),
             moves,
+            inference: None,
         }
     }
 }

@@ -295,6 +295,19 @@ async fn every_destructive_admin_action_writes_exactly_its_record() {
     let unused_file = db.input_data("winpct", "unused").await;
     let unused_config = db.static_player("unused", admin).await;
     let (pool, member) = pool_with_member(&db, admin).await;
+    // An opening-rack job analysed by a simmer, whose consensus may change.
+    let racks = db.bare_job("opening_rack", admin).await;
+    let simmer = db.sim_player("simmer", admin).await;
+    sqlx::query(
+        "INSERT INTO job_opening_rack_config
+             (job_id, player_config_id, racks_per_batch, rack_size, total_racks)
+         VALUES ($1, $2, 2, 7, 4)",
+    )
+    .bind(racks)
+    .bind(simmer)
+    .execute(&db.pool)
+    .await
+    .unwrap();
     let pool_anchor: Uuid = sqlx::query_scalar("SELECT anchor_player_config_id FROM rating_pools")
         .fetch_one(&db.pool)
         .await
@@ -356,6 +369,15 @@ async fn every_destructive_admin_action_writes_exactly_its_record() {
                      staged_results=0 artifacts=0",
                 ),
             ],
+        ),
+        (
+            "PATCH",
+            format!("/api/admin/jobs/{racks}/consensus"),
+            Some(json!({ "min_results_per_rack": 2, "max_results_per_rack": 3 })),
+            vec![census(
+                "job.consensus_changed", "job", racks.to_string(), Some(racks),
+                "min 1 -> 2, max 1 -> 3; 0 racks unsettled",
+            )],
         ),
         (
             "DELETE",

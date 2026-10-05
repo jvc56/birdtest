@@ -1,5 +1,5 @@
 /**
- * The SPRT card's pair-outcome table: a game-pairs job's five pair outcomes,
+ * The Significance Test card's pair-outcome table: a game-pairs job's five pair outcomes,
  * with a column per player.
  *
  * Bucket `i` holds the pairs in which player 1 scored `i` half-points across

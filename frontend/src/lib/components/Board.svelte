@@ -189,7 +189,9 @@
             <span class="rounded-full bg-primary px-2 text-xs text-primary-foreground">to move</span>
           {/if}
         </p>
-        <div class="flex min-h-8 flex-wrap gap-1">
+        <!-- One line, however narrow the board's column: the tiles shrink to
+             fit rather than wrap. -->
+        <div class="flex min-h-8 gap-1">
           {#each rack as tile}
             {@const points = score(tile)}
             <span
@@ -255,8 +257,9 @@
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 2rem;
-    height: 2rem;
+    flex: 0 1 2rem;
+    min-width: 0;
+    aspect-ratio: 1;
     border-radius: 0.25rem;
     background: hsl(40 55% 80%);
     color: hsl(222 47% 10%);

@@ -26,22 +26,22 @@ test.beforeAll(async ({ browser, playwright }) => {
   const admin = await browser.newContext({ storageState: ADMIN_STATE });
   const form = await admin.newPage();
   await form.goto('/admin/jobs/new');
-  await form.getByLabel('Job name').fill(`e17 first divergences ${suffix}`);
-  await form.getByLabel('Job type').selectOption({ label: 'Game pairs' });
-  const letterdist = form.getByLabel('Letter distribution');
+  await form.getByLabel('Job Name').fill(`e17 first divergences ${suffix}`);
+  await form.getByLabel('Job Type').selectOption({ label: 'Game Pairs' });
+  const letterdist = form.getByLabel('Letter Distribution');
   const fixtureBag = letterdist.locator('option', { hasText: `english_fixture (${SEEDED_DATA},` });
   await letterdist.selectOption((await fixtureBag.getAttribute('value'))!);
-  const layout = form.getByLabel('Board layout');
+  const layout = form.getByLabel('Board', { exact: true });
   const board = layout.locator('option', { hasText: `standard15 (${SEEDED_DATA},` });
   await layout.selectOption((await board.getAttribute('value'))!);
   await form.getByLabel('Player 1').selectOption({ label: names[0] });
   await form.getByLabel('Player 2').selectOption({ label: names[1] });
-  await form.getByLabel('Pairs per batch').fill('5');
-  await form.getByLabel('Pairs to play').fill('30');
+  await form.getByLabel('Pairs Per Task').fill('5');
+  await form.getByLabel('Pairs To Play').fill('30');
   // Offered only once positions are saved.
-  const firstDivergence = form.getByLabel('Only where each pair first diverges');
+  const firstDivergence = form.getByLabel('Only Where Each Pair First Diverges');
   await expect(firstDivergence).toHaveCount(0);
-  await form.getByLabel('Save the positions played').check();
+  await form.getByLabel('Position Recorder').check();
   await firstDivergence.check();
   await form.getByRole('button', { name: 'Create job' }).click();
   await expect(form).toHaveURL(/\/admin\/jobs\/[0-9a-f-]{36}$/);
@@ -78,7 +78,7 @@ test("E-17: a pairs job shows each pair's first divergence, one player's answer 
     heading: (await shown.getByTestId('position-heading').innerText()).trim(),
     rack: (await shown.getByTestId('position-rack').innerText()).trim(),
     played: (await shown.getByTestId('played-move').innerText()).trim(),
-    moves: await shown.locator('tbody tr').count()
+    moves: await shown.getByTestId('position-moves').locator('tbody tr').count()
   });
   const first = await read();
   expect(first.heading).toContain('Game 1 of the pair');

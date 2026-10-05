@@ -62,13 +62,14 @@ pub struct Job {
     /// to tell a job being served from one that is only on offer, and the
     /// claim path to tell a job returning from a spell unserved.
     pub last_claimed_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// The SPRT verdict the job was completed on, if the finish check completed
-    /// it: `passed`, `failed` or `terminated_at_max`, the LLR it crossed at,
-    /// and the units it had then. All three or none -- none for a job that
-    /// runs no SPRT, which has no verdict to keep.
-    pub sprt_decided_status: Option<String>,
-    pub sprt_decided_llr: Option<f64>,
-    pub sprt_decided_units: Option<i64>,
+    /// The match test's verdict the job was completed on, if the finish check
+    /// completed it: `player1_better`, `player2_better` or `inconclusive`,
+    /// player 1's score interval then, and the units it had. All four or none
+    /// -- none for a job that runs no test, which has no verdict to keep.
+    pub test_decided_status: Option<String>,
+    pub test_decided_lower: Option<f64>,
+    pub test_decided_upper: Option<f64>,
+    pub test_decided_units: Option<i64>,
     /// Games recorded by the first accepted result of each task; the dashboard's
     /// progress numerator, maintained in the submit transaction rather than
     /// summed on read. A pairs job's unit count is half of it.
@@ -179,10 +180,49 @@ pub struct OpeningRackConfig {
 }
 
 impl OpeningRackConfig {
-    /// Whether a rack may be analysed more than once, which is what keeps a
-    /// row per rack in `opening_rack_progress`.
-    pub fn seeks_consensus(&self) -> bool {
+    /// The settings that decide when a rack is settled, as the job was created.
+    /// An admin may change them since (`PATCH /api/admin/jobs/:id/consensus`),
+    /// so anything that acts on them reads [`ConsensusSettings::load`] instead.
+    pub fn consensus(&self) -> ConsensusSettings {
+        ConsensusSettings {
+            consensus_pct: self.consensus_pct,
+            min_results_per_rack: self.min_results_per_rack,
+            max_results_per_rack: self.max_results_per_rack,
+        }
+    }
+}
+
+/// An opening-rack job's consensus settings: a rack is analysed until at
+/// least `min_results_per_rack` analyses agree on its best move in
+/// `consensus_pct` percent of them, or until it has `max_results_per_rack`.
+///
+/// The one part of a job's configuration that changes after creation, so it
+/// is never taken from the cached [`crate::jobs::dispatch::JobTemplate`]: a
+/// claim reads it under the job's dispatch lock and a submission under its
+/// claim's lock, both of which the edit holds while it writes.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, sqlx::FromRow)]
+pub struct ConsensusSettings {
+    pub consensus_pct: f64,
+    pub min_results_per_rack: i32,
+    pub max_results_per_rack: i32,
+}
+
+impl ConsensusSettings {
+    /// Whether a rack may be analysed more than once: whether racks are
+    /// reissued once the rack space is covered.
+    pub fn reissues(&self) -> bool {
         self.max_results_per_rack > 1
+    }
+
+    /// The job's settings as they stand now.
+    pub async fn load(conn: &mut sqlx::PgConnection, job_id: Uuid) -> crate::error::AppResult<Self> {
+        Ok(sqlx::query_as::<_, Self>(
+            "SELECT consensus_pct, min_results_per_rack, max_results_per_rack
+             FROM job_opening_rack_config WHERE job_id = $1",
+        )
+        .bind(job_id)
+        .fetch_one(conn)
+        .await?)
     }
 }
 
@@ -192,15 +232,13 @@ pub struct GameConfig {
     pub player1_config_id: Uuid,
     pub player2_config_id: Uuid,
     pub games_per_batch: i32,
-    /// Whether the job runs an SPRT. Off, it plays `max_games` and stops, and
-    /// `min_games` and the SPRT parameters are stored defaults nothing reads.
-    pub sprt_enabled: bool,
+    /// Whether the job runs the match test. Off, it plays `max_games` and
+    /// stops, and `min_games` and `confidence_pct` are stored defaults nothing
+    /// reads.
+    pub test_enabled: bool,
     pub min_games: i32,
     pub max_games: i32,
-    pub sprt_alpha: f64,
-    pub sprt_beta: f64,
-    pub elo_low: f64,
-    pub elo_high: f64,
+    pub confidence_pct: f64,
     /// Keep the position analyses produced while playing. Off by default: at
     /// ~22.5 turns a game it roughly doubles the rows a job produces.
     pub capture_positions: bool,
@@ -212,15 +250,13 @@ pub struct GamePairConfig {
     pub player1_config_id: Uuid,
     pub player2_config_id: Uuid,
     pub pairs_per_batch: i32,
-    /// Whether the job runs an SPRT. Off, it plays `max_pairs` and stops, and
-    /// `min_pairs` and the SPRT parameters are stored defaults nothing reads.
-    pub sprt_enabled: bool,
+    /// Whether the job runs the match test. Off, it plays `max_pairs` and
+    /// stops, and `min_pairs` and `confidence_pct` are stored defaults nothing
+    /// reads.
+    pub test_enabled: bool,
     pub min_pairs: i32,
     pub max_pairs: i32,
-    pub sprt_alpha: f64,
-    pub sprt_beta: f64,
-    pub elo_low: f64,
-    pub elo_high: f64,
+    pub confidence_pct: f64,
     /// Keep the position analyses produced while playing. Off by default: at
     /// ~22.5 turns a game it roughly doubles the rows a job produces.
     pub capture_positions: bool,
@@ -264,45 +300,37 @@ impl LeaveConfig {
     }
 }
 
-/// `games` and `game_pairs` share every SPRT-relevant field; the only difference
-/// is whether the unit of observation is a game or a pair. Normalizing to one
-/// shape here keeps the SPRT and dashboard code from branching on job type.
+/// `games` and `game_pairs` share every field of the match test; the only
+/// difference is whether the unit of observation is a game or a pair.
+/// Normalizing to one shape here keeps the test and dashboard code from
+/// branching on job type.
 #[derive(Debug, Clone)]
-pub struct SprtParams {
+pub struct TestParams {
     /// Off, the job plays `max_units` and stops: nothing else here is read.
     pub enabled: bool,
     pub min_units: i32,
     pub max_units: i32,
-    pub alpha: f64,
-    pub beta: f64,
-    pub elo_low: f64,
-    pub elo_high: f64,
+    pub confidence_pct: f64,
 }
 
-impl From<&GameConfig> for SprtParams {
+impl From<&GameConfig> for TestParams {
     fn from(c: &GameConfig) -> Self {
         Self {
-            enabled: c.sprt_enabled,
+            enabled: c.test_enabled,
             min_units: c.min_games,
             max_units: c.max_games,
-            alpha: c.sprt_alpha,
-            beta: c.sprt_beta,
-            elo_low: c.elo_low,
-            elo_high: c.elo_high,
+            confidence_pct: c.confidence_pct,
         }
     }
 }
 
-impl From<&GamePairConfig> for SprtParams {
+impl From<&GamePairConfig> for TestParams {
     fn from(c: &GamePairConfig) -> Self {
         Self {
-            enabled: c.sprt_enabled,
+            enabled: c.test_enabled,
             min_units: c.min_pairs,
             max_units: c.max_pairs,
-            alpha: c.sprt_alpha,
-            beta: c.sprt_beta,
-            elo_low: c.elo_low,
-            elo_high: c.elo_high,
+            confidence_pct: c.confidence_pct,
         }
     }
 }
@@ -387,24 +415,21 @@ mod tests {
         }
     }
 
-    /// U-WIRE-7: the SPRT settings come out of a games config and a pairs
-    /// config the same way, with only the unit renamed. Every value is
-    /// distinct, so a swapped field (alpha for beta, low for high) shows.
+    /// U-WIRE-7: the match test's settings come out of a games config and a
+    /// pairs config the same way, with only the unit renamed. Every value is
+    /// distinct, so a swapped field (min for max) shows.
     #[test]
-    fn sprt_params_read_the_same_settings_from_games_and_pairs() {
+    fn test_params_read_the_same_settings_from_games_and_pairs() {
         let (job_id, p1, p2) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
         let games = GameConfig {
             job_id,
             player1_config_id: p1,
             player2_config_id: p2,
             games_per_batch: 7,
-            sprt_enabled: true,
+            test_enabled: true,
             min_games: 100,
             max_games: 5000,
-            sprt_alpha: 0.05,
-            sprt_beta: 0.1,
-            elo_low: -3.0,
-            elo_high: 4.5,
+            confidence_pct: 97.5,
             capture_positions: false,
         };
         let pairs = GamePairConfig {
@@ -412,22 +437,17 @@ mod tests {
             player1_config_id: p1,
             player2_config_id: p2,
             pairs_per_batch: 7,
-            sprt_enabled: true,
+            test_enabled: true,
             min_pairs: 100,
             max_pairs: 5000,
-            sprt_alpha: 0.05,
-            sprt_beta: 0.1,
-            elo_low: -3.0,
-            elo_high: 4.5,
+            confidence_pct: 97.5,
             capture_positions: false,
             capture_first_divergence: false,
         };
 
-        let fields = |p: SprtParams| {
-            (p.enabled, p.min_units, p.max_units, p.alpha, p.beta, p.elo_low, p.elo_high)
-        };
-        let expected = (true, 100, 5000, 0.05, 0.1, -3.0, 4.5);
-        assert_eq!(fields(SprtParams::from(&games)), expected);
-        assert_eq!(fields(SprtParams::from(&pairs)), expected);
+        let fields = |p: TestParams| (p.enabled, p.min_units, p.max_units, p.confidence_pct);
+        let expected = (true, 100, 5000, 97.5);
+        assert_eq!(fields(TestParams::from(&games)), expected);
+        assert_eq!(fields(TestParams::from(&pairs)), expected);
     }
 }

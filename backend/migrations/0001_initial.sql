@@ -468,21 +468,25 @@ CREATE TABLE jobs (
     -- climb, and a newcomer put level with *it* then took every claim from the
     -- jobs that were actually running until it had caught up with them.
     last_claimed_at TIMESTAMPTZ,
-    -- The SPRT verdict a games or game-pairs job was completed on, as the
-    -- finish check saw it: NULL for every other job, for one completed any
-    -- other way (by an admin, or at its cap in the claim path), and for one
-    -- that runs no SPRT -- there is no verdict to keep, and its `job.completed`
-    -- audit row says `reached_target` instead. The live
-    -- figures are recomputed from every accepted result, and the claims in
-    -- flight when a job completes are still played and accepted -- so without
-    -- this the page of a job that passed could drift back to "running" with no
-    -- record anywhere of the decision that stopped it. A purge clears it.
-    sprt_decided_status TEXT CHECK (sprt_decided_status IN ('passed', 'failed', 'terminated_at_max')),
-    sprt_decided_llr    DOUBLE PRECISION,
-    sprt_decided_units  BIGINT,
-    CONSTRAINT jobs_sprt_decided_together CHECK (
-        (sprt_decided_status IS NULL) = (sprt_decided_llr IS NULL)
-        AND (sprt_decided_status IS NULL) = (sprt_decided_units IS NULL)
+    -- The match test's verdict a games or game-pairs job was completed on, as
+    -- the finish check saw it, with player 1's score interval and the units it
+    -- had then: NULL for every other job, for one completed any other way (by
+    -- an admin, or at its cap in the claim path), and for one that runs no
+    -- test -- there is no verdict to keep, and its `job.completed` audit row
+    -- says `reached_target` instead. The live figures are recomputed from
+    -- every accepted result, and the claims in flight when a job completes are
+    -- still played and accepted -- so without this the page of a job that
+    -- decided could drift back to "running" with no record anywhere of the
+    -- decision that stopped it. A purge clears it.
+    test_decided_status TEXT CHECK (test_decided_status IN
+                            ('player1_better', 'player2_better', 'inconclusive')),
+    test_decided_lower  DOUBLE PRECISION,
+    test_decided_upper  DOUBLE PRECISION,
+    test_decided_units  BIGINT,
+    CONSTRAINT jobs_test_decided_together CHECK (
+        (test_decided_status IS NULL) = (test_decided_lower IS NULL)
+        AND (test_decided_status IS NULL) = (test_decided_upper IS NULL)
+        AND (test_decided_status IS NULL) = (test_decided_units IS NULL)
     ),
     -- Progress totals the dashboard reads, maintained in the submit transaction
     -- rather than counted on read (PLAN.md, "What these reads cost"), once per
@@ -493,7 +497,7 @@ CREATE TABLE jobs (
     -- counts distinct opening racks with an accepted analysis, which is a plain
     -- sum because each task covers its own disjoint slice of the rack space.
     --
-    -- Neither is authoritative for anything that decides: SPRT still reads
+    -- Neither is authoritative for anything that decides: the match test still reads
     -- game_results, so a drifted counter shows a wrong number on a page and
     -- cannot stop a job early. A purge zeroes them; a partial restore
     -- recomputes them (RUNBOOK 2.3).
@@ -701,9 +705,11 @@ CREATE TABLE job_opening_rack_config (
     -- of its analyses whose rank-1 move is the most common rank-1 move. It is
     -- settled once it has at least `min_results_per_rack` analyses and its
     -- consensus is at least `consensus_pct`, or once it has
-    -- `max_results_per_rack` analyses (settled without consensus), and never
-    -- analysed again. One and one is one analysis per rack, which is what a
-    -- static player gets: its analyses are deterministic and always agree.
+    -- `max_results_per_rack` analyses (settled without consensus), and not
+    -- analysed again unless an admin changes these three (the only settings a
+    -- job's config may change after creation), which restates every rack.
+    -- One and one is one analysis per rack, which is what a static player
+    -- gets: its analyses are deterministic and always agree.
     consensus_pct          DOUBLE PRECISION NOT NULL DEFAULT 100
                            CHECK (consensus_pct > 50 AND consensus_pct <= 100),
     min_results_per_rack   INT NOT NULL DEFAULT 1 CHECK (min_results_per_rack >= 1),
@@ -719,19 +725,20 @@ CREATE TABLE job_game_config (
     player1_config_id   UUID NOT NULL REFERENCES player_configs(id),
     player2_config_id   UUID NOT NULL REFERENCES player_configs(id),
     games_per_batch     INT NOT NULL DEFAULT 1,
-    -- Whether the job runs an SPRT. Off, it plays max_games and stops, and
-    -- min_games and the four SPRT parameters are stored at their defaults and
-    -- read by nothing. Off by default: a job that only wants the games played
-    -- should not be stopped early by a test it did not ask for.
-    sprt_enabled        BOOLEAN NOT NULL DEFAULT FALSE,
-    -- Two finish conditions: SPRT significance (evaluated after min_games) OR reaching max_games.
-    min_games           INT NOT NULL,   -- SPRT is not evaluated until this many games are complete
-    max_games           INT NOT NULL,   -- job auto-completes at this count regardless of SPRT
-    -- SPRT parameters (H0: elo_diff = elo_low, H1: elo_diff = elo_high)
-    sprt_alpha          DOUBLE PRECISION NOT NULL DEFAULT 0.05,
-    sprt_beta           DOUBLE PRECISION NOT NULL DEFAULT 0.05,
-    elo_low             DOUBLE PRECISION NOT NULL DEFAULT -10.0,
-    elo_high            DOUBLE PRECISION NOT NULL DEFAULT 10.0,
+    -- Whether the job runs the match test (stats/match_test.rs): a confidence
+    -- interval for player 1's score that stays valid however often it is
+    -- checked, the job stopping once it excludes an even score. Off, it plays
+    -- max_games and stops, and min_games and confidence_pct are stored at
+    -- their defaults and read by nothing. Off by default: a job that only
+    -- wants the games played should not be stopped early by a test it did not
+    -- ask for.
+    test_enabled        BOOLEAN NOT NULL DEFAULT FALSE,
+    -- Two finish conditions: a decision (looked for from min_games on) OR reaching max_games.
+    min_games           INT NOT NULL,   -- the test is not acted on before this many games are complete
+    max_games           INT NOT NULL,   -- job auto-completes at this count regardless of the test
+    -- How confident a decision is: the interval's coverage, in percent.
+    confidence_pct      DOUBLE PRECISION NOT NULL DEFAULT 95
+                        CHECK (confidence_pct > 50 AND confidence_pct < 100),
     -- Keep the position analyses the worker produces while playing. A worker
     -- analyses a position every turn regardless; this decides whether those are
     -- recorded. Off by default: at ~22.5 turns a game it roughly doubles the
@@ -747,13 +754,11 @@ CREATE TABLE job_game_pair_config (
     player2_config_id   UUID NOT NULL REFERENCES player_configs(id),
     pairs_per_batch     INT NOT NULL DEFAULT 1,
     -- As on job_game_config: off, the job plays max_pairs and stops.
-    sprt_enabled        BOOLEAN NOT NULL DEFAULT FALSE,
+    test_enabled        BOOLEAN NOT NULL DEFAULT FALSE,
     min_pairs           INT NOT NULL,
     max_pairs           INT NOT NULL,
-    sprt_alpha          DOUBLE PRECISION NOT NULL DEFAULT 0.05,
-    sprt_beta           DOUBLE PRECISION NOT NULL DEFAULT 0.05,
-    elo_low             DOUBLE PRECISION NOT NULL DEFAULT -10.0,
-    elo_high            DOUBLE PRECISION NOT NULL DEFAULT 10.0,
+    confidence_pct      DOUBLE PRECISION NOT NULL DEFAULT 95
+                        CHECK (confidence_pct > 50 AND confidence_pct < 100),
     -- Keep the position analyses the worker produces while playing. A worker
     -- analyses a position every turn regardless; this decides whether those are
     -- recorded. Off by default: at ~22.5 turns a game it roughly doubles the
@@ -1072,13 +1077,13 @@ CREATE TABLE leave_requests (
     player_config_id    UUID NOT NULL REFERENCES player_configs(id)
 );
 
--- An opening-rack consensus job's racks: how many analyses each has, its most
--- common rank-1 move and how many analyses ranked it first, and whether it is
--- settled (see job_opening_rack_config). Only for a job wanting more than one
--- analysis per rack: one that wants one settles each rack at its first, and
--- needs no row per rack to know it. A rack has a row from its first analysis;
--- the racks still to be reissued are its unsettled rows, fewest analyses
--- first.
+-- An opening-rack job's racks: how many analyses each has, its most common
+-- rank-1 move and how many analyses ranked it first, and whether it is
+-- settled (see job_opening_rack_config). Every opening-rack job keeps them,
+-- even one wanting one analysis per rack, which settles each rack at its
+-- first: an admin may change its consensus settings later, and its reissues
+-- then start from these rows. A rack has a row from its first analysis; the
+-- racks still to be reissued are its unsettled rows, fewest analyses first.
 CREATE TABLE opening_rack_progress (
     job_id     UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
     rack       TEXT NOT NULL,
@@ -1344,6 +1349,10 @@ CREATE TABLE position_analysis_moves (
     move            TEXT NOT NULL,
     score           INT NOT NULL,
     equity          DOUBLE PRECISION NOT NULL,
+    -- How many times a simulation played the move out (its share of the
+    -- simulation's iterations, most going to the leaders). 0 for a move nothing
+    -- simulated; NULL from a client that did not say.
+    iterations      BIGINT CHECK (iterations >= 0),
     -- The win percentage: a simulation's, or a pre-endgame solve's over every
     -- way the bag can be drawn. NULL for a static or endgame analysis.
     win_percentage  DOUBLE PRECISION,
@@ -1385,11 +1394,27 @@ CREATE TABLE position_analysis_plies (
     PRIMARY KEY (move_id, ply)
 );
 
+-- What a simming player inferred of the opponent's leave before it simmed a
+-- captured position: how many distinct leaves the inference found, how many it
+-- drew in all, their mean equity, and the most drawn of them -- at most ten
+-- `{leave, draws, equity}` objects, most drawn first. Only a simulated in-game
+-- position past a game's first turn, whose opponent did not pass, has one; an
+-- opening rack never does (there is no opponent move to infer from).
+CREATE TABLE position_analysis_inference (
+    record_id      BIGINT PRIMARY KEY
+                   REFERENCES position_analysis_records(id) ON DELETE CASCADE,
+    num_leaves     BIGINT NOT NULL CHECK (num_leaves >= 0),
+    total_draws    BIGINT NOT NULL CHECK (total_draws >= 0),
+    average_equity DOUBLE PRECISION NOT NULL,
+    leaves         JSONB NOT NULL CHECK (jsonb_typeof(leaves) = 'array'
+                                         AND jsonb_array_length(leaves) <= 10)
+);
+
 -- Shared by games and game pairs: one row per accepted claim, holding the
 -- aggregate MAGPIE's autoplay reports. Autoplay does not emit individual games
 -- -- it reports counts and score moments for a batch, and in `-gp` mode also
 -- the pentanomial: how many completed pairs ended in each of the five possible
--- pair outcomes. The pentanomial is what SPRT and the rating fits read; the
+-- pair outcomes. The pentanomial is what the match test and the rating fits read; the
 -- divergent summary alongside it is a diagnostic only.
 CREATE TABLE game_results (
     task_claim_id     UUID PRIMARY KEY REFERENCES task_claims(id) ON DELETE CASCADE,
@@ -1413,7 +1438,7 @@ CREATE TABLE game_results (
     -- pent_0 is "player 1 lost both games" and pent_4 is "won both". NULL for
     -- `games` jobs, which do not play pairs.
     --
-    -- This -- not the divergent subset below -- is what SPRT and the ratings
+    -- This -- not the divergent subset below -- is what the match test and the ratings
     -- read. The pair is the independent unit of a paired run, and *every* pair
     -- belongs in the sample: a pair whose two games played identically is a
     -- guaranteed 1-1 tie, lands in pent_2, and is exactly the observation that
@@ -1553,7 +1578,7 @@ CREATE TABLE leave_generation_transitions (
 -- while dispatching, claiming, validating or completing a task, and nothing
 -- above (jobs, the two game config tables, game_results) mentions a rating.
 -- The coupling runs one way -- the fit reads finished game_results -- so a
--- rating can never affect whether a job stops. SPRT stays on the job config
+-- rating can never affect whether a job stops. The match test stays on the job config
 -- tables where it belongs: it is a per-job stopping rule, not a measurement.
 
 -- A rating pool is a set of player configs whose ratings are comparable, plus

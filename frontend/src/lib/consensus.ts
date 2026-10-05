@@ -14,6 +14,21 @@ export interface ConsensusSettings {
   max_results_per_rack: number;
 }
 
+/**
+ * What is wrong with consensus settings, as the server would refuse them, or
+ * null: checked before a job is created with them and before they are
+ * changed on one. One analysis per rack is always fine, whatever the share.
+ */
+export function consensusProblem(c: ConsensusSettings): string | null {
+  const min = Number(c.min_results_per_rack);
+  const max = Number(c.max_results_per_rack);
+  const pct = Number(c.consensus_pct);
+  if (!(Number.isInteger(min) && min >= 1 && min <= 100)) return 'The fewest analyses must be a whole number from 1 to 100.';
+  if (!(Number.isInteger(max) && max >= min && max <= 100)) return 'The most analyses must be at least the fewest, and at most 100.';
+  if (max > 1 && !(pct > 50 && pct <= 100)) return 'The share that must agree must be above 50% and at most 100%.';
+  return null;
+}
+
 /** The settings as the job's settings table states them. */
 export function analysesPerRack(c: ConsensusSettings): string {
   if (c.max_results_per_rack <= 1) return '1';

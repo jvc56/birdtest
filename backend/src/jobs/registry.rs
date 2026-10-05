@@ -402,10 +402,7 @@ pub async fn store_result(
             // contributor is credited with. What the job's totals gain depends
             // on whether its racks were analysed before, which a consensus job
             // reissues them to be.
-            let JobKind::OpeningRack { config, .. } = &template.kind else {
-                return Err(template.mismatch("opening_rack"));
-            };
-            let tally = opening_rack::record_consensus(conn, template.job_id, config, &racks).await?;
+            let tally = opening_rack::record_consensus(conn, template.job_id, &racks).await?;
             let racks = record.positions.len() as i64;
             Ok((
                 ProgressDelta {

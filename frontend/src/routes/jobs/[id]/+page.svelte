@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { page } from '$app/stores';
-  import { api, type JobStats } from '$lib/api';
+  import { api, type JobStats, type RackLookupRow } from '$lib/api';
   import { subscribeToJob } from '$lib/sse';
   import { session } from '$lib/auth';
   import { datetime, jobTypeLabel, jobTitle } from '$lib/format';
@@ -12,10 +12,11 @@
   import ProgressBar from '$lib/components/ProgressBar.svelte';
   import JobSettings from '$lib/components/JobSettings.svelte';
   import MatchScore from '$lib/components/MatchScore.svelte';
-  import SprtCard from '$lib/components/SprtCard.svelte';
+  import MatchTestCard from '$lib/components/MatchTestCard.svelte';
   import SavedPositions from '$lib/components/SavedPositions.svelte';
   import { playersLine, type JobConfig } from '$lib/jobSettings';
-  import { analysesPerRack, rackConsensus, type LookupMove } from '$lib/consensus';
+  import { analysesPerRack, rackConsensus } from '$lib/consensus';
+  import { plyAt, plyColumns, plyHeaders, showsIterations } from '$lib/moveList';
 
   // The [id] route only matches when the param is present.
   const jobId = $page.params.id as string;
@@ -27,8 +28,11 @@
 
   // Opening-rack search
   let rackQuery = '';
-  let rackMoves: Record<string, unknown>[] | null = null;
-  $: lookupConsensus = rackMoves ? rackConsensus(rackMoves as unknown as LookupMove[]) : null;
+  let rackMoves: RackLookupRow[] | null = null;
+  $: lookupConsensus = rackMoves ? rackConsensus(rackMoves) : null;
+  $: lookupWinPct = rackMoves?.some((m) => m.win_percentage !== null) ?? false;
+  $: lookupPlies = rackMoves ? plyColumns(rackMoves) : 0;
+  $: lookupIters = rackMoves ? showsIterations(rackMoves) : false;
   $: seeksConsensus = (config?.opening_racks?.max_results_per_rack ?? 1) > 1;
   let rackError = '';
   // A few racks the job has analysed, to try the search on: the newest, from
@@ -73,7 +77,7 @@
     rackError = '';
     rackMoves = null;
     try {
-      const result = await api.jobResults(jobId, { rack: rackQuery });
+      const result = await api.rackLookup(jobId, rackQuery);
       rackMoves = result.items;
       if (!rackMoves.length) rackError = 'No analysis stored for that rack yet.';
     } catch (e) {
@@ -154,7 +158,7 @@
     {#if stats.games}
       <MatchScore games={stats.games} players={config?.players.map((p) => p.name) ?? []} />
     {/if}
-    <SprtCard {stats} {config} players={config?.players.map((p) => p.name) ?? []} />
+    <MatchTestCard {stats} players={config?.players.map((p) => p.name) ?? []} />
 
     {#if config?.games?.capture_positions}
       {#if $session}
@@ -256,11 +260,18 @@
           {/if}
           {#if rackMoves?.length}
             <div class="overflow-x-auto">
-            <table class="table">
+            <table class="table whitespace-nowrap">
               <thead>
                 <tr>
                   {#if lookupConsensus && lookupConsensus.analyses > 1}<th>Analysis</th>{/if}
                   <th>#</th><th>Move</th><th class="text-right">Score</th><th class="text-right">Equity</th>
+                  {#if lookupWinPct}<th class="text-right">Win %</th>{/if}
+                  {#if lookupIters}
+                    <th class="text-right" title="How often the simulation played the move out">Iters</th>
+                  {/if}
+                  {#each plyHeaders(lookupPlies) as header}
+                    <th class="text-right" title={header.title}>{header.label}</th>
+                  {/each}
                 </tr>
               </thead>
               <tbody>
@@ -272,7 +283,24 @@
                     <td class="tabular-nums">{move.rank}</td>
                     <td class="font-mono text-xs">{move.move}</td>
                     <td class="text-right tabular-nums">{move.score}</td>
-                    <td class="text-right tabular-nums">{Number(move.equity).toFixed(2)}</td>
+                    <td class="text-right tabular-nums">{move.equity.toFixed(2)}</td>
+                    {#if lookupWinPct}
+                      <td class="text-right tabular-nums">
+                        {move.win_percentage === null ? '—' : move.win_percentage.toFixed(1)}
+                      </td>
+                    {/if}
+                    {#if lookupIters}
+                      <td class="text-right tabular-nums">
+                        {move.iterations ? move.iterations.toLocaleString() : '—'}
+                      </td>
+                    {/if}
+                    {#each Array(lookupPlies) as _, i}
+                      {@const stats = plyAt(move.plies, i)}
+                      <td class="text-right tabular-nums">{stats ? stats.average_score.toFixed(1) : '—'}</td>
+                      <td class="text-right tabular-nums">
+                        {stats ? `${stats.bingo_percentage.toFixed(1)}%` : '—'}
+                      </td>
+                    {/each}
                   </tr>
                 {/each}
               </tbody>

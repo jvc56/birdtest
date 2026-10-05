@@ -14,13 +14,13 @@ test('E-16: a player config solves its endgame and pre-endgame', async ({ page }
   await page.goto('/admin/player-configs/new');
   await page.getByLabel('Name').fill(name);
 
-  const endgame = page.getByLabel('Solve the endgame', { exact: true });
-  const preEndgame = page.getByLabel('Solve the pre-endgame', { exact: true });
+  const endgame = page.getByLabel('Uses Endgame', { exact: true });
+  const preEndgame = page.getByLabel('Uses Preendgame', { exact: true });
   await expect(preEndgame).toBeDisabled();
   await endgame.check();
   await expect(preEndgame).toBeEnabled();
   await preEndgame.check();
-  await expect(page.getByLabel('Up to a bag of (-pegbag1)')).toHaveValue('2');
+  await expect(page.getByLabel('Preendgame Maximum Bag (-pegbag1)')).toHaveValue('2');
   // Turning the endgame off takes the pre-endgame with it.
   await endgame.uncheck();
   await expect(preEndgame).not.toBeChecked();
@@ -29,10 +29,10 @@ test('E-16: a player config solves its endgame and pre-endgame', async ({ page }
   await preEndgame.check();
 
   await page.getByRole('button', { name: 'Show pre-endgame schedule' }).click();
-  const survivors = page.getByLabel('Stage survivors (-pegtopk1)');
+  const survivors = page.getByLabel('PEG Schedule (-pegtopk1)');
   await survivors.fill('4, x');
   await page.getByRole('button', { name: 'Create' }).click();
-  await expect(page.getByRole('alert')).toHaveText('Stage survivors: "x" is not a whole number.');
+  await expect(page.getByRole('alert')).toHaveText('PEG Schedule: "x" is not a whole number.');
   await expect(page).toHaveURL(/\/admin\/player-configs\/new$/);
 
   await survivors.fill('');
@@ -46,10 +46,10 @@ test('E-16: a player config solves its endgame and pre-endgame', async ({ page }
   const row = (label: string) =>
     settings.getByRole('row').filter({ has: page.getByRole('cell', { name: label, exact: true }) });
   await expect(page.getByText(/^static, by equity · 6-ply endgame · PEG ≤2 · created/)).toBeVisible();
-  await expect(row('Endgame').getByRole('cell')).toHaveText(['Endgame', '6-ply endgame']);
-  await expect(row('Pre-endgame').getByRole('cell')).toHaveText(['Pre-endgame', 'bag ≤ 2']);
+  await expect(row('Uses Endgame').getByRole('cell')).toHaveText(['Uses Endgame', 'yes (6 plies)']);
+  await expect(row('Uses Preendgame').getByRole('cell')).toHaveText(['Uses Preendgame', 'yes (bag ≤ 2)']);
   // The schedule MAGPIE defaults to, written into the config, under All settings.
   await settings.getByRole('button', { name: 'All settings' }).click();
-  await expect(row('PEG schedule').getByRole('cell')).toHaveText(['PEG schedule', '32, 16, 8, 4, 2']);
-  await expect(row('Nested strides').getByRole('cell')).toHaveText(['Nested strides', '1, 1, 5, 7']);
+  await expect(row('PEG Schedule').getByRole('cell')).toHaveText(['PEG Schedule', '32, 16, 8, 4, 2']);
+  await expect(row('Nested Strides').getByRole('cell')).toHaveText(['Nested Strides', '1, 1, 5, 7']);
 });

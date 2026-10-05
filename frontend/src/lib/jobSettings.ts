@@ -6,7 +6,6 @@
  */
 import type { JobType } from '$lib/api';
 import { jobTypeLabel, targetsText } from '$lib/format';
-import { analysesPerRack } from '$lib/consensus';
 
 export interface PlayerSettings {
   /** Its part in a job ("player 1"); absent for a config read on its own. */
@@ -73,13 +72,11 @@ export interface JobConfig {
     unit: 'game' | 'pair';
     per_batch: number;
     /** Off, the job plays `max_units` and stops; the test's settings are unused. */
-    sprt_enabled: boolean;
+    test_enabled: boolean;
     min_units: number;
     max_units: number;
-    sprt_alpha: number;
-    sprt_beta: number;
-    elo_low: number;
-    elo_high: number;
+    /** The significance test's confidence, in percent. */
+    confidence_pct: number;
     capture_positions: boolean;
     /** Game pairs: only each pair's first divergence is kept. */
     capture_first_divergence: boolean;
@@ -116,22 +113,22 @@ export function show(value: Value): string {
 /** Whether a player solves its endgames, and so perhaps its pre-endgames. */
 const solves = (p: PlayerSettings) => p.endgame_plies > 0;
 
-/** The endgame a player solves, in a few words. */
+/** Whether a player solves its endgames, and to what depth. */
 export function endgameText(p: PlayerSettings): string {
-  return solves(p) ? `${p.endgame_plies}-ply endgame` : 'off';
+  return solves(p) ? `yes (${p.endgame_plies} plies)` : 'no';
 }
 
-/** The pre-endgame a player solves: off without the endgame, which it needs. */
+/** Whether a player solves its pre-endgames: never without the endgame, which it needs. */
 export function preEndgameText(p: PlayerSettings): string {
-  return solves(p) && p.peg_max_bag > 0 ? `bag ≤ ${p.peg_max_bag}` : 'off';
+  return solves(p) && p.peg_max_bag > 0 ? `yes (bag ≤ ${p.peg_max_bag})` : 'no';
 }
 
 /**
  * How a player searches, in a few words: what tells two configs apart. Its
  * endgame and pre-endgame solving follow the rest of the game's search.
- * Settings named in `unused` (by row label) are left out: an opening-rack
- * job's player never infers, and only a games or pairs job reaches the end of
- * a game.
+ * Settings named in `unused` (by row id) are left out: an opening-rack job's
+ * player never infers, and only a games or pairs job reaches the end of a
+ * game.
  */
 export function playerSummary(p: PlayerSettings, unused: ReadonlySet<string> = NONE): string {
   let search: string;
@@ -141,99 +138,97 @@ export function playerSummary(p: PlayerSettings, unused: ReadonlySet<string> = N
     const parts = [`${p.num_plies}-ply sim`];
     if (p.max_iterations !== null) parts.push(`${p.max_iterations.toLocaleString()} iterations`);
     if (p.stopping_pct !== null) parts.push(`stops at ${p.stopping_pct}%`);
-    if (p.use_inference && !unused.has('Inference')) parts.push('inference');
+    if (p.use_inference && !unused.has('use_inference')) parts.push('inference');
     search = parts.join(', ');
   }
-  if (unused.has('Endgame') || !solves(p)) return search;
-  const solving = [endgameText(p)];
+  if (unused.has('endgame') || !solves(p)) return search;
+  const solving = [`${p.endgame_plies}-ply endgame`];
   if (p.peg_max_bag > 0) solving.push(`PEG ≤${p.peg_max_bag}`);
   return [search, ...solving].join(' · ');
 }
 
-/** One of a job's settings; `key` if it is shown before "All settings". */
+/** One of a job's settings. `id` names the setting whatever its label says. */
 export interface JobSetting {
+  id: string;
   label: string;
   value: string;
-  key: boolean;
 }
 
-
-/** A key setting and one shown only under "All settings". */
-const key = (label: string, value: string): JobSetting => ({ label, value, key: true });
-const more = (label: string, value: string): JobSetting => ({ label, value, key: false });
+const setting = (id: string, label: string, value: string): JobSetting => ({ id, label, value });
 
 /**
- * The job's own settings and its type's, as one ordered list: a job shows the
- * rows that apply to it. The key rows say what the job is: its type; the
+ * The job's own settings and its type's, as one ordered list, all of them: a
+ * job shows the rows that apply to it. First what the job is: its type; the
  * rules every game is played by -- variant, letter distribution, board, bingo
- * bonus; how much it plays -- a games job's target, its test and whether it
- * records positions, an opening-rack job's racks and their size, a leave job's
- * generations and each one's target. The rest -- the simulation cutoff, the
- * test's minimum and error rates, batch sizes, the oldest MAGPIE --
- * is under "All settings". A leave job's lexicon and wordmap are its player's,
- * and shown with it; it has no sim cutoff row, since it never simulates.
+ * bonus; how much it plays -- a games job's target, its significance test and
+ * whether it records positions, an opening-rack job's analyses per rack and
+ * the agreement that settles a rack, a leave job's generations and each one's
+ * target. Then the simulation cutoff, the test's minimum, batch sizes and the
+ * oldest MAGPIE. A leave job's lexicon and wordmap are its player's, and shown
+ * with it; it has no sim cutoff row, since it never simulates.
  */
 export function jobSettings(c: JobConfig): JobSetting[] {
   const g = c.games;
   const o = c.opening_racks;
   const l = c.leave_generation;
-  const unit = g?.unit === 'pair' ? 'pair' : 'game';
   const units = g?.unit === 'pair' ? 'Pairs' : 'Games';
   const rows: JobSetting[] = [
-    key('Type', jobTypeLabel(c.job.job_type)),
-    key('Variant', show(c.job.variant)),
-    key('Letter distribution', show(c.job.letter_distribution)),
-    key('Board', show(c.job.layout)),
-    key('Bingo bonus', show(c.job.bingo_bonus))
+    setting('type', 'Type', jobTypeLabel(c.job.job_type)),
+    setting('variant', 'Variant', show(c.job.variant)),
+    setting('letter_distribution', 'Letter Distribution', show(c.job.letter_distribution)),
+    setting('board', 'Board', show(c.job.layout)),
+    setting('bingo_bonus', 'Bingo Bonus', show(c.job.bingo_bonus))
   ];
   if (g) {
     // A job without a test stores the test's defaults, which it never reads:
     // shown, they would read as a test it runs.
     rows.push(
-      g.sprt_enabled
-        ? key(`Cap (${unit}s)`, show(g.max_units))
-        : key(`${units} to play`, show(g.max_units)),
-      key('SPRT', g.sprt_enabled ? `Elo ${show(g.elo_low)} → ${show(g.elo_high)}` : 'none'),
-      key(
-        'Records positions',
-        g.capture_positions && g.capture_first_divergence ? 'first divergences' : show(g.capture_positions)
+      g.test_enabled
+        ? setting('max_units', `Maximum ${units}`, show(g.max_units))
+        : setting('max_units', `${units} To Play`, show(g.max_units)),
+      setting(
+        'test_enabled',
+        'Significance Test',
+        g.test_enabled ? `yes (${show(g.confidence_pct)}%)` : 'no'
+      ),
+      setting(
+        'capture_positions',
+        'Position Recorder',
+        g.capture_positions && g.capture_first_divergence ? 'yes (first divergences)' : show(g.capture_positions)
       )
     );
   }
   if (o) {
     rows.push(
-      key('Racks in all', show(o.total_racks)),
-      key('Rack size', show(o.rack_size)),
-      key('Analyses per rack', analysesPerRack(o))
+      setting('min_results_per_rack', 'Minimum Analyses Per Rack', show(o.min_results_per_rack)),
+      setting('max_results_per_rack', 'Maximum Analyses Per Rack', show(o.max_results_per_rack)),
+      // One analysis per rack settles each rack at its first: no agreement is sought.
+      setting('consensus_pct', 'Consensus %', o.max_results_per_rack > 1 ? `${show(o.consensus_pct)}%` : '—')
     );
   }
   if (l) {
     rows.push(
-      key('Generations', show(l.target_rack_counts.length)),
-      key('Target per rack', targetsText(l.target_rack_counts))
+      setting('generations', 'Generations', show(l.target_rack_counts.length)),
+      setting('target_rack_counts', 'Target Per Rack', targetsText(l.target_rack_counts))
     );
   }
-  if (!l) rows.push(more('Sim cutoff', show(c.job.sim_cutoff)));
-  if (g?.sprt_enabled) {
-    rows.push(
-      more(`Fewest ${unit}s before the test is acted on`, show(g.min_units)),
-      more('SPRT α', show(g.sprt_alpha)),
-      more('SPRT β', show(g.sprt_beta))
-    );
-  }
-  if (g) rows.push(more(`${units} per task`, show(g.per_batch)));
-  if (l) rows.push(more('Games per task', show(l.num_iterations)));
-  if (o) rows.push(more('Racks per task', show(o.racks_per_batch)));
-  if (l) rows.push(more('Racks per task', show(l.racks_per_task)));
-  rows.push(more('Oldest MAGPIE', show(c.job.min_magpie_version)));
+  if (!l) rows.push(setting('sim_cutoff', 'Sim Cutoff', show(c.job.sim_cutoff)));
+  if (g?.test_enabled) rows.push(setting('min_units', `Minimum ${units}`, show(g.min_units)));
+  if (g) rows.push(setting('per_batch', `${units} Per Task`, show(g.per_batch)));
+  if (l) rows.push(setting('num_iterations', 'Games Per Task', show(l.num_iterations)));
+  if (o) rows.push(setting('racks_per_batch', 'Racks Per Task', show(o.racks_per_batch)));
+  if (l) rows.push(setting('racks_per_task', 'Racks Per Task', show(l.racks_per_task)));
+  rows.push(setting('min_magpie_version', 'Oldest MAGPIE', show(c.job.min_magpie_version)));
   return rows;
 }
 
 /** A player setting as the table lists it. */
 interface PlayerRowSpec {
+  /** Names the setting whatever its label says. */
+  id: string;
   label: string;
   value: (p: PlayerSettings) => string;
-  /** Shown before "All settings". */
+  /** Always shown; the rest only under "All settings". */
   key?: true;
   /** A simulation setting: "—" for a static player, hidden when all are. */
   sim?: true;
@@ -247,47 +242,59 @@ const field =
 
 /**
  * Every player setting, in the order a reader compares them: the files, how
- * it searches and what it keeps, and how it solves the end of the game first
- * (the key rows), then the rest of each.
+ * it searches, what it keeps and whether it infers and solves the end of the
+ * game first (the key rows, always shown), then the rest of each. A row that
+ * does not apply to a player shows "—": inference for a static player, the
+ * plies one records, and the move-gen margin of a recorder that keeps no
+ * moves by equity.
  */
 const PLAYER_ROWS: PlayerRowSpec[] = [
-  { label: 'Lexicon', value: field('lexicon'), key: true },
-  { label: 'Leaves', value: field('leaves'), key: true },
-  { label: 'Plies', value: field('num_plies'), key: true },
-  { label: 'Plays considered', value: field('num_plays'), key: true },
-  { label: 'Sort', value: field('sort_strategy'), key: true },
-  { label: 'Win % model', value: field('win_pct'), key: true, sim: true },
-  { label: 'Iterations (most)', value: field('max_iterations'), key: true, sim: true },
-  { label: 'Stopping %', value: field('stopping_pct'), key: true, sim: true },
-  { label: 'Inference', value: field('use_inference'), key: true, sim: true },
-  { label: 'Recorder', value: field('recorder_type'), key: true },
-  { label: 'Plays recorded', value: field('num_plays_recorded'), key: true },
-  { label: 'Endgame', value: (p) => endgameText(p), key: true },
-  { label: 'Pre-endgame', value: (p) => preEndgameText(p), key: true },
-  { label: 'Plies recorded', value: field('num_plies_recorded') },
-  { label: 'Iterations per play (fewest)', value: field('min_play_iterations'), sim: true },
-  { label: 'Threshold', value: field('threshold'), sim: true },
-  { label: 'Sampling rule', value: field('sampling_rule'), sim: true },
-  { label: 'Inference margin', value: field('inference_margin'), sim: true },
-  { label: 'Utility weight: win %', value: field('utility_w_winpct'), sim: true },
-  { label: 'Utility weight: spread', value: field('utility_w_spread'), sim: true },
-  { label: 'Utility spread scale', value: field('utility_spread_scale'), sim: true },
-  { label: 'Time limit (s)', value: field('time_limit_secs'), sim: true },
-  { label: 'Move-gen margin', value: field('movegen_margin') },
-  { label: 'PEG schedule', value: (p) => list(p.peg_stage_top_k) },
-  { label: 'PEG stride', value: field('peg_scenario_stride') },
-  { label: 'PEG opponent', value: field('peg_opp_model') },
-  { label: 'Nested lookahead', value: field('peg_nested') },
-  { label: 'Nested caps', value: (p) => list(p.peg_nested_cand_caps) },
-  { label: 'Nested depth', value: field('peg_nested_max_depth') },
-  { label: 'Nested strides', value: (p) => list(p.peg_nested_strides) },
-  { label: 'Wordmap', value: field('use_wordmap') },
-  { label: 'Rack info table', value: field('use_rit') },
-  { label: 'Word info table', value: field('use_wit') }
+  { id: 'lexicon', label: 'Lexicon', value: field('lexicon'), key: true },
+  { id: 'leaves', label: 'Leaves', value: field('leaves'), key: true },
+  { id: 'sort_strategy', label: 'Sorted By', value: field('sort_strategy'), key: true },
+  { id: 'recorder_type', label: 'Move Recorder', value: field('recorder_type'), key: true },
+  { id: 'num_plays', label: 'Moves Generated', value: field('num_plays'), key: true },
+  { id: 'num_plies', label: 'Plies', value: field('num_plies'), key: true },
+  { id: 'use_inference', label: 'Uses Inference', value: field('use_inference'), key: true },
+  { id: 'pre_endgame', label: 'Uses Preendgame', value: (p) => preEndgameText(p), key: true },
+  { id: 'endgame', label: 'Uses Endgame', value: (p) => endgameText(p), key: true },
+  { id: 'win_pct', label: 'Win % Model', value: field('win_pct'), sim: true },
+  { id: 'max_iterations', label: 'Maximum Total Iterations', value: field('max_iterations'), sim: true },
+  { id: 'stopping_pct', label: 'Stopping %', value: field('stopping_pct'), sim: true },
+  { id: 'num_plays_recorded', label: 'Moves Recorded', value: field('num_plays_recorded') },
+  {
+    id: 'num_plies_recorded',
+    label: 'Plies Recorded',
+    value: (p) => (p.num_plies === 0 ? '—' : show(p.num_plies_recorded))
+  },
+  { id: 'min_play_iterations', label: 'Minimum Iterations per Play', value: field('min_play_iterations'), sim: true },
+  { id: 'threshold', label: 'Stopping Threshold Rule', value: field('threshold'), sim: true },
+  { id: 'sampling_rule', label: 'Sampling Rule', value: field('sampling_rule'), sim: true },
+  { id: 'inference_margin', label: 'Inference Margin', value: field('inference_margin'), sim: true },
+  { id: 'utility_w_winpct', label: 'Win % Utility Weight', value: field('utility_w_winpct'), sim: true },
+  { id: 'utility_w_spread', label: 'Spread Utility Weight', value: field('utility_w_spread'), sim: true },
+  { id: 'utility_spread_scale', label: 'Spread Utility Scale', value: field('utility_spread_scale'), sim: true },
+  { id: 'time_limit_secs', label: 'Time Limit (Seconds)', value: field('time_limit_secs'), sim: true },
+  {
+    id: 'movegen_margin',
+    label: 'Movegen Margin',
+    value: (p) => (p.recorder_type === 'equity' ? show(p.movegen_margin) : '—')
+  },
+  { id: 'peg_stage_top_k', label: 'PEG Schedule', value: (p) => list(p.peg_stage_top_k) },
+  { id: 'peg_scenario_stride', label: 'PEG Stride', value: field('peg_scenario_stride') },
+  { id: 'peg_opp_model', label: 'PEG Opponent', value: field('peg_opp_model') },
+  { id: 'peg_nested', label: 'Nested Lookahead', value: field('peg_nested') },
+  { id: 'peg_nested_cand_caps', label: 'Nested Caps', value: (p) => list(p.peg_nested_cand_caps) },
+  { id: 'peg_nested_max_depth', label: 'Nested Depth', value: field('peg_nested_max_depth') },
+  { id: 'peg_nested_strides', label: 'Nested Strides', value: (p) => list(p.peg_nested_strides) },
+  { id: 'use_wordmap', label: 'Wordmap', value: field('use_wordmap') },
+  { id: 'use_rit', label: 'Rack Info Table', value: field('use_rit') },
+  { id: 'use_wit', label: 'Word Info Table', value: field('use_wit') }
 ];
 
 /** A player setting: one value per player, and whether the players differ in it. */
 export interface SettingRow {
+  id: string;
   label: string;
   values: string[];
   differs: boolean;
@@ -295,40 +302,40 @@ export interface SettingRow {
   unused?: true;
 }
 
-function row(label: string, values: string[]): SettingRow {
-  return { label, values, differs: new Set(values).size > 1 };
+function row(id: string, label: string, values: string[]): SettingRow {
+  return { id, label, values, differs: new Set(values).size > 1 };
 }
 
-/** Every endgame and pre-endgame row's label. */
+/** Every endgame and pre-endgame row's id. */
 const SOLVER_ROWS = [
-  'Endgame',
-  'Pre-endgame',
-  'PEG schedule',
-  'PEG stride',
-  'PEG opponent',
-  'Nested lookahead',
-  'Nested caps',
-  'Nested depth',
-  'Nested strides'
+  'endgame',
+  'pre_endgame',
+  'peg_stage_top_k',
+  'peg_scenario_stride',
+  'peg_opp_model',
+  'peg_nested',
+  'peg_nested_cand_caps',
+  'peg_nested_max_depth',
+  'peg_nested_strides'
 ];
 
 const NONE: ReadonlySet<string> = new Set();
 
 /**
- * What a leave job's bot never reads of its player: the leaves, because every
- * generation plays the KLV the server built from the one before; the win%
- * model, because it plays statically; and what is kept of its moves -- the
- * recorder, the plays and plies recorded, and the move-gen margin that bounds
- * an equity recorder -- because it plays the best move and reports only the
- * racks it drew.
+ * What a leave job's bot never reads of its player, by row id: the leaves,
+ * because every generation plays the KLV the server built from the one
+ * before; the win% model, because it plays statically; and what is kept of
+ * its moves -- the recorder, the plays and plies recorded, and the move-gen
+ * margin that bounds an equity recorder -- because it plays the best move and
+ * reports only the racks it drew.
  */
 const LEAVE_UNUSED: ReadonlySet<string> = new Set([
-  'Leaves',
-  'Win % model',
-  'Recorder',
-  'Plays recorded',
-  'Plies recorded',
-  'Move-gen margin',
+  'leaves',
+  'win_pct',
+  'recorder_type',
+  'num_plays_recorded',
+  'num_plies_recorded',
+  'movegen_margin',
   // A leave game ends before the bag is small enough for either solver.
   ...SOLVER_ROWS
 ]);
@@ -339,8 +346,8 @@ const LEAVE_UNUSED: ReadonlySet<string> = new Set([
  * analysed on an empty board, far from the endgame.
  */
 const OPENING_RACK_UNUSED: ReadonlySet<string> = new Set([
-  'Inference',
-  'Inference margin',
+  'use_inference',
+  'inference_margin',
   ...SOLVER_ROWS
 ]);
 
@@ -348,9 +355,9 @@ const OPENING_RACK_UNUSED: ReadonlySet<string> = new Set([
  * What a games or pairs job that records no positions never reads: the plays
  * and plies recorded say what a captured position keeps, and nothing else.
  */
-const UNCAPTURED_UNUSED: ReadonlySet<string> = new Set(['Plays recorded', 'Plies recorded']);
+const UNCAPTURED_UNUSED: ReadonlySet<string> = new Set(['num_plays_recorded', 'num_plies_recorded']);
 
-/** The player settings, by row label, that a job never reads. */
+/** The player settings, by row id, that a job never reads. */
 export function unusedPlayerSettings(c: JobConfig): ReadonlySet<string> {
   if (c.job.job_type === 'leave_generation') return LEAVE_UNUSED;
   if (c.job.job_type === 'opening_rack') return OPENING_RACK_UNUSED;
@@ -359,30 +366,29 @@ export function unusedPlayerSettings(c: JobConfig): ReadonlySet<string> {
 }
 
 function marked(rows: SettingRow[], unused: ReadonlySet<string>): SettingRow[] {
-  return rows.map((r) => (unused.has(r.label) ? { ...r, unused: true } : r));
+  return rows.map((r) => (unused.has(r.id) ? { ...r, unused: true } : r));
 }
 
 /**
- * The rows that apply to these players: the simulation rows only when one of
- * them simulates (a static player shows "—" in them beside a simmer), and, in
- * the key rows, the endgame's only when one of them solves.
+ * The rows that apply to these players: every key row, and of the rest the
+ * simulation rows only when one of them simulates (a static player shows "—"
+ * in them beside a simmer).
  */
 function rowsFor(players: PlayerSettings[], keyOnly: boolean, unused: ReadonlySet<string>): SettingRow[] {
   const simulates = players.some((p) => p.num_plies > 0);
-  const solving = players.some(solves);
   return marked(
     PLAYER_ROWS.filter((spec) => !keyOnly || spec.key)
       .filter((spec) => simulates || !spec.sim)
-      .filter((spec) => !keyOnly || solving || !SOLVER_ROWS.includes(spec.label))
-      .map((spec) => row(spec.label, players.map(spec.value))),
+      .map((spec) => row(spec.id, spec.label, players.map(spec.value))),
     unused
   );
 }
 
 /**
  * What a reader compares configs by first -- the files, the search, what is
- * kept and how the end of the game is solved -- one value per player.
- * `playerRows` has every setting. Rows named in `unused` are marked so.
+ * kept, whether it infers and how the end of the game is solved -- one value
+ * per player. `playerRows` has every setting. Rows whose ids are in `unused`
+ * are marked so.
  */
 export function keySettings(players: PlayerSettings[], unused = NONE): SettingRow[] {
   return rowsFor(players, true, unused);
@@ -390,7 +396,7 @@ export function keySettings(players: PlayerSettings[], unused = NONE): SettingRo
 
 /**
  * Every setting, one value per player, in the key rows' order with the rest
- * after them. Rows named in `unused` are marked so.
+ * after them. Rows whose ids are in `unused` are marked so.
  */
 export function playerRows(players: PlayerSettings[], unused = NONE): SettingRow[] {
   return rowsFor(players, false, unused);

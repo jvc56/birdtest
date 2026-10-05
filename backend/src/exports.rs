@@ -64,7 +64,8 @@ pub const DOWNLOAD_URL_TTL: std::time::Duration = std::time::Duration::from_secs
 /// its analyses, its most common best move and how many ranked it first, and
 /// whether it is settled, and without a consensus) from
 /// `opening_rack_progress`, a primary-key probe per line; null for a job
-/// wanting one analysis per rack, and for an in-game position. Each record's moves come through
+/// wanting one analysis per rack (which keeps the rows too, see
+/// `opening_rack::record_consensus`, but has no consensus to report), and for an in-game position. Each record's moves come through
 /// `position_analysis_moves_record_idx (record_id, rank)` and each move's plies
 /// through the `(move_id, ply)` unique index, so the cost is an index probe per
 /// record and per simmed move, on a background task (or under the two-stream
@@ -74,7 +75,8 @@ const OPENING_RACK_CORPUS: &str = "
                SELECT jsonb_agg(
                           jsonb_build_object(
                               'rank', m.rank, 'move', m.move, 'score', m.score,
-                              'equity', m.equity, 'win_percentage', m.win_percentage,
+                              'equity', m.equity, 'iterations', m.iterations,
+                              'win_percentage', m.win_percentage,
                               'blended_utility', m.blended_utility,
                               'mean_spread', m.mean_spread,
                               'fidelity_plies', m.fidelity_plies,
@@ -90,13 +92,21 @@ const OPENING_RACK_CORPUS: &str = "
                           ORDER BY m.rank)
                FROM position_analysis_moves m WHERE m.record_id = r.id
            ), '[]'::jsonb),
+           'inference', (
+               SELECT jsonb_build_object(
+                          'num_leaves', i.num_leaves, 'total_draws', i.total_draws,
+                          'average_equity', i.average_equity, 'leaves', i.leaves)
+               FROM position_analysis_inference i WHERE i.record_id = r.id
+           ),
            'consensus', (
                SELECT jsonb_build_object(
                           'results', c.results, 'top_move', c.top_move,
                           'top_count', c.top_count, 'settled', c.settled,
                           'without_consensus', c.without_consensus)
                FROM opening_rack_progress c
+               JOIN job_opening_rack_config o ON o.job_id = c.job_id
                WHERE c.job_id = r.job_id AND c.rack = r.rack AND r.game_index IS NULL
+                 AND o.max_results_per_rack > 1
            )))::text AS row
     FROM position_analysis_records r
     WHERE r.job_id = $1";
@@ -637,7 +647,9 @@ async fn mark_ready(
         "UPDATE job_exports
          SET state = 'ready', artifact_key = $2, bytes = $3, sha256 = $4,
              row_count = $5, positions_artifact_key = $6, positions_bytes = $7,
-             positions_sha256 = $8, positions_row_count = $9, is_final = $10,
+             positions_sha256 = $8, positions_row_count = $9,
+             is_final = $10 AND (SELECT j.status = 'completed' FROM jobs j
+                                 WHERE j.id = job_exports.job_id),
              snapshot_at = $11, completed_at = now()
          WHERE id = $1 AND state = 'running'",
     )
@@ -749,6 +761,20 @@ pub async fn purge(conn: &mut sqlx::PgConnection, job_id: Uuid) -> AppResult<Vec
     .fetch_all(&mut *conn)
     .await?;
     Ok(rows.into_iter().flat_map(|(results, positions)| [results, positions]).flatten().collect())
+}
+
+/// A reopened job's final exports become snapshots: each is still the corpus
+/// as of its `snapshot_at`, but no longer the finished job's, which the job
+/// will have again once it completes. Left final, `newest_ready` would serve
+/// the old corpus as the completed job's once it completed again. An export
+/// still building when the job reopened is marked final only if the job is
+/// still completed when it finishes (`mark_ready`).
+pub async fn unfinalize(conn: &mut sqlx::PgConnection, job_id: Uuid) -> AppResult<()> {
+    sqlx::query("UPDATE job_exports SET is_final = FALSE WHERE job_id = $1 AND is_final")
+        .bind(job_id)
+        .execute(conn)
+        .await?;
+    Ok(())
 }
 
 /// Removes a purge's export objects, off the request: best-effort cleanup of

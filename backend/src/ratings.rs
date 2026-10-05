@@ -3,7 +3,7 @@
 //!
 //! Ratings live entirely in here and in the four `rating_*` tables. Nothing in
 //! this module is called while dispatching, claiming, validating or completing
-//! a task, and no job decision reads a rating — SPRT remains a per-job stopping
+//! a task, and no job decision reads a rating — the match test remains a per-job stopping
 //! rule on the job config tables. The coupling is one-way: a fit reads finished
 //! `game_results` and writes a snapshot.
 //!
@@ -474,7 +474,7 @@ async fn fit_within(
 ///
 /// Deliberately a periodic sweep rather than a hook on result submission: a fit
 /// is global to a pool, an active job submits thousands of results an hour, and
-/// unlike SPRT nothing blocks on the answer. Comparing the pair count against
+/// unlike the match test nothing blocks on the answer. Comparing the pair count against
 /// the last run's `pairs_used` avoids needing a dirty flag anywhere.
 ///
 /// One pool's failure does not stop the others. A fit can fail on state an

@@ -4,7 +4,7 @@
    * config's own page or a leave job's, two side by side for a games or pairs
    * job -- with the rows the players differ in bold. The key rows unless
    * `all`, when every setting; the card around it holds the toggle. Settings the
-   * job never reads (`unused`, by row label) are shown muted, with a note. A
+   * job never reads (`unused`, by row id) are shown muted, with a note. A
    * job's players are headed by their part in it and their name, which links
    * to the config's page.
    */
@@ -13,7 +13,7 @@
   export let players: PlayerSettings[];
   /** Every setting rather than the key rows. */
   export let all = false;
-  /** Row labels of the settings the job never reads. */
+  /** Row ids of the settings the job never reads. */
   export let unused: ReadonlySet<string> = new Set();
 
   $: rows = all ? playerRows(players, unused) : keySettings(players, unused);

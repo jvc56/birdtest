@@ -1,8 +1,8 @@
 //! The finish check a submission runs, through the worker API: the debounced
-//! SPRT check under steady load, and an opening-rack job completing once its
+//! match-test check under steady load, and an opening-rack job completing once its
 //! rack space is used up and every task is accepted.
 //!
-//! The check runs on every `SPRT_CHECK_EVERY`th submission for a job, or on
+//! The check runs on every `TEST_CHECK_EVERY`th submission for a job, or on
 //! any submission that leaves the job nothing in flight. Tests that submit with
 //! no other claim open only ever reach the second branch; these hold claims
 //! open so the first one is what decides.
@@ -12,8 +12,8 @@ mod common;
 use axum::http::StatusCode;
 use birdtest::jobstats;
 use birdtest::models::job::JobStatus;
-use birdtest::stats::sprt::SprtStatus;
-use birdtest::state::SPRT_CHECK_EVERY;
+use birdtest::stats::match_test::TestStatus;
+use birdtest::state::TEST_CHECK_EVERY;
 use common::*;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -58,22 +58,22 @@ async fn claim_state(db: &TestDb, assignment: &Value) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// The debounced SPRT check
+// The debounced match-test check
 // ---------------------------------------------------------------------------
 
 /// I-STATS-9 (debounced): under steady load -- one worker's claim open the
 /// whole time, so the job is never idle -- the finish check runs on every
-/// `SPRT_CHECK_EVERY`th submission and not before. Every batch is 90-10, so
-/// the LLR is past the bound from the first submission on (at `min_games`
-/// 100); the job is nonetheless still `active` right before the
-/// `SPRT_CHECK_EVERY`th submission, and `completed` by it. The open claim is
+/// `TEST_CHECK_EVERY`th submission and not before. Every batch is 90-10, so
+/// player 1's interval is above an even score from the first submission on
+/// (at `min_games` 100); the job is nonetheless still `active` right before the
+/// `TEST_CHECK_EVERY`th submission, and `completed` by it. The open claim is
 /// untouched, and its result is still accepted afterwards: the submit path
 /// validates the claim, not the job's status.
 #[tokio::test]
 async fn under_steady_load_the_finish_check_runs_on_every_nth_submission() {
     let db = TestDb::new().await;
     let job = db.games_job(100).await;
-    sqlx::query("UPDATE job_game_config SET min_games = 100 WHERE job_id = $1")
+    sqlx::query("UPDATE job_game_config SET min_games = 100, max_games = 10000 WHERE job_id = $1")
         .bind(job)
         .execute(&db.pool)
         .await
@@ -82,7 +82,7 @@ async fn under_steady_load_the_finish_check_runs_on_every_nth_submission() {
 
     let (held, held_uuid) = first_claim(&app).await;
 
-    for n in 1..=SPRT_CHECK_EVERY {
+    for n in 1..=TEST_CHECK_EVERY {
         let (assignment, uuid) = first_claim(&app).await;
         assert_eq!(job_status(&db, job).await, "active", "before submission {n}");
         submit(&app, &uuid, &assignment, games_result(100, 90)).await;
@@ -90,18 +90,18 @@ async fn under_steady_load_the_finish_check_runs_on_every_nth_submission() {
         let row = jobstats::load_job(&db.pool, job).await.unwrap();
         let games = jobstats::game_stats(&db.pool, &row).await.unwrap().unwrap();
         assert_eq!(games.units_completed, 100 * n);
-        let sprt = games.sprt.expect("an SPRT job");
-        assert_eq!(sprt.status, SprtStatus::Passed, "the verdict is there at {n}");
-        if n < SPRT_CHECK_EVERY {
+        let test = games.test.expect("a job with a test");
+        assert_eq!(test.status, TestStatus::Player1Better, "the verdict is there at {n}");
+        if n < TEST_CHECK_EVERY {
             assert_eq!(row.status, JobStatus::Active, "unchecked after submission {n}");
         }
     }
     assert_eq!(job_status(&db, job).await, "completed");
     assert_eq!(claim_state(&db, &held).await, "claimed", "the held claim is still open");
     let decided = jobstats::load_job(&db.pool, job).await.unwrap();
-    assert_eq!(decided.sprt_decided_status.as_deref(), Some("passed"));
-    assert_eq!(decided.sprt_decided_units, Some(100 * SPRT_CHECK_EVERY as i64));
-    let decided_llr = decided.sprt_decided_llr.unwrap();
+    assert_eq!(decided.test_decided_status.as_deref(), Some("player1_better"));
+    assert_eq!(decided.test_decided_units, Some(100 * TEST_CHECK_EVERY as i64));
+    let decided_lower = decided.test_decided_lower.unwrap();
 
     // I-STATS-9e: the result in flight at completion lands and moves the live
     // figures -- a losing batch -- and the verdict the job stopped on stays.
@@ -110,15 +110,15 @@ async fn under_steady_load_the_finish_check_runs_on_every_nth_submission() {
     assert_eq!(job_status(&db, job).await, "completed");
     let row = jobstats::load_job(&db.pool, job).await.unwrap();
     let games = jobstats::game_stats(&db.pool, &row).await.unwrap().unwrap();
-    let live = games.sprt.expect("an SPRT job").llr;
-    assert!(live < decided_llr, "the live LLR moved: {live} vs {decided_llr}");
+    let live = games.test.expect("a job with a test").lower;
+    assert!(live < decided_lower, "the live interval moved: {live} vs {decided_lower}");
     let stored = games.decided.expect("the stored verdict is reported");
-    assert_eq!((stored.status.as_str(), stored.llr), ("passed", decided_llr));
+    assert_eq!((stored.status.as_str(), stored.lower), ("player1_better", decided_lower));
     // I-STATS-9f: and the page is told why it finished -- its test, not an
     // admin and not its cap.
     let completion = jobstats::compute(&db.pool, &row).await.unwrap().completion.expect("completed");
     assert!(!completion.forced);
-    assert_eq!(completion.reason.as_deref(), Some("passed"));
+    assert_eq!(completion.reason.as_deref(), Some("player1_better"));
 }
 
 // ---------------------------------------------------------------------------
@@ -317,18 +317,18 @@ async fn a_job_whose_last_results_landed_while_inactive_completes_once_reactivat
     assert_eq!(eventually_completed(&db, job).await, "completed");
 }
 
-/// A games job at its `max_games` of 200, with or without its SPRT, whose
+/// A games job at its `max_games` of 200, with or without its test, whose
 /// last two batches, both even, landed while it was inactive; reactivated,
 /// the first claim to find it empty completes it.
-async fn a_games_job_whose_cap_landed_while_inactive(sprt_enabled: bool) -> (TestDb, Uuid) {
+async fn a_games_job_whose_cap_landed_while_inactive(test_enabled: bool) -> (TestDb, Uuid) {
     let db = TestDb::new().await;
     let job = db.games_job(100).await;
     sqlx::query(
-        "UPDATE job_game_config SET sprt_enabled = $2, min_games = 100, max_games = 200
+        "UPDATE job_game_config SET test_enabled = $2, min_games = 100, max_games = 200
          WHERE job_id = $1",
     )
     .bind(job)
-    .bind(sprt_enabled)
+    .bind(test_enabled)
     .execute(&db.pool)
     .await
     .unwrap();
@@ -360,16 +360,16 @@ async fn a_games_job_whose_cap_landed_while_inactive(sprt_enabled: bool) -> (Tes
 async fn a_games_job_at_its_cap_whose_results_landed_while_inactive_completes() {
     let (db, job) = a_games_job_whose_cap_landed_while_inactive(true).await;
     let row = jobstats::load_job(&db.pool, job).await.unwrap();
-    assert_eq!(row.sprt_decided_status.as_deref(), Some("terminated_at_max"));
+    assert_eq!(row.test_decided_status.as_deref(), Some("inconclusive"));
 }
 
-/// I-STATS-9g (games, no SPRT): and for one without a test, at its target --
+/// I-STATS-9g (games, no test): and for one without a test, at its target --
 /// with no verdict stored, and `reached_target` as the reason.
 #[tokio::test]
-async fn a_games_job_without_an_sprt_completes_at_its_target_once_reactivated() {
+async fn a_games_job_without_a_test_completes_at_its_target_once_reactivated() {
     let (db, job) = a_games_job_whose_cap_landed_while_inactive(false).await;
     let row = jobstats::load_job(&db.pool, job).await.unwrap();
-    assert_eq!(row.sprt_decided_status, None);
+    assert_eq!(row.test_decided_status, None);
     let completion = jobstats::compute(&db.pool, &row).await.unwrap().completion.expect("completed");
     assert!(!completion.forced);
     assert_eq!(completion.reason.as_deref(), Some("reached_target"));

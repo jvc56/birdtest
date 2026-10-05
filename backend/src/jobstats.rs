@@ -3,8 +3,9 @@
 //! stream is byte-for-byte what a page reload would produce.
 
 use crate::error::AppResult;
-use crate::models::job::{GameConfig, GamePairConfig, Job, JobType, LeaveConfig, SprtParams};
-use crate::stats::sprt::{self, Pentanomial, Sample, SprtResult, Tally};
+use crate::models::job::{GameConfig, GamePairConfig, Job, JobType, LeaveConfig, TestParams};
+use crate::stats::match_test::{self, TestResult};
+use crate::stats::outcomes::{Pentanomial, Sample, Tally};
 use serde::Serialize;
 use sqlx::{PgConnection, PgPool, Row};
 use uuid::Uuid;
@@ -59,10 +60,10 @@ pub struct Completion {
     pub at: chrono::DateTime<chrono::Utc>,
     /// Completed by an admin (force-complete) rather than by its own rule.
     pub forced: bool,
-    /// The server's reason, when it completed the job: the SPRT verdict
-    /// (`passed`, `failed`, `terminated_at_max`), `reached_target` for a
-    /// games or pairs job that runs no SPRT and played its games, or `last
-    /// generation built`. None for an opening-rack job whose racks were all
+    /// The server's reason, when it completed the job: the match test's
+    /// verdict (`player1_better`, `player2_better`, `inconclusive`),
+    /// `reached_target` for a games or pairs job that runs no test and played
+    /// its games, or `last generation built`. None for an opening-rack job whose racks were all
     /// analysed.
     pub reason: Option<String>,
 }
@@ -84,7 +85,7 @@ pub struct JobSummary {
 
 #[derive(Debug, Serialize)]
 pub struct GameStats {
-    /// "game" for `games` jobs, "pair" for `game_pairs` — the SPRT unit.
+    /// "game" for `games` jobs, "pair" for `game_pairs` — the test's unit.
     pub unit: &'static str,
     pub wins: u64,
     pub losses: u64,
@@ -98,7 +99,7 @@ pub struct GameStats {
     pub p1_score_mean: Option<f64>,
     pub p2_score_mean: Option<f64>,
     pub spread_mean: Option<f64>,
-    /// Game pairs only: the five pair-outcome counts the LLR is computed from,
+    /// Game pairs only: the five pair-outcome counts the test is computed from,
     /// indexed by player 1's half-point score across the pair.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pentanomial: Option<[u64; 5]>,
@@ -116,22 +117,24 @@ pub struct GameStats {
     pub win_pct: f64,
     pub loss_pct: f64,
     pub draw_pct: f64,
-    /// The test over every accepted result, recomputed on each read. `None`
-    /// for a job that runs no SPRT: it plays `max_units` and stops, and an LLR
-    /// nobody acts on would read as a verdict.
-    pub sprt: Option<SprtResult>,
+    /// The match test over every accepted result, recomputed on each read.
+    /// `None` for a job that runs no test: it plays `max_units` and stops, and
+    /// an interval nobody acts on would read as a verdict.
+    pub test: Option<TestResult>,
     /// What the job was completed on, when the finish check completed it
-    /// (`jobs.sprt_decided_*`). The claims in flight at that moment are still
-    /// played and accepted, so `sprt` can move after it -- even back inside
-    /// the bounds -- and this is the decision that stands.
+    /// (`jobs.test_decided_*`). The claims in flight at that moment are still
+    /// played and accepted, so `test` can move after it -- even back around
+    /// an even score -- and this is the decision that stands.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub decided: Option<SprtDecided>,
+    pub decided: Option<TestDecided>,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct SprtDecided {
+pub struct TestDecided {
     pub status: String,
-    pub llr: f64,
+    /// Player 1's score interval when it was decided.
+    pub lower: f64,
+    pub upper: f64,
     pub units: i64,
 }
 
@@ -595,7 +598,7 @@ async fn lexicon_and_variant(
     Ok((lexicon, Some(job.variant.clone())))
 }
 
-/// The SPRT-relevant statistics for a games or game-pairs job, and `None` for
+/// The match test's statistics for a games or game-pairs job, and `None` for
 /// every other job type.
 ///
 /// This is also what the submission path evaluates the finish conditions on,
@@ -611,15 +614,15 @@ async fn game_stats_on(conn: &mut PgConnection, job: &Job) -> AppResult<Option<G
         JobType::GamePairs => game_pair_stats(&mut *conn, job).await?,
         JobType::OpeningRack | JobType::LeaveGeneration => return Ok(None),
     };
-    if let (Some(status), Some(llr), Some(units)) =
-        (&job.sprt_decided_status, job.sprt_decided_llr, job.sprt_decided_units)
+    if let (Some(status), Some(lower), Some(upper), Some(units)) =
+        (&job.test_decided_status, job.test_decided_lower, job.test_decided_upper, job.test_decided_units)
     {
-        stats.decided = Some(SprtDecided { status: status.clone(), llr, units });
+        stats.decided = Some(TestDecided { status: status.clone(), lower, upper, units });
     }
     Ok(Some(stats))
 }
 
-/// Sum the per-task aggregates for a plain `games` job. The SPRT unit is a
+/// Sum the per-task aggregates for a plain `games` job. The test's unit is a
 /// game, so the tally and the unit count are the same number.
 async fn plain_game_stats(conn: &mut PgConnection, job: &Job) -> AppResult<GameStats> {
     let config = sqlx::query_as::<_, GameConfig>("SELECT * FROM job_game_config WHERE job_id = $1")
@@ -654,7 +657,7 @@ async fn plain_game_stats(conn: &mut PgConnection, job: &Job) -> AppResult<GameS
         ScoreMeans::from_row(&row),
         None,
         None,
-        &SprtParams::from(&config),
+        &TestParams::from(&config),
     ))
 }
 
@@ -749,7 +752,7 @@ async fn game_pair_stats(conn: &mut PgConnection, job: &Job) -> AppResult<GameSt
         ScoreMeans::from_row(&row),
         Some(counts),
         Some(row.get::<i64, _>("divergent_games") as u64 / 2),
-        &SprtParams::from(&config),
+        &TestParams::from(&config),
     );
     stats.divergent = Some(divergent);
     Ok(stats)
@@ -785,10 +788,10 @@ fn build_game_stats(
     scores: ScoreMeans,
     pentanomial: Option<[u64; 5]>,
     divergent_pairs: Option<u64>,
-    params: &SprtParams,
+    params: &TestParams,
 ) -> GameStats {
     // Percentages describe every game played, for both job types: the sample
-    // the LLR runs on is now the same games, viewed as pairs.
+    // the test runs on is the same games, viewed as pairs.
     let total = tally.total();
     let pct = |n: u64| {
         if total == 0 {
@@ -797,16 +800,14 @@ fn build_game_stats(
             100.0 * n as f64 / total as f64
         }
     };
-    let sprt = params.enabled.then(|| {
-        sprt::evaluate(
+    let test = params.enabled.then(|| {
+        match_test::evaluate(
             &sample,
+            if unit == "pair" { match_test::Unit::Pair } else { match_test::Unit::Game },
             units_completed,
+            params.confidence_pct,
             params.min_units as u64,
             params.max_units as u64,
-            params.alpha,
-            params.beta,
-            params.elo_low,
-            params.elo_high,
         )
     });
     GameStats {
@@ -826,7 +827,7 @@ fn build_game_stats(
         win_pct: pct(tally.wins),
         loss_pct: pct(tally.losses),
         draw_pct: pct(tally.draws),
-        sprt,
+        test,
         decided: None,
     }
 }
@@ -981,8 +982,8 @@ async fn worker_contributions_on(
 
 /// Throughput over the last hour, extrapolated to whatever is left. For games
 /// and pairs jobs "what's left" is the distance to `max_units`: the target of
-/// a job without an SPRT, and a ceiling for one with it -- that job may well
-/// stop earlier when the LLR crosses.
+/// a job without a test, and a ceiling for one with it -- that job may well
+/// stop earlier when the test decides.
 async fn estimate_eta(
     conn: &mut PgConnection,
     job: &Job,

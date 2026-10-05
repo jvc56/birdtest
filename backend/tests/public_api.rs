@@ -186,7 +186,8 @@ async fn a_jobs_full_configuration_is_public() {
     assert_eq!(config["games"]["unit"], "game");
     assert_eq!(config["games"]["max_units"], 1_000_000);
     assert_eq!(config["games"]["per_batch"], 10);
-    assert_eq!(config["games"]["sprt_enabled"], true, "{config}");
+    assert_eq!(config["games"]["test_enabled"], true, "{config}");
+    assert_eq!(config["games"]["confidence_pct"], 95.0, "{config}");
     let players = config["players"].as_array().unwrap();
     assert_eq!(players.len(), 2, "{config}");
     assert_eq!(players[0]["role"], "player 1");
@@ -372,7 +373,7 @@ async fn the_job_list_paginates_and_clamps_its_page_size() {
 }
 
 /// A-PUBLIC-2: each job type's detail carries its own stats block and no
-/// other -- games and pairs the SPRT block in their own unit, an opening-rack
+/// other -- games and pairs the match-test block in their own unit, an opening-rack
 /// job its rack progress, a leave job its generation -- and an unknown job is
 /// a 404, for the detail and the stream alike.
 #[tokio::test]
@@ -437,8 +438,8 @@ async fn job_detail_carries_the_stats_block_of_its_type() {
     assert_eq!(pairs["games"]["max_units"], 20);
     // A config row that says nothing of the test runs none, and reports none:
     // `games_job` asks for one, this pairs job does not.
-    assert_eq!(games["games"]["sprt"]["status"], "running", "{games}");
-    assert_eq!(pairs["games"]["sprt"], json!(null), "{pairs}");
+    assert_eq!(games["games"]["test"]["status"], "running", "{games}");
+    assert_eq!(pairs["games"]["test"], json!(null), "{pairs}");
     let (_, racks) = send(&app, get_request(&format!("/api/jobs/{racks}"), &[])).await;
     assert_eq!(
         racks["opening_racks"],
@@ -699,8 +700,10 @@ async fn rack_lookup_finds_an_analysed_rack() {
     assert_eq!(
         body["items"],
         json!([
-            { "analysis": 1, "rank": 1, "move": "8G WUZ", "score": 30, "equity": 32.5 },
-            { "analysis": 1, "rank": 2, "move": "8H ZA", "score": 22, "equity": 21.0 },
+            { "analysis": 1, "rank": 1, "move": "8G WUZ", "score": 30, "equity": 32.5,
+              "iterations": null, "win_percentage": null, "plies": [] },
+            { "analysis": 1, "rank": 2, "move": "8H ZA", "score": 22, "equity": 21.0,
+              "iterations": null, "win_percentage": null, "plies": [] },
         ]),
         "{typed} -> {}",
         racks[1]
@@ -733,6 +736,155 @@ async fn capturing_games_job(db: &TestDb) -> Uuid {
         .await
         .unwrap();
     job
+}
+
+/// A-PUBLIC-4g: a simulated position's moves show their win percentage and
+/// their first two plies' statistics, however many more the job recorded, and
+/// the position what its player inferred of the opponent's leave first. A
+/// position that claims an inference it cannot have -- on a static analysis,
+/// on a game's first turn, with eleven leaves, or leaves out of order -- is
+/// refused.
+#[tokio::test]
+async fn a_simulated_position_shows_its_plies_and_its_inference() {
+    let db = TestDb::new().await;
+    let state = db.state().await;
+    let cfg = state.cfg.clone();
+    let app = birdtest::app(state);
+    let job = capturing_games_job(&db).await;
+    // Recording four plies, so the read is what keeps it to two.
+    sqlx::query(
+        "UPDATE player_configs SET num_plies_recorded = 4
+         WHERE id = (SELECT player1_config_id FROM job_game_config WHERE job_id = $1)",
+    )
+    .bind(job)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let plies = json!([
+        { "ply": 0, "bingo_percentage": 12.5, "average_score": 31.25 },
+        { "ply": 1, "bingo_percentage": 7.5, "average_score": 28.5 },
+        { "ply": 2, "bingo_percentage": 5.0, "average_score": 30.5 },
+    ]);
+    let leaves = |n: usize| -> Vec<serde_json::Value> {
+        (0..n).map(|i| json!({ "leave": "EIR", "draws": 100 - i as i64, "equity": 18.25 })).collect()
+    };
+    let inference = json!({
+        "num_leaves": 40, "total_draws": 900, "average_equity": 12.5,
+        "leaves": [
+            { "leave": "EIR", "draws": 120, "equity": 18.25 },
+            { "leave": "AET", "draws": 80, "equity": 15.0 },
+        ],
+    });
+    let position = |turn: i64, analysis: &str, inference: Option<serde_json::Value>| {
+        let simmed = analysis == "sim";
+        let mut position = json!({
+            "game_index": 0, "turn_number": turn, "rack": "AABCDE?",
+            "position": format!("cgp-{turn}"), "played_move": "8D BACCAE",
+            "played_move_score": 74, "num_moves": 40, "analysis": analysis,
+            "moves": [{
+                "move": "8D BACCAE", "score": 74, "equity": 81.2,
+                "iterations": if simmed { 340 } else { 0 },
+                "win_percentage": if simmed { json!(61.5) } else { json!(null) },
+                "plies": if simmed { plies.clone() } else { json!([]) },
+            }],
+        });
+        if turn > 0 {
+            position["previous_move"] = json!("8G DAB");
+            position["previous_move_score"] = json!(12);
+        }
+        if let Some(inference) = inference {
+            position["inference"] = inference;
+        }
+        position
+    };
+    // Every submission also carries game 1's first turn, which a capturing
+    // job requires, so a refusal is the inference's.
+    let other_game = {
+        let mut other = position(0, "sim", None);
+        other["game_index"] = json!(1);
+        other["rack"] = json!("ABBCDEE");
+        other
+    };
+    let submit_positions = |positions: serde_json::Value| {
+        let app = app.clone();
+        let other_game = other_game.clone();
+        async move {
+            let (assignment, uuid) = first_claim(&app).await;
+            let mut result = games_result(2, 1);
+            let mut positions = positions.as_array().unwrap().clone();
+            positions.push(other_game);
+            result["positions"] = json!(positions);
+            send(
+                &app,
+                post_json(
+                    "/api/worker/result",
+                    &[("x-worker-uuid", uuid.as_str())],
+                    json!({ "claim_token": assignment["claim_token"], "result": result }),
+                ),
+            )
+            .await
+        }
+    };
+
+    let mut too_many = inference.clone();
+    too_many["leaves"] = json!(leaves(11));
+    too_many["num_leaves"] = json!(400);
+    let mut out_of_order = inference.clone();
+    out_of_order["leaves"] = json!([
+        { "leave": "AET", "draws": 80, "equity": 15.0 },
+        { "leave": "EIR", "draws": 120, "equity": 18.25 },
+    ]);
+    for (bad, why) in [
+        (position(3, "static", Some(inference.clone())), "a static analysis"),
+        (position(0, "sim", Some(inference.clone())), "a first turn"),
+        (position(3, "sim", Some(too_many)), "eleven leaves"),
+        (position(3, "sim", Some(out_of_order)), "leaves out of order"),
+    ] {
+        let (status, body) = submit_positions(json!([bad])).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{why}: {body}");
+    }
+
+    let (status, body) = submit_positions(json!([
+        position(0, "sim", None),
+        position(3, "sim", Some(inference.clone())),
+    ]))
+    .await;
+    assert_eq!((status, &body), (StatusCode::OK, &json!({ "accepted": true })));
+
+    let user = db.user(&format!("reader{}", Uuid::new_v4().simple()), false).await;
+    let headers = admin_headers(&cfg, user);
+    let (status, page) = send(
+        &app,
+        get_request(&format!("/api/jobs/{job}/positions?rack=AABCDE%3F"), &headers),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let items = page["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2, "{page}");
+    let at = |turn: i64| items.iter().find(|p| p["turn_number"] == turn).unwrap();
+    // Stored to the four plies recorded, shown to two.
+    let shown = json!([
+        { "ply": 0, "bingo_percentage": 12.5, "average_score": 31.25 },
+        { "ply": 1, "bingo_percentage": 7.5, "average_score": 28.5 },
+    ]);
+    for turn in [0, 3] {
+        assert_eq!(at(turn)["moves"][0]["plies"], shown, "{page}");
+        assert_eq!(at(turn)["moves"][0]["win_percentage"], json!(61.5), "{page}");
+        assert_eq!(at(turn)["moves"][0]["iterations"], json!(340), "{page}");
+    }
+    assert_eq!(at(0)["inference"], json!(null), "{page}");
+    assert_eq!(at(3)["inference"], inference, "{page}");
+    let stored: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM position_analysis_plies p
+         JOIN position_analysis_moves m ON m.id = p.move_id
+         JOIN position_analysis_records r ON r.id = m.record_id WHERE r.job_id = $1",
+    )
+    .bind(job)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(stored, 9, "three plies a move, three positions (game 1's too)");
 }
 
 /// A-PUBLIC-4b: a games job's captured positions are searchable by rack by a
@@ -786,12 +938,14 @@ async fn captured_positions_are_searchable_when_signed_in() {
     assert_eq!(
         first["items"][0]["moves"],
         json!([
-            { "rank": 1, "move": "8D BACCAE", "score": 74, "equity": 81.2, "win_percentage": null,
-              "mean_spread": null, "fidelity_plies": null },
-            { "rank": 2, "move": "8D ABACE", "score": 72, "equity": 79.0, "win_percentage": null,
-              "mean_spread": null, "fidelity_plies": null },
+            { "rank": 1, "move": "8D BACCAE", "score": 74, "equity": 81.2, "iterations": null,
+              "win_percentage": null, "mean_spread": null, "fidelity_plies": null, "plies": [] },
+            { "rank": 2, "move": "8D ABACE", "score": 72, "equity": 79.0, "iterations": null,
+              "win_percentage": null, "mean_spread": null, "fidelity_plies": null, "plies": [] },
         ])
     );
+    // A static position infers nothing.
+    assert_eq!(first["items"][0]["inference"], json!(null));
     let cursor = first["next_cursor"].as_str().expect("a full page has a next");
     let (_, second) = send(
         &app,
