@@ -1200,25 +1200,42 @@ async fn finish_condition_met(state: &AppState, job: &Job) -> AppResult<Option<c
             // job seeking a consensus, agreed on or analysed its most times.
             // A rack settles in the transaction that stores its analysis, so
             // the running count is exact.
-            sqlx::query_scalar::<_, bool>(
-                "SELECT j.racks_settled >= c.total_racks
-                        AND EXISTS (SELECT 1 FROM tasks t WHERE t.job_id = j.id)
-                        AND NOT EXISTS (SELECT 1 FROM tasks t
-                                        WHERE t.job_id = j.id AND t.state <> 'completed')
-                 FROM jobs j JOIN job_opening_rack_config c ON c.job_id = j.id
-                 WHERE j.id = $1",
-            )
-            .bind(job.id)
-            .fetch_optional(&state.pool)
-            .await?
-            .unwrap_or(false)
-            .then_some(Finish::RacksAnalysed)
+            sqlx::query_scalar::<_, bool>(OPENING_RACK_FINISHED)
+                .bind(job.id)
+                .fetch_optional(&state.pool)
+                .await?
+                .unwrap_or(false)
+                .then_some(Finish::RacksAnalysed)
         }
         // Leave generation completes in `run_transition` once the final
         // generation is aggregated.
         JobType::LeaveGeneration => None,
     })
 }
+
+/// Whether an opening-rack job is done: every rack settled, at least one task
+/// made, and none still out -- nothing `available` (a reissue, or a declined
+/// task, waiting to go out again) and no claim open. A task not completed is
+/// one or the other: `available`, or `claimed` with exactly one open claim
+/// (`task_claims_one_slot_idx`).
+///
+/// Asked through indexes bounded by the job's front, its queue and the
+/// fleet's open claims (`tasks_seed_unique_idx`, `tasks_queue_idx`,
+/// `task_claims_open_idx`), not as `EXISTS` over the job's tasks and
+/// `NOT EXISTS (... state <> 'completed')`: both were planned as sequential
+/// scans of `tasks`, every job's history, the second reading the whole table
+/// exactly when the job was done. 395-414 ms at 3.2 million tasks, on the
+/// submission that settles the job's last rack, before its worker is
+/// answered; 0.3 ms this way. "Any task at all" is a scalar subquery in seed
+/// order, not `EXISTS`, which Postgres would plan the same way again.
+/// Public so a test can check its plan (`I-STATS-9j`).
+pub const OPENING_RACK_FINISHED: &str = "SELECT j.racks_settled >= c.total_racks
+        AND (SELECT 1 FROM tasks t WHERE t.job_id = j.id ORDER BY t.seed LIMIT 1) IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.job_id = j.id AND t.state = 'available')
+        AND NOT EXISTS (SELECT 1 FROM task_claims k
+                        WHERE k.job_id = j.id AND k.state = 'claimed')
+     FROM jobs j JOIN job_opening_rack_config c ON c.job_id = j.id
+     WHERE j.id = $1";
 
 // ---------------------------------------------------------------------------
 
@@ -1280,18 +1297,36 @@ mod contract_fixtures {
         assert!(unsupported_build(body.board_dim, body.rack_size).is_none());
     }
 
+    /// C-10
     #[test]
     fn decline_parses_as_a_decline_body() {
-        let body: DeclineBody = serde_json::from_str(include_str!(
+        let fixture: Value = serde_json::from_str(include_str!(
             "../../../contract-fixtures/decline-missing-data.json"
         ))
-        .expect("decline-missing-data.json no longer parses as DeclineBody");
+        .unwrap();
+        let body: DeclineBody = serde_json::from_value(fixture.clone())
+            .expect("decline-missing-data.json no longer parses as DeclineBody");
         assert_eq!(body.reason, "missing_data");
         // One file absent entirely and one present with the wrong bytes: the
         // two cases `actual` exists to tell apart.
         assert_eq!(body.missing.len(), 2);
         assert!(body.missing.iter().any(|m| m.actual.is_none()));
         assert!(body.missing.iter().any(|m| m.actual.is_some()));
+
+        // MAGPIE leaves `actual` out for a file it did not find rather than
+        // writing the fixture's null (its test checks it builds this body
+        // otherwise key for key): the absence reads the same.
+        let mut magpie = fixture;
+        for entry in magpie["missing"].as_array_mut().unwrap() {
+            if entry["actual"].is_null() {
+                entry.as_object_mut().unwrap().remove("actual");
+            }
+        }
+        let theirs: DeclineBody = serde_json::from_value(magpie).unwrap();
+        assert_eq!(
+            theirs.missing.iter().map(|m| m.actual.clone()).collect::<Vec<_>>(),
+            body.missing.iter().map(|m| m.actual.clone()).collect::<Vec<_>>()
+        );
     }
 
     // Captured from a real `magpie contribute` exchange by
@@ -1352,14 +1387,12 @@ mod contract_fixtures {
                 name: "NWL23".into(),
                 path: "lexica/NWL23.kwg".into(),
                 sha256: "3e74af98".into(),
-                bytes: 4_719_596,
                 tarball_date: "20251004".into(),
             }]),
             derived: std::sync::Arc::new(vec![crate::derived::ExpectedDerived {
                 role: "wmp".into(),
                 name: "NWL23".into(),
                 sha256: "214a46d7".into(),
-                bytes: 104_857_600,
                 builder: "wmp-1".into(),
                 build_target: "nehalem".into(),
             }]),
@@ -1429,9 +1462,10 @@ mod contract_fixtures {
         let fixture: Value = serde_json::from_str(ANON_UUID_ASSIGNMENT).unwrap();
         let minted: Uuid = serde_json::from_value(fixture["worker_uuid"].clone())
             .expect("anon-uuid-assignment.json carries no worker_uuid");
-        // Its job pins no derived file, and says so rather than leaving the
-        // key out: a missing key reads to a client as a server that checks
-        // nothing.
+        // Its job pins no derived file, and says so with an empty list rather
+        // than leaving the key out: the shape the fixture pins. (MAGPIE reads
+        // the two alike: a player asking for a wordmap or table the list does
+        // not pin is refused, `derived_mismatch`.)
         assert_eq!(fixture["expected_data"]["derived"], serde_json::json!([]));
         let envelope = envelope_for(&fixture, Some(minted));
         assert_same_shape(&fixture, &envelope, "anon-uuid-assignment envelope");

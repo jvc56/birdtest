@@ -162,13 +162,15 @@ describe('F-AUTH-2 signOut', () => {
     expect((init as RequestInit).method).toBe('POST');
   });
 
-  it('clears the store even if the request fails with an error response', async () => {
+  it('a failed request leaves a live session signed in, and rethrows', async () => {
     const { session, refreshSession, signOut } = await freshAuth();
     fetchMock.mockResolvedValueOnce(json(200, ME));
     await refreshSession();
-    fetchMock.mockResolvedValueOnce(json(500, { code: 'internal', message: 'boom' }));
-    await expect(signOut()).rejects.toThrow('boom');
-    expect(get(session)).toBeNull();
+    fetchMock.mockResolvedValueOnce(json(503, { code: 'unavailable', message: 'busy' }));
+    fetchMock.mockResolvedValueOnce(json(200, ME));
+    await expect(signOut()).rejects.toThrow('busy');
+    expect(fetchMock.mock.calls[2][0]).toBe('/api/me');
+    expect(get(session)).toEqual(ME);
   });
 
   it('stops asking /api/me again after a failed refresh', async () => {
@@ -182,11 +184,23 @@ describe('F-AUTH-2 signOut', () => {
     expect(get(session)).toBeNull();
   });
 
-  it('clears the store even if the network is down', async () => {
+  it('with the network down, keeps the user it had rather than show signed out', async () => {
     const { session, refreshSession, signOut } = await freshAuth();
     fetchMock.mockResolvedValueOnce(json(200, ME));
     await refreshSession();
     fetchMock.mockRejectedValueOnce(new TypeError('Failed to fetch'));
+    fetchMock.mockRejectedValueOnce(new TypeError('Failed to fetch'));
+    await expect(signOut()).rejects.toThrow('Failed to fetch');
+    expect(get(session)).toEqual(ME);
+  });
+
+  it('a failed request whose re-ask finds no session shows signed out', async () => {
+    const { session, refreshSession, signOut } = await freshAuth();
+    fetchMock.mockResolvedValueOnce(json(200, ME));
+    await refreshSession();
+    // The logout landed but its answer was lost: the cookie is gone.
+    fetchMock.mockRejectedValueOnce(new TypeError('Failed to fetch'));
+    fetchMock.mockResolvedValueOnce(json(401, { code: 'unauthorized', message: 'Not signed in.' }));
     await expect(signOut()).rejects.toThrow('Failed to fetch');
     expect(get(session)).toBeNull();
   });

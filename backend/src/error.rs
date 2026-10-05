@@ -35,6 +35,10 @@ pub const LOCK_NOT_AVAILABLE: &str = "55P03";
 /// SQLSTATE for a statement Postgres cancelled, which here means the display
 /// pool's `statement_timeout` (`db::connect_read`): nothing else sets one.
 pub const QUERY_CANCELED: &str = "57014";
+/// SQLSTATE for a text value holding a NUL, which no Postgres text can.
+pub const CHARACTER_NOT_IN_REPERTOIRE: &str = "22021";
+/// SQLSTATE for a `\u0000` in JSON that Postgres is asked to read as text.
+pub const UNTRANSLATABLE_CHARACTER: &str = "22P05";
 
 #[derive(Serialize)]
 struct ErrorBody {
@@ -185,6 +189,16 @@ impl From<sqlx::Error> for AppError {
                             "that claim is busy; try again shortly",
                         )
                     },
+                    // A NUL in something the caller sent -- a query
+                    // parameter, a login name, a key's label -- bound as
+                    // text. Every text the server binds that could hold one
+                    // is the caller's (results and declines refuse it before
+                    // the database), so this is a malformed request, not a
+                    // fault: answered as one rather than a 500 and an error
+                    // line any caller could write at will.
+                    Some(CHARACTER_NOT_IN_REPERTOIRE | UNTRANSLATABLE_CHARACTER) => {
+                        AppError::bad_request("the request holds a character that cannot be stored (a NUL)")
+                    }
                     _ => AppError::internal(format!("database error: {db}")),
                 };
                 // The database's own words go to the log, never to the
@@ -398,6 +412,21 @@ mod tests {
             assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
             assert_eq!(body["message"], ours, "{body}");
             assert!(!body.to_string().contains("task_claims"), "{body}");
+        }
+    }
+
+    /// U-ERR-8: a NUL the database cannot store is the caller's 400, without
+    /// the database's words: a `?worker=%00` or a NUL in a login name was a
+    /// 500 and an error line.
+    #[tokio::test]
+    async fn a_nul_the_database_cannot_store_is_a_bad_request() {
+        for code in [CHARACTER_NOT_IN_REPERTOIRE, UNTRANSLATABLE_CHARACTER] {
+            let err: AppError =
+                db_error(code, "invalid byte sequence for encoding \"UTF8\": 0x00").into();
+            let (status, _, body) = rendered(err).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{code}");
+            assert_eq!(body["code"], "bad_request", "{body}");
+            assert!(!body.to_string().contains("UTF8"), "{body}");
         }
     }
 

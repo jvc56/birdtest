@@ -1014,7 +1014,6 @@ JobStats {
                                      spread_mean },   // pairs: the games that diverged
                        min_units, max_units,
                        p1_score_mean, p2_score_mean, spread_mean,   // null before any game
-                       win_pct, loss_pct, draw_pct,
                        test: { mean, lower, upper, elo, elo_lower, elo_upper,
                                confidence_pct, status } | null,
                        decided?: { status, lower, upper, units } }
@@ -1289,13 +1288,18 @@ are snapshots streams from the database, and the page offers to build its final
 export. (Before exports could be taken mid-run the rule was "completed only",
 and the redirect served the newest ready export whatever it was built from:
 an export taken mid-run would have become the completed job's corpus.) The one
-way a completed job takes results again is a consensus edit that unsettles an
-opening-rack job's racks; that reopens it and demotes its final exports to
-snapshots (`exports::unfinalize`), since it will have a new final corpus once
-it completes again; an export still building then fails ("the job reopened
-while this export was building: export it again"), since its snapshot may have
-been read while the job was completed, and the job may have completed again by
-the time it finishes.
+way a completed job's corpus changes is a consensus edit of an opening-rack
+job. One that unsettles racks reopens the job, which takes results again; one
+that leaves every rack settled still restates each rack's standing, which
+every line of the export carries (a lower share turns racks settled without a
+consensus into agreed ones). Either way the edit demotes the job's final
+exports to snapshots (`exports::unfinalize`), since its final corpus is the
+next one built once it is completed; an export still building then fails ("the
+job's consensus settings changed while this export was building: export it
+again"), since its snapshot may have been read before the edit, and the job is
+completed -- still, or again -- by the time it finishes. (Until the
+thirty-third audit's third pass only a reopening demoted them, and an edit
+that left the job completed went on serving the old standings as its corpus.)
 
 **Final is decided inside the snapshot.** An export reads its results and its
 captured positions in **one** `REPEATABLE READ`, read-only transaction on one
@@ -1387,6 +1391,8 @@ leave-generation job's 3,199,724 progress rows. Warm times, best of two:
 | Public worker list — **as it was**, grouping every claim | page view | 93 ms (it now reads the per-identity running counters on `users` and `anonymous_workers`, a page at a time through their indexes) |
 | Leave `next_step` rack selection — **as it was**, ordering on `(occurrence_count, rack)` through an index without `rack` | every leave claim, inside the dispatch lock | 225–390 ms at **400,000** racks (an eighth of English; a scan and sort of the generation, so linear from there — 2–3 s at full size). The 47 ms first recorded here was measured on counts that rarely tied |
 | Leave `next_step` rack selection **as it is now** — a sweep of the primary key from a cursor while many racks are below target, lowest count first on the narrow index once few are | every leave claim | sweep: 3.9 ms at 400,000 racks with 97% of them at target (16,000 rows stepped over for 501 racks; nearer 0.1 ms early in a generation), and the same with nothing staged or ten thousand results staged; tail: 0.5 ms with little out, 67 ms with all 50,000 racks below target out (it begins only at a lap's boundary, so a sweep's claims are never among what it excludes) |
+| Leave universe probe (`universe_exists`, and the tail's "any rack below target") — **as it was**, an `EXISTS` | every leave claim, inside the dispatch lock | a sequential scan once the generation is in the table's statistics, reading every older generation's rows of every leave job before the current one's: 133–156 ms over 2,000,000 older rows, custom or generic plan, and 135–279 ms with `synchronize_seqscans` on and two jobs' claims alternating (one job's claims alone were cheap only while each scan started where the last stopped). An English generation adds 3.2 million rows. Measured by the thirty-third audit's third pass (PostgreSQL 16.15, default settings): two leave jobs, generations 1–3 and 1–2, 1,000,000 racks each |
+| Leave universe probe **as it is now** — `ORDER BY` the index's order, `LIMIT 1`, outside an `EXISTS` (which drops the order) | every leave claim | 0.02–0.08 ms, an index-only scan of the primary key, custom or generic (below target: 0.04–0.13 ms on the pick index); `I-LEAVE-25` |
 | `leave_gen_stats` — **as it was**, counting the generation's racks at target | job detail and every SSE push | 210 ms |
 | `leave_gen_stats` **as it is now** — the generation's summary row | job detail and every SSE push | one single-row read |
 | Transition: stream generation 1 by rack | once per generation | 674 ms |
@@ -1396,6 +1402,8 @@ leave-generation job's 3,199,724 progress rows. Warm times, best of two:
 | Opening-rack in-flight racks **as they are now** — the open reissues alone, given back through the queue index and claimed through the open claims' | every reissue claim of a consensus job | 2–5 ms at 200,000 completed reissues (433 buffers), custom or generic plan; 11–12 ms with none completed, where the planner sorted the 5,000 racks to de-duplicate them rather than hashing them (the reads themselves under 1 ms, 230 buffers). Bounded by the open reissues and the fleet's open claims, not by history (`I-OR-REISSUE-2` for what it reads) |
 | Opening-rack "unseen first" — **as it was**, an `EXISTS` | every reissue claim of a consensus job, inside the dispatch lock | with current statistics, as above; with statistics that understate `position_analysis_records` — a database just restored by `pg_restore`, which restores none, or autovacuum behind — Postgres hashed it, reading every analysis the identity made in the job to answer for 2,000 racks: **1.95 s** custom and **1.2 s** generic for an identity with 300,000 analyses (the same dataset; 5.3 s generic with the table never analysed, in the pass's first measurement) |
 | Opening-rack "unseen first" **as it is now** — a scalar subquery, `(SELECT 1 … LIMIT 1) IS NOT NULL`, which Postgres never hashes | every reissue claim of a consensus job | 22–23 ms custom with current statistics (a window of 2,000 with 5,000 in flight, the same dataset), 25–27 ms with the understated ones; generic, 30–37 ms with JIT off and 116 ms with it on |
+| Opening-rack finish check — **as it was**, `EXISTS` a task and `NOT EXISTS` one not completed | the submission that settles the job's last rack, before its worker is answered; the idle and post-edit checks | 395–414 ms at 3,200,000 tasks over 11 jobs (607 ms with a claim per task): both were sequential scans of `tasks`, every job's history, the second the whole table exactly when the job was done. Measured by the thirty-third audit's third pass |
+| Opening-rack finish check **as it is now** — a first task by seed, none available, no open claim | the same | 0.32–0.37 ms done, 1.0 ms with reissues in flight, custom or generic; bounded by the fleet's open claims, not by history (`I-STATS-9j`) |
 | Materializing a generation's rack universe | once per generation | **56–66 s** (measured as a SQL copy inside the transition, which is where it used to run; it now runs from the first claim of the generation it belongs to, off the critical path) |
 
 What the numbers settled:
@@ -1624,7 +1632,7 @@ start. The process has no SSM code path of its own.
 | `S3_BUCKET` | `birdtest-artifacts` | |
 | `S3_ENDPOINT` | unset | Set to MinIO's address locally; the AWS SDK works against it unmodified. |
 | `S3_PUBLIC_ENDPOINT` | unset | The object store as a browser reaches it, when that differs from `S3_ENDPOINT`: export download links are signed for it. The compose stack sets `http://localhost:${MINIO_PORT}`, since its backend reaches MinIO as `minio:9000`; production leaves it unset. |
-| `MIN_MAGPIE_VERSION` | `0.1.1` | The enforced global floor, and the default floor for a new job. Also a floor the server's own pinned MAGPIE must clear: startup fails if `MAGPIE_BIN` reports less, since the server would be publishing hashes built by a MAGPIE its workers may not run. The default (`config::DEFAULT_MIN_MAGPIE_VERSION`) is copied into Terraform's `min_magpie_version`, both compose files, `scripts/e2e_magpie_native.sh`, the `jobs` column defaults and `scripts/dev.py`; `U-CFG-5` fails when a raise misses one. |
+| `MIN_MAGPIE_VERSION` | `0.1.1` | The enforced global floor, and the default floor for a new job. Also a floor the server's own pinned MAGPIE must clear: startup fails if `MAGPIE_BIN` reports less, since the server would be publishing hashes built by a MAGPIE its workers may not run. The default (`config::DEFAULT_MIN_MAGPIE_VERSION`) is copied into Terraform's `min_magpie_version`, both compose files, `scripts/e2e_magpie_native.sh`, `backend/.env.example`, the root `.env.example`, the `jobs` column defaults and `scripts/dev.py`; `U-CFG-5` fails when a raise misses one. |
 | `MAGPIE_BIN` | `/usr/local/bin/magpie` | The pinned MAGPIE the server runs for every derived file and every leave-generation KLV. The backend image builds one in; locally, a checkout's `bin/magpie`. Startup fails without a working one. |
 | `MAGPIE_THREADS` | `1` | Threads given to a conversion. The web task keeps 1; the derived-file builder task sets its vCPU count. |
 | `MAGPIE_SCRATCH_DIR` | the system temp directory | Where a conversion's throwaway data directory goes. The builder task points it at its ephemeral volume, since a rack info table is 1.9 GB. |
@@ -3041,7 +3049,10 @@ small for a one-analysis job, every row of which is settled. The job's
 job's row, and the job completes once `racks_settled` reaches `total_racks`
 with nothing in flight. The page's progress bar is racks settled; its rack
 lookup numbers each analysis of a rack and says what they agree on; an export
-line carries its rack's standing (for a job whose maximum is above one).
+line carries its rack's standing (for a job whose maximum is above one, and
+for a rack with more than one analysis whatever the maximum is now: a job
+whose maximum was lowered to one still counts those racks' disagreements in
+`racks_without_consensus`).
 
 **Editing the consensus.** `PATCH /api/admin/jobs/:id/consensus` takes any of
 the three settings; only those sent change, and none that differs is a `200`
@@ -3064,6 +3075,9 @@ racks. Then the job follows:
   for it, and to `inactive` otherwise, or with no allocation (`job.deactivated`,
   and the response says why). Either way its final exports become snapshots
   ([Exports](#exports)).
+- **Completed, with every rack still settled:** it stays completed, and its
+  final exports still become snapshots, since the standings their lines carry
+  were restated ([Exports](#exports)).
 - **Active, with every rack now settled:** it completes at once if nothing is
   in flight, or with its last in-flight claim's submission.
 - **Inactive:** its status stays; it completes when next activated if nothing
@@ -3145,7 +3159,7 @@ job page's **Consensus** card makes the same edit.
 Each task represents one batch of games (`games_per_batch` from the job config) played starting at a given seed. MAGPIE seeds a random stream with S and draws each of the batch's N game seeds from it, so a task's games are fixed by S alone. Consecutive task seeds are spaced `games_per_batch` apart, which keeps them unique and ordered.
 
 At claim time (all in one transaction):
-1. Compute next seed: `SELECT COALESCE(MAX(seed) + $games_per_batch, 1) FROM tasks WHERE job_id = $job_id`. This yields seed 1 for the first task, then `1 + games_per_batch`, `1 + 2*games_per_batch`, etc. The insert in step 2 will conflict on the unique seed index if two workers race; the loser retries.
+1. Compute next seed: `SELECT COALESCE(MAX(seed) + $games_per_batch, 1) FROM tasks WHERE job_id = $job_id`. This yields seed 1 for the first task, then `1 + games_per_batch`, `1 + 2*games_per_batch`, etc. This read and the insert in step 2 run under the job's dispatch lock (see [The claim loop in full](#the-claim-loop-in-full)), so no two claims compute the same seed; the unique seed index is a backstop, and a violation would re-run selection.
 2. `INSERT INTO tasks (job_id, seed, state) VALUES ($job_id, $next_seed, 'available') RETURNING id`; the claim in step 4 moves it to `claimed` in the same transaction, through the counter update every claim uses.
 3. `INSERT INTO game_requests (task_id, variant, letter_distribution, board_layout, seed, num_games, capture_positions, player1_config_id, player2_config_id)` — denormalize the job's settings so the worker receives a self-contained request. Each player config carries its own lexicon.
 
@@ -3802,9 +3816,9 @@ already uses elsewhere, rather than introducing a second sleep abstraction.
 
 **The WASM build compiles everything.** `Makefile-wasm` compiles every `.c` under
 `src`'s subdirectories, so every new file must compile under Emscripten.
-Networking is meaningless there, so the compat layer defines `MAGPIE_NO_NETWORK`
-for wasm and `chttp_request()` becomes a stub that pushes an error onto the
-stack. Nothing above compat needs to know.
+Networking is meaningless there, so `src/compat/chttp.c` compiles a stub under
+`#if defined(__wasm__)`: `chttp_request()` pushes an error onto the stack and
+`chttp_is_available()` is false. Nothing above compat needs to know.
 
 ### Design overview
 
@@ -4057,8 +4071,9 @@ not silently inherit whatever a user last set for simulation.
    and compare. Any file missing or mismatched: decline, record the job as
    unsupported, and claim again without starting the heartbeat or running the
    task. An assignment with no `expected_data`, or one naming an `algorithm`
-   other than `sha256`, fails the claim like any malformed assignment: nothing
-   runs on input data it cannot check.
+   other than `sha256`, or listing a file without a role, name or digest, or
+   with a role this build does not know, fails the claim like any malformed
+   assignment: nothing runs on input data it cannot check.
    Full detail in [Capability negotiation](#capability-negotiation).
 4. **Version cross-check.** The server has already filtered on the version sent
    in step 2, so an assignment whose `min_magpie_version` exceeds this build is a
@@ -4421,10 +4436,10 @@ file. Each claim carries them under `expected_data.derived`:
 
 ```json
 "derived": [
-  { "role": "wmp", "name": "NWL23", "sha256": "214a…", "bytes": 104857600,
+  { "role": "wmp", "name": "NWL23", "sha256": "214a…",
     "builder": "wmp-1", "build_target": "nehalem" },
   { "role": "rit", "name": "CSW24.CSW_quackle_leaves", "sha256": "157b…",
-    "bytes": 1885416048, "builder": "rit-1", "build_target": "nehalem" }
+    "builder": "rit-1", "build_target": "nehalem" }
 ]
 ```
 
@@ -4523,8 +4538,9 @@ web task: a table build peaks at about 2.4 GB and writes a 1.9 GB file, against
 the web task's 1 vCPU and 2 GB. It builds from a queue (`derived_data`), at most eight files a run, under a lease
 and exits. **A job whose derived files are not built is not dispatched** — the
 same wait as a leave-generation job whose universe is not seeded — because
-dispatching without the hash would mean sending a worker no `derived` entry,
-which it reads as a server that checks nothing. `/admin/derived-data` is where
+dispatching without the hash would carry no hash for a file its player asks
+for, which MAGPIE refuses (`derived_mismatch`), setting the job aside for the
+run on every worker that claims it. `/admin/derived-data` is where
 that wait is visible.
 
 The gate is a query over the job's config, its players, `input_data` and
@@ -4642,7 +4658,7 @@ MAGPIE's defaults fixes it).
     "algorithm": "sha256",
     "files": [
       { "role": "kwg", "name": "NWL23", "path": "lexica/NWL23.kwg",
-        "sha256": "3e74af98...", "bytes": 4719596, "tarball_date": "20260925" }
+        "sha256": "3e74af98...", "tarball_date": "20260925" }
     ]
   },
   "task_request": { "job_type": "games", "...": "..." }
@@ -4652,7 +4668,9 @@ MAGPIE's defaults fixes it).
 `expected_data` lists every file this task will load — the deduplicated union over
 the job and its players — with the digest the job pins. `role` and `name` are what
 the client resolves through `data_filepaths`; `path` and `tarball_date` are for the
-message it prints when something does not match. A `leave_generation` task carries
+message it prints when something does not match. No entry states a size, here or in
+`derived`: the client reads none (the thirty-third audit removed a `bytes` key that
+every entry carried and nothing on the worker side read). A `leave_generation` task carries
 exactly three entries: `kwg`, `letterdist`, `layout`.
 
 `min_magpie_version` is always present. `worker_uuid` is present **only** when the
@@ -5174,6 +5192,15 @@ response also carries a `Retry-After` header in whole seconds.
 `ApiQuery`): a malformed id in a URL is `404 not_found` — it names nothing — and
 a malformed query `400`, where axum's own extractors answered plain text.
 
+**So is a NUL.** Postgres stores no NUL in text, and refuses a statement that
+binds one (SQLSTATE `22021`, or `22P05` for a `\u0000` read from JSON as text).
+Every text the server binds that could hold one is the caller's — results and
+declines refuse it before the database — so that refusal is a `400
+bad_request` ("the request holds a character that cannot be stored"), not a
+`500`. Until the thirty-third audit's third pass a `?worker=%00` on a job's
+public results feed, a NUL in a login name or a reset address, or a key label
+was a `500` and an error line anyone could write.
+
 `message` is shown to people. A `500`'s is replaced by "internal error" when it
 came from the database; a `503`'s is not, since it says to try again.
 
@@ -5494,7 +5521,7 @@ All Admin API endpoints require the requesting user to have `is_admin = TRUE`. A
 | `GET` | `/api/admin/fleet` | What the field is running, from `task_claims.magpie_version`: workers and claims per version, over the claims completed in the last seven days and those made in that week and still open — an open claim older than a week, which lazy reclamation can leave behind long after its worker went (KL-1), is not counted (KL-32). |
 | `GET` | `/api/admin/backups` | Recent backup runs and how stale the newest successful one is. Read-only: backups are performed by a scheduled task, never by the server — see [Backups and Restore](#backups-and-restore). |
 | `POST` | `/api/admin/rating-pools` | Create a rating pool: name (as a job's: at most 100 characters, one line, stored trimmed), scope, and the anchor config that fixes the scale. The anchor joins as a member automatically. |
-| `POST` | `/api/admin/rating-pools/:id/members` | Add a player config to the pool and refit it. Returns the new run id. |
+| `POST` | `/api/admin/rating-pools/:id/members` | Add a player config to the pool and refit it. Returns the new run id; `run_id` is `null` for a config that is already a member (a second click, or the anchor), which is neither logged nor refitted. |
 | `DELETE` | `/api/admin/rating-pools/:id/members/:config_id` | Remove a config and refit. Refused for the pool's anchor, which every other rating is measured against (move the anchor first); `404` for a config not in the pool, which is neither logged nor refitted. |
 | `PATCH` | `/api/admin/rating-pools/:id` | Move the anchor (`anchor_player_config_id`, added as a member if it is not one) and/or its `anchor_rating`, and refit in the same transaction (trigger `anchor`). Logged as `rating_pool.anchor_changed` with old → new in the reason. `run_id` is `null` when nothing changed. |
 | `DELETE` | `/api/admin/rating-pools/:id` | Delete a pool with its members, runs, ratings and residuals, after logging its census. The games stay with their jobs. `204`; `404` for a pool that does not exist. |
@@ -5525,7 +5552,10 @@ a player simulates on plies alone: a "simmer" without plies would play
 statically on every worker. A simmer must also set `max_iterations`, and
 `time_limit_secs` of 0: MAGPIE applies a time limit only above 0 (a null means
 its 60-second default), and a limit makes how far a simulation gets depend on the
-contributor's hardware, so the iteration budget bounds it instead. `use_rit` is
+contributor's hardware, so the iteration budget bounds it instead. And it must
+generate at least two candidates (`num_plays`): autoplay's move list holds
+`num_plays` plays, and with one MAGPIE plays it without simulating, every turn
+-- the other way to a "simmer" that plays statically (thirty-third audit, pass 3). `use_rit` is
 accepted: a rack info table carries precomputed leave values that move
 generation uses in place of the leaves the config pins, which is why it was
 refused until the server could build the table for this exact (lexicon, leaves)
@@ -5614,12 +5644,14 @@ Beyond role matching, creation enforces eight rules the schema cannot express:
   Both players' lexicons must be compatible with each other and each with its own
   leaves, and both with the job's single letter distribution. birdtest must not
   be able to build a job MAGPIE would refuse to load.
-- **Shared-option agreement.** `win_pct_model` and `movegen_margin` are sent per
-  player but are really one MAGPIE setting for the whole run, so two *different*
-  configs must agree on both — the win% model only where both state one, since a
-  static player has none and static-versus-simmer is the mix a games job most
-  often wants. Skipped when both slots name the same config, which
-  is a legal and useful degenerate case.
+- **Shared-option agreement.** `win_pct_model` is sent per player but is really
+  one MAGPIE setting for the whole run, so two *different* configs must agree on
+  it where both state one, since a static player has none and
+  static-versus-simmer is the mix a games job most often wants. Skipped when
+  both slots name the same config, which is a legal and useful degenerate case.
+  `movegen_margin` is not compared: autoplay generates every move with a margin
+  of 0 and never reads it (until the thirty-third audit's pass 2, two margins
+  were refused here).
 - **A recorder that can rank, for opening racks.** A static player with
   `recorder_type = 'best'` and `num_plays_recorded` above 1 is refused: `best`
   records one move, so the job would store one move per rack while claiming to
@@ -5629,7 +5661,10 @@ Beyond role matching, creation enforces eight rules the schema cannot express:
 - **A capture job's simmers consider at least what is captured.** With
   `capture_positions` on, MAGPIE raises each simming player's `num_plays` to
   player 1's `num_plays_recorded`, so a smaller `num_plays` would make turning
-  capture on change the games. Refused, naming the player.
+  capture on change the games. Refused, naming the player. Both players must
+  also agree on `num_plays_recorded` and `num_plies_recorded`: MAGPIE keeps
+  player 1's for the whole run, so player 2's would be shown on the job page and
+  never applied. Refused on `capture_positions`, giving both pairs.
 - **A leave job's player plays statically on equity, with no rack info table.**
   A generation's leave values are the mean equity of the racks the bot drew, as
   MAGPIE's `leavegen` computes them: a simmer ranks on something else and plays
@@ -7652,10 +7687,11 @@ CREATE TABLE leave_generation_artifacts (
     -- SHA-256 of the KLV bytes as first written. The object store holds the
     -- only copy of these bytes, and an artifact is the one piece of state that
     -- can be silently overwritten -- by a restore that replays a generation
-    -- transition against fewer results, or by a rebuild under a changed
-    -- klv::build. Recording the hash is what turns that from invisible into a
-    -- query; the ON CONFLICT DO NOTHING on insert means the row keeps the
-    -- FIRST hash, so a later mismatch is evidence rather than an overwrite.
+    -- transition against fewer results, or by a rebuild under a changed KLV
+    -- builder (`builder`, below). Recording the hash is what turns that from
+    -- invisible into a query; the ON CONFLICT DO NOTHING on insert means the
+    -- row keeps the FIRST hash, so a later mismatch is evidence rather than an
+    -- overwrite.
     sha256        TEXT NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
     -- SHA-256 of the bytes the object store holds *now*, when they are not
     -- the bytes first written; NULL while they are. Set by every
@@ -7925,11 +7961,13 @@ CREATE INDEX        task_claims_user_idx      ON task_claims (claimed_by_user_id
     WHERE claimed_by_user_id IS NOT NULL;
 CREATE INDEX        task_claims_anon_idx      ON task_claims (claimed_by_anon_uuid, job_id, completed_at)
     WHERE claimed_by_anon_uuid IS NOT NULL;
--- There is no (job_id, state) index. Every job-scoped read of `tasks` -- the
--- detail page's counts by state; the census; the opening-rack finish check,
--- which needs `seed` -- is served by `tasks_seed_unique_idx (job_id, seed)`
--- and the heap, and a state index cost an entry on every task insert and
--- every state change, on the claim and submit paths, for no reader that
+-- There is no (job_id, state) index. The job-scoped reads of `tasks` -- the
+-- detail page's counts by state, the census -- are served by
+-- `tasks_seed_unique_idx (job_id, seed)` and the heap. The opening-rack finish
+-- check asks for the job's first task by seed there, and for a task not
+-- completed through `tasks_queue_idx` (available) and `task_claims_open_idx`
+-- (claimed), not by state. A state index cost an entry on every task insert
+-- and every state change, on the claim and submit paths, for no reader that
 -- needed it.
 -- For the cascade from `tasks` alone: no reader looks a result up by its task.
 -- It was (task_id, submitted_at) for the per-task "first accepted result" read
@@ -8426,7 +8464,11 @@ says so in its implemented option, rather than being removed.
 - **Justification:** The ceiling is high while the generation is in cache.
   Worth measuring on the production instance class late in a lap with a cold
   cache, where the reads are random and the lock's other claimants give up
-  after two seconds.
+  after two seconds. Every claim also asks whether its generation's universe
+  exists, inside the lock; until the thirty-third audit's third pass that was
+  a sequential scan of every older generation's rows (KL-18), 133–279 ms a
+  claim at 2–3 million rows and seconds once they outgrow the cache. It is
+  one index probe now, whatever the history (`I-LEAVE-25`).
 
 **KL-18. `leave_rack_progress` keeps every generation's rows for the life of the job.**
 - **Context:** About 430 MB a generation for English, never read again once that
@@ -8437,7 +8479,11 @@ says so in its implemented option, rather than being removed.
 - **Option implemented:** Kept.
 - **Justification:** The rows are what `rebuild-artifacts` derives a KLV from,
   and the design treats the object store as derivable from the database.
-  Dropping them trades that guarantee for the space.
+  Dropping them trades that guarantee for the space. They cost storage only,
+  as long as every per-claim read of the table reaches the current
+  generation through an index: an `EXISTS` probe that Postgres planned as a
+  sequential scan read every closed generation first, on every leave claim
+  (KL-17; fixed in the thirty-third audit's third pass).
 
 **KL-19. `rebuild-artifacts` runs every generation inline in the admin request.**
 - **Context:** About 13 seconds a generation in a release build.
@@ -9470,8 +9516,8 @@ says so in its implemented option, rather than being removed.
   that cannot run the job but does not say so -- it fails the task
   (`task_failed`) or vanishes -- leaves the settling its claim gave. And a job
   is lifted when a worker passes it over for want of a task, which may be that
-  worker's alone -- a task it declined within the hour, a slot of a task it
-  already holds: a job only a minority can run, lagging by design, is lifted
+  worker's alone -- a task it declined within the hour: a job only a minority
+  can run, lagging by design, is lifted
   each time such a worker passes it over, and loses the priority its lag gave
   it. Settling also costs, for that hour, about 40% of the claims of a
   newcomer only a minority can run beside an older job everyone runs, when
@@ -9639,35 +9685,37 @@ says so in its implemented option, rather than being removed.
   export ever takes hours.
 
 **KL-59. A failed sign-out leaves the session live.**
-- **Context:** `lib/auth.ts` sets the store to `null` in a `finally`, and the
-  layout's sign-out has no error path (`F-AUTH-2` pins the store's side).
+- **Context:** `lib/auth.ts` set the store to `null` in a `finally`, and the
+  layout's sign-out had no error path (`F-AUTH-2` pinned the store's side).
 - **Problem:** On a `503` or a network failure the server never cleared the
-  session cookie, yet the page shows the user signed out; the next page load
-  signs them back in. On a shared machine that matters.
+  session cookie, yet the page showed the user signed out; the next page load
+  signed them back in. On a shared machine that matters.
 - **Options considered:** keep the session and say "sign-out failed"; retry.
-- **Option implemented:** None yet. *Open (thirty-first audit).*
-- **Justification:** It needs a UI decision about what to show, and the
-  trigger is an outage during sign-out.
+- **Option implemented:** The first (thirty-third audit, pass 3). A failed
+  logout asks `/api/me` again rather than clear the store, so a live session
+  stays signed in (and one the server no longer knows shows signed out), and
+  the layout says the sign-out failed and to try again, staying on the page.
+- **Justification:** Only the logout's response can remove the HttpOnly
+  cookie, so the page must not claim what the server has not done. A retry
+  loop would outlast the user's attention; a message they can act on does not.
 
 **KL-60. Admin UI gaps the API covers.**
 - **Context:** The job form (`/admin/jobs/new`), the player-config pages and the
   password form.
 - **Problem:**
-  - The job form sends no `capture_positions`, `racks_per_batch` or
-    `rack_size`, so capture jobs and opening-rack jobs of another rack size can
-    be made only through the API.
+  - The job form sends no `racks_per_batch` or `rack_size`, so opening-rack
+    jobs of another rack size or batch can be made only through the API.
   - A blank password gets a generic `400` rather than a field error (the form's
     `required` normally stops it first).
   - The job form loads MAGPIE's version with the player configs and input
     data, so its failure is reported as "Could not load player configs and
     input data" (thirty-second audit).
-  - No page shows a player config in full: the list leaves out `num_plays`,
-    `num_plays_recorded` and the margins, and `GET /player-configs/:id` has no
-    page. A duplicate config name gets a generic `409` with no field error.
-    The job form lists every layout and defaults to the newest, so a release
-    that changes only `standard21` would make its default a layout creation
-    refuses.
+  - A duplicate config name gets a generic `409` with no field error.
     Creating a config writes no audit row, where creating a job or a pool does.
+  - Narrowed by the thirty-third audit, pass 3: the job form now sends
+    `capture_positions` (and `capture_first_divergence`), `/player-configs/[id]`
+    shows every setting of a config, and the job form's distribution and
+    layout start empty and must be chosen, so none of those is a gap any more.
   - The job and player-config forms show a server refusal as one line at the
     foot of the form, by API field name (`layout_id`, `confidence_pct`), not at the
     input under its label; and job creation checks the layout only once the
@@ -9956,9 +10004,16 @@ says so in its implemented option, rather than being removed.
   - The raw autoplay summary line is printed on every games and leave task.
   - A heartbeat's single attempt can block for about 120 seconds against an
     unreachable server, and the submission waits for it.
-  - An `expected_data` entry with a role MAGPIE does not know is skipped
-    silently, so a newer server's new role goes unchecked
-    (`min_magpie_version` is the only guard).
+  - An `expected_data` whose `files` is not an array, or lists an entry
+    without a role, name or digest, or with a role MAGPIE does not know, fails
+    the claim (`contribute_check_expected_data`) and ends the run, without a
+    decline, so the claim lapses on the heartbeat timeout. A new role must
+    therefore ship with a `min_magpie_version` raise, which the server filters
+    on before dispatch; otherwise every older worker's run ends on that job's
+    first claim, rather than the job being declined and set aside the way an
+    unknown `job_type` is. Until the thirty-third audit's pass 3 this bullet
+    said an unknown role was skipped silently; MAGPIE refuses it since its
+    pass 2.
   - `contribute_find_derived` takes the first matching entry; the server now
     refuses a job that would pin two files under one name, so only a server bug
     reaches it.

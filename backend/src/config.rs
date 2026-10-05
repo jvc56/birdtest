@@ -512,7 +512,9 @@ mod tests {
     /// and a raise that missed it passed CI -- tier 5 checks the compose value
     /// only -- and left production admitting the builds the raise was meant to
     /// keep out (thirty-third audit, pass 1). `backend/.env.example` is the
-    /// copy a backend run on the host starts from (README, "Without Docker").
+    /// copy a backend run on the host starts from (README, "Without Docker"),
+    /// and the root `.env.example` the one a compose user copies to `.env`,
+    /// which also says the contribute branch's version meets it.
     #[test]
     fn every_copy_of_the_version_floor_agrees() {
         // Compiled in, not read at run time: a unit test reads no file, and
@@ -557,6 +559,8 @@ mod tests {
                 1,
             ),
             ("backend/.env.example", source!("backend/.env.example"), "MIN_MAGPIE_VERSION=", 1),
+            (".env.example", source!(".env.example"), "MIN_MAGPIE_VERSION=", 1),
+            (".env.example", source!(".env.example"), "`birdtest-contribute` reports ", 1),
         ] {
             assert_eq!(versions_after(text, prefix), vec![floor; copies], "{path}");
         }

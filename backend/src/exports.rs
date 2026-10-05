@@ -63,9 +63,12 @@ pub const DOWNLOAD_URL_TTL: std::time::Duration = std::time::Duration::from_secs
 /// once, so each of its lines also carries its rack's standing (`consensus`:
 /// its analyses, its most common best move and how many ranked it first, and
 /// whether it is settled, and without a consensus) from
-/// `opening_rack_progress`, a primary-key probe per line; null for a job
-/// wanting one analysis per rack (which keeps the rows too, see
-/// `opening_rack::record_consensus`, but has no consensus to report), and for an in-game position. Each record's moves come through
+/// `opening_rack_progress`, a primary-key probe per line; null for a rack of
+/// one analysis in a job wanting one per rack (which keeps the rows too, see
+/// `opening_rack::record_consensus`, but has no consensus to report), and for
+/// an in-game position. A rack with several analyses carries it whatever the
+/// job wants now: a job whose maximum was lowered to one still counts their
+/// disagreements in `racks_without_consensus`. Each record's moves come through
 /// `position_analysis_moves_record_idx (record_id, rank)` and each move's plies
 /// through the `(move_id, ply)` unique index, so the cost is an index probe per
 /// record and per simmed move, on a background task (or under the two-stream
@@ -106,7 +109,7 @@ const OPENING_RACK_CORPUS: &str = "
                FROM opening_rack_progress c
                JOIN job_opening_rack_config o ON o.job_id = c.job_id
                WHERE c.job_id = r.job_id AND c.rack = r.rack AND r.game_index IS NULL
-                 AND o.max_results_per_rack > 1
+                 AND (c.results > 1 OR o.max_results_per_rack > 1)
            )))::text AS row
     FROM position_analysis_records r
     WHERE r.job_id = $1";
@@ -771,21 +774,24 @@ pub async fn purge(conn: &mut sqlx::PgConnection, job_id: Uuid) -> AppResult<Vec
     Ok(rows.into_iter().flat_map(|(results, positions)| [results, positions]).flatten().collect())
 }
 
-/// A reopened job's final exports become snapshots: each is still the corpus
-/// as of its `snapshot_at`, but no longer the finished job's, which the job
-/// will have again once it completes. Left final, `newest_ready` would serve
-/// the old corpus as the completed job's once it completed again.
+/// A completed job whose consensus settings changed has its final exports
+/// become snapshots: each is still the corpus as of its `snapshot_at`, but no
+/// longer the finished job's. Each line carries its rack's standing under the
+/// settings it was read with, which the edit restated; a reopened job will
+/// have a new final corpus once it completes again, and one the edit left
+/// completed has it on its next export. Left final, `newest_ready` would
+/// serve the old standings as the completed job's.
 ///
 /// An export still building fails, and is to be taken again. Its snapshot may
-/// have been read while the job was completed, and the job can complete again
-/// before the export finishes -- a large corpus uploads for minutes, an edit
-/// that unsettles a handful of racks is re-completed within one reissue's
-/// analysis -- and `mark_ready`, reading the job completed once more, stored
-/// the corpus from before the edit as the final one: what every download of
-/// the completed job was redirected to until someone exported it again.
-/// Failed here, its `mark_ready` matches no row and removes its objects. (That update reads the job's row `FOR SHARE`
-/// before it locks its own, so one waiting on the reopening re-reads this
-/// row once it commits rather than deadlocking with it.)
+/// have been read before the edit, and `mark_ready`, reading the job
+/// completed -- still, or once more: a large corpus uploads for minutes, an
+/// edit that unsettles a handful of racks is re-completed within one
+/// reissue's analysis -- stored the corpus from before the edit as the final
+/// one: what every download of the completed job was redirected to until
+/// someone exported it again. Failed here, its `mark_ready` matches no row
+/// and removes its objects. (That update reads the job's row `FOR SHARE`
+/// before it locks its own, so one waiting on the edit re-reads this row once
+/// it commits rather than deadlocking with it.)
 pub async fn unfinalize(conn: &mut sqlx::PgConnection, job_id: Uuid) -> AppResult<()> {
     sqlx::query("UPDATE job_exports SET is_final = FALSE WHERE job_id = $1 AND is_final")
         .bind(job_id)
@@ -794,7 +800,8 @@ pub async fn unfinalize(conn: &mut sqlx::PgConnection, job_id: Uuid) -> AppResul
     sqlx::query(
         "UPDATE job_exports
          SET state = 'failed', completed_at = now(),
-             error = 'the job reopened while this export was building: export it again'
+             error = 'the job''s consensus settings changed while this export was building: \
+                      export it again'
          WHERE job_id = $1 AND state = 'running'",
     )
     .bind(job_id)

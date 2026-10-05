@@ -932,23 +932,29 @@ async fn claims_in_flight(conn: &mut PgConnection, job_id: Uuid, generation: i32
 }
 
 /// Whether any rack of the generation is below target, holding nothing out:
-/// one probe of `leave_rack_progress_pick_idx` from its lowest count.
+/// one probe of `leave_rack_progress_pick_idx` from its lowest count, asked
+/// as [`BELOW_TARGET_PROBE`] (an `ORDER BY` the index supplies, for the
+/// reason [`universe_exists`] gives).
 async fn any_rack_below_target(
     conn: &mut PgConnection,
     job_id: Uuid,
     generation: i32,
     config: &LeaveConfig,
 ) -> AppResult<bool> {
-    Ok(sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS (SELECT 1 FROM leave_rack_progress
-                        WHERE job_id = $1 AND generation = $2 AND occurrence_count < $3)",
-    )
-    .bind(job_id)
-    .bind(generation)
-    .bind(config.target_for(generation))
-    .fetch_one(&mut *conn)
-    .await?)
+    Ok(sqlx::query_scalar::<_, i32>(BELOW_TARGET_PROBE)
+        .bind(job_id)
+        .bind(generation)
+        .bind(config.target_for(generation))
+        .fetch_optional(&mut *conn)
+        .await?
+        .is_some())
 }
+
+/// [`any_rack_below_target`]'s query. Public so a test can check its plan
+/// (`I-LEAVE-25`).
+pub const BELOW_TARGET_PROBE: &str = "SELECT 1 FROM leave_rack_progress
+     WHERE job_id = $1 AND generation = $2 AND occurrence_count < $3
+     ORDER BY occurrence_count LIMIT 1";
 
 /// Whether any accepted result of this generation is still waiting for a merge.
 async fn anything_staged(conn: &mut PgConnection, job_id: Uuid, generation: i32) -> AppResult<bool> {
@@ -1310,14 +1316,7 @@ pub async fn seed_generation(
 
     // Idempotent: a universe already seeded (a seeding started twice) is left
     // as it is.
-    let seeded: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM leave_rack_progress WHERE job_id = $1 AND generation = $2)",
-    )
-    .bind(job_id)
-    .bind(generation)
-    .fetch_one(&mut *conn)
-    .await?;
-    if seeded {
+    if universe_exists(&mut *conn, job_id, generation).await? {
         return Ok(total as i64);
     }
     tracing::info!(job_id = %job_id, generation, racks = total, "seeding full-rack universe");
@@ -1371,20 +1370,38 @@ pub async fn seed_generation(
     Ok(total as i64)
 }
 
-/// Whether `generation`'s rack universe has been written. One index probe.
+/// Whether `generation`'s rack universe has been written. Every leave claim
+/// asks, under the job's dispatch lock.
+///
+/// One probe of the primary key, because it is asked as [`UNIVERSE_PROBE`]:
+/// an `ORDER BY` the index supplies, then `LIMIT 1`, outside any `EXISTS`.
+/// Asked as `EXISTS (... WHERE job_id = $1 AND generation = $2)`, it was a
+/// sequential scan once the generation was in the table's statistics: with a
+/// handful of distinct jobs and generations, Postgres expects a match within
+/// a few rows of the heap's start, but a generation's rows sit together
+/// after every older generation's of every leave job, closed ones kept for
+/// the life of the job (KL-18). It measured 133-156 ms a claim over 2 million
+/// older rows, read under the lock, and it grows by 3.2 million rows an
+/// English generation. Inside an `EXISTS` Postgres drops the `ORDER BY`, so
+/// that form stays a sequential scan.
 pub async fn universe_exists(
     conn: &mut PgConnection,
     job_id: Uuid,
     generation: i32,
 ) -> AppResult<bool> {
-    Ok(sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM leave_rack_progress WHERE job_id = $1 AND generation = $2)",
-    )
-    .bind(job_id)
-    .bind(generation)
-    .fetch_one(&mut *conn)
-    .await?)
+    Ok(sqlx::query_scalar::<_, i32>(UNIVERSE_PROBE)
+        .bind(job_id)
+        .bind(generation)
+        .fetch_optional(&mut *conn)
+        .await?
+        .is_some())
 }
+
+/// [`universe_exists`]'s query. Public so a test can check its plan
+/// (`I-LEAVE-25`).
+pub const UNIVERSE_PROBE: &str = "SELECT 1 FROM leave_rack_progress
+     WHERE job_id = $1 AND generation = $2
+     ORDER BY rack LIMIT 1";
 
 /// Make sure `generation`'s rack universe exists, seeding it if it does not.
 ///
@@ -1396,7 +1413,7 @@ pub async fn universe_exists(
 /// wrote it made every worker on the job wait, every time.
 ///
 /// Idempotent and cheap when there is nothing to do: [`seed_generation`]
-/// returns on an `EXISTS` check, which is one index probe.
+/// returns on [`universe_exists`], which is one index probe.
 pub async fn ensure_universe(
     conn: &mut PgConnection,
     job_id: Uuid,

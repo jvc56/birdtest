@@ -4,6 +4,7 @@
   import { page } from '$app/stores';
   import { goto } from '$app/navigation';
   import { session, refreshSession, signOut } from '$lib/auth';
+  import { errorText } from '$lib/api';
 
   onMount(refreshSession);
 
@@ -15,8 +16,18 @@
     { href: '/users', label: 'Users' }
   ];
 
+  let signOutError = '';
+
+  // A failed sign-out leaves the session cookie in place, so the page says so
+  // and stays put rather than looking signed out (`signOut` keeps the store).
   async function handleSignOut() {
-    await signOut();
+    signOutError = '';
+    try {
+      await signOut();
+    } catch (e) {
+      signOutError = `Could not sign out (${errorText(e)}); you are still signed in. Try again.`;
+      return;
+    }
     goto('/');
   }
 </script>
@@ -64,6 +75,11 @@
         {/if}
       </div>
     </nav>
+    {#if signOutError && $session}
+      <p class="mx-auto max-w-6xl px-4 pb-3 text-sm text-destructive sm:px-6" role="alert">
+        {signOutError}
+      </p>
+    {/if}
   </header>
 
   <main class="mx-auto w-full max-w-6xl flex-1 px-4 py-8 sm:px-6">

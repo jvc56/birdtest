@@ -421,7 +421,8 @@ run "a_sender_at_a_lookalike_domain_is_refused" {
 # A circuit-breaker rollback mails the alerts topic. The service's ARN in the
 # pattern and the delivery itself need a real account (TESTING.md); what plans
 # is that the rule exists, matches the failed deployment and only that, on one
-# resource, and is wired to the topic.
+# resource, and has a target. That the target is the alerts topic is not
+# checked: a mock topic's ARN is unknown at plan on CI's Terraform.
 run "a_failed_deploy_is_alerted" {
   command = plan
   assert {
@@ -438,6 +439,6 @@ run "a_failed_deploy_is_alerted" {
   }
   assert {
     condition     = aws_cloudwatch_event_target.deploy_failed.rule == "birdtest-deploy-failed"
-    error_message = "The deploy-failed rule must have a target (the alerts topic)."
+    error_message = "The deploy-failed rule must have a target."
   }
 }

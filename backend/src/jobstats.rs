@@ -63,7 +63,7 @@ pub struct Completion {
     /// verdict (`player1_better`, `player2_better`, `inconclusive`),
     /// `reached_target` for a games or pairs job that runs no test and played
     /// its games, or `last generation built`. None for an opening-rack job whose racks were all
-    /// analysed.
+    /// settled.
     pub reason: Option<String>,
 }
 
@@ -113,9 +113,6 @@ pub struct GameStats {
     pub divergent: Option<MatchTally>,
     pub min_units: i32,
     pub max_units: i32,
-    pub win_pct: f64,
-    pub loss_pct: f64,
-    pub draw_pct: f64,
     /// The match test over every accepted result, recomputed on each read.
     /// `None` for a job that runs no test: it plays `max_units` and stops, and
     /// an interval nobody acts on would read as a verdict.
@@ -786,16 +783,6 @@ fn build_game_stats(
     divergent_pairs: Option<u64>,
     params: &TestParams,
 ) -> GameStats {
-    // Percentages describe every game played, for both job types: the sample
-    // the test runs on is the same games, viewed as pairs.
-    let total = tally.total();
-    let pct = |n: u64| {
-        if total == 0 {
-            0.0
-        } else {
-            100.0 * n as f64 / total as f64
-        }
-    };
     let test = params.enabled.then(|| {
         match_test::evaluate(
             &sample,
@@ -820,9 +807,6 @@ fn build_game_stats(
         divergent: None,
         min_units: params.min_units,
         max_units: params.max_units,
-        win_pct: pct(tally.wins),
-        loss_pct: pct(tally.losses),
-        draw_pct: pct(tally.draws),
         test,
         decided: None,
     }

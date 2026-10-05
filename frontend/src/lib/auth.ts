@@ -69,11 +69,24 @@ export function resetSession(): Promise<Me | null | undefined> {
   return refreshSession();
 }
 
+/**
+ * Signs out. Only a successful logout ends the session: its response removes
+ * the HttpOnly session cookie, which page JavaScript cannot. If the request
+ * fails — a deploy's 502 or 503, a network blip, a 403 for a missing CSRF
+ * cookie — the session may well be live, so the store is not set to `null`
+ * (the page would say "signed out" on a shared machine whose account is still
+ * open). It asks `/api/me` instead, which keeps a signed-in user signed in
+ * unless the server now says otherwise, and rethrows for the caller to show.
+ * `refreshSession`, not `resetSession`: going back to unresolved would hide the
+ * Sign out button while the server is down, leaving nothing to try again with.
+ */
 export async function signOut(): Promise<void> {
   try {
     await api.logout();
-  } finally {
-    stopRetrying();
-    session.set(null);
+  } catch (e) {
+    await refreshSession();
+    throw e;
   }
+  stopRetrying();
+  session.set(null);
 }

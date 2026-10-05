@@ -352,21 +352,46 @@ const OPENING_RACK_UNUSED: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * The recorder and the move-gen margin, which only an opening-rack static
+ * analysis reads: autoplay generates every move of a games, pairs or leave job
+ * with MAGPIE's own record type and a margin of 0, and an opening-rack simmer
+ * ranks every play up to its candidate count whatever its recorder says.
+ */
+const RECORDER_ROWS = ['recorder_type', 'movegen_margin'];
+
+/** What an opening-rack job whose player simulates never reads. */
+const OPENING_RACK_SIM_UNUSED: ReadonlySet<string> = new Set([
+  ...OPENING_RACK_UNUSED,
+  ...RECORDER_ROWS
+]);
+
+/** What a games or pairs job that records positions never reads. */
+const CAPTURED_UNUSED: ReadonlySet<string> = new Set(RECORDER_ROWS);
+
+/**
  * What a games or pairs job that records no positions never reads: the plays
  * and plies recorded say what a captured position keeps, and nothing else.
  */
-const UNCAPTURED_UNUSED: ReadonlySet<string> = new Set(['num_plays_recorded', 'num_plies_recorded']);
+const UNCAPTURED_UNUSED: ReadonlySet<string> = new Set([
+  ...RECORDER_ROWS,
+  'num_plays_recorded',
+  'num_plies_recorded'
+]);
 
 /** The player settings, by row id, that a job never reads. */
 export function unusedPlayerSettings(c: JobConfig): ReadonlySet<string> {
   if (c.job.job_type === 'leave_generation') return LEAVE_UNUSED;
-  if (c.job.job_type === 'opening_rack') return OPENING_RACK_UNUSED;
+  if (c.job.job_type === 'opening_rack') {
+    return c.players.some((p) => p.num_plies > 0) ? OPENING_RACK_SIM_UNUSED : OPENING_RACK_UNUSED;
+  }
   if (c.games && !c.games.capture_positions) return UNCAPTURED_UNUSED;
-  return NONE;
+  return CAPTURED_UNUSED;
 }
 
 function marked(rows: SettingRow[], unused: ReadonlySet<string>): SettingRow[] {
-  return rows.map((r) => (unused.has(r.id) ? { ...r, unused: true } : r));
+  // A setting the job never reads cannot tell its players apart, so it is
+  // never marked as a difference.
+  return rows.map((r) => (unused.has(r.id) ? { ...r, unused: true, differs: false } : r));
 }
 
 /**

@@ -362,9 +362,9 @@ def link_tree(source: Path, target: Path, skip: Callable[[Path], bool]) -> None:
 
 
 def derived_file(path: Path) -> bool:
-    # Anything a worker builds for itself: a wordmap and its sidecar, a rack
-    # info table, a word info table, and leave generation's outputs.
-    return (path.name.endswith((".wmp", ".wmp.src", ".rit", ".wit", "_report.txt"))
+    # Anything a worker builds for itself: a wordmap, a rack info table, a word
+    # info table, and leave generation's outputs.
+    return (path.name.endswith((".wmp", ".rit", ".wit", "_report.txt"))
             or "_gen_" in path.name)
 
 

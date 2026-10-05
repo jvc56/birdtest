@@ -1289,9 +1289,9 @@ history endpoint's points — are not restored.
 2. Copy the two rows across, in one transaction. It refuses, and copies
    nothing, if a pool of the same name has been made since (rename that one
    first), or if its anchor or a member config has since been deleted
-   (restore that config first, or drop it from `/tmp/pool_members.csv`), or if
-   the admin who added a member has since been deleted (empty that line's last
-   field, `added_by`). It also refuses — a foreign-key error on
+   (restore that config first, or drop it from `/tmp/pool_members.csv`). A
+   member's `added_by` always resolves: deleting an account anonymizes its row
+   and keeps it (§0). It also refuses — a foreign-key error on
    `rating_pools_letterdist_id_fkey` or `rating_pools_layout_id_fkey` — if the
    pool's letter distribution or layout has since been deleted from Input data,
    which the pool's deletion allowed. Importing the file again does not mend

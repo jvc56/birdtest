@@ -49,3 +49,17 @@ export function testSentence(test: TestResult, names: [string, string]): string 
       return score;
   }
 }
+
+/**
+ * What job creation refuses of a significance test's confidence, or null: it
+ * must be above 50 (at or below half it is no test) and below 100 (the
+ * interval would never close). Checked here rather than by the input's `min`
+ * and `max`, which can only state inclusive bounds and so either let 50 and
+ * 100 through or block values the server takes (`min="50.1"` blocked 50.05).
+ */
+export function confidenceProblem(pct: number | null): string | null {
+  if (pct == null || !Number.isFinite(pct) || !(pct > 50 && pct < 100)) {
+    return 'The confidence must be above 50% and below 100%.';
+  }
+  return null;
+}

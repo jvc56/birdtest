@@ -498,7 +498,7 @@ Every label is in Title Case, and the player-config form uses the same names, wi
 | 1 | Lexicon | `kwg_id` | `l1`/`l2` (`lex`) | n/a |
 | 2 | Leaves | `klv_id` | `k1`/`k2` (`leaves`) | leave jobs |
 | 3 | Sorted By | `sort_strategy` | `s1`/`s2` | n/a |
-| 4 | Move Recorder | `recorder_type` | `r1`/`r2` | leave jobs |
+| 4 | Move Recorder | `recorder_type` | `r1`/`r2` | every job but an opening-rack static analysis |
 | 5 | Moves Generated | `num_plays` | `np1`/`np2` (`numplays`) | n/a |
 | 6 | Plies (0 = static) | `num_plies` | `pl1`/`pl2` (`plies`) | n/a |
 | 7 | Uses Inference ("—" for a static player) | `use_inference` | `si1`/`si2` (`sinfer`) | static players, opening-rack jobs (Fix 2) |
@@ -517,7 +517,7 @@ Every label is in Title Case, and the player-config form uses the same names, wi
 | 20 | Spread Utility Weight | `utility_w_spread` | `uspread1`/`uspread2` (`uspread`) | static players |
 | 21 | Spread Utility Scale | `utility_spread_scale` | `uspreadscale1`/`uspreadscale2` (`uspreadscale`) | static players |
 | 22 | Time Limit (Seconds) | `time_limit_secs` | `tl1`/`tl2` (`tlim`) | static players (always 0 for a simmer) |
-| 23 | Movegen Margin ("—" unless the recorder is `equity`) | `movegen_margin` | `mmargin` | leave jobs |
+| 23 | Movegen Margin ("—" unless the recorder is `equity`) | `movegen_margin` | `mmargin` | every job but an opening-rack static analysis |
 | 24 | PEG Schedule | `peg_stage_top_k` | `pegtopk1`/`pegtopk2` | players without the pre-endgame; opening-rack and leave jobs |
 | 25 | PEG Stride | `peg_scenario_stride` | `pegstride1`/`pegstride2` | the same |
 | 26 | PEG Opponent | `peg_opp_model` | `pegpess1`/`pegpess2` | the same |
@@ -533,8 +533,10 @@ How the "Never read by" column affects the display:
 
 - A row that a job never reads is shown muted
   ([`unusedPlayerSettings`](frontend/src/lib/jobSettings.ts)): a leave job's
-  set, an opening-rack job's, and a games or pairs job's plays and plies
-  recorded when it records no positions.
+  set, an opening-rack job's (with the recorder and move-gen margin when its
+  player simulates), and a games or pairs job's recorder and move-gen margin
+  (autoplay generates with MAGPIE's own record type and a margin of 0), with
+  its plays and plies recorded when it records no positions.
 - A simulation-only row (7, 10–12 and 15–22) shows "—" for a static player, and a
   pre-endgame row (24–30) shows "—" for a player that does not run it. So do
   Plies Recorded for a static player, which records no plies, and Movegen

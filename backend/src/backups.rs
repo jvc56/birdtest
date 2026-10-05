@@ -42,7 +42,7 @@ pub struct BackupStatus {
     /// reset this: what matters is the age of the newest restorable thing.
     pub last_success_at: Option<DateTime<Utc>>,
     pub last_success_age_seconds: Option<i64>,
-    /// No successful backup within `STALE_AFTER` — including the case of never
+    /// No successful backup within `STALE_AFTER_HOURS` — including the case of never
     /// having had one, which is what a freshly deployed stack looks like.
     pub stale: bool,
     pub recent: Vec<BackupRun>,

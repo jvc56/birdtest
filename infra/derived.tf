@@ -1,9 +1,9 @@
 # The derived-file builder: a scheduled ECS task that drains `derived_data`.
 #
-# See README.md's "MAGPIE on the server". A wordmap and a rack info table are
-# built on every contributor's own machine and are far too large to ship, so birdtest checks
-# them by building its own reference copy with a pinned MAGPIE and publishing
-# the hash. This is where those builds run.
+# See README.md's "MAGPIE on the server". A wordmap, a rack info table and a
+# word info table are built on every contributor's own machine and are far too
+# large to ship, so birdtest checks them by building its own reference copy
+# with a pinned MAGPIE and publishing the hash. This is where those builds run.
 #
 # Not in the web task. A rack info table build peaks at about 2.4 GB of memory,
 # writes a 1.9 GB file, and takes one to three minutes; the web task has 1 vCPU
@@ -268,7 +268,7 @@ resource "aws_iam_role_policy" "derived_builder_scheduler" {
 
 resource "aws_scheduler_schedule" "derived_builder" {
   name                         = "${local.name}-derived-builder"
-  description                  = "Drain the wordmap and rack info table build queue"
+  description                  = "Drain the wordmap, rack info table and word info table build queue"
   schedule_expression          = var.derived_builder_schedule
   schedule_expression_timezone = "UTC"
   state                        = var.scheduled_tasks_enabled ? "ENABLED" : "DISABLED"

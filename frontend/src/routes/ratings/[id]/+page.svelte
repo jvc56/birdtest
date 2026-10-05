@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import { page } from '$app/stores';
   import { goto } from '$app/navigation';
-  import { api, type PlayerConfig, type RatingPoolDetail } from '$lib/api';
+  import { api, errorText, type PlayerConfig, type RatingPoolDetail } from '$lib/api';
   import { session } from '$lib/auth';
   import RatingDotPlot from '$lib/components/RatingDotPlot.svelte';
   import ResidualMatrix from '$lib/components/ResidualMatrix.svelte';
@@ -47,17 +47,25 @@
     anchorRating = pool.anchor_rating;
   }
 
-  function saveAnchor() {
+  async function saveAnchor() {
     if (!pool) return;
+    const id = anchorId;
     const rating = anchorRating;
-    if (rating == null || !Number.isFinite(rating)) {
-      error = 'The anchor rating must be a number.';
+    // The server's bound (`MAX_ABS_ANCHOR_RATING`), checked here so the admin
+    // is told before a request rather than after it.
+    if (rating == null || !Number.isFinite(rating) || Math.abs(rating) > 10000) {
+      error = 'The anchor rating must be a number between -10000 and 10000.';
       return;
     }
     const body: { anchor_player_config_id?: string; anchor_rating?: number } = {};
-    if (anchorId !== pool.anchor_player_config_id) body.anchor_player_config_id = anchorId;
+    if (id !== pool.anchor_player_config_id) body.anchor_player_config_id = id;
     if (rating !== pool.anchor_rating) body.anchor_rating = rating;
-    mutate(() => api.updateRatingPool(poolId, body));
+    // A refused change leaves what was typed in the form to correct, rather
+    // than the reload's stored values.
+    if (!(await mutate(() => api.updateRatingPool(poolId, body)))) {
+      anchorId = id;
+      anchorRating = rating;
+    }
   }
 
   async function removePool() {
@@ -75,7 +83,7 @@
       await api.deleteRatingPool(poolId);
       goto('/ratings');
     } catch (e) {
-      error = e instanceof Error ? e.message : String(e);
+      error = errorText(e);
       busy = false;
     }
   }
@@ -102,23 +110,27 @@
   }
 
   /** Membership changes refit the whole pool, so the page reloads everything
-   *  rather than patching one row: every other rating has moved too. */
-  async function mutate(action: () => Promise<unknown>) {
+   *  rather than patching one row: every other rating has moved too. Says
+   *  whether the change itself succeeded. */
+  async function mutate(action: () => Promise<unknown>): Promise<boolean> {
     busy = true;
     error = '';
+    let ok = true;
     try {
       await action();
     } catch (e) {
-      error = e instanceof Error ? e.message : String(e);
+      ok = false;
+      error = errorText(e);
     }
     // Reloaded either way: a change whose refit failed has still committed.
     try {
       await load();
     } catch (e) {
-      error ||= e instanceof Error ? e.message : String(e);
+      error ||= errorText(e);
     } finally {
       busy = false;
     }
+    return ok;
   }
 </script>
 
@@ -268,6 +280,8 @@
               class="input"
               type="number"
               step="any"
+              min="-10000"
+              max="10000"
               bind:value={anchorRating}
               disabled={busy}
             />

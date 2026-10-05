@@ -218,7 +218,6 @@ pub struct ExpectedDerived {
     pub role: String,
     pub name: String,
     pub sha256: String,
-    pub bytes: i64,
     /// The builder that produced this hash, e.g. `wmp-1`.
     pub builder: String,
     /// The instruction-set target the building MAGPIE was compiled for.
@@ -279,7 +278,7 @@ pub async fn status_for_job(
 
     let rows = sqlx::query(&format!(
         "{NEEDS_CTE}
-         SELECT n.role, n.name, d.state, d.sha256, d.bytes, d.build_target
+         SELECT n.role, n.name, d.state, d.sha256, d.build_target
          FROM needs n
          LEFT JOIN derived_data d
            ON d.role = n.role AND d.name = n.name
@@ -314,7 +313,6 @@ pub async fn status_for_job(
                 role,
                 name,
                 sha256: row.get("sha256"),
-                bytes: row.get("bytes"),
                 // What built this hash, as the row records it: the builder
                 // task's target, which this process's need not be.
                 build_target: row
@@ -877,7 +875,6 @@ mod tests {
             role: "wmp".into(),
             name: "NWL23".into(),
             sha256: "0".repeat(64),
-            bytes: 1,
             builder: "wmp-1".into(),
             build_target: "nehalem".into(),
         };

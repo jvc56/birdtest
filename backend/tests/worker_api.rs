@@ -521,7 +521,8 @@ async fn consensus_job(db: &TestDb, admin: Uuid, pct: f64, min: i32, max: i32) -
 /// its settings after it completed reopens it and reissues every rack from
 /// those rows; lowering them while a reissue is in flight settles every rack,
 /// and that reissue's submission completes the job without counting its racks
-/// a second time. Raising what is already satisfied leaves it completed.
+/// a second time. Raising what is already satisfied leaves it completed, and
+/// still demotes its final export: the standings it carries changed.
 #[tokio::test]
 async fn an_opening_rack_jobs_consensus_can_change_and_the_job_follows() {
     let db = TestDb::new().await;
@@ -670,11 +671,50 @@ async fn an_opening_rack_jobs_consensus_can_change_and_the_job_follows() {
     // settles them without a consensus.
     submit(again_b, uuid_b.clone(), "8G ZOA").await;
     assert_eq!(counters().await, (4, 4, 2, "completed".into()));
+    // Each line of the corpus carries its rack's standing: every rack has two
+    // analyses, which the job's maximum of one no longer hides.
+    let response = tower::ServiceExt::oneshot(
+        app.clone(),
+        get_request(&format!("/api/admin/jobs/{job}/results/stream"), &headers),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let corpus = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    let standings: Vec<serde_json::Value> = String::from_utf8(corpus.to_vec())
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["consensus"].clone())
+        .collect();
+    assert_eq!(standings.len(), 8, "four racks analysed twice each");
+    assert!(standings.iter().all(|c| c["results"] == json!(2)), "{standings:?}");
+    assert_eq!(standings.iter().filter(|c| c["without_consensus"] == json!(true)).count(), 4);
 
-    // Asking for what every rack already has leaves it completed.
+    // Asking for what every rack already has leaves it completed -- but its
+    // standings are restated under the new share, so its final export, and
+    // one still building from before the edit, no longer stand for it.
+    sqlx::query(
+        "INSERT INTO job_exports (job_id, state, is_final) VALUES ($1, 'ready', TRUE), ($1, 'running', FALSE)",
+    )
+    .bind(job)
+    .execute(&db.pool)
+    .await
+    .unwrap();
     let (status, body) = patch_consensus(&app, &headers, job, json!({ "consensus_pct": 60 })).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!((body["reopened"].clone(), body["job"]["status"].clone()), (json!(false), json!("completed")));
+    let exports: Vec<(String, bool)> = sqlx::query_as(
+        "SELECT state, is_final FROM job_exports WHERE job_id = $1 ORDER BY state",
+    )
+    .bind(job)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        exports,
+        vec![("failed".into(), false), ("ready".into(), false), ("ready".into(), false)],
+        "a completed job's edit demotes its final export and fails a running one"
+    );
 
     // A purge's census counts the rack standings it destroys with the rest.
     let mut purge = axum::http::Request::post(format!("/api/admin/jobs/{job}/purge"));
@@ -2243,8 +2283,9 @@ async fn job_between(db: &TestDb, p1: Uuid, p2: Uuid) -> Uuid {
 /// The gate. A wordmap and a rack info table are built on the contributor's own
 /// machine, and what makes that checkable is the hash the server publishes —
 /// so a job whose hash does not exist yet must not be handed out. Dispatching
-/// early would send a worker no `derived` entry, which it reads as a server
-/// that checks nothing: the exact state this replaces, reached silently.
+/// early would carry no hash for a file its player asks for, which MAGPIE
+/// refuses (`derived_mismatch`), setting the job aside for the run on every
+/// worker that claims it.
 #[tokio::test]
 async fn a_job_is_not_dispatched_until_its_derived_files_are_built() {
     let db = TestDb::new().await;

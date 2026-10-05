@@ -1009,6 +1009,39 @@ async fn adding_and_removing_a_member_each_refit_the_pool() {
     assert_eq!(run_count(&db, f.pool).await, 3);
 }
 
+/// A-RATE-4c: adding a config that is already a member -- a second click, or
+/// the anchor, which the pool was created with -- adds nothing, and is
+/// answered `run_id: null` with no audit row and no refit. It was logged as an
+/// addition and refitted, a `membership` run the ratings page showed as the
+/// reason for a change that did not happen.
+#[tokio::test]
+async fn adding_a_config_that_is_already_a_member_changes_nothing() {
+    let db = TestDb::new().await;
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+    let f = fixture(&db).await;
+    let headers = admin_headers(&state.cfg, f.admin);
+    ratings::recompute(&db.pool, f.pool, Trigger::Manual).await.unwrap();
+    let runs = run_count(&db, f.pool).await;
+
+    let members = format!("/api/admin/rating-pools/{}/members", f.pool);
+    for member in [f.rival, f.anchor] {
+        let (status, body) = send(
+            &app,
+            request("POST", &members, &headers, Some(json!({ "player_config_id": member }))),
+        )
+        .await;
+        assert_eq!((status, &body), (StatusCode::OK, &json!({ "run_id": null })));
+    }
+    assert_eq!(run_count(&db, f.pool).await, runs, "nothing refitted");
+    let logged: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE action = 'rating_pool.member_added'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(logged, 0, "nothing logged");
+}
+
 /// A-RATE-4b: adding a config that does not exist is a 400 on its field, and
 /// to a pool that does not exist a 404 -- not the 409 "still referenced" a
 /// bare foreign-key failure maps to. Neither refits anything.

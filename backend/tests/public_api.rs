@@ -1743,3 +1743,31 @@ async fn a_pairs_position_without_a_partner_turn_says_so() {
         send(&app, get_request(&format!("/api/jobs/{games}/positions/random"), &headers)).await;
     assert!(random.get("partner").is_none(), "{random}");
 }
+
+/// A-PUBLIC-8: a NUL in what an unauthenticated caller sends is the caller's
+/// `400`, not a `500`. Postgres stores no NUL in text and refuses the
+/// statement; that refusal was a 500 and an error line, written at will by
+/// anyone with `?worker=%00` on a public, unlimited route.
+#[tokio::test]
+async fn a_nul_in_a_public_request_is_a_bad_request() {
+    let db = TestDb::new().await;
+    let job = db.games_job(2).await;
+    let app = birdtest::app(db.state().await);
+
+    let (status, body) =
+        send(&app, get_request(&format!("/api/jobs/{job}/results?worker=%00"), &[])).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "bad_request", "{body}");
+    let (status, body) = send(
+        &app,
+        post_json("/api/auth/login", &[], json!({ "username": "\u{0}", "password": "hunter22" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, body) = send(
+        &app,
+        post_json("/api/auth/reset-password/request", &[], json!({ "email": "a\u{0}@b.co" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}

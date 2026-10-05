@@ -494,7 +494,8 @@ struct MemberBody {
     player_config_id: Uuid,
 }
 
-/// Adds a config and refits the pool.
+/// Adds a config and refits the pool; a config already a member is answered
+/// `run_id: null`, neither logged nor refitted.
 ///
 /// The refit is the whole point of the endpoint: a new member brings its games
 /// in as evidence, which moves every other rating too, so there is no such
@@ -520,7 +521,7 @@ async fn add_member(
         .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| AppError::not_found("rating pool not found"))?;
-    sqlx::query(
+    let added = sqlx::query(
         "INSERT INTO rating_pool_members (pool_id, player_config_id, added_by)
          VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
     )
@@ -536,7 +537,15 @@ async fn add_member(
             "player_config_id",
             body.player_config_id,
         )
-    })?;
+    })?
+    .rows_affected();
+    // A config that is already a member -- a second click, or the anchor,
+    // which the pool was created with -- adds nothing, and is answered so
+    // rather than logged as an addition and refitted, as a removal's second
+    // click is.
+    if added == 0 {
+        return Ok(Json(serde_json::json!({ "run_id": null })));
+    }
     audit::log(
         &mut tx,
         "rating_pool.member_added",

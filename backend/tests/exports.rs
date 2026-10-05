@@ -972,7 +972,7 @@ async fn an_export_finishing_while_its_job_reopens_fails() {
     let (_, export) = send(&app, get_request(&path, &headers)).await;
     assert_eq!(export["state"], "failed", "the job was reopened as it finished: {export}");
     assert_eq!(export["is_final"], false, "{export}");
-    assert!(export["error"].as_str().unwrap_or_default().contains("reopened"), "{export}");
+    assert!(export["error"].as_str().unwrap_or_default().contains("consensus settings changed"), "{export}");
 }
 
 /// I-EXPORT-16: an export whose snapshot was read while its job was completed

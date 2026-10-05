@@ -76,8 +76,8 @@ database get 25% each. The games and pairs jobs stop at 100,000 games or pairs
 if their test has not decided first, and neither test is acted on before
 50,000 games or pairs. Their players use a
 wordmap and a rack info table; the workers share one ~1.9 GB copy of the
-table (dev.py runs them with `-ritmmap true`, so it is mapped rather than read
-into each), and `--no-rit` seeds players without one.
+table (MAGPIE maps it by default rather than reading it into each), and
+`--no-rit` seeds players without one.
 
 The workers run in the background and write to
 `.dev-workers/worker-NN/contribute.log`. With `--worker-windows` each runs in
@@ -166,7 +166,7 @@ The fresh database is seeded with:
 | `--threads` | 2 | Threads inside each contributor |
 | `--max-tasks` | 0 | Tasks each contributor runs before exiting; 0 runs until stopped |
 | `--idle-wait` | 5 | Seconds a contributor waits when there is no work |
-| `--build-threads` | `$MAGPIE_THREADS`, or every core | Threads the server's wordmap / rack info table builder gives MAGPIE |
+| `--build-threads` | `$MAGPIE_THREADS`, or every core | Threads the server's derived-file builder (wordmaps, rack info tables, word info tables) gives MAGPIE |
 | `--api-key` | anonymous | Contribute under an account instead of anonymously |
 | `--leavegen-job`, `--opening-rack-job`, `--games-job`, `--pairs-job`, `--sim-games-job`, `--sim-pairs-job` | none | The jobs to start with, which stack: see above. Each also comes as `<flag>-ab`, the same job on the two-letter `english_ab` data |
 | `--lexicon`, `--variant` | CSW24, classic | The lexicon of every job not on the `-ab` data, and of its players; the variant of every job (left unset, `seed.py`'s default, classic) |
@@ -481,10 +481,10 @@ compared" below.
 
    ```text
    "derived": [
-     { "role": "wmp", "name": "CSW24", "sha256": "1830…", "bytes": 178929167,
+     { "role": "wmp", "name": "CSW24", "sha256": "1830…",
        "builder": "wmp-1", "build_target": "nehalem" },
      { "role": "rit", "name": "CSW24.CSW_quackle_leaves", "sha256": "6da8…",
-       "bytes": 1885416048, "builder": "rit-1", "build_target": "nehalem" }
+       "builder": "rit-1", "build_target": "nehalem" }
    ]
    ```
 
@@ -763,9 +763,9 @@ A first deployment, in order (each step is described below):
    The import's GitHub calls are 60 an hour per address without
    `github_token_parameter_arn`; set it first if more than a few imports are
    expected. Then make player configs and jobs. A job whose players need a
-   wordmap or a rack info table is not dispatched until the derived-data
-   builder (every five minutes) has built them: `/admin/derived-data` shows the
-   queue.
+   wordmap, a rack info table or a word info table is not dispatched until
+   the derived-data builder (every five minutes) has built them:
+   `/admin/derived-data` shows the queue.
 
 `infra/` is a complete Terraform description of the AWS side. Keep the stack's
 variables in `infra/prod.tfvars` (not committed: it names the account's

@@ -121,12 +121,6 @@ export interface Page<T> {
   per_page: number;
 }
 
-/**
- * A job's results page by cursor rather than by offset: the corpus runs to
- * millions of rows, where `OFFSET` produces every row before the page asked
- * for. Pass `next_cursor` back as `cursor` for the next page; its absence is
- * the end. This is the only endpoint that pages this way.
- */
 /** A position a games or pairs job captured, with its ranked moves. */
 export interface SavedPosition {
   task_id: string;
@@ -217,7 +211,6 @@ export interface RackLookupRow {
 /** Static equity, a simulation, a pre-endgame solve or an endgame solve. */
 export type PositionAnalysis = 'static' | 'sim' | 'peg' | 'endgame';
 
-/** A layout square, by what it multiplies (`#` in MAGPIE's layout is a brick). */
 /** What the contributor list can be ranked by; the server's default is compute time. */
 export type ContributorSort = 'compute' | 'games' | 'racks' | 'tasks';
 
@@ -238,6 +231,7 @@ export interface Contributor {
   last_seen_at: string | null;
 }
 
+/** A layout square, by what it multiplies (`#` in MAGPIE's layout is a brick). */
 export type BoardSquare =
   | 'normal'
   | 'double_letter'
@@ -258,9 +252,19 @@ export interface BoardData {
   letters: { letter: string; blank: string; score: number }[];
 }
 
+/**
+ * A page by cursor rather than by offset, for a job's results and its captured
+ * positions: the corpus runs to millions of rows, where `OFFSET` produces every
+ * row before the page asked for. Pass `next_cursor` back as `cursor` for the
+ * next page; its absence is the end. These two are the only endpoints that page
+ * this way.
+ */
 export interface CursorPage<T> {
   items: T[];
-  /** Always -1: an exact count costs more than it is worth to the caller. */
+  /**
+   * -1 for a results or positions page (an exact count costs more than it is
+   * worth to the caller); a rack lookup's count of the moves it returns.
+   */
   total: number;
   per_page: number;
   next_cursor?: string;
@@ -352,9 +356,6 @@ export interface GameStats {
   };
   min_units: number;
   max_units: number;
-  win_pct: number;
-  loss_pct: number;
-  draw_pct: number;
   /**
    * The significance test over every accepted result, recomputed on each read; null
    * for a job that runs none, which plays `max_units` and stops.
@@ -373,7 +374,7 @@ export interface GameStats {
  * `reason` is the server's: the significance test's verdict (`player1_better`,
  * `player2_better`, `inconclusive`), `reached_target` for a games or pairs job without a
  * test, `last generation built`, or none for an opening-rack job whose racks
- * were all analysed.
+ * were all settled.
  */
 export interface Completion {
   at: string;
@@ -739,12 +740,16 @@ export const api = {
   jobs: (page = 0, status?: JobStatus) =>
     get<Page<JobListItem>>(`/api/jobs?page=${page}${status ? `&status=${status}` : ''}`),
   job: (id: string) => get<JobStats>(`/api/jobs/${id}`),
-  /** Cursor-paginated; see {@link CursorPage}. `?rack=` returns one rack's whole list. */
+  /** Cursor-paginated; see {@link CursorPage}. `?rack=` is `rackLookup`'s one page. */
   jobResults: (id: string, params: Record<string, string | number | undefined> = {}) =>
     get<CursorPage<Record<string, unknown>>>(
       `/api/jobs/${id}/results?${query(params)}`
     ),
-  /** One rack's ranked moves in an opening-rack job, every analysis of it, in one page. */
+  /**
+   * One rack's ranked moves in an opening-rack job, in one page: every analysis
+   * of it, each with its best moves -- the whole list when there are few
+   * analyses, and fewer per analysis the more there are (32,767 moves in all).
+   */
   rackLookup: (id: string, rack: string) =>
     get<CursorPage<RackLookupRow>>(`/api/jobs/${id}/results?${new URLSearchParams({ rack })}`),
   /** Signed-in users only: a games or pairs job's captured positions with one rack, newest first. */
@@ -818,7 +823,10 @@ export const api = {
       klv_id: row.klv_id,
       letterdist_id: row.letterdist_id
     }),
-  /** `409` unless the job is completed and its last claims have landed. */
+  /**
+   * A snapshot while the job is not completed; `409` for a completed job with
+   * claims still in flight, or while an export of the job is already running.
+   */
   startExport: (id: string) =>
     post<{ id: string; state: string }>(`/api/admin/jobs/${id}/export`),
   /** The newest export; `404` when the job has never been exported. */

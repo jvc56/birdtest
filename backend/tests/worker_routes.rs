@@ -400,8 +400,13 @@ async fn a_claim_states_its_digests_and_a_missing_data_decline_releases_it_at_on
     // Two static players on two lexicons of their own, one bag, one board.
     assert_eq!(roles, ["klv", "klv", "kwg", "kwg", "layout", "letterdist"], "{assignment}");
     for file in files {
-        let (sha256, bytes, date): (String, i64, String) = sqlx::query_as(
-            "SELECT sha256, bytes, tarball_date FROM input_data WHERE path = $1 AND role = $2",
+        // What MAGPIE reads, and nothing it does not: a size the client never
+        // looks at is a field to keep in step for no one.
+        let mut keys: Vec<&str> = file.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["name", "path", "role", "sha256", "tarball_date"], "{file}");
+        let (sha256, date): (String, String) = sqlx::query_as(
+            "SELECT sha256, tarball_date FROM input_data WHERE path = $1 AND role = $2",
         )
         .bind(file["path"].as_str().unwrap())
         .bind(file["role"].as_str().unwrap())
@@ -409,7 +414,6 @@ async fn a_claim_states_its_digests_and_a_missing_data_decline_releases_it_at_on
         .await
         .unwrap();
         assert_eq!(file["sha256"], json!(sha256), "{file}");
-        assert_eq!(file["bytes"], json!(bytes), "{file}");
         assert_eq!(file["tarball_date"], json!(date), "{file}");
     }
 

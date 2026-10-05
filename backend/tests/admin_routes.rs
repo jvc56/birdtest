@@ -403,6 +403,12 @@ async fn job_creation_refuses_each_impossible_combination_and_says_which() {
     let (status, refusal) = admin.post("/api/admin/player-configs", static_with_model).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{refusal}");
     assert!(message(&refusal).contains("must not name a win% model"), "{refusal}");
+    // A simmer with one candidate play never simulates: MAGPIE plays it.
+    let mut one_candidate = simming_config("one-candidate", &files, Some(winpct));
+    one_candidate["num_plays"] = json!(1);
+    let (status, refusal) = admin.post("/api/admin/player-configs", one_candidate).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refusal}");
+    assert_eq!(refusal["fields"][0]["field"], "num_plays", "{refusal}");
     assert_eq!(count(&db, "SELECT COUNT(*) FROM player_configs").await, 3);
 }
 

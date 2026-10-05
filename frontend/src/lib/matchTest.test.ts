@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { testBar, testSentence } from './matchTest';
+import { confidenceProblem, testBar, testSentence } from './matchTest';
 import type { TestResult } from './api';
 
 const result = (over: Partial<TestResult>): TestResult => ({
@@ -34,5 +34,16 @@ describe('F-TEST-2 testSentence', () => {
       / static is better at 95% confidence\.$/
     );
     expect(testSentence(result({ status: 'inconclusive' }), names)).toMatch(/Neither is better at 95% confidence/);
+  });
+});
+
+describe('F-TEST-3 confidenceProblem', () => {
+  it('takes what the server takes, strictly between 50 and 100', () => {
+    for (const pct of [50.05, 50.1, 95, 99.99, 99.995]) expect(confidenceProblem(pct)).toBeNull();
+    for (const pct of [50, 100, 49, 120, Number.NaN, Infinity]) {
+      expect(confidenceProblem(pct)).toBe('The confidence must be above 50% and below 100%.');
+    }
+    // A cleared number input binds null.
+    expect(confidenceProblem(null)).not.toBeNull();
   });
 });

@@ -1980,3 +1980,84 @@ async fn a_transition_that_fails_before_it_starts_hands_ownership_back() {
     .await;
     assert!(released, "a transition that failed before it started hands ownership back");
 }
+
+/// I-LEAVE-25: the universe probe reads an index whatever the generation's
+/// history. Every leave claim asks whether its generation's universe exists,
+/// under the job's dispatch lock; asked as an `EXISTS`, that was a sequential
+/// scan once the generation was in the statistics, reading every older
+/// generation's rows (kept for the life of the job) before reaching it. So
+/// was the tail's "any rack below target". Two generations of thirty thousand
+/// racks, analysed: both probes for the later one are index scans, in a custom
+/// plan and a generic one, and still answer correctly.
+#[tokio::test]
+async fn the_universe_probe_reads_an_index_whatever_the_generations_history() {
+    use birdtest::jobs::leave_gen::{BELOW_TARGET_PROBE, UNIVERSE_PROBE};
+    let db = TestDb::new().await;
+    let admin = db.user("leaveplanner", true).await;
+    let job = db.bare_job("leave_generation", admin).await;
+    sqlx::query(
+        "INSERT INTO leave_rack_progress (job_id, generation, rack, occurrence_count)
+         SELECT $1, g, 'R' || lpad(i::text, 7, '0'), CASE WHEN g = 1 THEN 50 ELSE 0 END
+         FROM generate_series(1, 2) g, generate_series(0, 29999) i",
+    )
+    .bind(job)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query("ANALYZE leave_rack_progress").execute(&db.pool).await.unwrap();
+
+    // The data is what made the old form a sequential scan, so the assertions
+    // below are not vacuous.
+    let old: Vec<String> = sqlx::query_scalar(&format!(
+        "EXPLAIN SELECT EXISTS (SELECT 1 FROM leave_rack_progress
+                                WHERE job_id = '{job}' AND generation = 2)"
+    ))
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert!(old.join("\n").contains("Seq Scan on leave_rack_progress"), "{old:?}");
+
+    // Prepared as the server's statements are, so a generic plan is a real
+    // generic plan; `auto` makes custom plans for the first five executions.
+    for mode in ["auto", "force_generic_plan"] {
+        let mut tx = db.pool.begin().await.unwrap();
+        for statement in [
+            format!("SET LOCAL plan_cache_mode = {mode}"),
+            format!("PREPARE universe AS {UNIVERSE_PROBE}"),
+            format!("PREPARE below AS {BELOW_TARGET_PROBE}"),
+        ] {
+            sqlx::raw_sql(&statement).execute(&mut *tx).await.unwrap();
+        }
+        for (execute, index) in [
+            (format!("EXECUTE universe('{job}', 2)"), "leave_rack_progress_pkey"),
+            (format!("EXECUTE below('{job}', 2, 50)"), "leave_rack_progress_pick_idx"),
+        ] {
+            let plan: Vec<String> = sqlx::query_scalar(&format!("EXPLAIN {execute}"))
+                .fetch_all(&mut *tx)
+                .await
+                .unwrap();
+            let plan = plan.join("\n");
+            assert!(!plan.contains("Seq Scan"), "{mode}: {plan}");
+            assert!(plan.contains(index), "{mode}: {plan}");
+        }
+        tx.rollback().await.unwrap();
+    }
+
+    let mut conn = db.pool.acquire().await.unwrap();
+    for (generation, exists) in [(1, true), (2, true), (3, false)] {
+        let found = birdtest::jobs::leave_gen::universe_exists(&mut conn, job, generation)
+            .await
+            .unwrap();
+        assert_eq!(found, exists, "generation {generation}");
+    }
+    for (generation, target, below) in [(1, 50i64, false), (1, 51, true), (2, 1, true)] {
+        let found: Option<i32> = sqlx::query_scalar(BELOW_TARGET_PROBE)
+            .bind(job)
+            .bind(generation)
+            .bind(target)
+            .fetch_optional(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(found.is_some(), below, "generation {generation}, target {target}");
+    }
+}

@@ -840,6 +840,17 @@ async fn create_player_config(
                  contributor's hardware, so the iteration budget bounds a simulation instead",
             );
         }
+        // The other way to a simmer that never simulates: autoplay's move
+        // list holds `num_plays` plays, and with one MAGPIE plays it without
+        // simulating (`get_top_simming_move`), every turn -- a static player
+        // pinned, rated and labelled as a simmer.
+        if body.num_plays.unwrap_or(crate::magpie_defaults::NUM_PLAYS) < 2 {
+            err = err.with_field(
+                "num_plays",
+                "a simming player needs at least 2 candidate plays: with one, MAGPIE plays it \
+                 without simulating",
+            );
+        }
         if !err.fields.is_empty() {
             return Err(err);
         }
@@ -2290,7 +2301,7 @@ async fn activate_job(
 
     let mut tx = state.pool.begin().await?;
     let job = load_job_for_update(&mut tx, id).await?;
-    refuse_if_purged_since(&state, id, purges)?;
+    refuse_if_purged_since(&state.dispatch_holds, id, purges)?;
     if job.status == JobStatus::Completed {
         return Err(AppError::conflict("a completed job cannot be reactivated"));
     }
@@ -2461,7 +2472,7 @@ async fn set_allocations(
                     "the job is completed, and a completed job cannot be reactivated",
                 )
             }
-            Some(_) => refuse_if_purged_since(&state, row.job_id, purges[&row.job_id])?,
+            Some(_) => refuse_if_purged_since(&state.dispatch_holds, row.job_id, purges[&row.job_id])?,
         }
     }
     if !err.fields.is_empty() {
@@ -2592,7 +2603,7 @@ async fn deactivate_job(
 
     let mut tx = state.pool.begin().await?;
     let before = load_job_for_update(&mut tx, id).await?;
-    refuse_if_purged_since(&state, id, purges)?;
+    refuse_if_purged_since(&state.dispatch_holds, id, purges)?;
     // Completion is final as far as the lifecycle actions go (only a purge,
     // or an opening-rack job's consensus edit, takes a job out of it).
     // Flipping a completed job to inactive would be a way around that rule:
@@ -2635,7 +2646,7 @@ async fn complete_job(
 
     let mut tx = state.pool.begin().await?;
     let before = load_job_for_update(&mut tx, id).await?;
-    refuse_if_purged_since(&state, id, purges)?;
+    refuse_if_purged_since(&state.dispatch_holds, id, purges)?;
     // Already completed -- by the server's own finish check, say, while the
     // admin's page was stale -- is a conflict, not a second completion on
     // record (the audit's pass 23).
@@ -2699,8 +2710,10 @@ struct ConsensusResult {
 /// The job then starts or stops to match. A completed job the change leaves
 /// with unsettled racks is reopened: active at its allocation if the other
 /// active jobs leave room for it, inactive otherwise (the admin then makes
-/// room and activates it), and its final exports become snapshots, since the
-/// job will have a new final corpus once it completes again. An active job
+/// room and activates it). Either way a completed job's final exports become
+/// snapshots, since the standings they carry are the old settings': the job
+/// has a new final corpus once it completes again, or, left completed, once
+/// it is exported again. An active job
 /// the change leaves with every rack settled completes now, or with its last
 /// in-flight claim's submission. An inactive job keeps its status, and
 /// completes when next activated if there is nothing left for it to do.
@@ -2877,6 +2890,14 @@ async fn consensus_body(
             if fits { "active" } else { "inactive" },
         )
         .await?;
+    }
+    // Any change to a completed job's settings, not only one that reopens
+    // it: each line of an export carries its rack's standing under the
+    // settings it was read with, and an edit that leaves every rack settled
+    // still restates them (a lower share turns racks settled without a
+    // consensus into agreed ones). Left final, the export went on being
+    // served as the completed job's corpus with the old standings.
+    if job.status == JobStatus::Completed {
         crate::exports::unfinalize(&mut tx, id).await?;
     }
     let job = sqlx::query_as::<_, Job>("SELECT * FROM jobs WHERE id = $1")
@@ -3266,9 +3287,17 @@ fn refuse_while_purging(state: &AppState, id: Uuid) -> AppResult<u64> {
 /// the check exists to prevent. Compared by count, not by whether a hold is
 /// held: a purge of a job with nothing to do after its commit has released
 /// its hold by the time the waiter wakes.
-fn refuse_if_purged_since(state: &AppState, id: Uuid, taken: u64) -> AppResult<()> {
-    if state.dispatch_holds.claims_holds_taken(id) != taken || state.dispatch_holds.claims_held(id) {
+///
+/// A hold held with the count unchanged is a consensus edit's, which is not
+/// counted: one that took its hold after the first check and now queues on
+/// this row behind the action. Refused too, since the edit is about to
+/// restate the job, but as running, not as a purge: nothing was purged.
+fn refuse_if_purged_since(holds: &crate::jobs::DispatchHolds, id: Uuid, taken: u64) -> AppResult<()> {
+    if holds.claims_holds_taken(id) != taken {
         return Err(AppError::conflict(PURGED_WHILE_WAITING));
+    }
+    if holds.claims_held(id) {
+        return Err(AppError::conflict(ALREADY_RUNNING));
     }
     Ok(())
 }
@@ -4321,6 +4350,31 @@ async fn load_job_for_update(conn: &mut sqlx::PgConnection, id: Uuid) -> AppResu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// I-OR-EDIT-6: an action that waited on a job's row is told a purge
+    /// happened only when one did. A consensus edit's hold, which is not
+    /// counted, is refused as running: it read "the job was purged".
+    #[test]
+    fn an_action_that_waited_on_an_edit_is_not_told_the_job_was_purged() {
+        let holds = crate::jobs::DispatchHolds::default();
+        let job = Uuid::new_v4();
+        let grace = std::time::Duration::from_secs(1);
+        let taken = holds.claims_holds_taken(job);
+        assert!(refuse_if_purged_since(&holds, job, taken).is_ok());
+
+        let edit = holds.try_hold_claims_uncounted(job, grace).unwrap();
+        let err = refuse_if_purged_since(&holds, job, taken).unwrap_err();
+        assert_eq!((err.status, err.message.as_str()), (StatusCode::CONFLICT, ALREADY_RUNNING));
+        drop(edit);
+        assert!(refuse_if_purged_since(&holds, job, taken).is_ok());
+
+        let purge = holds.try_hold_claims(job, grace).unwrap();
+        let err = refuse_if_purged_since(&holds, job, taken).unwrap_err();
+        assert_eq!(err.message, PURGED_WHILE_WAITING);
+        drop(purge);
+        let err = refuse_if_purged_since(&holds, job, taken).unwrap_err();
+        assert_eq!(err.message, PURGED_WHILE_WAITING, "by count, after the hold is gone");
+    }
 
     /// Nothing MAGPIE's loader (`board_layout.c`) refuses is accepted, and what
     /// it loads is too, but for parser quirks birdtest is stricter about (e.g. a

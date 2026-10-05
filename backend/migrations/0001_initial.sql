@@ -1535,10 +1535,11 @@ CREATE TABLE leave_generation_artifacts (
     -- SHA-256 of the KLV bytes as first written. The object store holds the
     -- only copy of these bytes, and an artifact is the one piece of state that
     -- can be silently overwritten -- by a restore that replays a generation
-    -- transition against fewer results, or by a rebuild under a changed
-    -- klv::build. Recording the hash is what turns that from invisible into a
-    -- query; the ON CONFLICT DO NOTHING on insert means the row keeps the
-    -- FIRST hash, so a later mismatch is evidence rather than an overwrite.
+    -- transition against fewer results, or by a rebuild under a changed KLV
+    -- builder (`builder`, below). Recording the hash is what turns that from
+    -- invisible into a query; the ON CONFLICT DO NOTHING on insert means the
+    -- row keeps the FIRST hash, so a later mismatch is evidence rather than an
+    -- overwrite.
     sha256        TEXT NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
     -- SHA-256 of the bytes the object store holds *now*, when they are not
     -- the bytes first written; NULL while they are. Set by every
@@ -1808,11 +1809,13 @@ CREATE INDEX        task_claims_user_idx      ON task_claims (claimed_by_user_id
     WHERE claimed_by_user_id IS NOT NULL;
 CREATE INDEX        task_claims_anon_idx      ON task_claims (claimed_by_anon_uuid, job_id, completed_at)
     WHERE claimed_by_anon_uuid IS NOT NULL;
--- There is no (job_id, state) index. Every job-scoped read of `tasks` -- the
--- detail page's counts by state; the census; the opening-rack finish check,
--- which needs `seed` -- is served by `tasks_seed_unique_idx (job_id, seed)`
--- and the heap, and a state index cost an entry on every task insert and
--- every state change, on the claim and submit paths, for no reader that
+-- There is no (job_id, state) index. The job-scoped reads of `tasks` -- the
+-- detail page's counts by state, the census -- are served by
+-- `tasks_seed_unique_idx (job_id, seed)` and the heap. The opening-rack finish
+-- check asks for the job's first task by seed there, and for a task not
+-- completed through `tasks_queue_idx` (available) and `task_claims_open_idx`
+-- (claimed), not by state. A state index cost an entry on every task insert
+-- and every state change, on the claim and submit paths, for no reader that
 -- needed it.
 -- For the cascade from `tasks` alone: no reader looks a result up by its task.
 -- It was (task_id, submitted_at) for the per-task "first accepted result" read

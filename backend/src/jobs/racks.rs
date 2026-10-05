@@ -44,17 +44,12 @@ pub struct LetterDistribution {
     /// one of which MAGPIE does read.
     pub bytes: Vec<u8>,
     pub tiles: Vec<Tile>,
-    /// Letters in the order they appeared in the distribution file, before
-    /// the canonical sort below. This is MAGPIE's own machine-letter
-    /// numbering: it assigns index 0, 1, 2, ... to each row as it reads the
-    /// file, in file order, never re-sorted. `klv.rs` needs this exact
-    /// numbering baked into a KWG's node bytes; nothing else in this struct
-    /// does, which is why it's kept separately rather than replacing `tiles`.
-    machine_letters: Vec<char>,
-    /// Every row whole, in the same machine-letter order: what the saved
-    /// positions page needs to draw a tile, which `machine_letters` (a
-    /// letter's first character) and `tiles` (sorted, zero counts dropped)
-    /// cannot say.
+    /// Every row whole, in the order it appeared in the distribution file.
+    /// This is MAGPIE's own machine-letter numbering: it assigns index 0, 1,
+    /// 2, ... to each row as it reads the file, in file order, never
+    /// re-sorted, and a row's position here is its number --
+    /// [`Self::canonical_rack`] and the saved positions page read it so.
+    /// `tiles` (sorted, zero counts dropped) cannot say it.
     letters: Vec<Letter>,
     /// Why this distribution's racks cannot be enumerated, if they cannot.
     ///
@@ -200,7 +195,6 @@ impl LetterDistribution {
             name: origin.to_string(),
             bytes: bytes.to_vec(),
             tiles,
-            machine_letters,
             letters,
             unenumerable,
         })
@@ -263,17 +257,6 @@ impl LetterDistribution {
         )
     }
 
-    /// MAGPIE's machine-letter index for `letter` -- see the `machine_letters`
-    /// field comment. `None` means the letter isn't in this distribution at
-    /// all, which for a leave actually enumerated from it is a bug, not a
-    /// legitimate input to handle gracefully.
-    pub fn machine_letter(&self, letter: char) -> Option<u8> {
-        self.machine_letters
-            .iter()
-            .position(|&c| c == letter)
-            .map(|i| i as u8)
-    }
-
     /// Builds a distribution from an explicit tile list, for tests only --
     /// everywhere else goes through [`Self::parse`], which is the only place
     /// that should construct one from the bytes a job pins.
@@ -283,7 +266,6 @@ impl LetterDistribution {
     /// reads has to be the pinned bytes, not a reconstruction of them.
     #[cfg(test)]
     pub fn from_tiles_for_test(tiles: Vec<Tile>) -> Self {
-        let machine_letters: Vec<char> = tiles.iter().map(|t| t.letter).collect();
         let bytes = tiles
             .iter()
             .map(|t| format!("{},{},{},1,0\n", t.letter, t.letter.to_lowercase(), t.count))
@@ -299,7 +281,7 @@ impl LetterDistribution {
             .collect();
         let mut tiles = tiles;
         tiles.sort_by_key(|t| t.letter);
-        Self { name: "test".into(), bytes, tiles, machine_letters, letters, unenumerable: None }
+        Self { name: "test".into(), bytes, tiles, letters, unenumerable: None }
     }
 
     /// Every distinct multiset of exactly `size` tiles drawable from the bag,
@@ -486,6 +468,12 @@ impl RackIndex {
 mod tests {
     use super::*;
 
+    /// A letter's machine-letter number: its row's position in `letters()`,
+    /// which is how `canonical_rack` and the positions page number it.
+    fn machine_letter(distribution: &LetterDistribution, letter: &str) -> Option<usize> {
+        distribution.letters().iter().position(|l| l.letter == letter)
+    }
+
     fn tiny() -> LetterDistribution {
         LetterDistribution::from_tiles_for_test(vec![
             Tile { letter: 'A', count: 2 },
@@ -612,11 +600,11 @@ mod tests {
         assert!(letters.windows(2).all(|w| w[0] < w[1]), "{letters:?}");
         assert_eq!(letters[0], '?');
 
-        assert_eq!(english.machine_letter('?'), Some(0));
-        assert_eq!(english.machine_letter('A'), Some(1));
-        assert_eq!(english.machine_letter('Z'), Some(26));
-        assert_eq!(english.machine_letter('a'), None, "the lowercase column is not a letter");
-        assert_eq!(english.machine_letter('!'), None);
+        assert_eq!(machine_letter(&english, "?"), Some(0));
+        assert_eq!(machine_letter(&english, "A"), Some(1));
+        assert_eq!(machine_letter(&english, "Z"), Some(26));
+        assert_eq!(machine_letter(&english, "a"), None, "the lowercase column is not a letter");
+        assert_eq!(machine_letter(&english, "!"), None);
     }
 
     /// U-RACK-1: the smallest distribution there is. Written out of order, so
@@ -631,20 +619,20 @@ mod tests {
         assert_eq!(count_of(&distribution, 'A'), Some(2));
         assert_eq!(count_of(&distribution, 'B'), Some(1));
         assert_eq!(distribution.tiles[0].letter, 'A', "tiles are sorted");
-        assert_eq!(distribution.machine_letter('B'), Some(0), "numbered in file order");
-        assert_eq!(distribution.machine_letter('A'), Some(1));
+        assert_eq!(machine_letter(&distribution, "B"), Some(0), "numbered in file order");
+        assert_eq!(machine_letter(&distribution, "A"), Some(1));
         assert_eq!(distribution.enumerate_racks(2), ["AA", "AB"]);
     }
 
     /// U-RACK-1: MAGPIE numbers every row it reads, so a zero-count row still
     /// takes a machine letter. Dropping it along with its tiles would shift
-    /// every letter after it by one in a KWG built from this numbering.
+    /// every letter after it, against MAGPIE's numbering.
     #[test]
     fn a_zero_count_row_keeps_its_machine_letter_but_has_no_tiles() {
         let distribution =
             LetterDistribution::parse(b"A,a,1,1,1\nB,b,0,3,0\nC,c,1,3,0\n", "zero").unwrap();
         assert_eq!(count_of(&distribution, 'B'), None, "no tiles to draw");
-        assert_eq!(distribution.machine_letter('C'), Some(2));
+        assert_eq!(machine_letter(&distribution, "C"), Some(2));
         assert_eq!(distribution.enumerate_racks(2), ["AC"]);
     }
 
@@ -703,8 +691,8 @@ mod tests {
             assert!(message.contains("origin-name.csv"), "{why}: {message}");
         }
         let hash = LetterDistribution::parse(b"#,#,1,1,0\nA,a,1,1,1\n", "hash").unwrap();
-        assert_eq!(hash.machine_letter('#'), Some(0));
-        assert_eq!(hash.machine_letter('A'), Some(1), "numbered after the `#` row");
+        assert_eq!(machine_letter(&hash, "#"), Some(0));
+        assert_eq!(machine_letter(&hash, "A"), Some(1), "numbered after the `#` row");
     }
 
     /// U-RACK-2: each malformed shape is refused for its own reason, and every

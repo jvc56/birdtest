@@ -392,7 +392,7 @@ pub enum Finish {
     /// is no verdict to keep, so `test_decided_*` stay NULL and the audit
     /// row's reason is what says why it stopped.
     ReachedTarget,
-    /// An opening-rack job's racks were all handed out and analysed.
+    /// An opening-rack job's racks were all handed out and settled.
     RacksAnalysed,
 }
 
@@ -800,7 +800,6 @@ pub struct ExpectedFile {
     pub name: String,
     pub path: String,
     pub sha256: String,
-    pub bytes: i64,
     pub tarball_date: String,
 }
 
@@ -846,7 +845,7 @@ pub async fn expected_data(
              -- joins to nothing and so contributes no entry.
              UNION SELECT pc.winpct_id FROM player_configs pc JOIN players p ON p.id = pc.id
          )
-         SELECT d.role, d.name, d.path, d.sha256, d.bytes, d.tarball_date
+         SELECT d.role, d.name, d.path, d.sha256, d.tarball_date
          FROM input_data d JOIN ids ON ids.id = d.id
          ORDER BY d.role, d.name",
     )
@@ -861,7 +860,6 @@ pub async fn expected_data(
             name: row.get("name"),
             path: row.get("path"),
             sha256: row.get("sha256"),
-            bytes: row.get("bytes"),
             tarball_date: row.get("tarball_date"),
         })
         .collect())

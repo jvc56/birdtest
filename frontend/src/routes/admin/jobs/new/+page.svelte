@@ -4,6 +4,7 @@
   import { api, errorText, type InputData, type JobType, type PlayerConfig } from '$lib/api';
   import { blankFields, jobTypeLabel, leavePlayerConflict, parseTargetRackCounts, targetsText, unchosenText } from '$lib/format';
   import { consensusFields, consensusProblem as checkConsensus } from '$lib/consensus';
+  import { confidenceProblem as checkConfidence } from '$lib/matchTest';
 
   let configs: PlayerConfig[] = [];
   let files: InputData[] = [];
@@ -81,6 +82,10 @@
           max_results_per_rack: maxResults,
           consensus_pct: consensusPct
         });
+  $: confidenceProblem =
+    (jobType === 'games' || jobType === 'game_pairs') && testEnabled
+      ? checkConfidence(confidencePct)
+      : null;
   $: openingRackConflict =
     jobType !== 'opening_rack' || !selectedConfig
       ? null
@@ -198,6 +203,11 @@
     }
     if (consensusProblem) {
       error = `Analyses per rack: ${consensusProblem}`;
+      fromSubmit = true;
+      return;
+    }
+    if (confidenceProblem) {
+      error = `Confidence %: ${confidenceProblem}`;
       fromSubmit = true;
       return;
     }
@@ -466,17 +476,19 @@
     </div>
     {#if testEnabled}
       <div class="grid grid-cols-2 gap-3">
+        <!-- No `min` or `max`: the server takes anything strictly between 50 and 100, which
+             no inclusive bound can say (`min="50.1"` blocked 50.05); `confidenceProblem` says
+             what it must be. -->
         <div>
           <label class="label" for="confidence">Confidence %</label>
           <input
             id="confidence"
             type="number"
             step="any"
-            min="50.1"
-            max="99.99"
             class="input"
             bind:value={confidencePct}
           />
+          {#if confidenceProblem}<p class="field-error">{confidenceProblem}</p>{/if}
           <p class="mt-1 text-xs text-muted-foreground">
             The chance of naming a winner between two equal players is at most about
             {Math.round((100 - confidencePct) * 100) / 100}%. Higher takes more {units.toLowerCase()}

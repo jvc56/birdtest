@@ -68,10 +68,10 @@ at tier 5 names a symptom.
 
 | Tier | Tests | Where |
 |---|---|---|
-| 1 Unit | 248 | `#[cfg(test)]` in `jobs::plausibility` (30), `inputdata` (30), `jobs::racks` (17), `stats::bradley_terry` (30), `stats::match_test` (10), `stats::outcomes` (7), `error` (8), `config` (8), `extract` (7), `routes::admin` (15), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (5), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (7), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (8), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `board`, `exports`, `jobs`, `jobs::leave_gen`, `routes` (1 each); `jobs::game_pair` (3), `artifacts` (2) |
-| 1F Frontend unit | 214 | Vitest, `frontend/src/lib/`: `format.test.ts` (45), `jobSettings.test.ts` (13), `matchScore.test.ts` (4), `matchTest.test.ts` (4), `moveList.test.ts` (5), `compare.test.ts` (3), `consensus.test.ts` (8), `cgp.test.ts` (16), `api.test.ts` (18), `auth.test.ts` (16), `accountRules.test.ts` (9), `sse.test.ts` (12), `importWatch.test.ts` (10), `poller.test.ts` (7), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (3), and `charts/`: `ratingDotPlot.test.ts` (19), `labels.test.ts` (2), `residuals.test.ts` (11), `pentanomial.test.ts` (5) |
-| 2 Integration | 182 | `backend/tests/`: `leave_gen.rs` (33), `ratings.rs` (31), `scheduler.rs` (19), `jobs.rs` (20), `stats.rs` (19), `input_data.rs` (14), `derived.rs` (9), `leave_generation.rs` (8), `exports.rs` (15), `submissions.rs` (6), `artifacts.rs` (5), `audit.rs` (3) |
-| 3 API | 246 | `backend/tests/`: `worker_api.rs` (52), `admin_api.rs` (59), `auth_routes.rs` (28), `worker_routes.rs` (24), `boundaries.rs` (18), `public_api.rs` (22), `admin_routes.rs` (13), `authz.rs` (7), `account.rs` (10), `auth_api.rs` (5), `finish.rs` (7), `fake_worker.rs` (1) |
+| 1 Unit | 250 | `#[cfg(test)]` in `jobs::plausibility` (30), `inputdata` (30), `jobs::racks` (17), `stats::bradley_terry` (30), `stats::match_test` (10), `stats::outcomes` (7), `error` (9), `config` (8), `extract` (7), `routes::admin` (16), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (5), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (7), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (8), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `board`, `exports`, `jobs`, `jobs::leave_gen`, `routes` (1 each); `jobs::game_pair` (3), `artifacts` (2) |
+| 1F Frontend unit | 216 | Vitest, `frontend/src/lib/`: `format.test.ts` (45), `jobSettings.test.ts` (13), `matchScore.test.ts` (4), `matchTest.test.ts` (5), `moveList.test.ts` (5), `compare.test.ts` (3), `consensus.test.ts` (8), `cgp.test.ts` (16), `api.test.ts` (18), `auth.test.ts` (17), `accountRules.test.ts` (9), `sse.test.ts` (12), `importWatch.test.ts` (10), `poller.test.ts` (7), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (3), and `charts/`: `ratingDotPlot.test.ts` (19), `labels.test.ts` (2), `residuals.test.ts` (11), `pentanomial.test.ts` (5) |
+| 2 Integration | 184 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (32), `scheduler.rs` (19), `jobs.rs` (20), `stats.rs` (19), `input_data.rs` (14), `derived.rs` (9), `leave_generation.rs` (8), `exports.rs` (15), `submissions.rs` (6), `artifacts.rs` (5), `audit.rs` (3) |
+| 3 API | 248 | `backend/tests/`: `worker_api.rs` (52), `admin_api.rs` (59), `auth_routes.rs` (28), `worker_routes.rs` (24), `boundaries.rs` (18), `public_api.rs` (23), `admin_routes.rs` (13), `authz.rs` (7), `account.rs` (10), `auth_api.rs` (5), `finish.rs` (8), `fake_worker.rs` (1) |
 | 4 Contract | 15 | `routes::worker::contract_fixtures`, over 18 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
 | 5 End-to-end | 21 | Playwright journeys `E-1`..`E-18` (`E-11` in three tests, `E-12` in two) in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
 | 6 MAGPIE smoke | 15 cases + 16 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-16` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 16 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (6), `magpie_leave.rs` (7), `magpie_routes.rs` (3) |
@@ -79,9 +79,9 @@ at tier 5 names a symptom.
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
 directly to assert one. With the tier-6 tests selected, `cargo nextest run
---run-ignored all` runs 707 backend tests (the per-tier counts above are
+--run-ignored all` runs 713 backend tests (the per-tier counts above are
 from `cargo nextest list --run-ignored all` and `vitest`, after the thirty-third
-audit's second pass).
+audit's third pass).
 
 Tier 2 was the largest gap and the highest value.
 `sqlx::query` is checked at runtime, so the compiler sees opaque text. Two bugs
@@ -204,7 +204,10 @@ The rack index is a permanent identifier: opening-rack results are stored
 against it, so a change in ordering silently re-points existing rows.
 
 - `U-RACK-1` `LetterDistribution::parse` accepts a real `english.csv` and a
-  minimal two-letter one, and reports the right tile counts and machine letters.
+  minimal two-letter one, and reports the right tile counts and machine letters
+  -- read as a row's position in `letters()`, the numbering `canonical_rack`
+  and the positions page use (a `machine_letter()` the tests alone read, kept
+  for a KLV builder since deleted, went in the thirty-third audit's third pass).
   A zero-count row keeps its machine letter (it used to shift every later
   letter's number). *(Covered:
   `racks::tests::the_real_english_distribution_parses_with_magpies_numbering`,
@@ -343,6 +346,12 @@ Every handler returns `AppResult`, so this type decides what a caller sees.
   and a pool timeout is a 503 with `Retry-After`. *(Covered:
   `error::tests::constraint_violations_are_conflicts_without_the_constraint_text`,
   `error::tests::a_pool_timeout_is_a_503_with_retry_after`.)*
+- `U-ERR-8` A NUL the database cannot store (SQLSTATE `22021`, and `22P05`
+  for a `\u0000` read from JSON as text) is a `400 bad_request` that does not
+  carry the database's words: every text the server binds that could hold one
+  is the caller's. *(Covered:
+  `error::tests::a_nul_the_database_cannot_store_is_a_bad_request`; through
+  the API, `A-PUBLIC-8`.)* (Thirty-third audit, pass 3.)
 
 ### `U-AUTH-*` — credentials (`auth/api_key.rs`, `auth/session.rs`, `auth/csrf.rs`)
 
@@ -420,8 +429,10 @@ process environment, so no test mutates `std::env` under another.
   `DEFAULT_MIN_MAGPIE_VERSION`: Terraform's `min_magpie_version` default (and
   its description), which `ecs.tf` and `derived.tf` pass through; both compose
   files; `scripts/e2e_magpie_native.sh`; `backend/.env.example`, which a
-  backend run on the host starts from; the `jobs` table's three column
-  defaults; and `scripts/dev.py`'s note. A raise that missed Terraform passed
+  backend run on the host starts from; the root `.env.example`, which a
+  compose user copies to `.env` (its commented value and the version it says
+  the contribute branch reports; thirty-third audit, pass 3); the `jobs`
+  table's three column defaults; and `scripts/dev.py`'s note. A raise that missed Terraform passed
   CI and left production admitting the builds it was meant to keep out
   (thirty-third audit, pass 1). *(Covered:
   `config::tests::every_copy_of_the_version_floor_agrees`.)*
@@ -878,9 +889,13 @@ Each entry's tests are the `describe` block named for its id.
   without the rules that mark rows. Marked unused: what a leave job never reads
   (leaves, win% model, recorder, plays and plies recorded, move-gen margin,
   the endgame and pre-endgame rows); an opening-rack job's inference and
-  inference margin and endgame and pre-endgame rows; a games or pairs job's
-  plays and plies recorded when it records no positions, and nothing when it
-  does. A player's search in a few words leaves out what the job never reads
+  inference margin and endgame and pre-endgame rows, and its recorder and
+  move-gen margin too when its player simulates (only a static opening-rack
+  analysis reads them); a games or pairs job's recorder and move-gen margin
+  (autoplay generates with MAGPIE's own record type and a margin of 0), and
+  its plays and plies recorded too when it records no positions; a row marked
+  unused is never marked as a difference, since the job cannot tell its players
+  apart by it. A player's search in a few words leaves out what the job never reads
   (an opening-rack player's inference, the solving where the job never
   reaches the end of a game). *(Covered: `jobSettings.test.ts`.)*
 - `F-FMT-12` `completionText` says how a job finished: a match test that
@@ -962,6 +977,12 @@ Each entry's tests are the `describe` block named for its id.
   interval 51.2% to 55.0%)."), then names the better player
   once it is decided, or says neither is when it ended inconclusive.
   *(Covered: `matchTest.test.ts`.)*
+- `F-TEST-3` `confidenceProblem` refuses what job creation refuses of a
+  test's confidence, and only that: above 50 and below 100, so 50.05 and
+  99.995 pass and 50, 100, a non-number and a cleared input do not. The job
+  form checks it on submit and under the input, which has no `min` or `max`
+  (`min="50.1" max="99.99"` blocked values the server takes; thirty-third
+  audit, pass 3). *(Covered: `matchTest.test.ts`.)*
 
 ### `F-MOVES-*` — `lib/moveList.ts`
 
@@ -1124,9 +1145,14 @@ Test the pure functions; do not snapshot the SVG.
   network failure asked again on schedule until a 200, `Retry-After`
   honoured, a 502 keeping a signed-in user and asking nothing more, in
   flight, and a later 401 replacing a user.)*
-- `F-AUTH-2` `signOut` clears the store even if the request fails, so the UI
-  cannot be left showing a session that is gone, and stops a refresh waiting
-  to ask again. *(Covered: `auth.test.ts`.)*
+- `F-AUTH-2` `signOut` clears the store when the logout succeeds, and stops a
+  refresh waiting to ask again. When it fails (a `503`, a network failure) the
+  server never removed the HttpOnly session cookie, so the store is not cleared:
+  `signOut` asks `/api/me` again and rethrows, a live session stays signed in,
+  and only a re-ask the server answers `401` shows signed out. (Until the
+  thirty-third audit's pass 3 it cleared the store in a `finally`, telling a
+  user on a shared machine they were signed out while the session lived; KL-59.)
+  *(Covered: `auth.test.ts`.)*
 - `F-AUTH-3` `resetSession` asks again from unresolved, for the two callers
   whose session has just changed: the login page after a sign-in, and the
   import watcher after a 401. Through `refreshSession` alone, a sign-in that
@@ -1682,9 +1708,16 @@ job creation touches needs one caller here.
   max 1 -> 3; 4 racks unsettled", then `job.activated`), demotes its final
   export to a snapshot, and reissues the racks from those rows; lowering them
   again while a reissue is in flight settles every rack, and that reissue's
-  submission completes the job without counting its racks a second time.
-  Asking for what every rack already has leaves a completed job completed.
-  *(Covered:
+  submission completes the job without counting its racks a second time, and
+  every line of its corpus then carries its rack's standing, each rack having
+  two analyses, though the maximum is one again (it was gated on the maximum
+  alone, and hid the disagreements `racks_without_consensus` counts).
+  Asking for what every rack already has leaves a completed job completed,
+  and still demotes its final export and fails one building from before the
+  edit ("the job's consensus settings changed while this export was
+  building"): the standings each line carries were restated (thirty-third
+  audit, pass 3; only a reopening demoted them, and the old standings went on
+  being served as the completed job's corpus). *(Covered:
   `worker_api::an_opening_rack_jobs_consensus_can_change_and_the_job_follows`.)*
 - `I-OR-EDIT-2` The edit refuses by name what creation refuses (a share at
   or below 50%, no analyses, a most below the fewest or above 100, any
@@ -1718,6 +1751,15 @@ job creation touches needs one caller here.
   lapsed claims were not reclaimed. *(Covered:
   `worker_api::a_refused_or_unchanged_consensus_edit_holds_nothing`.)*
   (Thirty-third audit, pass 2.)
+- `I-OR-EDIT-6` **An action that waited on a job's row is told it was purged
+  only when it was.** An activate, deactivate, force-complete or allocation
+  change that took the row before a consensus edit queued on it is refused as
+  running ("a purge, delete or consensus change of this job is running"): the
+  edit's hold is not counted, and it was answered "the job was purged while
+  this waited". A purge started meanwhile is still "purged", by count, after
+  its hold is gone. *(Covered:
+  `routes::admin::tests::an_action_that_waited_on_an_edit_is_not_told_the_job_was_purged`.)*
+  (Thirty-third audit, pass 3.)
 - `I-JOB-2` **`validate_shared_player_options` runs against real rows.** Two
   configs with different `winpct_id` are rejected; two with the same are
   accepted; two with different `movegen_margin` are accepted, since autoplay
@@ -2044,6 +2086,16 @@ job creation touches needs one caller here.
   `leave_generation::each_generation_closes_at_its_own_target`;
   `stats::leave_stats_report_the_current_generations_racks_against_its_universe`,
   `public_api::job_detail_carries_the_stats_block_of_its_type`.)*
+- `I-LEAVE-25` **The universe probe reads an index whatever the generation's
+  history.** Every leave claim asks whether its generation's universe exists,
+  inside the dispatch lock; as an `EXISTS` it was a sequential scan through
+  every older generation's rows once the generation was in the statistics, and
+  so was the tail's "any rack below target". Two analysed generations of 30,000
+  racks (where the `EXISTS` form plans a `Seq Scan`): both probes for the later
+  one are index scans of the primary key and the pick index, in a custom plan
+  and a generic one, and answer correctly. *(Covered:
+  `leave_gen::the_universe_probe_reads_an_index_whatever_the_generations_history`.)*
+  (Thirty-third audit, pass 3.)
 
 ### `I-RATE-*` — rating pools (`ratings.rs`)
 
@@ -2232,6 +2284,18 @@ permanent.
   `finish::a_job_whose_last_results_landed_while_inactive_completes_once_reactivated`,
   `finish::a_games_job_at_its_cap_whose_results_landed_while_inactive_completes`.)*
   (Thirty-second audit.)
+- `I-STATS-9j` **The opening-rack finish check reads indexes, not every
+  job's tasks.** It runs on the submission that settles the job's last rack,
+  before the worker is answered; as `EXISTS` a task and `NOT EXISTS` one not
+  completed it was two sequential scans of `tasks`, whose rows every job keeps.
+  With 30,000 of an older job's tasks laid down first, a completed claim each,
+  and analysed (where the old form plans a `Seq Scan on tasks`), its plan is
+  index scans of
+  `tasks_seed_unique_idx`, `tasks_queue_idx` and `task_claims_open_idx`, custom
+  and generic; it answers done with every task completed, and not done with a
+  task available, a task claimed, or no task at all. *(Covered:
+  `finish::the_opening_rack_finish_check_reads_indexes_not_every_jobs_tasks`.)*
+  (Thirty-third audit, pass 3.)
 - `I-STATS-9g` **A job without a match test plays to its target.** A 90-10
   batch past its floor, which completes a job with a test, leaves it active
   and reports no test (`games.test` null); the batch that reaches `max_games` completes it with
@@ -2478,8 +2542,9 @@ runs against a real MinIO.
   `leave_generation.rs`, which asserts `derived_ready(job) == 1`.)*
 - `I-DERIVED-3` A job with any unbuilt derived file is not dispatched, and the
   same job dispatches once the row says `built`. The single most important test
-  here: without it, dispatching early sends a worker no `derived` entry, which
-  it reads as a server that checks nothing. *(Covered:
+  here: without it, dispatching early carries no hash for a file its player
+  asks for, which MAGPIE refuses (`derived_mismatch`), setting the job aside
+  for the run on every worker that claims it. *(Covered:
   `worker_api::a_job_is_not_dispatched_until_its_derived_files_are_built`,
   `derived::tests::a_job_waits_for_anything_not_built`,
   `worker_api::a_dispatchable_jobs_hashes_are_remembered_for_the_process`; on a
@@ -2918,7 +2983,9 @@ below.
   lexicon/distribution, an unknown `input_data` id. The win%-model rules on a
   single player — a simming player with no model, a static player with one —
   are enforced where the player is made, at player-config creation, not at job
-  creation as this entry first listed them, so no job can name such a config.
+  creation as this entry first listed them, so no job can name such a config;
+  so is a simming player's candidate count, at least 2 (with one, MAGPIE plays
+  it without simulating, every turn; thirty-third audit, pass 3).
   A config's `kwg_id`, `klv_id` and `winpct_id` must each name a file of that
   role (`A-BOUND-3`). A letter distribution MAGPIE cannot hold (`U-RACK-9`) is
   refused at creation, not by every claim as a 500. *(Covered:
@@ -3102,6 +3169,11 @@ below.
   `ratings::a_pool_that_could_rate_no_one_is_refused`.)* (Eleventh audit.)
 - `A-RATE-4` Adding and removing a member each trigger a refit and return a new
   `run_id`. *(Covered: `ratings::adding_and_removing_a_member_each_refit_the_pool`.)*
+- `A-RATE-4c` Adding a config that is already a member (a second click, or
+  the anchor) is answered `run_id: null`, with no `rating_pool.member_added`
+  row and no new run; it was logged and refitted as an addition. *(Covered:
+  `ratings::adding_a_config_that_is_already_a_member_changes_nothing`.)*
+  (Thirty-third audit, pass 3.)
 - `A-RATE-4b` Adding a config that does not exist is a `400` on
   `player_config_id`, and adding to a pool that does not exist a `404`; an
   anchor that does not exist is a `400` too. None was the `409` "still
@@ -3286,6 +3358,12 @@ below.
   `public_api::tied_jobs_and_users_are_each_listed_exactly_once`,
   `worker_api::public_endpoints_name_anonymous_workers_by_pseudonym_only`; tied
   contributors were duplicated and skipped across pages.)*
+- `A-PUBLIC-8` **A NUL in what a caller sends is a `400`.** Postgres stores no
+  NUL in text and refuses the statement (SQLSTATE `22021`, or `22P05` from
+  JSON), which was a `500` and an error line: `?worker=%00` on a job's public
+  results feed, a login name, a password-reset address. *(Covered:
+  `public_api::a_nul_in_a_public_request_is_a_bad_request`; the mapping,
+  `U-ERR-8`.)* (Thirty-third audit, pass 3.)
 
 ### `A-ACCOUNT-*` — `routes/account.rs`
 
@@ -3444,11 +3522,17 @@ branch's copy.
   `contract_fixtures::the_expected_data_block_matches_what_the_server_sends`.)*
 - `C-9` `anon-uuid-assignment.json`, a first claim that mints a UUID.
   *(Covered: `contract_fixtures::a_first_claim_is_assigned_a_worker_uuid`.)*
+- `C-10` `decline-missing-data.json`, a decline naming a file not found and one
+  found with other bytes, parses as the body the server takes, with `actual`
+  left out reading as its `null`; MAGPIE builds the same body key for key.
+  *(Covered: `contract_fixtures::decline_parses_as_a_decline_body`; MAGPIE's
+  `test_the_decline_body_matches_the_decline_fixture`.)* (Thirty-third audit,
+  pass 3: until then nothing on MAGPIE's side read its copy.)
 
 Client→server results are not only parsed: each runs through its job type's
 validation, as a submission would, so a captured result the server would
 refuse fails here.
-MAGPIE's half, in `test/contribute_test.c`, is four tests:
+MAGPIE's half, in `test/contribute_test.c`, is five tests:
 `test_contract_fixtures_carry_every_key_contribute_reads` (every key
 `contribute` reads off a server message is in its fixture, and the assigned
 `worker_uuid` is in the form the client takes — the server's
@@ -3457,10 +3541,12 @@ MAGPIE's half, in `test/contribute_test.c`, is four tests:
 result is built with still produce every key the result fixtures carry, so a
 key renamed in MAGPIE fails there rather than every submission),
 `test_only_a_data_shutdown_is_waited_out_for_a_set_aside_job` (the wait-or-exit
-decision on each of the four shutdown fixtures) and
+decision on each of the four shutdown fixtures),
 `test_the_claim_body_matches_the_claim_fixture` (the claim body, built from the
 fixture's version and ids, has its keys and values, and states this build's
-`BOARD_DIM` and `RACK_SIZE`). MAGPIE's sanitizer CI
+`BOARD_DIM` and `RACK_SIZE`) and
+`test_the_decline_body_matches_the_decline_fixture` (the decline body, built
+for the files the fixture names, has its keys and values). MAGPIE's sanitizer CI
 shard runs them (`contribute` in its `rest` shard).
 
 Beyond the wire, `contribute_test.c` holds MAGPIE's regression tests for what
@@ -3481,14 +3567,24 @@ next write of the name, and a fresh one or another name's is not.
 `test_inferring_players_report_their_inference`: a simming player that infers
 reports, on each captured position past the first turn whose previous move was
 not a pass, how many leaves its inference found, how many it drew, their mean
-equity and up to ten of the most drawn, most drawn first; a first-turn
-position reports none, and a player that does not infer reports none anywhere.
+equity and up to ten of the most drawn, most drawn first — unless its turn had
+one legal play, which is not simulated and is recorded `static` with that one
+play and no inference; a first-turn position reports none, and a player that
+does not infer reports none anywhere.
 It also checks `result-games-inference.json` holds no key that output lacks.
 From the thirty-third audit: `test_an_unverifiable_assignment_is_refused`
 (an assignment with no `expected_data`, or one naming an algorithm other than
-sha256, fails the claim, where it used to run unverified), and the two
+sha256, or listing a file it cannot check — no `files` array, an entry missing
+its role, name or digest, or an unknown role — fails the claim, where it used
+to run unverified; and each of the games, game-pairs, opening-rack and leave
+assignment fixtures passes the check); `test_a_forced_turn_is_not_simulated`
+(a simming player's turn with one legal play, a forced pass, runs no
+simulation and says so, leaving the previous simulation's results in place,
+which autoplay used to capture as that turn's analysis); and the two
 settings-leak tests now also hold a contributor's sim margin forecast
-(`-sm1`/`-sm2`, `-smargin`) to off, since no request states it.
+(`-sm1`/`-sm2`, `-smargin`) to off, since no request states it. The claim's
+libcurl check (`chttp_is_available`) has no unit test: a test build always has
+libcurl.
 
 **Capture** is `scripts/capture_contract.py`, a recording proxy that sits
 between `magpie contribute` and the backend, forwards everything unchanged, and
@@ -4074,9 +4170,11 @@ run that breaks one variable expects only that one.
 - `S-TF-3` A deployment the circuit breaker rolls back mails the alerts topic:
   the `-deploy-failed` rule matches `aws.ecs`'s "ECS Deployment State Change"
   with `eventName` `SERVICE_DEPLOYMENT_FAILED` only, on one resource, and has
-  the topic's target. That the resource is the web service's ARN, and that the
-  mail arrives, are known only at apply (below; README's "Check that the
-  alarms reach you" checks the pattern against the live service). *(Covered:
+  a target. That the target is the alerts topic (a mock's ARN is unknown at
+  plan on CI's Terraform 1.9.8), that the resource is the web service's ARN,
+  and that the mail arrives, are known only at apply (below; README's "Check
+  that the alarms reach you" checks the pattern against the live service).
+  *(Covered:
   `infra/tests/variables.tftest.hcl`, `a_failed_deploy_is_alerted`.)*
   (Thirty-third audit, pass 2: a rollback was silent, and the next apply
   redeployed the release it abandoned.)
@@ -4373,7 +4471,8 @@ GitHub Actions.
    builder image, and the frontend image.
 4. **e2e** — tier 5: MAGPIE at the commit `docker/Dockerfile` pins, built `portable_release`
    inside `debian:bookworm-slim` (the backend image's glibc), Playwright's
-   Chromium, the three images from the Dockerfile with buildx, then
+   Chromium, the backend and fake-worker images from `docker/Dockerfile` and
+   the frontend's from `frontend/`, with buildx, then
    `e2e/run.sh --no-build`; the Playwright report and traces are uploaded on
    failure. The image builds are cached between runs: buildx's layer cache,
    and the Dockerfile's cargo cache mounts carried in the Actions cache keyed
@@ -4429,9 +4528,10 @@ branch it can reach, so until `docker/Dockerfile`'s `MAGPIE_COMMIT` is pushed to
 `birdtest-contribute`:
 - `images`, `e2e` and `magpie-contract` fail: the image fetches the commit, and
   the other two check it out.
-- The nightly's pin leg fails at its checkout. Its head leg builds whatever the
-  branch's remote head is, which may be older than the backend's
-  `MIN_MAGPIE_VERSION` allows.
+- The nightly's `e2e` fails on both legs: the pin leg at its MAGPIE checkout,
+  and the head leg at "Start the stack", whose backend image (compose builds it
+  from `docker/Dockerfile`) fetches the pinned commit too. `restore-roundtrip`
+  and `backup-drill` build no image and are unaffected.
 - `backend`, `frontend`, `terraform` and `scripts` are unaffected.
 
 Push the pin before relying on CI. Once pushed, it must stay reachable: a
