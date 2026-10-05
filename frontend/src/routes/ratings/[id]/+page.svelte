@@ -278,8 +278,8 @@
         </div>
         <p class="text-xs text-muted-foreground">
           Every rating is measured from the anchor, so moving it or its rating refits the pool on
-          the new scale. Earlier runs keep the scale they were fitted on, so the history chart steps
-          at the change. A config that is not a member joins the pool as its anchor.
+          the new scale. Earlier runs keep the scale they were fitted on. A config that is not a
+          member joins the pool as its anchor.
         </p>
         <div class="flex flex-wrap items-center gap-3 border-t border-border pt-3">
           <button class="btn-destructive" disabled={busy} on:click={removePool}>

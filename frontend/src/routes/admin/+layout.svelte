@@ -18,7 +18,8 @@
   ];
 
   // Only an explicitly resolved session is acted on; `undefined` is still
-  // loading. Signed out -- a lapsed session, "sign out everywhere" in another
+  // loading, or the server could not answer yet (a deploy's 503: lib/auth.ts
+  // asks again). Signed out -- a lapsed session, "sign out everywhere" in another
   // tab -- goes to sign in and comes back here (an import in progress is
   // picked up again on return); signed in but not an admin goes home.
   $: if ($session === null) goto(`/login?next=${encodeURIComponent($page.url.pathname)}`);

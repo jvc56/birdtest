@@ -3,7 +3,7 @@
   import { goto } from '$app/navigation';
   import { api, errorText, type InputData, type JobType, type PlayerConfig } from '$lib/api';
   import { blankFields, jobTypeLabel, leavePlayerConflict, parseTargetRackCounts, targetsText, unchosenText } from '$lib/format';
-  import { consensusProblem as checkConsensus } from '$lib/consensus';
+  import { consensusFields, consensusProblem as checkConsensus } from '$lib/consensus';
 
   let configs: PlayerConfig[] = [];
   let files: InputData[] = [];
@@ -74,7 +74,7 @@
   $: selectedConfig = configs.find((config) => config.id === playerConfigId);
   $: selectedStatic = selectedConfig ? selectedConfig.num_plies === 0 : false;
   $: consensusProblem =
-    jobType !== 'opening_rack' || selectedStatic || maxResults <= 1
+    jobType !== 'opening_rack' || selectedStatic
       ? null
       : checkConsensus({
           min_results_per_rack: minResults,
@@ -139,13 +139,13 @@
           ...common,
           player_config_id: playerConfigId,
           // A static player's analyses always agree, so it gets one per rack.
-          ...(selectedStatic || maxResults <= 1
+          ...(selectedStatic
             ? { min_results_per_rack: 1, max_results_per_rack: 1 }
-            : {
+            : consensusFields({
                 min_results_per_rack: minResults,
                 max_results_per_rack: maxResults,
                 consensus_pct: consensusPct
-              })
+              }))
         };
       case 'games':
         return {
@@ -362,13 +362,14 @@
             <label class="label" for="maxres">Maximum Analyses Per Rack</label>
             <input id="maxres" type="number" min="1" max="100" class="input" bind:value={maxResults} />
           </div>
+          <!-- No `min`: the share must be above 50, which no `min` can say (51 blocked the
+               50.5 the server takes); `consensusProblem` says what it must be. -->
           <div>
             <label class="label" for="consensus">Consensus %</label>
             <input
               id="consensus"
               type="number"
-              min="51"
-              max="100"
+                max="100"
               step="any"
               class="input"
               bind:value={consensusPct}
