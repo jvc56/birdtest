@@ -22,7 +22,7 @@ use uuid::Uuid;
 /// Limits on the archive walk. Every one of them aborts the import rather than
 /// skipping the entry: a malformed archive is not a partially trustworthy one.
 mod limits {
-    /// The real tarball is ~190 MB (`data-20251004.tgz`, five chunks).
+    /// The real tarball is ~195 MB (`data-20260925.tgz`, five chunks).
     pub const COMPRESSED_BYTES: u64 = 512 * 1024 * 1024;
     /// `download_data.sh` stops at 26 (`aa`..`az`); this is headroom without
     /// being unbounded.

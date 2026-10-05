@@ -332,7 +332,7 @@ def input_data_ids(client: Client, args) -> dict:
         raise SeedError(f"no {role} named {name!r} was imported. Available: {available}")
 
     # A simulating player's win% model, where the data has one.
-    winpct = next((row["id"] for row in rows if row["role"] == "winpct" and row["name"] == "winpct"), None)
+    winpct = winpct_for(rows, args.letterdist)
     return {
         "kwg": find("kwg", args.lexicon),
         "klv": find("klv", args.lexicon),
@@ -340,6 +340,21 @@ def input_data_ids(client: Client, args) -> dict:
         "layout": find("layout", args.layout),
         "winpct": winpct,
     }
+
+
+def winpct_for(rows: list, letterdist: str) -> Optional[str]:
+    """The win% model a simmer on `letterdist` plays with, newest import first.
+
+    MAGPIE-DATA from data-20260925 has one per letter distribution
+    (`strategy/winpct_<distribution>.csv`), keyed by game state, and MAGPIE
+    checks that the one a player names covers its distribution's bag; earlier
+    data had a single `winpct` for every distribution, which is the fallback.
+    """
+    for name in (f"winpct_{letterdist}", "winpct"):
+        matches = [r for r in rows if r["role"] == "winpct" and r["name"] == name]
+        if matches:
+            return max(matches, key=lambda r: r.get("tarball_date") or "")["id"]
+    return None
 
 
 # --- player configs and a job ----------------------------------------------

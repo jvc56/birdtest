@@ -1671,14 +1671,14 @@ A task request used to name its inputs without pinning them:
 |---|---|---|---|
 | `lexicon` (per player) | `"NWL23"` | `lexica/NWL23.kwg` | 4,719,596 B |
 | `leaves` (per player) | `"NWL23"` or null | `lexica/NWL23.klv2` | 3,667,340 B |
-| `win_pct_model` (per player) | `"winpct"` | `strategy/winpct.csv` | 836,150 B |
+| `win_pct_model` (per player) | `"winpct_english"` | `strategy/winpct_english.csv` (one per letter distribution from `data-20260925`; a single `winpct.csv` before it) | 397,459 B |
 | `letter_distribution` | `"english"` | `letterdistributions/english.csv` | 489 B |
 | (board layout, never named) | — | `layouts/standard15.txt` | 244 B |
 | `use_wordmap` | true/false | `lexica/NWL23.wmp` — built locally from the `.kwg` | ~104 MB |
 | `use_rit` | true/false | `lexica/NWL23.NWL23.rit` — built locally from the `.klv2` and the `.wmp` | ~1.9 GB |
 
 Two contributors could both honestly report running `NWL23` with `winpct` and be
-running different bytes. This is not hypothetical: `download_data.sh` installs
+running different bytes. This is not hypothetical: `download_data.sh` installed
 `data-20251004.tgz`, whose `english.csv` is 489 bytes, while the live file on
 MAGPIE-DATA's `main` is a different 273-byte file that dropped two full-width
 display columns. Both are called `english`, and nothing in the protocol could
@@ -1718,7 +1718,7 @@ not at dispatch, and never by the client.
 |---|---|---|---|
 | `kwg` | **each player**, independently (`-l1` / `-l2`) | `lexica/<name>.kwg` | per-player lexicons are first-class; `PlayerSpec.lexicon` only fell back to a shared one because birdtest sent one |
 | `klv` | each player (`-k1` / `-k2`) | `lexica/<name>.klv2` | `get_default_klv_name(lex) = lex` — the old default was a duplicate of the lexicon name |
-| `winpct` | each player, **only if it simulates** | `strategy/<name>.csv` | `DEFAULT_WIN_PCT "winpct"`; loaded lazily by `config_load_win_pcts` |
+| `winpct` | each player, **only if it simulates** | `strategy/<name>.csv` | `DEFAULT_WIN_PCT_PREFIX "winpct_"` + the letter distribution (`winpct_english`), checked to cover the distribution's bag; loaded lazily by `config_load_win_pcts`. The dev and tier-6 seeds pick `winpct_<distribution>`, falling back to a pre-20260925 `winpct` |
 | `letterdist` | **the job** — one per job, shared by both players | `letterdistributions/<name>.csv` | stated by the job, never inferred |
 | `layout` | **the job** — `standard15` unless stated | `layouts/standard15.txt` | `board_layout_get_default_name()` = `"standard" BOARD_DIM`, `DEFAULT_BOARD_DIM = 15` |
 
@@ -1774,9 +1774,9 @@ locally generated file. Don't.
 ### How production data is actually distributed
 
 `download_data.sh` pins a version as a constant in the script
-(`DATA_VERSION="20251004"`), probes for `data-<version>.tgz.aa`, walks the chunk
+(`DATA_VERSION="20260925"`), probes for `data-<version>.tgz.aa`, walks the chunk
 suffixes `aa`, `ab`, `ac`, … while they exist, concatenates them, and pipes the
-result through `tar -xzf`. Today (`data-20251004`) that is five chunks, ~190 MB total, 250 MB uncompressed. Two
+result through `tar -xzf`. Today (`data-20260925`) that is five chunks, ~195 MB total, 257 MB uncompressed. Two
 consequences:
 
 1. **The data version is a MAGPIE release-time constant.** Everyone running a
@@ -1790,11 +1790,11 @@ consequences:
 
 Most of `data/versioned/<version>/` upstream is symlinks into the live tree, so
 **a version name is a label, not a freeze**: change `data/lexica/NWL23.kwg` and
-the versioned path changes with it, and the name stays `20251004`. The only
+the versioned path changes with it, and the name stays `20260925`. The only
 thing that pins content is the built tarball — which is what production installs
 and what import reads. The dedupe rule below is what makes this survivable: if
-`20251004` is ever re-cut with different bytes, importing it again produces *new
-rows*, visibly, rather than silently redefining what `20251004` meant.
+`20260925` is ever re-cut with different bytes, importing it again produces *new
+rows*, visibly, rather than silently redefining what `20260925` meant.
 
 ### The `input_data` table
 
@@ -4424,7 +4424,7 @@ and gets one for keeps once a task is actually available.
     "algorithm": "sha256",
     "files": [
       { "role": "kwg", "name": "NWL23", "path": "lexica/NWL23.kwg",
-        "sha256": "3e74af98...", "bytes": 4719596, "tarball_date": "20251004" }
+        "sha256": "3e74af98...", "bytes": 4719596, "tarball_date": "20260925" }
     ]
   },
   "task_request": { "job_type": "games", "...": "..." }
