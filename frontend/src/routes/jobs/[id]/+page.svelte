@@ -1,19 +1,22 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { page } from '$app/stores';
-  import { api, type JobStats } from '$lib/api';
+  import { api, type JobStats, type RackLookupRow } from '$lib/api';
   import { subscribeToJob } from '$lib/sse';
   import { session } from '$lib/auth';
-  import { duration, datetime, jobTypeLabel, sprtLabel, sprtState, jobTitle } from '$lib/format';
-  import JobStatusBadge from '$lib/components/JobStatusBadge.svelte';
-  import CompletionNote from '$lib/components/CompletionNote.svelte';
+  import { datetime, jobTypeLabel, jobTitle } from '$lib/format';
+  import JobStatusCard from '$lib/components/JobStatusCard.svelte';
+  import JobStatsRow from '$lib/components/JobStatsRow.svelte';
+  import TaskCounts from '$lib/components/TaskCounts.svelte';
   import WorkerTable from '$lib/components/WorkerTable.svelte';
   import ProgressBar from '$lib/components/ProgressBar.svelte';
-  import OutcomeChart from '$lib/components/OutcomeChart.svelte';
   import JobSettings from '$lib/components/JobSettings.svelte';
+  import MatchScore from '$lib/components/MatchScore.svelte';
+  import MatchTestCard from '$lib/components/MatchTestCard.svelte';
   import SavedPositions from '$lib/components/SavedPositions.svelte';
   import { playersLine, type JobConfig } from '$lib/jobSettings';
-  import { pentanomialRows } from '$lib/charts/pentanomial';
+  import { analysesPerRack, rackConsensus } from '$lib/consensus';
+  import { plyAt, plyColumns, plyHeaders, showsIterations } from '$lib/moveList';
 
   // The [id] route only matches when the param is present.
   const jobId = $page.params.id as string;
@@ -25,7 +28,12 @@
 
   // Opening-rack search
   let rackQuery = '';
-  let rackMoves: Record<string, unknown>[] | null = null;
+  let rackMoves: RackLookupRow[] | null = null;
+  $: lookupConsensus = rackMoves ? rackConsensus(rackMoves) : null;
+  $: lookupWinPct = rackMoves?.some((m) => m.win_percentage !== null) ?? false;
+  $: lookupPlies = rackMoves ? plyColumns(rackMoves) : 0;
+  $: lookupIters = rackMoves ? showsIterations(rackMoves) : false;
+  $: seeksConsensus = (config?.opening_racks?.max_results_per_rack ?? 1) > 1;
   let rackError = '';
   // A few racks the job has analysed, to try the search on: the newest, from
   // the results feed. Read once, when the page knows it is an opening-rack job.
@@ -69,7 +77,7 @@
     rackError = '';
     rackMoves = null;
     try {
-      const result = await api.jobResults(jobId, { rack: rackQuery });
+      const result = await api.rackLookup(jobId, rackQuery);
       rackMoves = result.items;
       if (!rackMoves.length) rackError = 'No analysis stored for that rack yet.';
     } catch (e) {
@@ -89,7 +97,6 @@
       {#if stats.job.name}
         <span class="text-sm text-muted-foreground">{jobTypeLabel(stats.job.job_type)}</span>
       {/if}
-      <JobStatusBadge status={stats.job.status} />
       <span class="text-sm text-muted-foreground">
         {stats.job.lexicon ?? '—'} · {stats.job.variant ?? '—'}{#if config?.players.length}
           · {playersLine(config)}{/if}
@@ -100,28 +107,9 @@
         <a href="/admin/jobs/{stats.job.id}" class="btn-secondary ml-auto no-underline">Manage</a>
       {/if}
     </header>
-    <CompletionNote {stats} />
+    <JobStatusCard {stats} />
 
-    <div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-      <div class="card">
-        <p class="text-xs uppercase text-muted-foreground">Allocation</p>
-        <p class="mt-1 text-xl tabular-nums">
-          {stats.job.allocation === null ? '—' : `${stats.job.allocation}%`}
-        </p>
-      </div>
-      <div class="card">
-        <p class="text-xs uppercase text-muted-foreground">Redundancy</p>
-        <p class="mt-1 text-xl tabular-nums">{stats.job.redundancy}×</p>
-      </div>
-      <div class="card">
-        <p class="text-xs uppercase text-muted-foreground">Results accepted</p>
-        <p class="mt-1 text-xl tabular-nums">{stats.results_accepted.toLocaleString()}</p>
-      </div>
-      <div class="card">
-        <p class="text-xs uppercase text-muted-foreground">Estimated time left</p>
-        <p class="mt-1 text-xl tabular-nums">{duration(stats.eta_seconds)}</p>
-      </div>
-    </div>
+    <JobStatsRow {stats} />
 
     <div class="card space-y-4">
       <h2 class="text-lg font-medium">Progress</h2>
@@ -129,15 +117,17 @@
         <ProgressBar
           value={stats.games.units_completed}
           max={stats.games.max_units}
-          label="{stats.games.unit}s completed (hard cap)"
+          label="{stats.games.unit}s completed"
         />
       {:else if stats.opening_racks}
         <!-- Tasks are made on demand, so a task count is only what has been
-             handed out so far: a job 1% through its racks read 99%. -->
+             handed out so far: a job 1% through its racks read 99%. A rack is
+             done once settled, which for a consensus job may take several
+             analyses. -->
         <ProgressBar
-          value={stats.opening_racks.racks_analyzed}
+          value={stats.opening_racks.racks_settled}
           max={stats.opening_racks.racks_total}
-          label="racks analysed"
+          label="racks settled"
         />
       {:else if stats.leave_generation}
         <ProgressBar
@@ -152,14 +142,11 @@
           label="tasks completed"
         />
       {/if}
-      <dl class="grid grid-cols-2 gap-x-6 gap-y-1 text-sm sm:grid-cols-4">
-        <div><dt class="text-muted-foreground">Available</dt><dd class="tabular-nums">{stats.tasks_available.toLocaleString()}</dd></div>
-        <div><dt class="text-muted-foreground">Claimed</dt><dd class="tabular-nums">{stats.tasks_claimed.toLocaleString()}</dd></div>
-        <div><dt class="text-muted-foreground">Completed</dt><dd class="tabular-nums">{stats.tasks_completed.toLocaleString()}</dd></div>
-        <div><dt class="text-muted-foreground">Created</dt><dd>{datetime(stats.job.created_at)}</dd></div>
-      </dl>
+      <TaskCounts {stats} />
       <p class="text-xs text-muted-foreground">
-        Created by <span class="break-all">{stats.job.created_by ?? 'unknown'}</span>{#if stats.job.min_magpie_version}
+        Created by <span class="break-all">{stats.job.created_by ?? 'unknown'}</span>, {datetime(
+          stats.job.created_at
+        )}{#if stats.job.min_magpie_version}
           · requires MAGPIE ≥ {stats.job.min_magpie_version}{/if}
       </p>
     </div>
@@ -169,102 +156,28 @@
     {/if}
 
     {#if stats.games}
-      <div class="card space-y-4">
-        <div class="flex items-center justify-between">
-          <h2 class="text-lg font-medium">SPRT</h2>
-          <JobStatusBadge status={sprtState(stats.job.status, stats.games)} />
-        </div>
-        {#if stats.games.decided}
-          <p class="text-sm text-muted-foreground">
-            Completed: {sprtLabel(stats.games.decided.status)}, LLR
-            {stats.games.decided.llr.toFixed(3)} after {stats.games.decided.units.toLocaleString()}
-            {stats.games.unit}{stats.games.decided.units === 1 ? '' : 's'}. With the {stats.games.unit}s that were in flight then, LLR
-            {stats.games.sprt.llr.toFixed(3)}, bounds [{stats.games.sprt.lower_bound.toFixed(2)},
-            {stats.games.sprt.upper_bound.toFixed(2)}].
-          </p>
-        {:else if stats.job.status !== 'active'}
-          <!-- Nothing is being played: the test is where it stopped, and said
-               "running" as if it were not. -->
-          <p class="text-sm text-muted-foreground">
-            {sprtLabel(sprtState(stats.job.status, stats.games))}{stats.job.status === 'inactive'
-              ? `: no ${stats.games.unit}s are being played, so the test is not moving`
-              : ''}. LLR {stats.games.sprt.llr.toFixed(3)}, bounds
-            [{stats.games.sprt.lower_bound.toFixed(2)}, {stats.games.sprt.upper_bound.toFixed(2)}].
-          </p>
-        {:else}
-          <p class="text-sm text-muted-foreground">
-            {sprtLabel(stats.games.sprt.status)} — LLR {stats.games.sprt.llr.toFixed(3)}, bounds
-            [{stats.games.sprt.lower_bound.toFixed(2)}, {stats.games.sprt.upper_bound.toFixed(2)}].
-            {#if stats.games.min_units > 0 && stats.games.units_completed < stats.games.min_units}
-              SPRT is not acted on until {stats.games.min_units.toLocaleString()}
-              {stats.games.unit}{stats.games.min_units === 1 ? ' is' : 's are'} complete.
-            {:else if stats.games.min_units > 0}
-              The minimum of {stats.games.min_units.toLocaleString()}
-              {stats.games.unit}{stats.games.min_units === 1 ? '' : 's'} is reached; SPRT is checked as
-              {stats.games.unit}s arrive.
-            {:else}
-              SPRT is checked as {stats.games.unit}s arrive, with no minimum number of them.
-            {/if}
-          </p>
-        {/if}
-        <OutcomeChart
-          wins={stats.games.wins}
-          losses={stats.games.losses}
-          draws={stats.games.draws}
-        />
-        <p class="text-sm tabular-nums text-muted-foreground">
-          Player 1: {stats.games.wins.toLocaleString()} W ({stats.games.win_pct.toFixed(1)}%) ·
-          {stats.games.losses.toLocaleString()} L ({stats.games.loss_pct.toFixed(1)}%) ·
-          {stats.games.draws.toLocaleString()} D ({stats.games.draw_pct.toFixed(1)}%)
-        </p>
-        {#if stats.games.pentanomial}
-          <div class="space-y-1">
-            <p class="text-xs text-muted-foreground">
-              The test runs on all {stats.games.units_completed.toLocaleString()} pairs, scored by
-              player 1's result across the pair. Pairs whose two games played identically are 1-1
-              ties — they stay in the sample, where they are what makes a paired run
-              lower-variance than an unpaired one.
-            </p>
-            <div class="overflow-x-auto">
-            <table class="table text-xs">
-              <thead>
-                <tr>
-                  <th>Pair outcome</th>
-                  <th class="text-right">Pairs</th>
-                  <th class="text-right">Share</th>
-                </tr>
-              </thead>
-              <tbody>
-                {#each pentanomialRows(stats.games.pentanomial, stats.games.units_completed) as bucket}
-                  <tr>
-                    <td>{bucket.label}</td>
-                    <td class="text-right tabular-nums">{bucket.pairs.toLocaleString()}</td>
-                    <td class="text-right tabular-nums">{bucket.share}%</td>
-                  </tr>
-                {/each}
-              </tbody>
-            </table>
-            </div>
-            {#if stats.games.divergent_pairs !== undefined}
-              <p class="text-xs text-muted-foreground">
-                {stats.games.divergent_pairs.toLocaleString()} of {stats.games.units_completed.toLocaleString()}
-                pairs diverged — a diagnostic of how often these two configs differ at all, not
-                part of the test.
-              </p>
-            {/if}
-          </div>
-        {/if}
-      </div>
+      <MatchScore games={stats.games} players={config?.players.map((p) => p.name) ?? []} />
     {/if}
+    <MatchTestCard {stats} players={config?.players.map((p) => p.name) ?? []} />
 
     {#if config?.games?.capture_positions}
       {#if $session}
-        <SavedPositions {jobId} />
+        <SavedPositions
+          {jobId}
+          players={config.players.map((p) => p.name)}
+          paired={config.job.job_type === 'game_pairs'}
+          firstDivergence={config.games.capture_first_divergence}
+          progress={stats.games?.units_completed ?? 0}
+        />
       {:else if $session === null}
         <div class="card space-y-1">
           <h2 class="text-lg font-medium">Saved positions</h2>
           <p class="text-sm text-muted-foreground">
-            This job keeps the position analysed on every turn of its games.
+            {#if config.games.capture_first_divergence}
+              This job keeps the turn where each game pair's two games first diverged.
+            {:else}
+              This job keeps the position analysed on every turn of its games.
+            {/if}
             <a href="/login?next={encodeURIComponent(`/jobs/${jobId}`)}">Sign in</a> to search them.
           </p>
         </div>
@@ -278,7 +191,7 @@
     {#if stats.opening_racks}
       <div class="card space-y-4">
         <h2 class="text-lg font-medium">Opening racks</h2>
-        <dl class="grid grid-cols-2 gap-4 text-sm">
+        <dl class="grid grid-cols-2 gap-4 text-sm sm:grid-cols-3">
           <div>
             <dt class="text-muted-foreground">Racks analyzed</dt>
             <dd class="text-xl tabular-nums">
@@ -288,7 +201,29 @@
               </span>
             </dd>
           </div>
+          {#if seeksConsensus}
+            <div>
+              <dt class="text-muted-foreground" title="Agreed on, or analysed the most times the job allows">
+                Racks settled
+              </dt>
+              <dd class="text-xl tabular-nums">{stats.opening_racks.racks_settled.toLocaleString()}</dd>
+            </div>
+            <div>
+              <dt class="text-muted-foreground" title="Analysed the most times the job allows, their analyses still split">
+                Settled without a consensus
+              </dt>
+              <dd class="text-xl tabular-nums">
+                {stats.opening_racks.racks_without_consensus.toLocaleString()}
+              </dd>
+            </div>
+          {/if}
         </dl>
+        {#if seeksConsensus && config?.opening_racks}
+          <p class="text-xs text-muted-foreground">
+            Each rack is analysed {analysesPerRack(config.opening_racks)}; a rack is settled once
+            they agree, or once it has been analysed the most times, and is not analysed again.
+          </p>
+        {/if}
 
         <div class="space-y-2 border-t border-border pt-4">
           <label class="label" for="rack">Look up a rack</label>
@@ -317,19 +252,55 @@
             </div>
           {/if}
           {#if rackError}<p class="field-error">{rackError}</p>{/if}
+          {#if lookupConsensus && lookupConsensus.analyses > 1}
+            <p class="text-sm" data-testid="rack-consensus">
+              <span class="font-mono">{lookupConsensus.top}</span> is the best move in
+              {lookupConsensus.count} of {lookupConsensus.analyses} analyses ({lookupConsensus.share}%).
+            </p>
+          {/if}
           {#if rackMoves?.length}
             <div class="overflow-x-auto">
-            <table class="table">
+            <table class="table whitespace-nowrap">
               <thead>
-                <tr><th>#</th><th>Move</th><th class="text-right">Score</th><th class="text-right">Equity</th></tr>
+                <tr>
+                  {#if lookupConsensus && lookupConsensus.analyses > 1}<th>Analysis</th>{/if}
+                  <th>#</th><th>Move</th><th class="text-right">Score</th><th class="text-right">Equity</th>
+                  {#if lookupWinPct}<th class="text-right">Win %</th>{/if}
+                  {#if lookupIters}
+                    <th class="text-right" title="How often the simulation played the move out">Iters</th>
+                  {/if}
+                  {#each plyHeaders(lookupPlies) as header}
+                    <th class="text-right" title={header.title}>{header.label}</th>
+                  {/each}
+                </tr>
               </thead>
               <tbody>
                 {#each rackMoves as move}
-                  <tr>
+                  <tr class:border-t-2={lookupConsensus && lookupConsensus.analyses > 1 && move.rank === 1}>
+                    {#if lookupConsensus && lookupConsensus.analyses > 1}
+                      <td class="tabular-nums">{move.rank === 1 ? move.analysis : ''}</td>
+                    {/if}
                     <td class="tabular-nums">{move.rank}</td>
                     <td class="font-mono text-xs">{move.move}</td>
                     <td class="text-right tabular-nums">{move.score}</td>
-                    <td class="text-right tabular-nums">{Number(move.equity).toFixed(2)}</td>
+                    <td class="text-right tabular-nums">{move.equity.toFixed(2)}</td>
+                    {#if lookupWinPct}
+                      <td class="text-right tabular-nums">
+                        {move.win_percentage === null ? '—' : move.win_percentage.toFixed(1)}
+                      </td>
+                    {/if}
+                    {#if lookupIters}
+                      <td class="text-right tabular-nums">
+                        {move.iterations ? move.iterations.toLocaleString() : '—'}
+                      </td>
+                    {/if}
+                    {#each Array(lookupPlies) as _, i}
+                      {@const stats = plyAt(move.plies, i)}
+                      <td class="text-right tabular-nums">{stats ? stats.average_score.toFixed(1) : '—'}</td>
+                      <td class="text-right tabular-nums">
+                        {stats ? `${stats.bingo_percentage.toFixed(1)}%` : '—'}
+                      </td>
+                    {/each}
                   </tr>
                 {/each}
               </tbody>
@@ -347,6 +318,31 @@
           Generation {lg.current_generation} of {lg.generation_count} — target
           {lg.target_rack_count.toLocaleString()} occurrences per rack
         </h2>
+        {#if lg.generation_count > 1}
+          <div class="overflow-x-auto">
+            <table class="table text-xs" data-testid="leave-generations">
+              <thead>
+                <tr>
+                  <th>Generation</th>
+                  <th class="text-right">Target per rack</th>
+                  <th>State</th>
+                </tr>
+              </thead>
+              <tbody>
+                {#each lg.target_rack_counts as target, i}
+                  {@const generation = i + 1}
+                  <tr class:font-medium={generation === lg.current_generation && generation > lg.generations_closed}>
+                    <td class="tabular-nums">{generation}</td>
+                    <td class="text-right tabular-nums">{target.toLocaleString()}</td>
+                    <td>
+                      {#if generation <= lg.generations_closed}closed{:else if generation === lg.current_generation}playing now{:else}to come{/if}
+                    </td>
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          </div>
+        {/if}
         <p class="text-sm">
           <span class="tabular-nums">{lg.tasks_completed.toLocaleString()}</span> tasks and
           <span class="tabular-nums">{lg.games_played.toLocaleString()}</span> games played this

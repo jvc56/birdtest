@@ -43,7 +43,7 @@ async fn with_history(app: &axum::Router) {
 #[tokio::test]
 async fn a_job_with_history_can_be_deleted_and_its_census_survives() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     let state = db.state().await;
     let app = birdtest::app(state.clone());
     with_history(&app).await;
@@ -88,7 +88,7 @@ async fn a_job_with_history_can_be_deleted_and_its_census_survives() {
 #[tokio::test]
 async fn a_job_can_be_purged_and_its_dispatch_counter_resets() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     let state = db.state().await;
     let app = birdtest::app(state.clone());
     with_history(&app).await;
@@ -122,7 +122,7 @@ async fn a_job_can_be_purged_and_its_dispatch_counter_resets() {
 #[tokio::test]
 async fn purging_a_job_removes_its_captured_positions_through_the_record() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     sqlx::query("UPDATE job_game_config SET capture_positions = true WHERE job_id = $1")
         .bind(job)
         .execute(&db.pool)
@@ -137,13 +137,13 @@ async fn purging_a_job_removes_its_captured_positions_through_the_record() {
     let uuid = assignment["worker_uuid"].as_str().unwrap();
     let mut result = games_result(2, 1);
     result["positions"] = json!([
-        { "game_index": 0, "turn_number": 0, "rack": "AEINRST", "position": "cgp-0",
+        { "game_index": 0, "turn_number": 0, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "sim", "rack": "AEINRST", "position": "cgp-0",
           "num_moves": 40,
           "moves": [{ "move": "8D RETAINS", "score": 74, "equity": 81.2,
                       "win_percentage": 55.0, "blended_utility": 0.6,
                       "plies": [{ "ply": 0, "bingo_percentage": 0.0, "average_score": 24.0 }] }] },
         // A capturing job's result has positions from every game of its batch.
-        { "game_index": 1, "turn_number": 0, "rack": "AEINRST", "position": "cgp-1",
+        { "game_index": 1, "turn_number": 0, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "AEINRST", "position": "cgp-1",
           "num_moves": 1, "moves": [{ "move": "8D RETAINS", "score": 74, "equity": 81.2 }] },
     ]);
     let (_, body) = send(
@@ -334,7 +334,7 @@ async fn a_user_with_history_can_be_deleted() {
 #[tokio::test]
 async fn a_completed_job_cannot_be_deactivated() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET status = 'completed' WHERE id = $1")
         .bind(job)
         .execute(&db.pool)
@@ -367,7 +367,7 @@ async fn a_completed_job_cannot_be_deactivated() {
 #[tokio::test]
 async fn the_results_stream_is_admin_only_and_the_paginated_one_is_not() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 10).await;
+    let job = db.games_job(10).await;
     let cfg = db.config();
     let admin = db.user("streamadmin", true).await;
     let plain = db.user("plainuser", false).await;
@@ -392,14 +392,16 @@ async fn the_results_stream_is_admin_only_and_the_paginated_one_is_not() {
     assert_eq!(status, StatusCode::OK);
 }
 
-/// Only a completed job can be exported: an export of a job still taking
-/// results would be stale before anyone downloaded it, and nothing would say so.
+/// A running job exports a snapshot: it has claims in flight -- an active job
+/// always does -- and is exported all the same, where it was refused while it
+/// was not completed. A completed job with a claim still out is refused (the
+/// admin wants its final corpus, which is not yet fixed).
 /// A-ADMIN-15b: the audit row is written with the export's own row, so a
 /// refused one logs nothing (logged before it, every refusal read as a start).
 #[tokio::test]
-async fn only_a_completed_job_can_be_exported() {
+async fn a_running_job_exports_a_snapshot() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 10).await;
+    let job = db.games_job(10).await;
     let cfg = db.config();
     let admin = db.user("exportadmin", true).await;
     let app = birdtest::app(db.state().await);
@@ -410,15 +412,11 @@ async fn only_a_completed_job_can_be_exported() {
         send(&app, get_request(&format!("/api/admin/jobs/{job}/export"), &headers)).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
-    let start = |headers: Vec<(String, String)>| {
+    let start = || {
         let borrowed: Vec<(&str, &str)> =
             headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         post_json(&format!("/api/admin/jobs/{job}/export"), &borrowed, serde_json::json!({}))
     };
-
-    let (status, body) = send(&app, start(headers.clone())).await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert!(body["message"].as_str().unwrap().contains("completed"), "{body}");
     let logged = || async {
         sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM audit_log WHERE job_id = $1 AND action = 'job.export_started'",
@@ -428,24 +426,20 @@ async fn only_a_completed_job_can_be_exported() {
         .await
         .unwrap()
     };
-    // A refused export is not logged as started (A-ADMIN-15b).
-    assert_eq!(logged().await, 0);
 
-    sqlx::query("UPDATE jobs SET status = 'completed' WHERE id = $1")
-        .bind(job)
-        .execute(&db.pool)
-        .await
-        .unwrap();
-
-    let headers_again = || headers.clone();
-    let (status, body) = send(&app, start(headers.clone())).await;
+    // Active, with a claim out.
+    let (status, claim) =
+        send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
+    assert_eq!(status, StatusCode::OK, "{claim}");
+    let (status, body) = send(&app, start()).await;
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
     assert!(body["id"].is_string(), "{body}");
 
     // The row exists from the moment the task is spawned. Its outcome depends
     // on an object store the test config points at a closed port, so the state
     // is whatever the spawned task reached; what is pinned here is that the
-    // export was accepted and recorded, not that the upload succeeded.
+    // export was accepted and recorded, not that the upload succeeded
+    // (`exports.rs` builds one against a real store).
     let recorded: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM job_exports WHERE job_id = $1")
         .bind(job)
         .fetch_one(&db.pool)
@@ -454,16 +448,16 @@ async fn only_a_completed_job_can_be_exported() {
     assert_eq!(recorded, 1);
     assert_eq!(logged().await, 1, "one begun export, one row");
 
-    // A second while it runs -- or, if the first has finished, another
-    // begun -- never a row without its export.
-    let (status, body) = send(&app, start(headers_again())).await;
-    assert!(matches!(status, StatusCode::CONFLICT | StatusCode::ACCEPTED), "{status} {body}");
-    let exports: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM job_exports WHERE job_id = $1")
+    // Completed with that claim still out: refused, and not logged.
+    sqlx::query("UPDATE jobs SET status = 'completed' WHERE id = $1")
         .bind(job)
-        .fetch_one(&db.pool)
+        .execute(&db.pool)
         .await
         .unwrap();
-    assert_eq!(logged().await, exports, "one row per export begun");
+    let (status, body) = send(&app, start()).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body["message"].as_str().unwrap().contains("in flight"), "{body}");
+    assert_eq!(logged().await, 1, "a refused export is not logged as started");
 }
 
 /// An opening-rack job whose static player records only the best move cannot
@@ -581,22 +575,42 @@ async fn an_opening_rack_job_cannot_rank_moves_with_a_best_recorder() {
 async fn purging_and_deleting_a_job_give_back_what_it_earned() {
     for destroy in ["purge", "delete"] {
         let db = TestDb::new().await;
-        let job = db.games_job(1, 2).await;
+        let job = db.games_job(2).await;
         let state = db.state().await;
         let app = birdtest::app(state.clone());
         with_history(&app).await;
         let admin = db.user("root", true).await;
         let headers = admin_headers(&state.cfg, admin);
 
+        // As if the claim had been held a minute: its contributor credited
+        // with the time, which is what the give-back reads off the claim.
+        sqlx::query(
+            "WITH held AS (
+                 UPDATE task_claims SET claimed_at = claimed_at - interval '1 minute'
+                 WHERE job_id = $1 RETURNING claimed_by_anon_uuid
+             )
+             UPDATE anonymous_workers SET compute_ms = compute_ms + 60000
+             WHERE uuid IN (SELECT claimed_by_anon_uuid FROM held)",
+        )
+        .bind(job)
+        .execute(&db.pool)
+        .await
+        .unwrap();
         let contributed = || async {
-            sqlx::query_scalar::<_, i64>(
-                "SELECT COALESCE(SUM(tasks_completed), 0)::bigint FROM anonymous_workers",
+            sqlx::query_as::<_, (i64, i64, i64, i64)>(
+                "SELECT COALESCE(SUM(tasks_completed), 0)::bigint,
+                        COALESCE(SUM(compute_ms), 0)::bigint,
+                        COALESCE(SUM(games_played), 0)::bigint,
+                        COALESCE(SUM(racks_analyzed), 0)::bigint
+                 FROM anonymous_workers",
             )
             .fetch_one(&db.pool)
             .await
             .unwrap()
         };
-        assert_eq!(contributed().await, 1, "the worker's task is on its counter");
+        let (tasks, compute_ms, games, racks) = contributed().await;
+        assert_eq!((tasks, games, racks), (1, 2, 0), "the worker's task is on its counters");
+        assert!(compute_ms >= 60_000, "and the minute it was held: {compute_ms} ms");
 
         let (status, body) = match destroy {
             "purge" => {
@@ -612,8 +626,8 @@ async fn purging_and_deleting_a_job_give_back_what_it_earned() {
         assert!(status.is_success(), "{destroy}: {body}");
         assert_eq!(
             contributed().await,
-            0,
-            "{destroy}: the claims are gone, so the contribution must be too"
+            (0, 0, 0, 0),
+            "{destroy}: the claims are gone, so every counter of the contribution must be too"
         );
     }
 }
@@ -630,7 +644,7 @@ async fn purging_and_deleting_a_job_give_back_what_it_earned() {
 #[tokio::test]
 async fn a_purge_waits_for_a_submission_in_flight_before_counting_contributions() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     let state = db.state().await;
     let app = birdtest::app(state.clone());
     let admin = db.user("root", true).await;
@@ -692,11 +706,13 @@ async fn a_purge_waits_for_a_submission_in_flight_before_counting_contributions(
 ///
 /// Completion does not stop results arriving: a job that met its stopping rule
 /// still accepts every claim already issued. An export built in that window
-/// was short, and every later download of the job was redirected to it.
+/// was short, and every later download of the job was redirected to it; it
+/// would now be a snapshot, but the admin exporting a completed job wants the
+/// final corpus.
 #[tokio::test]
 async fn a_completed_job_is_not_exported_until_its_claims_have_landed() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     let state = db.state().await;
     let app = birdtest::app(state.clone());
     let admin = db.user("root", true).await;
@@ -937,7 +953,7 @@ async fn a_games_job_may_pit_a_static_player_against_a_simmer() {
                 "job_type": "games", "variant": "classic",
                 "letterdist_id": letterdist, "layout_id": layout,
                 "player1_config_id": p1, "player2_config_id": p2,
-                "min_games": 1, "max_games": 10,
+                "max_games": 10,
             }),
         )
     };
@@ -1036,7 +1052,7 @@ async fn a_capture_job_refuses_simmers_that_capture_would_change() {
         let (status, created) = player_config(&app, &headers, json!({
             "name": format!("simmer-{plays}"), "recorder_type": "best", "kwg_id": kwg,
             "klv_id": klv, "winpct_id": winpct, "num_plies": 2, "num_plays": plays,
-            "max_iterations": 100, "time_limit_secs": 0, "num_plays_recorded": 1,
+            "max_iterations": 100, "time_limit_secs": 0, "num_plays_recorded": 20,
         })).await;
         assert_eq!(status, StatusCode::CREATED, "{created}");
         simmers.push(created["id"].clone());
@@ -1047,7 +1063,7 @@ async fn a_capture_job_refuses_simmers_that_capture_would_change() {
             "job_type": "games", "variant": "classic",
             "letterdist_id": letterdist, "layout_id": layout,
             "player1_config_id": capturing["id"], "player2_config_id": p2,
-            "min_games": 1, "max_games": 10, "capture_positions": capture,
+            "max_games": 10, "capture_positions": capture,
         }))
     };
     let (status, body) = send(&app, create(&simmers[0], true)).await;
@@ -1057,6 +1073,85 @@ async fn a_capture_job_refuses_simmers_that_capture_would_change() {
     assert_eq!(status, StatusCode::CREATED, "without capture nothing is raised: {body}");
     let (status, body) = send(&app, create(&simmers[1], true)).await;
     assert_eq!(status, StatusCode::CREATED, "a simmer already at the cap: {body}");
+}
+
+/// A-ADMIN-26: how many plays and plies a captured position keeps is one
+/// setting for the whole run in MAGPIE, read from player 1. So a capturing
+/// games or pairs job whose players disagree on either is refused, naming
+/// `capture_positions`; without capture neither is read, and they may differ.
+/// Keeping only first divergences (`capture_first_divergence`) is a pairs
+/// job's, and needs capture: on a games job, or without it, it is refused.
+#[tokio::test]
+async fn a_capture_job_refuses_players_that_record_differently() {
+    let db = TestDb::new().await;
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+    let admin = db.user("root", true).await;
+    let headers = admin_headers(&state.cfg, admin);
+    let headers: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let letterdist = db.input_data("letterdist", "english").await;
+    let layout = db.input_data("layout", "standard15").await;
+    let kwg = db.input_data("kwg", "NWL23").await;
+    let klv = db.input_data("klv", "NWL23").await;
+    let mut configs = Vec::new();
+    for (name, plays, plies) in [("ten-two", 10, 2), ("ten-two-b", 10, 2), ("five-two", 5, 2), ("ten-four", 10, 4)] {
+        let (status, created) = player_config(&app, &headers, json!({
+            "name": name, "recorder_type": "all", "kwg_id": kwg, "klv_id": klv,
+            "num_plays_recorded": plays, "num_plies_recorded": plies,
+        })).await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        configs.push(created["id"].clone());
+    }
+    let create = |job_type: &str, p2: &serde_json::Value, capture: bool| {
+        let units = if job_type == "games" { "max_games" } else { "max_pairs" };
+        let mut body = json!({
+            "job_type": job_type, "variant": "classic",
+            "letterdist_id": letterdist, "layout_id": layout,
+            "player1_config_id": configs[0], "player2_config_id": p2,
+            "capture_positions": capture,
+        });
+        body[units] = json!(10);
+        post_json("/api/admin/jobs", &headers, body)
+    };
+    for job_type in ["games", "game_pairs"] {
+        for differing in [&configs[2], &configs[3]] {
+            let (status, body) = send(&app, create(job_type, differing, true)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{job_type}: {body}");
+            assert_eq!(body["fields"][0]["field"], "capture_positions", "{body}");
+            let (status, body) = send(&app, create(job_type, differing, false)).await;
+            assert_eq!(status, StatusCode::CREATED, "{job_type} without capture: {body}");
+        }
+        let (status, body) = send(&app, create(job_type, &configs[1], true)).await;
+        assert_eq!(status, StatusCode::CREATED, "{job_type}, agreeing: {body}");
+    }
+
+    // First divergences: a pairs job's, and only with capture.
+    let with_divergence = |job_type: &str, capture: bool| {
+        let units = if job_type == "games" { "max_games" } else { "max_pairs" };
+        let mut body = json!({
+            "job_type": job_type, "variant": "classic",
+            "letterdist_id": letterdist, "layout_id": layout,
+            "player1_config_id": configs[0], "player2_config_id": configs[1],
+            "capture_positions": capture, "capture_first_divergence": true,
+        });
+        body[units] = json!(10);
+        post_json("/api/admin/jobs", &headers, body)
+    };
+    for (job_type, capture) in [("games", true), ("game_pairs", false)] {
+        let (status, body) = send(&app, with_divergence(job_type, capture)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{job_type}, capture {capture}: {body}");
+        assert_eq!(body["fields"][0]["field"], "capture_first_divergence", "{body}");
+    }
+    let (status, body) = send(&app, with_divergence("game_pairs", true)).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let stored: bool = sqlx::query_scalar(
+        "SELECT capture_first_divergence FROM job_game_pair_config WHERE job_id = $1",
+    )
+    .bind(body["job"]["id"].as_str().unwrap().parse::<uuid::Uuid>().unwrap())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert!(stored);
 }
 
 /// A config states every setting a task needs, and a job every run-wide one:
@@ -1091,6 +1186,8 @@ async fn a_player_config_and_a_job_state_every_setting_a_task_needs() {
         ("movegen_margin", json!(5.0)),
         ("use_wordmap", json!(true)),
         ("use_rit", json!(true)),
+        // On unless the config opts out.
+        ("use_wit", json!(true)),
         ("max_iterations", json!(null)),
         ("threshold", json!(null)),
         ("utility_w_spread", json!(null)),
@@ -1133,11 +1230,130 @@ async fn a_player_config_and_a_job_state_every_setting_a_task_needs() {
         "job_type": "games", "variant": "classic",
         "letterdist_id": letterdist, "layout_id": layout,
         "player1_config_id": static_player["id"], "player2_config_id": simmer["id"],
-        "min_games": 1, "max_games": 10,
+        "max_games": 10,
     }))).await;
     assert_eq!(status, StatusCode::CREATED, "{created}");
     assert_eq!(created["job"]["bingo_bonus"], json!(50), "{created}");
     assert_eq!(created["job"]["sim_cutoff"], json!(0.005), "{created}");
+
+    // A-ADMIN-27: the two may be stated instead, and are kept as stated.
+    let job = |extra: serde_json::Value| {
+        let mut body = json!({
+            "job_type": "games", "variant": "classic",
+            "letterdist_id": letterdist, "layout_id": layout,
+            "player1_config_id": static_player["id"], "player2_config_id": simmer["id"],
+            "max_games": 10,
+        });
+        for (key, value) in extra.as_object().unwrap() {
+            body[key] = value.clone();
+        }
+        post_json("/api/admin/jobs", &headers, body)
+    };
+    let (status, created) = send(&app, job(json!({ "bingo_bonus": 35, "sim_cutoff": 0.5 }))).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(created["job"]["bingo_bonus"], json!(35), "{created}");
+    assert_eq!(created["job"]["sim_cutoff"], json!(0.5), "{created}");
+    for (extra, field) in [
+        (json!({ "bingo_bonus": -1 }), "bingo_bonus"),
+        (json!({ "sim_cutoff": 100.5 }), "sim_cutoff"),
+        (json!({ "sim_cutoff": -0.1 }), "sim_cutoff"),
+    ] {
+        let (status, body) = send(&app, job(extra.clone())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{extra}: {body}");
+        assert_eq!(body["fields"][0]["field"], field, "{extra}: {body}");
+    }
+}
+
+/// A-ADMIN-25: a player config solves the endgame and the pre-endgame
+/// exactly as it states. `endgame_plies` 0 solves nothing, and the
+/// pre-endgame is refused without it, since PEG scores its emptier scenarios
+/// with endgame solves. A PEG setting without the pre-endgame on is refused,
+/// as a simulation setting without plies is; what a PEG player leaves out is
+/// MAGPIE's default, written into the row.
+#[tokio::test]
+async fn a_player_config_solves_the_end_of_the_game_only_as_it_states() {
+    let db = TestDb::new().await;
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+    let admin = db.user("root", true).await;
+    let headers = admin_headers(&state.cfg, admin);
+    let headers: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let kwg = db.input_data("kwg", "NWL23").await;
+    let klv = db.input_data("klv", "NWL23").await;
+    let body = |name: &str, extra: serde_json::Value| {
+        let mut body = json!({
+            "name": name, "recorder_type": "best", "kwg_id": kwg, "klv_id": klv,
+            "num_plays_recorded": 1,
+        });
+        for (key, value) in extra.as_object().unwrap() {
+            body[key] = value.clone();
+        }
+        body
+    };
+
+    // Off unless asked for.
+    let (status, plain) = player_config(&app, &headers, body("plain", json!({}))).await;
+    assert_eq!(status, StatusCode::CREATED, "{plain}");
+    assert_eq!(plain["endgame_plies"], json!(0), "{plain}");
+    assert_eq!(plain["peg_max_bag"], json!(0), "{plain}");
+    assert_eq!(plain["peg_stage_top_k"], json!(null), "{plain}");
+
+    // The endgame alone states no PEG settings.
+    let (status, endgamer) =
+        player_config(&app, &headers, body("endgamer", json!({ "endgame_plies": 4 }))).await;
+    assert_eq!(status, StatusCode::CREATED, "{endgamer}");
+    assert_eq!(endgamer["endgame_plies"], json!(4), "{endgamer}");
+    assert_eq!(endgamer["peg_nested"], json!(null), "{endgamer}");
+
+    // The pre-endgame with only its switch takes MAGPIE's schedule.
+    let (status, pegger) = player_config(&app, &headers, body("pegger", json!({
+        "endgame_plies": 6, "peg_max_bag": 2,
+    }))).await;
+    assert_eq!(status, StatusCode::CREATED, "{pegger}");
+    for (field, expected) in [
+        ("peg_max_bag", json!(2)),
+        ("peg_stage_top_k", json!([32, 16, 8, 4, 2])),
+        ("peg_scenario_stride", json!(1)),
+        ("peg_opp_model", json!("rational")),
+        ("peg_nested", json!(true)),
+        ("peg_nested_cand_caps", json!([8, 4, 2])),
+        ("peg_nested_max_depth", json!(1)),
+        ("peg_nested_strides", json!([1, 1, 5, 7])),
+    ] {
+        assert_eq!(pegger[field], expected, "pegger {field}: {pegger}");
+    }
+
+    // Without nested lookahead the nested settings are not stated.
+    let (status, flat) = player_config(&app, &headers, body("flat", json!({
+        "endgame_plies": 3, "peg_max_bag": 1, "peg_nested": false,
+        "peg_stage_top_k": [8, 4], "peg_opp_model": "pessimistic",
+    }))).await;
+    assert_eq!(status, StatusCode::CREATED, "{flat}");
+    assert_eq!(flat["peg_nested_cand_caps"], json!(null), "{flat}");
+    assert_eq!(flat["peg_opp_model"], json!("pessimistic"), "{flat}");
+
+    let refused = [
+        ("peg-without-endgame", json!({ "peg_max_bag": 2 }), "peg_max_bag"),
+        ("peg-with-endgame-off", json!({ "endgame_plies": 0, "peg_max_bag": 2 }), "peg_max_bag"),
+        ("too-deep", json!({ "endgame_plies": 26 }), "endgame_plies"),
+        ("bag-too-big", json!({ "endgame_plies": 6, "peg_max_bag": 5 }), "peg_max_bag"),
+        ("stride-without-peg", json!({ "endgame_plies": 6, "peg_scenario_stride": 2 }), "peg_scenario_stride"),
+        (
+            "depth-without-nested",
+            json!({ "endgame_plies": 6, "peg_max_bag": 2, "peg_nested": false, "peg_nested_max_depth": 2 }),
+            "peg_nested_max_depth",
+        ),
+        ("one-play-stage", json!({ "endgame_plies": 6, "peg_max_bag": 2, "peg_stage_top_k": [4, 1] }), "peg_stage_top_k"),
+        ("growing-stages", json!({ "endgame_plies": 6, "peg_max_bag": 2, "peg_stage_top_k": [4, 8] }), "peg_stage_top_k"),
+        ("zero-stride", json!({ "endgame_plies": 6, "peg_max_bag": 2, "peg_scenario_stride": 0 }), "peg_scenario_stride"),
+        ("unknown-opponent", json!({ "endgame_plies": 6, "peg_max_bag": 2, "peg_opp_model": "nice" }), "peg_opp_model"),
+        ("three-strides", json!({ "endgame_plies": 6, "peg_max_bag": 2, "peg_nested_strides": [1, 1, 5] }), "peg_nested_strides"),
+    ];
+    for (name, extra, field) in refused {
+        let (status, response) = player_config(&app, &headers, body(name, extra)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{name}: {response}");
+        assert_eq!(response["fields"][0]["field"], field, "{name}: {response}");
+    }
 }
 
 /// A config or job no worker can run is refused at creation. Each of these
@@ -1213,36 +1429,33 @@ async fn a_config_or_job_no_worker_can_run_is_refused() {
     .fetch_one(&db.pool)
     .await
     .unwrap();
-    let job_with = |layout_id: uuid::Uuid, alpha: f64, beta: f64| {
+    let job_with = |layout_id: uuid::Uuid, confidence: f64| {
         json!({
             "job_type": "games", "variant": "classic",
             "letterdist_id": letterdist, "layout_id": layout_id,
             "player1_config_id": player["id"], "player2_config_id": player["id"],
-            "min_games": 1, "max_games": 10, "sprt_alpha": alpha, "sprt_beta": beta,
+            "test_enabled": true, "min_games": 1, "max_games": 10,
+            "confidence_pct": confidence,
         })
     };
-    let job = |layout_id: uuid::Uuid, alpha: f64| job_with(layout_id, alpha, 0.05);
-    let (status, body) = send(&app, post_json("/api/admin/jobs", &headers, job(super21, 0.05))).await;
+    let job = |layout_id: uuid::Uuid| job_with(layout_id, 95.0);
+    let (status, body) = send(&app, post_json("/api/admin/jobs", &headers, job(super21))).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(body["fields"][0]["field"], "layout_id", "{body}");
 
-    // A subnormal alpha made the SPRT's upper bound infinite, which the job
-    // page could not print; beta keeps the same floor for symmetry.
-    for (alpha, beta, field) in [
-        (1e-309, 0.05, "sprt_alpha"),
-        (0.000_000_9, 0.05, "sprt_alpha"),
-        (0.05, 0.000_000_9, "sprt_beta"),
-    ] {
+    // A confidence of 100% put a logarithm of zero in the match test's
+    // interval, which then never closes; one just short of it is a test.
+    for confidence in [100.0, 100.000_000_1] {
         let (status, body) =
-            send(&app, post_json("/api/admin/jobs", &headers, job_with(layout, alpha, beta))).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{alpha} {beta}: {body}");
-        assert_eq!(body["fields"][0]["field"], field, "{body}");
+            send(&app, post_json("/api/admin/jobs", &headers, job_with(layout, confidence))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{confidence}: {body}");
+        assert_eq!(body["fields"][0]["field"], "confidence_pct", "{body}");
     }
     let (status, body) =
-        send(&app, post_json("/api/admin/jobs", &headers, job_with(layout, 0.000_001, 0.000_001))).await;
-    assert_eq!(status, StatusCode::CREATED, "at the floor: {body}");
+        send(&app, post_json("/api/admin/jobs", &headers, job_with(layout, 99.999))).await;
+    assert_eq!(status, StatusCode::CREATED, "just short of all: {body}");
 
-    let (status, body) = send(&app, post_json("/api/admin/jobs", &headers, job(layout, 0.05))).await;
+    let (status, body) = send(&app, post_json("/api/admin/jobs", &headers, job(layout))).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
 }
 
@@ -1319,7 +1532,7 @@ async fn an_identity_can_be_banned_once_and_unbanning_lifts_it() {
 #[tokio::test]
 async fn a_finish_check_overtaken_by_a_purge_does_not_complete_the_job() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     let status = |db: &TestDb| {
         let pool = db.pool.clone();
         async move {
@@ -1331,13 +1544,22 @@ async fn a_finish_check_overtaken_by_a_purge_does_not_complete_the_job() {
         }
     };
 
+    // The check observed five claims; `purged` is the second witness.
+    let complete = |db: &TestDb, purged: bool| {
+        let pool = db.pool.clone();
+        async move {
+            let finish = birdtest::jobs::Finish::ReachedTarget;
+            birdtest::jobs::complete_unless_purged(&pool, job, 5, finish, || purged).await.unwrap()
+        }
+    };
+
     // The check observed five claims; a purge then reset the counter.
     sqlx::query("UPDATE jobs SET claims_issued = 0 WHERE id = $1")
         .bind(job)
         .execute(&db.pool)
         .await
         .unwrap();
-    assert!(!birdtest::jobs::complete_unless_purged(&db.pool, job, 5, None, || false).await.unwrap());
+    assert!(!complete(&db, false).await);
     assert_eq!(status(&db).await, "active");
 
     // The counter has grown past what was observed -- but a purge came and
@@ -1347,11 +1569,11 @@ async fn a_finish_check_overtaken_by_a_purge_does_not_complete_the_job() {
         .execute(&db.pool)
         .await
         .unwrap();
-    assert!(!birdtest::jobs::complete_unless_purged(&db.pool, job, 5, None, || true).await.unwrap());
+    assert!(!complete(&db, true).await);
     assert_eq!(status(&db).await, "active");
 
     // With no purge in between the counter has only grown, and it completes.
-    assert!(birdtest::jobs::complete_unless_purged(&db.pool, job, 5, None, || false).await.unwrap());
+    assert!(complete(&db, false).await);
     assert_eq!(status(&db).await, "completed");
 }
 
@@ -1396,6 +1618,16 @@ async fn a_player_config_may_ask_for_a_rack_info_table() {
     assert_eq!(status, StatusCode::CREATED, "{response}");
     assert_eq!(response["use_rit"], json!(true), "{response}");
 
+    // A word info table is stored as asked, and is on when nothing says.
+    assert_eq!(response["use_wit"], json!(true), "{response}");
+    let (status, response) = player_config(&app, &headers, json!({
+        "name": "static-no-wit", "recorder_type": "best",
+        "kwg_id": kwg, "klv_id": klv, "num_plays_recorded": 1, "use_wit": false,
+    }))
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{response}");
+    assert_eq!(response["use_wit"], json!(false), "{response}");
+
     // The table travels under the pair's name, not the lexicon's. That is what
     // keeps NWL23-with-CSW21-leaves -- a configuration birdtest accepts on
     // purpose -- from loading NWL23's own table and ranking every full rack on
@@ -1413,7 +1645,7 @@ async fn a_player_config_may_ask_for_a_rack_info_table() {
 #[tokio::test]
 async fn an_export_is_not_blocked_by_a_claim_whose_worker_vanished() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     let state = db.state().await;
     let app = birdtest::app(state.clone());
     let admin = db.user("root", true).await;
@@ -1483,13 +1715,13 @@ async fn a_newly_activated_job_joins_at_parity_instead_of_taking_everything() {
     let db = TestDb::new().await;
     let cfg = db.config();
     let admin = db.user("root", true).await;
-    let veteran = db.games_job(1, 2).await;
+    let veteran = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET claims_issued = 100000 WHERE id = $1")
         .bind(veteran)
         .execute(&db.pool)
         .await
         .unwrap();
-    let newcomer = db.games_job(1, 2).await;
+    let newcomer = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET status = 'inactive', allocation = NULL WHERE id = $1")
         .bind(newcomer)
         .execute(&db.pool)
@@ -1539,8 +1771,8 @@ async fn a_purged_job_rejoins_at_parity() {
     let db = TestDb::new().await;
     let cfg = db.config();
     let admin = db.user("root", true).await;
-    let steady = db.games_job(1, 2).await;
-    let purged = db.games_job(1, 2).await;
+    let steady = db.games_job(2).await;
+    let purged = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET claims_issued = 100000 WHERE id = ANY($1)")
         .bind(vec![steady, purged])
         .execute(&db.pool)
@@ -1573,7 +1805,7 @@ async fn a_job_nobody_is_being_served_from_does_not_set_a_newcomers_parity() {
     let db = TestDb::new().await;
     let cfg = db.config();
     let admin = db.user("root", true).await;
-    let veteran = db.games_job(1, 2).await;
+    let veteran = db.games_job(2).await;
     sqlx::query(
         "UPDATE jobs SET claims_issued = 100000, allocation = 40, last_claimed_at = now()
          WHERE id = $1",
@@ -1584,13 +1816,13 @@ async fn a_job_nobody_is_being_served_from_does_not_set_a_newcomers_parity() {
     .unwrap();
     // On offer, and out of this fleet's reach: a floor above what the workers
     // run. It has issued nothing, so its ratio is zero and stays there.
-    let lagging = db.games_job(1, 2).await;
+    let lagging = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET allocation = 20, min_magpie_major = 9 WHERE id = $1")
         .bind(lagging)
         .execute(&db.pool)
         .await
         .unwrap();
-    let newcomer = db.games_job(1, 2).await;
+    let newcomer = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET status = 'inactive', allocation = NULL WHERE id = $1")
         .bind(newcomer)
         .execute(&db.pool)
@@ -1629,13 +1861,14 @@ async fn a_job_nobody_is_being_served_from_does_not_set_a_newcomers_parity() {
 #[tokio::test]
 async fn purging_a_completed_job_returns_it_to_inactive() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     let state = db.state().await;
     let app = birdtest::app(state.clone());
     with_history(&app).await;
     sqlx::query(
-        "UPDATE jobs SET status = 'completed', sprt_decided_status = 'passed',
-                         sprt_decided_llr = 3.1, sprt_decided_units = 200
+        "UPDATE jobs SET status = 'completed', test_decided_status = 'player1_better',
+                         test_decided_lower = 0.51, test_decided_upper = 0.6,
+                         test_decided_units = 200
          WHERE id = $1",
     )
     .bind(job)
@@ -1649,7 +1882,7 @@ async fn purging_a_completed_job_returns_it_to_inactive() {
         send(&app, request("POST", &format!("/api/admin/jobs/{job}/purge"), &headers)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let (job_status, verdict): (String, Option<String>) =
-        sqlx::query_as("SELECT status::text, sprt_decided_status FROM jobs WHERE id = $1")
+        sqlx::query_as("SELECT status::text, test_decided_status FROM jobs WHERE id = $1")
             .bind(job)
             .fetch_one(&db.pool)
             .await
@@ -1675,7 +1908,7 @@ async fn purging_a_completed_job_returns_it_to_inactive() {
 #[tokio::test]
 async fn a_purge_in_progress_neither_parks_submissions_nor_costs_its_claims() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     let state = db.state().await;
     let app = birdtest::app(state.clone());
 
@@ -1735,7 +1968,7 @@ async fn a_purge_in_progress_neither_parks_submissions_nor_costs_its_claims() {
 #[tokio::test]
 async fn a_second_purge_or_delete_is_refused_while_one_runs() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     let state = db.state().await;
     let app = birdtest::app(state.clone());
     let admin = db.user("root", true).await;
@@ -1779,7 +2012,7 @@ async fn a_second_purge_or_delete_is_refused_while_one_runs() {
 #[tokio::test]
 async fn a_purge_waiting_on_a_rating_fit_holds_up_no_submissions() {
     let db = TestDb::new().await;
-    let purged = db.games_job(1, 2).await;
+    let purged = db.games_job(2).await;
     let state = db.state().await;
     let app = birdtest::app(state.clone());
     let admin = db.user("root", true).await;
@@ -1802,7 +2035,7 @@ async fn a_purge_waiting_on_a_rating_fit_holds_up_no_submissions() {
     assert_eq!(status, StatusCode::OK, "{body}");
     // ...and holds a claim on another job.
     sqlx::query("UPDATE jobs SET status = 'inactive' WHERE id = $1").bind(purged).execute(&db.pool).await.unwrap();
-    db.games_job(1, 2).await;
+    db.games_job(2).await;
     let (status, other) = send(
         &app,
         post_json("/api/worker/task", &[("x-worker-uuid", uuid.as_str())], claim_body("1.0.0", &[])),
@@ -1880,7 +2113,7 @@ async fn a_purge_waiting_on_a_rating_fit_holds_up_no_submissions() {
 #[tokio::test]
 async fn a_locked_identity_row_does_not_hold_up_its_requests() {
     let db = TestDb::new().await;
-    db.games_job(1, 2).await;
+    db.games_job(2).await;
     let state = db.state().await;
     let app = birdtest::app(state.clone());
     let (status, claim) =
@@ -1995,7 +2228,7 @@ async fn a_job_cannot_pin_two_files_under_one_name() {
             "job_type": "games", "variant": "classic",
             "letterdist_id": letterdist, "layout_id": layout,
             "player1_config_id": p1, "player2_config_id": p2,
-            "min_games": 1, "max_games": 10,
+            "max_games": 10,
         }))
     };
 
@@ -2114,7 +2347,7 @@ async fn a_wordmap_on_a_distribution_with_more_than_two_blanks_is_refused() {
         "job_type": "games", "variant": "classic",
         "letterdist_id": three_blanks, "layout_id": layout,
         "player1_config_id": player, "player2_config_id": player,
-        "min_games": 1, "max_games": 10,
+        "max_games": 10,
     });
     let (status, body) = send(&app, post_json("/api/admin/jobs", &headers, job(&players[0]))).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
@@ -2125,6 +2358,8 @@ async fn a_wordmap_on_a_distribution_with_more_than_two_blanks_is_refused() {
         sqlx::query_scalar("SELECT COUNT(*) FROM derived_data").fetch_one(&db.pool).await.unwrap();
     assert_eq!((jobs, queued), (0, 0), "nothing is created or queued");
 
+    // A word info table -- on by default, as "without" has it -- is built from
+    // the lexicon alone, which has no blanks, so it is no reason to refuse.
     let (status, body) = send(&app, post_json("/api/admin/jobs", &headers, job(&players[1]))).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
 }
@@ -2208,8 +2443,8 @@ async fn a_newcomer_is_not_put_level_with_a_job_that_has_run_out_of_work() {
     let db = TestDb::new().await;
     let cfg = db.config();
     let admin = db.user("root", true).await;
-    let veteran = db.games_job(1, 2).await;
-    let capped = db.games_job(1, 2).await;
+    let veteran = db.games_job(2).await;
+    let capped = db.games_job(2).await;
     // The capped job's whole space is one task (max 2 games).
     sqlx::query("UPDATE job_game_config SET max_games = 2, min_games = 2 WHERE job_id = $1")
         .bind(capped)
@@ -2239,7 +2474,7 @@ async fn a_newcomer_is_not_put_level_with_a_job_that_has_run_out_of_work() {
         }
     }
     assert_eq!(capped_claims, 1, "the capped job has one task");
-    let newcomer = db.games_job(1, 2).await;
+    let newcomer = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET status = 'inactive', allocation = NULL WHERE id = $1")
         .bind(newcomer).execute(&db.pool).await.unwrap();
     let app = birdtest::app(state.clone());
@@ -2282,17 +2517,17 @@ async fn after_a_quiet_spell_a_newcomer_still_joins_level_with_the_jobs_served()
     let db = TestDb::new().await;
     let cfg = db.config();
     let admin = db.user("root", true).await;
-    let veteran = db.games_job(1, 2).await;
+    let veteran = db.games_job(2).await;
     sqlx::query(
         "UPDATE jobs SET claims_issued = 100000, allocation = 40,
                          last_claimed_at = now() - interval '10 minutes'
          WHERE id = $1",
     )
     .bind(veteran).execute(&db.pool).await.unwrap();
-    let lagging = db.games_job(1, 2).await;
+    let lagging = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET allocation = 20, min_magpie_major = 9 WHERE id = $1")
         .bind(lagging).execute(&db.pool).await.unwrap();
-    let newcomer = db.games_job(1, 2).await;
+    let newcomer = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET status = 'inactive', allocation = NULL WHERE id = $1")
         .bind(newcomer).execute(&db.pool).await.unwrap();
     let app = birdtest::app(db.state().await);
@@ -2358,14 +2593,14 @@ async fn split_activate(db: &TestDb, state: &birdtest::state::AppState, admin: U
 async fn in_a_split_fleet_a_newcomer_is_not_starved_behind_a_lagging_job() {
     let db = TestDb::new().await;
     let admin = db.user("root", true).await;
-    let t = db.games_job(1, 2).await; // runnable by everyone (floor 0.1.0)
-    let a = db.games_job(1, 2).await; // needs MAGPIE 2
+    let t = db.games_job(2).await; // runnable by everyone (floor 0.1.0)
+    let a = db.games_job(2).await; // needs MAGPIE 2
     sqlx::query("UPDATE jobs SET allocation = 10 WHERE id = $1").bind(t).execute(&db.pool).await.unwrap();
     sqlx::query("UPDATE jobs SET allocation = 50, min_magpie_major = 2 WHERE id = $1").bind(a).execute(&db.pool).await.unwrap();
     let state = db.state().await;
     // 30% of claims from workers still on MAGPIE 1.
     split_run(&state, 1000, |i| i % 10 < 3).await;
-    let n = db.games_job(1, 2).await;
+    let n = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET status = 'inactive', allocation = NULL, min_magpie_major = 2 WHERE id = $1")
         .bind(n).execute(&db.pool).await.unwrap();
     split_activate(&db, &state, admin, n, 40).await;
@@ -2383,14 +2618,14 @@ async fn in_a_split_fleet_a_newcomer_is_not_starved_behind_a_lagging_job() {
 async fn a_minority_newcomer_is_not_starved_behind_a_lagging_minority_job() {
     let db = TestDb::new().await;
     let admin = db.user("root", true).await;
-    let a = db.games_job(1, 2).await; // everyone
-    let b = db.games_job(1, 2).await; // MAGPIE 2 only
+    let a = db.games_job(2).await; // everyone
+    let b = db.games_job(2).await; // MAGPIE 2 only
     sqlx::query("UPDATE jobs SET allocation = 40 WHERE id = $1").bind(a).execute(&db.pool).await.unwrap();
     sqlx::query("UPDATE jobs SET allocation = 30, min_magpie_major = 2 WHERE id = $1").bind(b).execute(&db.pool).await.unwrap();
     let state = db.state().await;
     // 80% of claims from MAGPIE-1 workers.
     split_run(&state, 1000, |i| i % 10 < 8).await;
-    let n = db.games_job(1, 2).await;
+    let n = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET status = 'inactive', allocation = NULL, min_magpie_major = 2 WHERE id = $1")
         .bind(n).execute(&db.pool).await.unwrap();
     split_activate(&db, &state, admin, n, 30).await;
@@ -2409,8 +2644,8 @@ async fn a_minority_newcomer_is_not_starved_behind_a_lagging_minority_job() {
 #[tokio::test]
 async fn a_job_nobody_could_run_rejoins_at_parity_when_the_fleet_can() {
     let db = TestDb::new().await;
-    let veteran = db.games_job(1, 2).await;
-    let waiting = db.games_job(1, 2).await;
+    let veteran = db.games_job(2).await;
+    let waiting = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET allocation = 40 WHERE id = $1").bind(veteran).execute(&db.pool).await.unwrap();
     // Activated an hour ago; nobody has had MAGPIE 9 since.
     sqlx::query("UPDATE jobs SET allocation = 40, min_magpie_major = 9, activated_at = now() - interval '1 hour' WHERE id = $1")
@@ -2433,9 +2668,9 @@ async fn a_job_nobody_could_run_rejoins_at_parity_when_the_fleet_can() {
 #[tokio::test]
 async fn jobs_lagging_together_keep_their_shares() {
     let db = TestDb::new().await;
-    let t = db.games_job(1, 2).await;
-    let b = db.games_job(1, 2).await;
-    let c = db.games_job(1, 2).await;
+    let t = db.games_job(2).await;
+    let b = db.games_job(2).await;
+    let c = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET allocation = 10 WHERE id = $1").bind(t).execute(&db.pool).await.unwrap();
     sqlx::query("UPDATE jobs SET allocation = 45, min_magpie_major = 2, created_at = now() - interval '1 hour' WHERE id = $1")
         .bind(b).execute(&db.pool).await.unwrap();
@@ -2455,8 +2690,8 @@ async fn jobs_lagging_together_keep_their_shares() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_concurrent_burst_to_a_small_job_is_paid_back() {
     let db = TestDb::new().await;
-    let a = db.games_job(1, 2).await;
-    let b = db.games_job(1, 2).await;
+    let a = db.games_job(2).await;
+    let b = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET allocation = 1 WHERE id = $1").bind(a).execute(&db.pool).await.unwrap();
     sqlx::query("UPDATE jobs SET allocation = 99 WHERE id = $1").bind(b).execute(&db.pool).await.unwrap();
     let state = db.state().await;
@@ -2504,8 +2739,8 @@ async fn majority_claims(state: &birdtest::state::AppState, n: usize) -> Vec<Uui
 /// A at 50% that everyone runs, L at 40% that only the 20% of claims from
 /// MAGPIE 2 can run -- L lags, served, for as long as the split lasts.
 async fn minority_split(db: &TestDb) -> (birdtest::state::AppState, Uuid, Uuid) {
-    let a = db.games_job(1, 2).await;
-    let l = db.games_job(1, 2).await;
+    let a = db.games_job(2).await;
+    let l = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET allocation = 50 WHERE id = $1").bind(a).execute(&db.pool).await.unwrap();
     sqlx::query("UPDATE jobs SET allocation = 40, min_magpie_major = 2 WHERE id = $1").bind(l).execute(&db.pool).await.unwrap();
     let state = db.state().await;
@@ -2525,7 +2760,7 @@ async fn a_newcomer_everyone_can_run_is_not_put_level_with_a_minority_job() {
     let db = TestDb::new().await;
     let admin = db.user("root", true).await;
     let (state, a, _) = minority_split(&db).await;
-    let n = db.games_job(1, 2).await;
+    let n = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET status = 'inactive', allocation = NULL WHERE id = $1").bind(n).execute(&db.pool).await.unwrap();
     split_activate(&db, &state, admin, n, 10).await;
     let majority = majority_claims(&state, 1000).await;
@@ -2544,9 +2779,9 @@ async fn a_newcomer_everyone_can_run_is_not_put_level_with_a_minority_job() {
 async fn an_allocation_changed_in_a_split_fleet_takes_nothing_over() {
     let db = TestDb::new().await;
     let admin = db.user("root", true).await;
-    let a = db.games_job(1, 2).await;
-    let b = db.games_job(1, 2).await;
-    let l = db.games_job(1, 2).await;
+    let a = db.games_job(2).await;
+    let b = db.games_job(2).await;
+    let l = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET allocation = 40 WHERE id = $1").bind(a).execute(&db.pool).await.unwrap();
     sqlx::query("UPDATE jobs SET allocation = 20 WHERE id = $1").bind(b).execute(&db.pool).await.unwrap();
     sqlx::query("UPDATE jobs SET allocation = 40, min_magpie_major = 2 WHERE id = $1").bind(l).execute(&db.pool).await.unwrap();
@@ -2568,7 +2803,7 @@ async fn an_allocation_changed_in_a_split_fleet_takes_nothing_over() {
 #[tokio::test]
 async fn a_returning_job_in_a_split_fleet_takes_nothing_over() {
     let db = TestDb::new().await;
-    let x = db.games_job(1, 2).await;
+    let x = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET allocation = 10, min_magpie_major = 9, activated_at = now() - interval '1 hour' WHERE id = $1")
         .bind(x).execute(&db.pool).await.unwrap();
     let (state, a, _) = minority_split(&db).await;
@@ -2587,9 +2822,9 @@ async fn a_returning_job_in_a_split_fleet_takes_nothing_over() {
 #[tokio::test]
 async fn a_job_passed_over_for_a_moment_waits_for_nothing() {
     let db = TestDb::new().await;
-    let p = db.games_job(1, 2).await;
-    let c = db.games_job(1, 2).await;
-    let d = db.games_job(1, 2).await;
+    let p = db.games_job(2).await;
+    let c = db.games_job(2).await;
+    let d = db.games_job(2).await;
     for (job, alloc, age) in [(p, 50, 3), (c, 1, 2), (d, 49, 1)] {
         sqlx::query("UPDATE jobs SET allocation = $2, created_at = now() - make_interval(hours => $3) WHERE id = $1")
             .bind(job).bind(alloc).bind(age).execute(&db.pool).await.unwrap();
@@ -2631,8 +2866,8 @@ async fn a_job_passed_over_for_a_moment_waits_for_nothing() {
 #[tokio::test]
 async fn a_job_with_nothing_to_hand_out_banks_no_debt() {
     let db = TestDb::new().await;
-    let p = db.games_job(1, 2).await;
-    let d = db.games_job(1, 2).await;
+    let p = db.games_job(2).await;
+    let d = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET allocation = 50 WHERE id = ANY($1)").bind(vec![p, d]).execute(&db.pool).await.unwrap();
     let state = db.state().await;
     split_run(&state, 100, |_| false).await;
@@ -2679,8 +2914,8 @@ async fn minority_claims(state: &birdtest::state::AppState, n: usize) -> std::co
 async fn a_burst_in_the_first_hour_is_paid_back() {
     let db = TestDb::new().await;
     let admin = db.user("root", true).await;
-    let a = db.games_job(1, 2).await;
-    let b = db.games_job(1, 2).await;
+    let a = db.games_job(2).await;
+    let b = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET status = 'inactive', allocation = NULL WHERE id = ANY($1)")
         .bind(vec![a, b]).execute(&db.pool).await.unwrap();
     let state = db.state().await;
@@ -2721,11 +2956,11 @@ async fn a_burst_in_the_first_hour_is_paid_back() {
 async fn a_newcomer_the_majority_declines_is_not_settled_at_its_pace() {
     let db = TestDb::new().await;
     let admin = db.user("root", true).await;
-    let a = db.games_job(1, 2).await;
-    let l = db.games_job(1, 2).await;
+    let a = db.games_job(2).await;
+    let l = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET allocation = 50 WHERE id = $1").bind(a).execute(&db.pool).await.unwrap();
     sqlx::query("UPDATE jobs SET allocation = 40, min_magpie_major = 2 WHERE id = $1").bind(l).execute(&db.pool).await.unwrap();
-    let n = db.games_job(1, 2).await;
+    let n = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET status = 'inactive', allocation = NULL WHERE id = $1").bind(n).execute(&db.pool).await.unwrap();
     let state = db.state().await;
     let app = birdtest::app(state.clone());
@@ -2786,13 +3021,13 @@ async fn a_newcomer_the_majority_declines_is_not_settled_at_its_pace() {
 async fn a_newcomer_is_not_settled_past_a_job_paused_for_a_moment() {
     let db = TestDb::new().await;
     let admin = db.user("root", true).await;
-    let a = db.games_job(1, 2).await;
-    let l = db.games_job(1, 2).await;
+    let a = db.games_job(2).await;
+    let l = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET allocation = 40 WHERE id = $1").bind(a).execute(&db.pool).await.unwrap();
     sqlx::query("UPDATE jobs SET allocation = 30, min_magpie_major = 2 WHERE id = $1").bind(l).execute(&db.pool).await.unwrap();
     let state = db.state().await;
     minority_claims(&state, 1000).await;
-    let n = db.games_job(1, 2).await;
+    let n = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET status = 'inactive', allocation = NULL, min_magpie_major = 2 WHERE id = $1")
         .bind(n).execute(&db.pool).await.unwrap();
     split_activate(&db, &state, admin, n, 30).await;
@@ -2846,7 +3081,7 @@ async fn concurrent_claims(state: &birdtest::state::AppState, per_worker: usize)
 async fn equal_jobs_claimed_together_leave_no_worker_idle() {
     let db = TestDb::new().await;
     for _ in 0..3 {
-        db.games_job(1, 2).await;
+        db.games_job(2).await;
     }
     sqlx::query("UPDATE jobs SET allocation = 33").execute(&db.pool).await.unwrap();
     let state = db.state().await;
@@ -2864,8 +3099,8 @@ async fn equal_jobs_claimed_together_leave_no_worker_idle() {
 #[tokio::test]
 async fn a_busy_job_costs_a_claim_one_wait() {
     let db = TestDb::new().await;
-    let a = db.games_job(1, 2).await;
-    let b = db.games_job(1, 2).await;
+    let a = db.games_job(2).await;
+    let b = db.games_job(2).await;
     let state = db.state().await;
     split_run(&state, 20, |_| false).await;
     // Another holder keeps A's dispatch lock.
@@ -2896,8 +3131,8 @@ async fn a_busy_job_costs_a_claim_one_wait() {
 async fn a_busy_large_job_does_not_hand_a_small_one_its_claims() {
     let db = TestDb::new().await;
     let admin = db.user("root", true).await;
-    let a = db.games_job(1, 2).await;
-    let b = db.games_job(1, 2).await;
+    let a = db.games_job(2).await;
+    let b = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET status = 'inactive', allocation = NULL WHERE id = ANY($1)")
         .bind(vec![a, b]).execute(&db.pool).await.unwrap();
     let state = db.state().await;
@@ -2934,8 +3169,8 @@ async fn a_busy_large_job_does_not_hand_a_small_one_its_claims() {
 async fn repeated_busy_spells_on_a_settling_job_are_paid_back() {
     let db = TestDb::new().await;
     let admin = db.user("root", true).await;
-    let small = db.games_job(1, 2).await;
-    let large = db.games_job(1, 2).await;
+    let small = db.games_job(2).await;
+    let large = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET status = 'inactive', allocation = NULL WHERE id = ANY($1)")
         .bind(vec![small, large]).execute(&db.pool).await.unwrap();
     let state = db.state().await;
@@ -2973,7 +3208,7 @@ async fn a_newcomer_busy_once_is_still_settled() {
     let db = TestDb::new().await;
     let admin = db.user("root", true).await;
     let (state, a, _) = minority_split(&db).await;
-    let n = db.games_job(1, 2).await;
+    let n = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET status = 'inactive', allocation = NULL WHERE id = $1").bind(n).execute(&db.pool).await.unwrap();
     split_activate(&db, &state, admin, n, 10).await;
     // One claim while another holder keeps N's dispatch lock.
@@ -2988,4 +3223,114 @@ async fn a_newcomer_busy_once_is_still_settled() {
     let first = majority.iter().position(|j| *j == a);
     assert!(first.is_some_and(|i| i < 16), "A's first claim at {first:?}");
     assert!((630..=690).contains(&got), "A got {got} of the majority's 800, not about 667");
+}
+
+
+/// The allocations, the status and the audit trail of a set of jobs.
+async fn allocations_of(db: &TestDb, jobs: &[Uuid]) -> Vec<(String, Option<i32>)> {
+    let mut out = Vec::new();
+    for job in jobs {
+        out.push(
+            sqlx::query_as::<_, (String, Option<i32>)>("SELECT status::text, allocation FROM jobs WHERE id = $1")
+                .bind(job)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap(),
+        );
+    }
+    out
+}
+
+/// A-ADMIN-28: several jobs' allocations are set in one request, checked as
+/// a whole: 50/50 becomes 60/40, which one job at a time cannot do without
+/// first lowering one -- 50 + 60 is over 100. A job named at 0% is
+/// deactivated, an inactive one named above 0% is activated, and each change
+/// is audited (`job.allocation_changed` from what to what, and the status
+/// changes as activation and deactivation write them). A request totalling
+/// over 100%, naming a completed job, a job twice, or an allocation outside
+/// 0-100 changes nothing.
+#[tokio::test]
+async fn allocations_are_set_together_and_checked_as_a_whole() {
+    let db = TestDb::new().await;
+    let cfg = db.config();
+    let admin = db.user("root", true).await;
+    let a = db.games_job(2).await;
+    let b = db.games_job(2).await;
+    let paused = db.games_job(2).await;
+    sqlx::query("UPDATE jobs SET status = 'inactive', allocation = NULL WHERE id = $1")
+        .bind(paused)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let done = db.games_job(2).await;
+    sqlx::query("UPDATE jobs SET status = 'completed' WHERE id = $1")
+        .bind(done)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let app = birdtest::app(db.state().await);
+    let headers = admin_headers(&cfg, admin);
+    let borrowed: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let set = |rows: serde_json::Value| {
+        send(&app, put_json("/api/admin/jobs/allocations", &borrowed, json!({ "allocations": rows })))
+    };
+
+    // One at a time this is refused: the other job still holds 50%.
+    let (status, _) = send(
+        &app,
+        post_json(&format!("/api/admin/jobs/{a}/activate"), &borrowed, json!({ "allocation": 60 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, body) = set(json!([{ "job_id": a, "allocation": 60 }, { "job_id": b, "allocation": 40 }])).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["jobs"].as_array().unwrap().len(), 2, "{body}");
+    assert_eq!(
+        allocations_of(&db, &[a, b]).await,
+        [("active".to_string(), Some(60)), ("active".to_string(), Some(40))]
+    );
+    let changes: Vec<(String, String)> = sqlx::query_as(
+        "SELECT target_id, reason FROM audit_log WHERE action = 'job.allocation_changed' ORDER BY reason",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(changes, [(b.to_string(), "50% -> 40%".to_string()), (a.to_string(), "50% -> 60%".to_string())]);
+
+    // B's share to the paused job: B deactivated, the paused job activated.
+    let (status, body) = set(json!([{ "job_id": b, "allocation": 0 }, { "job_id": paused, "allocation": 40 }])).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        allocations_of(&db, &[b, paused]).await,
+        [("inactive".to_string(), Some(40)), ("active".to_string(), Some(40))]
+    );
+    let statuses: Vec<(String, String)> = sqlx::query_as(
+        "SELECT action, target_id FROM audit_log
+         WHERE action IN ('job.activated', 'job.deactivated') ORDER BY action",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        statuses,
+        [("job.activated".to_string(), paused.to_string()), ("job.deactivated".to_string(), b.to_string())]
+    );
+
+    // Refused whole, each for what is wrong with it.
+    let before = allocations_of(&db, &[a, b, paused, done]).await;
+    let (status, body) = set(json!([{ "job_id": a, "allocation": 70 }, { "job_id": b, "allocation": 1 }])).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body["message"].as_str().unwrap().contains("111%"), "{body}");
+    let (status, body) = set(json!([{ "job_id": done, "allocation": 10 }])).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["fields"][0]["field"], "allocations[0].job_id", "{body}");
+    let (status, body) = set(json!([{ "job_id": a, "allocation": 10 }, { "job_id": a, "allocation": 20 }])).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["fields"][0]["field"], "allocations[1].job_id", "{body}");
+    let (status, body) = set(json!([{ "job_id": a, "allocation": 101 }])).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["fields"][0]["field"], "allocations[0].allocation", "{body}");
+    let (status, _) = set(json!([])).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(allocations_of(&db, &[a, b, paused, done]).await, before, "nothing changed");
 }

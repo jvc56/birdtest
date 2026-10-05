@@ -58,7 +58,9 @@ async fn the_binary_reports_its_builders() {
     assert!(builders.wmp_builder_version >= 1);
     assert!(builders.rit_builder_version >= 1);
     assert!(builders.klv_builder_version >= 1);
+    assert!(builders.wit_builder_version >= 1);
     assert_eq!(builders.wmp(), format!("wmp-{}", builders.wmp_builder_version));
+    assert_eq!(builders.wit(), format!("wit-{}", builders.wit_builder_version));
 }
 
 /// Generation 0's zeroed KLV: every leave worth exactly nothing, built from the
@@ -195,4 +197,32 @@ async fn a_wordmap_is_a_function_of_its_inputs() {
         digests.push(hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&bytes)));
     }
     assert_eq!(digests[0], digests[1], "two builds of one wordmap differ");
+}
+
+/// A word info table is built from the `.kwg` alone -- no wordmap, no leaves --
+/// named for its lexicon, and the same bytes on every build: two builds agree,
+/// and both are the bytes MAGPIE's own `builderhash` test pins for `wit-1`.
+#[tokio::test]
+#[ignore]
+async fn a_word_info_table_is_built_from_the_lexicon_alone() {
+    let magpie = magpie();
+    let root = std::env::var("MAGPIE_ROOT").unwrap_or_else(|_| "../MAGPIE".to_string());
+    let testdata = std::path::Path::new(&root).join("testdata");
+    let kwg = tokio::fs::read(testdata.join("lexica/CSW21_ab.kwg")).await.unwrap();
+    let ld = tokio::fs::read(testdata.join("letterdistributions/english_ab.csv")).await.unwrap();
+
+    let mut digests = Vec::new();
+    for _ in 0..2 {
+        let scratch = ScratchData::empty().await.unwrap();
+        scratch.write("letterdistributions", "english_ab", ".csv", &ld).await.unwrap();
+        scratch.write("lexica", "CSW21_ab", ".kwg", &kwg).await.unwrap();
+        magpie.convert(&scratch, "kwg2wit", "CSW21_ab", "english_ab").await.unwrap();
+        assert!(!scratch.lexicon_path("CSW21_ab", ".wmp").exists(), "no wordmap is built for it");
+        let bytes = tokio::fs::read(scratch.lexicon_path("CSW21_ab", ".wit")).await.unwrap();
+        digests.push(hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&bytes)));
+    }
+    assert_eq!(digests[0], digests[1], "two builds of one word info table differ");
+    if magpie.builders().await.unwrap().wit() == "wit-1" {
+        assert_eq!(digests[0], "a5677f57982fd8b89aed8acce09c76cea2ae90659c8da70a822d8ed1b265397c");
+    }
 }

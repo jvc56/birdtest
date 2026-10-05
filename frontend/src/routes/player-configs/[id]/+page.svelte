@@ -1,11 +1,14 @@
 <script lang="ts">
   import { page } from '$app/stores';
   import { api } from '$lib/api';
-  import { keySettings, playerRows, playerSummary, type PublicPlayerConfig } from '$lib/jobSettings';
+  import PlayerSettingsTable from '$lib/components/PlayerSettingsTable.svelte';
+  import { playerSummary, type PublicPlayerConfig } from '$lib/jobSettings';
 
   let config: PublicPlayerConfig | null = null;
   let clonedFrom: PublicPlayerConfig | null = null;
   let error = '';
+  /** Every setting rather than the key rows. */
+  let all = false;
 
   $: configId = $page.params.id as string;
 
@@ -46,37 +49,19 @@
       </p>
     </div>
 
-    <div class="card space-y-3">
-      <h2 class="text-lg font-medium">Settings</h2>
-      <dl class="grid grid-cols-2 gap-x-6 gap-y-2 text-sm sm:grid-cols-3">
-        {#each keySettings(config) as [label, value]}
-          <div>
-            <dt class="text-muted-foreground">{label}</dt>
-            <dd class="break-all">{value}</dd>
-          </div>
-        {/each}
-      </dl>
-
-      <details>
-        <summary class="cursor-pointer text-sm font-medium">All settings</summary>
-        <div class="mt-3 overflow-x-auto">
-          <table class="table text-sm">
-            <tbody>
-              {#each playerRows([config]) as row}
-                <tr>
-                  <td class="text-muted-foreground">{row.label}</td>
-                  <td class="break-all tabular-nums">{row.values[0]}</td>
-                </tr>
-              {/each}
-            </tbody>
-          </table>
-        </div>
-        <p class="mt-2 text-xs">
-          <a href="/api/player-configs/{config.id}" download="player-config-{config.id}.json"
-            >Download every setting as JSON</a
-          >
-        </p>
-      </details>
+    <div class="card space-y-4">
+      <div class="flex flex-wrap items-center justify-between gap-2">
+        <h2 class="text-lg font-medium">Settings</h2>
+        <button type="button" class="btn-secondary" aria-expanded={all} on:click={() => (all = !all)}>
+          {all ? 'Key settings only' : 'All settings'}
+        </button>
+      </div>
+      <PlayerSettingsTable players={[config]} {all} />
+      <p class="text-xs">
+        <a href="/api/player-configs/{config.id}" download="player-config-{config.id}.json"
+          >Download every setting as JSON</a
+        >
+      </p>
     </div>
   </section>
 {/if}

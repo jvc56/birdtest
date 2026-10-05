@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { api, type JobListItem, type Page } from '$lib/api';
+  import { session } from '$lib/auth';
   import { jobTitle, jobTypeLabel } from '$lib/format';
   import JobStatusBadge from '$lib/components/JobStatusBadge.svelte';
   import Pagination from '$lib/components/Pagination.svelte';
@@ -40,9 +41,14 @@
     }
     return { value: job.tasks_completed, max: job.tasks_total, unit: 'tasks' };
   }
+
+  $: isAdmin = $session?.is_admin ?? false;
 </script>
 
-<h1 class="mb-6 text-2xl font-semibold">Jobs</h1>
+<div class="mb-6 flex flex-wrap items-center justify-between gap-2">
+  <h1 class="text-2xl font-semibold">Jobs</h1>
+  {#if isAdmin}<a class="btn-primary no-underline hover:no-underline" href="/admin/jobs/new">New job</a>{/if}
+</div>
 
 {#if loadError}
   <p class="text-sm text-destructive">Could not load the jobs: {loadError}</p>
@@ -54,7 +60,7 @@
       <thead>
         <tr>
           <th>Name</th><th>Type</th><th>Status</th><th>Allocation</th>
-          <th>Redundancy</th><th class="text-right">Progress</th>
+          <th class="text-right">Progress</th>
         </tr>
       </thead>
       <tbody>
@@ -75,7 +81,6 @@
               {/if}
             </td>
             <td class="tabular-nums">{job.allocation === null ? '—' : `${job.allocation}%`}</td>
-            <td class="tabular-nums">{job.redundancy}×</td>
             <td class="text-right tabular-nums">
               {p.value.toLocaleString()} / {p.max.toLocaleString()}
               <span class="text-muted-foreground">{p.unit}</span>

@@ -3,15 +3,24 @@
   import { page } from '$app/stores';
   import { api } from '$lib/api';
   import { refreshSession } from '$lib/auth';
+  import { problems, requiredProblem } from '$lib/accountRules';
 
   let username = '';
   let password = '';
+  let fields: Record<string, string> = {};
   let error = '';
   let busy = false;
 
   async function submit() {
-    busy = true;
     error = '';
+    // Under each field, as the register form shows its errors, rather than
+    // the browser's popup (the form is `novalidate`).
+    fields = problems({
+      username: requiredProblem(username),
+      password: requiredProblem(password, false)
+    });
+    if (Object.keys(fields).length) return;
+    busy = true;
     try {
       await api.login({ username, password });
       await refreshSession();
@@ -39,10 +48,11 @@
 
 <div class="mx-auto max-w-md">
   <h1 class="mb-6 text-2xl font-semibold">Sign in</h1>
-  <form class="card space-y-4" on:submit|preventDefault={submit}>
+  <form class="card space-y-4" novalidate on:submit|preventDefault={submit}>
     <div>
       <label class="label" for="username">Username</label>
       <input id="username" class="input" bind:value={username} autocomplete="username" required />
+      {#if fields.username}<p class="field-error" role="alert">{fields.username}</p>{/if}
     </div>
     <div>
       <label class="label" for="password">Password</label>
@@ -54,6 +64,7 @@
         autocomplete="current-password"
         required
       />
+      {#if fields.password}<p class="field-error" role="alert">{fields.password}</p>{/if}
     </div>
     {#if error}<p class="field-error" role="alert">{error}</p>{/if}
     <button class="btn-primary w-full" disabled={busy}>{busy ? 'Signing in…' : 'Sign in'}</button>

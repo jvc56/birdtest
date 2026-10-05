@@ -4,12 +4,12 @@ use crate::backups::{self, BackupStatus};
 use crate::extract::ApiJson;
 use crate::error::{AppError, AppResult};
 use crate::jobs::registry;
-use crate::models::job::{Job, JobStatus, JobType, PlayerConfig};
+use crate::models::job::{ConsensusSettings, Job, JobStatus, JobType, OpeningRackConfig, PlayerConfig};
 use crate::state::AppState;
 use crate::extract::{ApiPath as Path, ApiQuery as Query};
 use axum::extract::State;
 use axum::http::{HeaderMap, Method, StatusCode};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use axum_extra::extract::CookieJar;
 use serde::{Deserialize, Serialize};
@@ -20,9 +20,11 @@ pub fn router() -> Router<AppState> {
         .route("/player-configs", get(list_player_configs).post(create_player_config))
         .route("/player-configs/:id", get(get_player_config).delete(delete_player_config))
         .route("/jobs", post(create_job))
+        .route("/jobs/allocations", put(set_allocations))
         .route("/jobs/:id/activate", post(activate_job))
         .route("/jobs/:id/deactivate", post(deactivate_job))
         .route("/jobs/:id/complete", post(complete_job))
+        .route("/jobs/:id/consensus", patch(update_consensus))
         .route("/jobs/:id/purge", post(purge_job))
         .route("/jobs/:id", delete(delete_job))
         .route("/users/:id", delete(delete_user))
@@ -83,7 +85,6 @@ async fn list_input_data(
                       WHERE j.letterdist_id = d.id OR j.layout_id = d.id)
                   + (SELECT COUNT(*) FROM player_configs pc
                       WHERE pc.kwg_id = d.id OR pc.klv_id = d.id OR pc.winpct_id = d.id)
-                  + (SELECT COUNT(*) FROM job_leave_config lc WHERE lc.kwg_id = d.id)
                   + (SELECT COUNT(*) FROM rating_pools rp
                       WHERE rp.letterdist_id = d.id OR rp.layout_id = d.id)
                     AS references
@@ -114,7 +115,6 @@ async fn delete_input_data(
                   WHERE j.letterdist_id = $1 OR j.layout_id = $1)
               + (SELECT COUNT(*) FROM player_configs pc
                   WHERE pc.kwg_id = $1 OR pc.klv_id = $1 OR pc.winpct_id = $1)
-              + (SELECT COUNT(*) FROM job_leave_config lc WHERE lc.kwg_id = $1)
               + (SELECT COUNT(*) FROM rating_pools rp
                   WHERE rp.letterdist_id = $1 OR rp.layout_id = $1)",
     )
@@ -333,6 +333,9 @@ async fn confirm_import(
     .await?
     .ok_or_else(|| AppError::not_found("no such import"))?;
 
+    if import.state == "nothing_new" {
+        return Err(AppError::conflict("this import has nothing new to insert"));
+    }
     if import.state != "staged" {
         return Err(AppError::conflict(format!(
             "this import is {}, not staged",
@@ -525,6 +528,8 @@ struct CreatePlayerConfigBody {
     #[serde(default)]
     use_rit: Option<bool>,
     #[serde(default)]
+    use_wit: Option<bool>,
+    #[serde(default)]
     min_play_iterations: Option<i32>,
     #[serde(default)]
     threshold: Option<String>,
@@ -540,6 +545,184 @@ struct CreatePlayerConfigBody {
     utility_spread_scale: Option<f64>,
     #[serde(default)]
     movegen_margin: Option<f64>,
+    /// Endgame and pre-endgame solving, for games and game-pairs jobs. Off
+    /// unless `endgame_plies` is above 0, which PEG needs too; see
+    /// [`resolve_solver_settings`].
+    #[serde(default)]
+    endgame_plies: Option<i32>,
+    #[serde(default)]
+    peg_max_bag: Option<i32>,
+    #[serde(default)]
+    peg_stage_top_k: Option<Vec<i32>>,
+    #[serde(default)]
+    peg_scenario_stride: Option<i32>,
+    #[serde(default)]
+    peg_opp_model: Option<String>,
+    #[serde(default)]
+    peg_nested: Option<bool>,
+    #[serde(default)]
+    peg_nested_cand_caps: Option<Vec<i32>>,
+    #[serde(default)]
+    peg_nested_max_depth: Option<i32>,
+    #[serde(default)]
+    peg_nested_strides: Option<Vec<i32>>,
+}
+
+/// A player config's endgame and pre-endgame settings as the row stores them.
+#[derive(Debug, Default, PartialEq)]
+struct SolverSettings {
+    endgame_plies: i32,
+    peg_max_bag: i32,
+    peg_stage_top_k: Option<Vec<i32>>,
+    peg_scenario_stride: Option<i32>,
+    peg_opp_model: Option<String>,
+    peg_nested: Option<bool>,
+    peg_nested_cand_caps: Option<Vec<i32>>,
+    peg_nested_max_depth: Option<i32>,
+    peg_nested_strides: Option<Vec<i32>>,
+}
+
+/// MAGPIE's endgame depth ceiling (`MAX_VARIANT_LENGTH`) and largest
+/// pre-endgame bag (`PEG_MAX_BAG`).
+const MAGPIE_MAX_ENDGAME_PLIES: i32 = 25;
+const MAGPIE_PEG_MAX_BAG: i32 = 4;
+/// The most stages a PEG schedule, or levels a nested cap list, may have
+/// (`AUTOPLAY_SOLVER_MAX_PEG_STAGES`, `AUTOPLAY_SOLVER_MAX_NESTED_CAND_CAPS`).
+const MAGPIE_MAX_PEG_STAGES: usize = 16;
+
+/// Resolves and checks a body's endgame and pre-endgame settings.
+///
+/// They nest, as MAGPIE reads them: `endgame_plies` 0 solves nothing, and PEG
+/// is refused without it, since PEG scores its emptier scenarios with endgame
+/// solves. A PEG setting without `peg_max_bag` above 0 is refused, as is a
+/// nested setting without nested lookahead -- the same rule simulation
+/// settings follow without plies: a setting nothing reads would read as one
+/// the player uses. Settings left out take MAGPIE's defaults
+/// ([`crate::magpie_defaults`]), written into the row like every other.
+fn resolve_solver_settings(body: &CreatePlayerConfigBody) -> AppResult<SolverSettings> {
+    use crate::magpie_defaults as defaults;
+    let mut err = AppError::bad_request("player config is invalid");
+    let plies = body.endgame_plies.unwrap_or(0);
+    let max_bag = body.peg_max_bag.unwrap_or(0);
+    if !(0..=MAGPIE_MAX_ENDGAME_PLIES).contains(&plies) {
+        err = err.with_field(
+            "endgame_plies",
+            format!("must be between 0 (off) and {MAGPIE_MAX_ENDGAME_PLIES}"),
+        );
+    }
+    if !(0..=MAGPIE_PEG_MAX_BAG).contains(&max_bag) {
+        err = err
+            .with_field("peg_max_bag", format!("must be between 0 (off) and {MAGPIE_PEG_MAX_BAG}"));
+    } else if max_bag > 0 && plies == 0 {
+        err = err.with_field(
+            "peg_max_bag",
+            "the pre-endgame needs endgame solving: set an endgame depth (endgame_plies) as well",
+        );
+    }
+    let peg_stated = [
+        ("peg_stage_top_k", body.peg_stage_top_k.is_some()),
+        ("peg_scenario_stride", body.peg_scenario_stride.is_some()),
+        ("peg_opp_model", body.peg_opp_model.is_some()),
+        ("peg_nested", body.peg_nested.is_some()),
+        ("peg_nested_cand_caps", body.peg_nested_cand_caps.is_some()),
+        ("peg_nested_max_depth", body.peg_nested_max_depth.is_some()),
+        ("peg_nested_strides", body.peg_nested_strides.is_some()),
+    ];
+    if max_bag <= 0 {
+        for (field, stated) in peg_stated {
+            if stated {
+                err = err.with_field(
+                    field,
+                    "is a pre-endgame setting: set peg_max_bag above 0 to run the pre-endgame, \
+                     or leave it out",
+                );
+            }
+        }
+        return if err.fields.is_empty() {
+            Ok(SolverSettings { endgame_plies: plies, peg_max_bag: 0, ..Default::default() })
+        } else {
+            Err(err)
+        };
+    }
+
+    let top_k = body.peg_stage_top_k.clone().unwrap_or_else(|| defaults::PEG_STAGE_TOP_K.to_vec());
+    if top_k.is_empty() || top_k.len() > MAGPIE_MAX_PEG_STAGES {
+        err = err.with_field(
+            "peg_stage_top_k",
+            format!("needs 1 to {MAGPIE_MAX_PEG_STAGES} stages"),
+        );
+    } else if top_k.iter().any(|&k| k < 2) || top_k.windows(2).any(|w| w[1] > w[0]) {
+        err = err.with_field(
+            "peg_stage_top_k",
+            "each stage keeps at least 2 plays, and no more than the stage before it",
+        );
+    }
+    let stride = body.peg_scenario_stride.unwrap_or(defaults::PEG_SCENARIO_STRIDE);
+    if stride < 1 {
+        err = err.with_field("peg_scenario_stride", "must be at least 1 (1 is full enumeration)");
+    }
+    let opp_model = body.peg_opp_model.clone().unwrap_or_else(|| defaults::PEG_OPP_MODEL.into());
+    if !matches!(opp_model.as_str(), "rational" | "pessimistic") {
+        err = err.with_field("peg_opp_model", "must be 'rational' or 'pessimistic'");
+    }
+    let nested = body.peg_nested.unwrap_or(defaults::PEG_NESTED);
+    let mut settings = SolverSettings {
+        endgame_plies: plies,
+        peg_max_bag: max_bag,
+        peg_stage_top_k: Some(top_k),
+        peg_scenario_stride: Some(stride),
+        peg_opp_model: Some(opp_model),
+        peg_nested: Some(nested),
+        ..Default::default()
+    };
+    if !nested {
+        for (field, stated) in &peg_stated[4..] {
+            if *stated {
+                err = err.with_field(
+                    *field,
+                    "is a nested-lookahead setting: set peg_nested to true, or leave it out",
+                );
+            }
+        }
+    } else {
+        let caps = body
+            .peg_nested_cand_caps
+            .clone()
+            .unwrap_or_else(|| defaults::PEG_NESTED_CAND_CAPS.to_vec());
+        if caps.is_empty() || caps.len() > MAGPIE_MAX_PEG_STAGES || caps.iter().any(|&c| c < 1) {
+            err = err.with_field(
+                "peg_nested_cand_caps",
+                format!("needs 1 to {MAGPIE_MAX_PEG_STAGES} caps, each at least 1"),
+            );
+        }
+        let depth = body.peg_nested_max_depth.unwrap_or(defaults::PEG_NESTED_MAX_DEPTH);
+        if !(1..=MAGPIE_PEG_MAX_BAG).contains(&depth) {
+            err = err.with_field(
+                "peg_nested_max_depth",
+                format!("must be between 1 and {MAGPIE_PEG_MAX_BAG}"),
+            );
+        }
+        let strides = body
+            .peg_nested_strides
+            .clone()
+            .unwrap_or_else(|| defaults::PEG_NESTED_STRIDES.to_vec());
+        if strides.len() != MAGPIE_PEG_MAX_BAG as usize || strides.iter().any(|&s| s < 1) {
+            err = err.with_field(
+                "peg_nested_strides",
+                format!(
+                    "needs one stride per inner bag size 1 to {MAGPIE_PEG_MAX_BAG}, each at least 1"
+                ),
+            );
+        }
+        settings.peg_nested_cand_caps = Some(caps);
+        settings.peg_nested_max_depth = Some(depth);
+        settings.peg_nested_strides = Some(strides);
+    }
+    if err.fields.is_empty() {
+        Ok(settings)
+    } else {
+        Err(err)
+    }
 }
 
 async fn create_player_config(
@@ -553,6 +736,7 @@ async fn create_player_config(
     csrf::verify(&method, &headers, &jar)?;
 
     validate_player_config_body(&body)?;
+    let solver = resolve_solver_settings(&body)?;
 
     if !matches!(body.recorder_type.as_str(), "best" | "equity" | "all") {
         return Err(AppError::bad_request("recorder_type must be 'best', 'equity' or 'all'"));
@@ -698,9 +882,12 @@ async fn create_player_config(
               stopping_pct, use_inference, time_limit_secs,
               use_wordmap, use_rit, min_play_iterations, threshold,
               sampling_rule, inference_margin, utility_w_winpct, utility_w_spread,
-              utility_spread_scale, movegen_margin, created_by)
+              utility_spread_scale, movegen_margin, created_by,
+              endgame_plies, peg_max_bag, peg_stage_top_k, peg_scenario_stride,
+              peg_opp_model, peg_nested, peg_nested_cand_caps, peg_nested_max_depth,
+              peg_nested_strides, use_wit)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,
-                 $18,$19,$20,$21,$22,$23,$24,$25,$26)
+                 $18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36)
          RETURNING *",
     )
     .bind(body.name.trim())
@@ -736,6 +923,20 @@ async fn create_player_config(
     .bind(utility_spread_scale)
     .bind(movegen_margin)
     .bind(admin.0.id)
+    .bind(solver.endgame_plies)
+    .bind(solver.peg_max_bag)
+    .bind(&solver.peg_stage_top_k)
+    .bind(solver.peg_scenario_stride)
+    .bind(&solver.peg_opp_model)
+    .bind(solver.peg_nested)
+    .bind(&solver.peg_nested_cand_caps)
+    .bind(solver.peg_nested_max_depth)
+    .bind(&solver.peg_nested_strides)
+    // On unless the config opts out, although MAGPIE has it opt-in (-wit):
+    // it speeds move generation, and costs little. The server builds the
+    // table before any job using it dispatches, once per lexicon: about three
+    // seconds and 122 MB for CSW24.
+    .bind(body.use_wit.unwrap_or(true))
     .fetch_one(&state.pool)
     .await
     .map_err(|e| match body.cloned_from_id {
@@ -759,6 +960,14 @@ const MAGPIE_MAX_WORDMAP_BLANKS: u32 = 2;
 /// about 80 KB of racks in each claim.
 const MAX_RACKS_PER_TASK: i32 = 10_000;
 
+/// The most generations a leave job runs. MAGPIE's own runs are a handful;
+/// each generation is a full pass over the rack universe and a KLV build.
+const MAX_LEAVE_GENERATIONS: usize = 100;
+/// The highest occurrence target a generation may set. A million per rack is
+/// some three trillion forced racks for English's 3.2 million -- no run gets
+/// there, so a larger number is a typo, not a plan.
+const MAX_TARGET_RACK_COUNT: i32 = 1_000_000;
+
 /// Numbers MAGPIE would refuse, or silently read as "use your own default".
 ///
 /// MAGPIE validates these too, but only on a contributor's machine, after a
@@ -779,48 +988,9 @@ const MAGPIE_MAX_MARGIN: f64 = 2_147_483.645;
 const MAX_NUM_PLAYS: i32 = 200_000;
 /// Plays recorded: each is stored with its rank as a `SMALLINT`.
 const MAX_NUM_PLAYS_RECORDED: i32 = i16::MAX as i32;
-/// The board every MAGPIE the fleet runs is built for (`BOARD_DIM`). A layout
-/// of another size, or one MAGPIE otherwise refuses, loads on no worker: each
-/// fails the task, and after five in a row `magpie contribute` stops.
-const MAGPIE_BOARD_DIM: usize = 15;
-
-/// Why MAGPIE would refuse this board layout — never accepting one its loader
-/// (`board_layout.c`) refuses, and stricter than it only on parser quirks — the file split on newlines with empty lines
-/// ignored, a line's trailing `\r` dropped; a start square `row, col` inside
-/// the board; then exactly `BOARD_DIM` rows of `BOARD_DIM` bonus squares.
+/// Why MAGPIE would refuse this board layout; see [`crate::board::BoardLayout::parse`].
 pub(crate) fn layout_problem(content: &[u8]) -> Option<String> {
-    let text = String::from_utf8_lossy(content);
-    let lines: Vec<&str> = text
-        .split('\n')
-        .filter(|line| !line.is_empty())
-        .map(|line| line.strip_suffix('\r').unwrap_or(line))
-        .collect();
-    if lines.len() != MAGPIE_BOARD_DIM + 1 {
-        return Some(format!(
-            "has {} rows; every MAGPIE build the fleet runs plays on {MAGPIE_BOARD_DIM}x{MAGPIE_BOARD_DIM}",
-            lines.len().saturating_sub(1)
-        ));
-    }
-    let coords: Vec<&str> = lines[0].split(',').filter(|part| !part.is_empty()).collect();
-    let in_board = |part: &str| {
-        part.trim_matches([' ', '\t', '\n', '\r'])
-            .parse::<i64>()
-            .is_ok_and(|v| (0..MAGPIE_BOARD_DIM as i64).contains(&v))
-    };
-    if coords.len() != 2 || !coords.iter().all(|part| in_board(part)) {
-        return Some(format!("has a start square MAGPIE cannot read: {:?}", lines[0]));
-    }
-    for (row, line) in lines[1..].iter().enumerate() {
-        // Bytes, as MAGPIE counts them (a non-UTF-8 byte reads as three here,
-        // after the lossy decode, and is refused either way).
-        if line.len() != MAGPIE_BOARD_DIM {
-            return Some(format!("row {} is {} squares wide, not {MAGPIE_BOARD_DIM}", row + 1, line.len()));
-        }
-        if let Some(square) = line.chars().find(|c| !matches!(c, ' ' | '\'' | '-' | '"' | '=' | '^' | '~' | '#')) {
-            return Some(format!("row {} has a square MAGPIE does not know: {square:?}", row + 1));
-        }
-    }
-    None
+    crate::board::layout_problem(content)
 }
 
 fn validate_player_config_body(body: &CreatePlayerConfigBody) -> AppResult<()> {
@@ -932,6 +1102,7 @@ async fn delete_player_config(
                  WHERE player1_config_id = $1 OR player2_config_id = $1
              UNION ALL SELECT 1 FROM job_game_pair_config
                  WHERE player1_config_id = $1 OR player2_config_id = $1
+             UNION ALL SELECT 1 FROM job_leave_config WHERE player_config_id = $1
              UNION ALL SELECT 1 FROM rating_pools WHERE anchor_player_config_id = $1
              UNION ALL SELECT 1 FROM rating_pool_members WHERE player_config_id = $1
              UNION ALL SELECT 1 FROM player_config_ratings WHERE player_config_id = $1
@@ -1005,8 +1176,6 @@ struct CreateJobBody {
     #[serde(default)]
     name: Option<String>,
     job_type: JobType,
-    #[serde(default = "one")]
-    redundancy: i32,
     /// Rules setting shared by every job type.
     variant: String,
     /// One letter distribution and one board per job: MAGPIE takes a single
@@ -1018,6 +1187,14 @@ struct CreateJobBody {
     /// effective value is shown on the creation form so the default is visible
     /// rather than hidden.
     min_magpie_version: Option<String>,
+    /// Run-wide rules every request states. MAGPIE's defaults
+    /// ([`crate::magpie_defaults`]) where the body leaves them out, written
+    /// into the row like every other setting. A leave job states no cutoff:
+    /// its bot never simulates.
+    #[serde(default)]
+    bingo_bonus: Option<i32>,
+    #[serde(default)]
+    sim_cutoff: Option<f64>,
     #[serde(flatten)]
     config: JobTypeConfig,
 }
@@ -1034,80 +1211,118 @@ fn two() -> i32 {
 
 /// Per-job-type configuration, expanded into typed columns rather than stored
 /// as JSON.
+///
+/// Untagged, so the first variant a body fits is the one it becomes, and extra
+/// fields are ignored: `Leave` comes first because a leave body, which names a
+/// `player_config_id` too, would otherwise fit `OpeningRack` on its defaults.
+/// No other body fits `Leave`, whose settings have no defaults.
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum JobTypeConfig {
+    Leave {
+        /// The player the leave-generating bot plays as, in both seats: its
+        /// lexicon and wordmap setting are the job's. Held to static equity
+        /// play without a rack info table (see [`validate_leave_player`]).
+        player_config_id: Uuid,
+        num_iterations: i32,
+        /// One occurrence target per generation, in order; its length is how
+        /// many generations the job runs.
+        target_rack_counts: Vec<i32>,
+        racks_per_task: i32,
+    },
     OpeningRack {
         player_config_id: Uuid,
         #[serde(default = "default_racks_per_batch")]
         racks_per_batch: i32,
         #[serde(default = "default_rack_size")]
         rack_size: i32,
+        /// Consensus: a rack is analysed until at least `min_results_per_rack`
+        /// analyses agree on its best move in this share (percent), or until
+        /// it has `max_results_per_rack`. One analysis per rack by default.
+        #[serde(default = "default_consensus_pct")]
+        consensus_pct: f64,
+        #[serde(default = "one")]
+        min_results_per_rack: i32,
+        #[serde(default = "one")]
+        max_results_per_rack: i32,
     },
     Game {
         player1_config_id: Uuid,
         player2_config_id: Uuid,
         #[serde(default = "two")]
         games_per_batch: i32,
-        min_games: i32,
+        /// With the test off, the job plays this many games and stops; with it
+        /// on, it stops here at the latest.
         max_games: i32,
-        #[serde(default = "default_alpha")]
-        sprt_alpha: f64,
-        #[serde(default = "default_alpha")]
-        sprt_beta: f64,
-        #[serde(default = "default_elo_low")]
-        elo_low: f64,
-        #[serde(default = "default_elo_high")]
-        elo_high: f64,
+        /// The fewest games before the test is acted on: a setting of the
+        /// match test, required with one and refused without.
+        #[serde(default)]
+        min_games: Option<i32>,
+        #[serde(flatten)]
+        test: TestRequest,
         #[serde(default)]
         capture_positions: bool,
+        /// Refused: a games job has no pairs to diverge. Read so that it is
+        /// refused rather than ignored by this untagged body.
+        #[serde(default)]
+        capture_first_divergence: bool,
     },
     GamePair {
         player1_config_id: Uuid,
         player2_config_id: Uuid,
         #[serde(default = "one")]
         pairs_per_batch: i32,
-        min_pairs: i32,
+        /// With the test off, the job plays this many pairs and stops; with it
+        /// on, it stops here at the latest.
         max_pairs: i32,
-        #[serde(default = "default_alpha")]
-        sprt_alpha: f64,
-        #[serde(default = "default_alpha")]
-        sprt_beta: f64,
-        #[serde(default = "default_elo_low")]
-        elo_low: f64,
-        #[serde(default = "default_elo_high")]
-        elo_high: f64,
+        /// The fewest pairs before the test is acted on: a setting of the
+        /// match test, required with one and refused without.
+        #[serde(default)]
+        min_pairs: Option<i32>,
+        #[serde(flatten)]
+        test: TestRequest,
         #[serde(default)]
         capture_positions: bool,
-    },
-    Leave {
-        /// The one place a lexicon still sits on a job: leave generation has a
-        /// single bot and no player config to hold it.
-        kwg_id: Uuid,
-        num_iterations: i32,
-        #[serde(default = "one")]
-        generation_count: i32,
-        target_rack_count: i32,
-        racks_per_task: i32,
-        /// Whether the leave-generating bot plays with a wordmap. Defaults on:
-        /// leave generation is the most game-heavy job type there is, and a
-        /// wordmap is a large speedup. Workers build one on demand.
-        #[serde(default = "default_true")]
-        use_wordmap: bool,
+        /// Of the captured positions, keep only each pair's first divergence.
+        #[serde(default)]
+        capture_first_divergence: bool,
     },
 }
 
-fn default_alpha() -> f64 {
-    0.05
+/// A games or pairs job's match test (`stats::match_test`), as the request
+/// states it.
+///
+/// Off unless `test_enabled` says otherwise, and then its settings are
+/// refused (see [`validate_job_body`]). On, a confidence left out is 95%.
+#[derive(Deserialize)]
+struct TestRequest {
+    #[serde(default)]
+    test_enabled: bool,
+    #[serde(default)]
+    confidence_pct: Option<f64>,
 }
-fn default_elo_low() -> f64 {
-    -10.0
+
+/// The test as a config row stores it. A job without one stores the default
+/// confidence and a floor of 0, which nothing reads: `TestParams::enabled`
+/// gates them all.
+struct TestSettings {
+    enabled: bool,
+    min_units: i32,
+    confidence_pct: f64,
 }
-fn default_elo_high() -> f64 {
-    10.0
+
+impl TestRequest {
+    fn settings(&self, min_units: Option<i32>) -> TestSettings {
+        TestSettings {
+            enabled: self.test_enabled,
+            min_units: min_units.unwrap_or(0),
+            confidence_pct: self.confidence_pct.unwrap_or(95.0),
+        }
+    }
 }
-fn default_true() -> bool {
-    true
+
+fn default_consensus_pct() -> f64 {
+    100.0
 }
 fn default_racks_per_batch() -> i32 {
     500
@@ -1176,13 +1391,12 @@ async fn create_job(
     let mut tx = state.pool.begin().await?;
     let job = sqlx::query_as::<_, Job>(
         "INSERT INTO jobs
-             (job_type, redundancy, variant, letterdist_id, layout_id,
+             (job_type, variant, letterdist_id, layout_id,
               min_magpie_major, min_magpie_minor, min_magpie_patch, bingo_bonus,
               sim_cutoff, created_by, name)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *",
     )
     .bind(body.job_type)
-    .bind(body.redundancy)
     .bind(&body.variant)
     .bind(body.letterdist_id)
     .bind(body.layout_id)
@@ -1192,8 +1406,10 @@ async fn create_job(
     // Written from MAGPIE's defaults, like a player config's settings, so
     // every request states them rather than each worker's build supplying
     // its own.
-    .bind(crate::magpie_defaults::BINGO_BONUS)
-    .bind(crate::magpie_defaults::SIM_CUTOFF)
+    .bind(body.bingo_bonus.unwrap_or(crate::magpie_defaults::BINGO_BONUS))
+    // Stored for a leave job too, as the column requires; its requests never
+    // carry it.
+    .bind(body.sim_cutoff.unwrap_or(crate::magpie_defaults::SIM_CUTOFF))
     .bind(admin.0.id)
     .bind(job_name(&body))
     .fetch_one(&mut *tx)
@@ -1205,9 +1421,10 @@ async fn create_job(
     // blanks (`cannot create WMP with more than 2 blanks`, an abort): a job
     // that needs either on `english_super` was created, its build failed
     // three times, and it never dispatched, with nothing on its page to say
-    // why (the audit's pass 7).
+    // why (the audit's pass 7). A word info table is built from the `.kwg`
+    // alone, which has no blanks, so it is no reason to refuse.
     if blanks > MAGPIE_MAX_WORDMAP_BLANKS
-        && !crate::derived::needs_for_job(&mut tx, job.id).await?.is_empty()
+        && crate::derived::needs_for_job(&mut tx, job.id).await?.iter().any(|need| need.role != "wit")
     {
         return Err(AppError::bad_request(
             "no wordmap or rack info table can be built for this letter distribution",
@@ -1216,8 +1433,7 @@ async fn create_job(
             "letterdist_id",
             format!(
                 "{letterdist_name} has {blanks} blanks, and MAGPIE builds them for at most \
-                 {MAGPIE_MAX_WORDMAP_BLANKS}: no player of this job may use either, and a leave \
-                 job must not use a wordmap"
+                 {MAGPIE_MAX_WORDMAP_BLANKS}: no player of this job may use either"
             ),
         ));
     }
@@ -1252,6 +1468,8 @@ async fn create_job(
 /// its request and every rack comes back analysed in one submission, so this
 /// bounds both; 500 is the default.
 const MAX_RACKS_PER_BATCH: i32 = 10_000;
+/// The most analyses an opening-rack consensus may ask of one rack.
+const MAX_RESULTS_PER_RACK: i32 = 100;
 
 /// The most games one task may play (a pair counts two), and the most when
 /// the job captures positions. A captured position's game is an `i16`, so a
@@ -1276,9 +1494,8 @@ fn games_batch_field(mut err: AppError, unit: &str, games_per_unit: i32, batch: 
 /// Each of these used to be accepted and fail later, far from the admin who
 /// typed it: a `games_per_batch` of 0 makes every claim generate the seed the
 /// previous claim already took, so the job retries a unique-index violation
-/// forever and dispatches nothing; an `elo_low` above `elo_high` inverts the
-/// LLR's sign, so SPRT confidently accepts the wrong hypothesis; an `alpha` of
-/// 0 or 1 puts a logarithm of zero or infinity in the bounds. Every problem is
+/// forever and dispatches nothing; a confidence of 100% puts a logarithm of
+/// zero in the test's interval, which then never closes. Every problem is
 /// reported at once, like registration does.
 /// The longest job name, in characters (the column's check).
 const MAX_JOB_NAME_CHARS: usize = 100;
@@ -1286,6 +1503,29 @@ const MAX_JOB_NAME_CHARS: usize = 100;
 /// The job's name as stored: trimmed, empty when none was given.
 fn job_name(body: &CreateJobBody) -> String {
     body.name.as_deref().unwrap_or("").trim().to_string()
+}
+
+/// An opening-rack job's consensus settings, checked alike at creation and
+/// when an admin changes them (`update_consensus`): each problem is a field
+/// error added to `err`.
+fn consensus_problems(mut err: AppError, consensus_pct: f64, min: i32, max: i32) -> AppError {
+    // Above half: at or below it two moves could each hold the consensus, and
+    // a tie would settle a rack on whichever sorted first.
+    if !(consensus_pct.is_finite() && consensus_pct > 50.0 && consensus_pct <= 100.0) {
+        err = err.with_field("consensus_pct", "must be above 50 and at most 100");
+    }
+    if !(1..=MAX_RESULTS_PER_RACK).contains(&min) {
+        err = err.with_field(
+            "min_results_per_rack",
+            format!("must be between 1 and {MAX_RESULTS_PER_RACK}"),
+        );
+    } else if !(min..=MAX_RESULTS_PER_RACK).contains(&max) {
+        err = err.with_field(
+            "max_results_per_rack",
+            format!("must be between min_results_per_rack ({min}) and {MAX_RESULTS_PER_RACK}"),
+        );
+    }
+    err
 }
 
 fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
@@ -1298,17 +1538,24 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
     } else if name.chars().any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')) {
         err = err.with_field("name", "one line, with no control characters");
     }
-    if body.redundancy < 1 {
-        err = err.with_field("redundancy", "must be at least 1");
-    }
-    // A leave task's redundant copies replay the same seed only when MAGPIE runs
-    // single-threaded; multi-threaded they are different samples, and there is
-    // no integrity use for them today. Refused rather than given a meaning.
-    if body.job_type == JobType::LeaveGeneration && body.redundancy > 1 {
-        err = err.with_field("redundancy", "leave generation runs at redundancy 1");
-    }
     if !matches!(body.variant.as_str(), "classic" | "wordsmog") {
         err = err.with_field("variant", "must be 'classic' or 'wordsmog'");
+    }
+    // MAGPIE takes any integer, but a bonus that takes points away from a
+    // bingo is a typo, not a variant anyone plays.
+    if body.bingo_bonus.is_some_and(|b| b < 0) {
+        err = err.with_field("bingo_bonus", "must not be negative");
+    }
+    if let Some(cutoff) = body.sim_cutoff {
+        // The range MAGPIE's -cutoff accepts, and the column's CHECK.
+        if !(cutoff.is_finite() && (0.0..=100.0).contains(&cutoff)) {
+            err = err.with_field("sim_cutoff", "must be between 0 and 100");
+        } else if body.job_type == JobType::LeaveGeneration {
+            err = err.with_field(
+                "sim_cutoff",
+                "a leave job never simulates, so it has no cutoff: leave it out",
+            );
+        }
     }
     // Read loosely, a typo ("v1.6.0", "1") was 0.0.0: the lowest floor there
     // is, so a raise meant to keep older builds off the job let them all on.
@@ -1318,51 +1565,61 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
         }
     }
 
-    let sprt = |mut err: AppError,
-                unit: &str,
-                batch: i32,
-                min_units: i32,
-                max_units: i32,
-                alpha: f64,
-                beta: f64,
-                elo_low: f64,
-                elo_high: f64| {
+    let match_test = |mut err: AppError,
+                      unit: &str,
+                      batch: i32,
+                      min_units: Option<i32>,
+                      max_units: i32,
+                      test: &TestRequest| {
         if batch < 1 {
             err = err.with_field(format!("{unit}s_per_batch"), "must be at least 1");
-        }
-        if min_units < 0 {
-            err = err.with_field(format!("min_{unit}s"), "must not be negative");
         }
         if max_units < 1 {
             err = err.with_field(format!("max_{unit}s"), "must be at least 1");
         }
-        // Not merely above 0: a subnormal alpha made the upper bound
-        // infinite, serialised as `null`, and the public job page threw on it.
-        for (field, value) in [("sprt_alpha", alpha), ("sprt_beta", beta)] {
-            if !(1e-6..1.0).contains(&value) {
-                err = err.with_field(field, "must be at least 0.000001 and below 1");
+        let min_field = format!("min_{unit}s");
+        // Refused rather than ignored: a request that sets the test up
+        // without turning it on would, ignored, play to its cap with no test,
+        // and nothing would say so until it finished.
+        if !test.test_enabled {
+            let stated = [
+                min_units.is_some().then_some(min_field),
+                test.confidence_pct.is_some().then(|| "confidence_pct".to_string()),
+            ];
+            for field in stated.into_iter().flatten() {
+                err = err.with_field(
+                    field,
+                    "is a setting of the match test: send test_enabled: true to run it, or leave \
+                     it out",
+                );
             }
+            return err;
         }
-        if alpha + beta >= 1.0 {
-            err = err.with_field("sprt_beta", "sprt_alpha + sprt_beta must be below 1");
-        }
-        if !(elo_low.is_finite() && elo_high.is_finite() && elo_low < elo_high) {
-            err = err.with_field("elo_high", "must be a finite number greater than elo_low");
-        }
-        // A bound on what a hypothesis may say: far enough out, both are an
-        // expected score of 1 to the last bit (from about 6,400 Elo), the LLR
-        // is always 0 and the job runs to its cap. Past a thousand no job
-        // between two word-game players means anything.
-        for (field, value) in [("elo_low", elo_low), ("elo_high", elo_high)] {
-            if value.is_finite() && value.abs() > 1000.0 {
-                err = err.with_field(field, "must be between -1000 and 1000");
+        // The test's interval is asymptotic: it holds once enough units are
+        // in for their mean to be close to normal, which is what the floor
+        // is for. Above the cap it would never be reached.
+        match min_units {
+            None => err = err.with_field(min_field, "is required when the job runs the match test"),
+            Some(min_units) if min_units < 1 => err = err.with_field(min_field, "must be at least 1"),
+            Some(min_units) if min_units > max_units && max_units >= 1 => {
+                err = err.with_field(min_field, format!("must be at most max_{unit}s ({max_units})"))
             }
+            Some(_) => {}
+        }
+        // Not 100: the interval's logarithm of 1 - confidence is then
+        // infinite, and it never closes. At or below half it is no test.
+        let confidence = test.settings(min_units).confidence_pct;
+        if !(confidence.is_finite() && confidence > 50.0 && confidence < 100.0) {
+            err = err.with_field("confidence_pct", "must be above 50 and below 100");
         }
         err
     };
 
     err = match &body.config {
-        JobTypeConfig::OpeningRack { racks_per_batch, rack_size, .. } => {
+        JobTypeConfig::OpeningRack {
+            racks_per_batch, rack_size, consensus_pct, min_results_per_rack,
+            max_results_per_rack, ..
+        } => {
             if !(1..=MAX_RACKS_PER_BATCH).contains(racks_per_batch) {
                 err = err.with_field(
                     "racks_per_batch",
@@ -1372,20 +1629,23 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
             if !(1..=7).contains(rack_size) {
                 err = err.with_field("rack_size", "must be between 1 and 7");
             }
-            err
+            consensus_problems(err, *consensus_pct, *min_results_per_rack, *max_results_per_rack)
         }
         JobTypeConfig::Game {
-            games_per_batch, min_games, max_games, sprt_alpha, sprt_beta, elo_low, elo_high,
-            capture_positions, ..
+            games_per_batch, min_games, max_games, test, capture_positions,
+            capture_first_divergence, ..
         } => {
-            let mut err = sprt(
-                err, "game", *games_per_batch, *min_games, *max_games, *sprt_alpha, *sprt_beta,
-                *elo_low, *elo_high,
-            );
+            let mut err = match_test(err, "game", *games_per_batch, *min_games, *max_games, test);
             err = games_batch_field(err, "game", 1, *games_per_batch, *capture_positions);
+            if *capture_first_divergence {
+                err = err.with_field(
+                    "capture_first_divergence",
+                    "a games job plays no pairs, so its games have no first divergence",
+                );
+            }
             // MAGPIE alternates the first mover within one run, from player 1,
             // and every task is a run of its own: at a batch of 1 player 1
-            // moved first in every game of the job, and SPRT passed two
+            // moved first in every game of the job, and the SPRT then in use passed two
             // identical players on the first move alone (+42 Elo; the audit's
             // pass 18). An even batch gives each player the first move equally
             // in every task. Game pairs swap it within each pair already.
@@ -1398,27 +1658,42 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
             err
         }
         JobTypeConfig::GamePair {
-            pairs_per_batch, min_pairs, max_pairs, sprt_alpha, sprt_beta, elo_low, elo_high,
-            capture_positions, ..
+            pairs_per_batch, min_pairs, max_pairs, test, capture_positions,
+            capture_first_divergence, ..
         } => {
-            let err = sprt(
-                err, "pair", *pairs_per_batch, *min_pairs, *max_pairs, *sprt_alpha, *sprt_beta,
-                *elo_low, *elo_high,
-            );
+            let mut err = match_test(err, "pair", *pairs_per_batch, *min_pairs, *max_pairs, test);
+            if *capture_first_divergence && !*capture_positions {
+                err = err.with_field(
+                    "capture_first_divergence",
+                    "keeps only some of the positions a job captures, so it needs \
+                     capture_positions",
+                );
+            }
             games_batch_field(err, "pair", 2, *pairs_per_batch, *capture_positions)
         }
-        JobTypeConfig::Leave {
-            num_iterations, generation_count, target_rack_count, racks_per_task, ..
-        } => {
+        JobTypeConfig::Leave { num_iterations, target_rack_counts, racks_per_task, .. } => {
             for (field, value) in [
                 ("num_iterations", *num_iterations),
-                ("generation_count", *generation_count),
-                ("target_rack_count", *target_rack_count),
                 ("racks_per_task", *racks_per_task),
             ] {
                 if value < 1 {
                     err = err.with_field(field, "must be at least 1");
                 }
+            }
+            if target_rack_counts.is_empty() {
+                err = err.with_field("target_rack_counts", "must list at least one generation's target");
+            } else if target_rack_counts.len() > MAX_LEAVE_GENERATIONS {
+                err = err.with_field(
+                    "target_rack_counts",
+                    format!("must list at most {MAX_LEAVE_GENERATIONS} generations"),
+                );
+            } else if let Some(bad) =
+                target_rack_counts.iter().find(|t| !(1..=MAX_TARGET_RACK_COUNT).contains(*t))
+            {
+                err = err.with_field(
+                    "target_rack_counts",
+                    format!("every target must be between 1 and {MAX_TARGET_RACK_COUNT}, not {bad}"),
+                );
             }
             // Every claim carries its task's forced racks, and so does every
             // `leave_requests` row: a typo of millions sent the generation's
@@ -1469,6 +1744,7 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
 async fn validate_opening_rack_player(
     conn: &mut sqlx::PgConnection,
     player_config_id: Uuid,
+    max_results_per_rack: i32,
 ) -> AppResult<()> {
     let (recorder, recorded, plies, plays) = sqlx::query_as::<_, (String, i32, i32, i32)>(
         "SELECT recorder_type, num_plays_recorded, num_plies, num_plays
@@ -1504,6 +1780,19 @@ async fn validate_opening_rack_player(
                  with at most {plays} moves rather than the {recorded} it asks for. Use a \
                  config with num_plays of at least {recorded}, or a lower num_plays_recorded."
             ),
+        ));
+    }
+    // A static analysis is deterministic: a second one of a rack ranks it
+    // exactly as the first did, so asking for more costs the fleet and can
+    // only ever agree.
+    if plies == 0 && max_results_per_rack > 1 {
+        return Err(AppError::bad_request(
+            "a static player's analyses of a rack always agree, so there is no consensus to seek",
+        )
+        .with_field(
+            "max_results_per_rack",
+            "a static player analyses each rack once: set min_results_per_rack and \
+             max_results_per_rack to 1, or use a simulating player",
         ));
     }
     Ok(())
@@ -1575,12 +1864,36 @@ async fn validate_capture_play_cap(
     player1_config_id: Uuid,
     player2_config_id: Uuid,
 ) -> AppResult<()> {
-    let cap: i32 =
-        sqlx::query_scalar("SELECT num_plays_recorded FROM player_configs WHERE id = $1")
-            .bind(player1_config_id)
-            .fetch_optional(&mut *conn)
-            .await?
-            .ok_or_else(|| AppError::bad_request("player config not found"))?;
+    // How many plays and plies a captured position keeps is one setting for
+    // the whole run in MAGPIE, which reads both from player 1: player 2's
+    // would be shown on the job page and never applied. So they must agree,
+    // as `movegen_margin` must (see `validate_shared_player_options`).
+    let recorded = sqlx::query_as::<_, (Uuid, i32, i32)>(
+        "SELECT id, num_plays_recorded, num_plies_recorded FROM player_configs WHERE id = ANY($1)",
+    )
+    .bind(vec![player1_config_id, player2_config_id])
+    .fetch_all(&mut *conn)
+    .await?;
+    let of = |id: Uuid| {
+        recorded
+            .iter()
+            .find(|(row, _, _)| *row == id)
+            .map(|(_, plays, plies)| (*plays, *plies))
+            .ok_or_else(|| AppError::bad_request("player config not found"))
+    };
+    let (cap, plies) = of(player1_config_id)?;
+    let (cap2, plies2) = of(player2_config_id)?;
+    if (cap, plies) != (cap2, plies2) {
+        return Err(AppError::bad_request("job settings are invalid").with_field(
+            "capture_positions",
+            format!(
+                "the players record {cap} and {cap2} plays and {plies} and {plies2} plies per \
+                 position; MAGPIE keeps one number of each for the whole run, player 1's, so \
+                 with capture on both configs must agree on num_plays_recorded and \
+                 num_plies_recorded"
+            ),
+        ));
+    }
     let players = sqlx::query_as::<_, (String, i32, i32)>(
         "SELECT name, num_plies, num_plays FROM player_configs WHERE id = ANY($1)",
     )
@@ -1648,6 +1961,76 @@ async fn player_file_names(
     Ok(row)
 }
 
+/// A leave job's player, held to what leave generation measures.
+///
+/// A generation's leave values are the mean equity of every rack the bot
+/// drew, as MAGPIE's own `leavegen` computes them: static play, ranked on
+/// equity, with the generation's KLV supplying the leave half of that equity.
+/// A simulating player would rank on something else and play each game orders
+/// of magnitude slower; a score sort ignores the very leave values each
+/// generation feeds back in, so no generation would learn from the last; and a
+/// rack info table caches the leave values of one fixed KLV, where every
+/// generation plays a new one -- MAGPIE loads none for this job type, so the
+/// setting would be shown and not honoured. Each is refused rather than
+/// quietly overridden.
+///
+/// Its lexicon must be a kwg that the job's distribution can spell. Its leaves
+/// are not checked: every generation plays a server-built KLV, generation 1's
+/// being a zeroed one, and the player's own is never loaded.
+async fn validate_leave_player(
+    conn: &mut sqlx::PgConnection,
+    player_config_id: Uuid,
+    letterdist_name: &str,
+) -> AppResult<()> {
+    let (plies, sort, use_rit, endgame_plies, kwg_role, lexicon) =
+        sqlx::query_as::<_, (i32, String, bool, i32, String, String)>(
+            "SELECT pc.num_plies, pc.sort_strategy, pc.use_rit, pc.endgame_plies, kwg.role,
+                    kwg.name
+             FROM player_configs pc JOIN input_data kwg ON kwg.id = pc.kwg_id
+             WHERE pc.id = $1",
+        )
+        .bind(player_config_id)
+        .fetch_optional(&mut *conn)
+        .await?
+        .ok_or_else(|| AppError::bad_request("no such player config"))?;
+
+    let mut problems = Vec::new();
+    if plies > 0 {
+        problems.push(format!("simulates {plies} plies (it must play statically: num_plies 0)"));
+    }
+    if sort != "equity" {
+        problems.push(format!("sorts on {sort} (it must sort on equity)"));
+    }
+    if use_rit {
+        problems.push("asks for a rack info table (it must not)".to_string());
+    }
+    // A leave game ends before the bag is small enough for either solver, so
+    // the settings would be shown and never honoured.
+    if endgame_plies > 0 {
+        problems.push(format!(
+            "solves endgames to {endgame_plies} plies (it must not: leave games end before the \
+             endgame, so set endgame_plies to 0)"
+        ));
+    }
+    if !problems.is_empty() {
+        return Err(AppError::bad_request("this player config cannot generate leaves").with_field(
+            "player_config_id",
+            format!("leave generation plays statically on equity; this config {}", problems.join(", ")),
+        ));
+    }
+    if kwg_role != "kwg" {
+        return Err(AppError::bad_request(format!(
+            "expected a kwg row, but {lexicon} is a {kwg_role} row"
+        )));
+    }
+    if !crate::compat::lex_ld_compat(&lexicon, letterdist_name) {
+        return Err(AppError::bad_request(format!(
+            "lexicon {lexicon:?} is not compatible with letter distribution {letterdist_name:?}"
+        )));
+    }
+    Ok(())
+}
+
 /// MAGPIE decides compatibility from names, and birdtest must not be able to
 /// build a job MAGPIE would refuse to load.
 async fn validate_player_compatibility(
@@ -1684,7 +2067,10 @@ async fn insert_job_config(
     match (job.job_type, config) {
         (
             JobType::OpeningRack,
-            JobTypeConfig::OpeningRack { player_config_id, racks_per_batch, rack_size },
+            JobTypeConfig::OpeningRack {
+                player_config_id, racks_per_batch, rack_size, consensus_pct,
+                min_results_per_rack, max_results_per_rack,
+            },
         ) => {
             validate_player_compatibility(
                 &mut *conn,
@@ -1692,7 +2078,8 @@ async fn insert_job_config(
                 letterdist_name,
             )
             .await?;
-            validate_opening_rack_player(&mut *conn, *player_config_id).await?;
+            validate_opening_rack_player(&mut *conn, *player_config_id, *max_results_per_rack)
+                .await?;
             // Counting the space is cheap -- a small dynamic-programming table
             // over the letter distribution -- and recording it here means the
             // scheduler can tell when the job is exhausted without re-deriving
@@ -1704,15 +2091,18 @@ async fn insert_job_config(
                 crate::jobs::opening_rack::total_racks(&job_data.letterdist, *rack_size)?;
             sqlx::query(
                 "INSERT INTO job_opening_rack_config
-                     (job_id, player_config_id,
-                      racks_per_batch, rack_size, total_racks)
-                 VALUES ($1, $2, $3, $4, $5)",
+                     (job_id, player_config_id, racks_per_batch, rack_size, total_racks,
+                      consensus_pct, min_results_per_rack, max_results_per_rack)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
             )
             .bind(job.id)
             .bind(player_config_id)
             .bind(racks_per_batch)
             .bind(rack_size)
             .bind(total_racks)
+            .bind(consensus_pct)
+            .bind(min_results_per_rack)
+            .bind(max_results_per_rack)
             .execute(conn)
             .await?;
         }
@@ -1720,8 +2110,7 @@ async fn insert_job_config(
             JobType::Games,
             JobTypeConfig::Game {
                 player1_config_id, player2_config_id, games_per_batch,
-                min_games, max_games, sprt_alpha, sprt_beta, elo_low, elo_high,
-                capture_positions,
+                min_games, max_games, test, capture_positions, ..
             },
         ) => {
             validate_shared_player_options(&mut *conn, *player1_config_id, *player2_config_id)
@@ -1736,17 +2125,18 @@ async fn insert_job_config(
                 validate_capture_play_cap(&mut *conn, *player1_config_id, *player2_config_id)
                     .await?;
             }
+            let test = test.settings(*min_games);
             sqlx::query(
                 "INSERT INTO job_game_config
                      (job_id, player1_config_id,
-                      player2_config_id, games_per_batch, min_games, max_games, sprt_alpha, sprt_beta,
-                      elo_low, elo_high, capture_positions)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+                      player2_config_id, games_per_batch, test_enabled, min_games, max_games,
+                      confidence_pct, capture_positions)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
             )
             .bind(job.id)
             .bind(player1_config_id).bind(player2_config_id)
-            .bind(games_per_batch).bind(min_games).bind(max_games)
-            .bind(sprt_alpha).bind(sprt_beta).bind(elo_low).bind(elo_high)
+            .bind(games_per_batch).bind(test.enabled).bind(test.min_units).bind(max_games)
+            .bind(test.confidence_pct)
             .bind(capture_positions)
             .execute(conn)
             .await?;
@@ -1755,8 +2145,7 @@ async fn insert_job_config(
             JobType::GamePairs,
             JobTypeConfig::GamePair {
                 player1_config_id, player2_config_id, pairs_per_batch,
-                min_pairs, max_pairs, sprt_alpha, sprt_beta, elo_low, elo_high,
-                capture_positions,
+                min_pairs, max_pairs, test, capture_positions, capture_first_divergence,
             },
         ) => {
             validate_shared_player_options(&mut *conn, *player1_config_id, *player2_config_id)
@@ -1771,49 +2160,30 @@ async fn insert_job_config(
                 validate_capture_play_cap(&mut *conn, *player1_config_id, *player2_config_id)
                     .await?;
             }
+            let test = test.settings(*min_pairs);
             sqlx::query(
                 "INSERT INTO job_game_pair_config
                      (job_id, player1_config_id,
-                      player2_config_id, pairs_per_batch, min_pairs, max_pairs, sprt_alpha, sprt_beta,
-                      elo_low, elo_high, capture_positions)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+                      player2_config_id, pairs_per_batch, test_enabled, min_pairs, max_pairs,
+                      confidence_pct, capture_positions, capture_first_divergence)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
             )
             .bind(job.id)
             .bind(player1_config_id).bind(player2_config_id)
-            .bind(pairs_per_batch).bind(min_pairs).bind(max_pairs)
-            .bind(sprt_alpha).bind(sprt_beta).bind(elo_low).bind(elo_high)
+            .bind(pairs_per_batch).bind(test.enabled).bind(test.min_units).bind(max_pairs)
+            .bind(test.confidence_pct)
             .bind(capture_positions)
+            .bind(capture_first_divergence)
             .execute(conn)
             .await?;
         }
         (
             JobType::LeaveGeneration,
             JobTypeConfig::Leave {
-                kwg_id, num_iterations,
-                generation_count, target_rack_count, racks_per_task, use_wordmap,
+                player_config_id, num_iterations, target_rack_counts, racks_per_task,
             },
         ) => {
-            let lexicon: (String, String) = sqlx::query_as(
-                "SELECT role, name FROM input_data WHERE id = $1",
-            )
-            .bind(kwg_id)
-            .fetch_optional(&mut *conn)
-            .await?
-            .ok_or_else(|| AppError::bad_request("no such input data row"))?;
-            if lexicon.0 != "kwg" {
-                return Err(AppError::bad_request(format!(
-                    "expected a kwg row, but {} is a {} row",
-                    lexicon.1, lexicon.0
-                )));
-            }
-            // No leaves to check: every generation plays with a server-built
-            // KLV, generation 1's being a zeroed one.
-            if !crate::compat::lex_ld_compat(&lexicon.1, letterdist_name) {
-                return Err(AppError::bad_request(format!(
-                    "lexicon {:?} is not compatible with letter distribution {letterdist_name:?}",
-                    lexicon.1
-                )));
-            }
+            validate_leave_player(&mut *conn, *player_config_id, letterdist_name).await?;
             // Every generation seeds and hands out full racks over the pinned
             // distribution, so one whose racks cannot be spelt is refused now
             // rather than at the first claim.
@@ -1821,13 +2191,13 @@ async fn insert_job_config(
             crate::jobs::racks::RackIndex::new(&job_data.letterdist, crate::jobs::leave_gen::RACK_SIZE)?;
             sqlx::query(
                 "INSERT INTO job_leave_config
-                     (job_id, kwg_id, num_iterations,
-                      generation_count, target_rack_count, racks_per_task, use_wordmap)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7)",
+                     (job_id, player_config_id, num_iterations,
+                      target_rack_counts, racks_per_task)
+                 VALUES ($1,$2,$3,$4,$5)",
             )
-            .bind(job.id).bind(kwg_id)
-            .bind(num_iterations).bind(generation_count).bind(target_rack_count)
-            .bind(racks_per_task).bind(use_wordmap)
+            .bind(job.id).bind(player_config_id)
+            .bind(num_iterations).bind(target_rack_counts)
+            .bind(racks_per_task)
             .execute(conn)
             .await?;
         }
@@ -1937,6 +2307,236 @@ async fn activate_job(
     Ok(Json(updated))
 }
 
+/// The most jobs one allocation change names: more than any fleet runs at once.
+const MAX_ALLOCATION_ROWS: usize = 200;
+
+#[derive(Deserialize)]
+struct AllocationsBody {
+    allocations: Vec<AllocationRow>,
+}
+
+#[derive(Deserialize)]
+struct AllocationRow {
+    job_id: Uuid,
+    allocation: i32,
+}
+
+#[derive(Serialize)]
+struct AllocationsResult {
+    /// Every job the request named, as it now stands, in the request's order.
+    jobs: Vec<Job>,
+}
+
+/// Several jobs' allocations at once, checked as a whole: the active jobs
+/// must sum to at most 100% *after* the change, not after each step of it.
+/// One at a time, moving 20% from a job at 60% to one at 40% meant lowering
+/// the first before the second could be raised, and an admin rebalancing
+/// three jobs had to work out an order that never passed through 101%.
+///
+/// A row above 0% leaves its job active at that allocation, activating it if
+/// it was not; a row at 0% leaves it inactive, deactivating it if it was
+/// active (its last allocation is kept, as deactivation keeps it). A job the
+/// request does not name keeps what it has. A completed job, or one being
+/// purged, is refused, and so is everything else in the request with it:
+/// nothing changes unless all of it does.
+///
+/// Each job that changes is audited as activation and deactivation are --
+/// `job.activated` / `job.deactivated` when its status changes -- and a new
+/// allocation as `job.allocation_changed`, from what to what.
+async fn set_allocations(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    method: Method,
+    headers: HeaderMap,
+    jar: CookieJar,
+    ApiJson(body): ApiJson<AllocationsBody>,
+) -> AppResult<Json<AllocationsResult>> {
+    csrf::verify(&method, &headers, &jar)?;
+
+    let mut err = AppError::bad_request("allocations are invalid");
+    if body.allocations.is_empty() {
+        err = err.with_field("allocations", "name at least one job");
+    } else if body.allocations.len() > MAX_ALLOCATION_ROWS {
+        err = err.with_field("allocations", format!("at most {MAX_ALLOCATION_ROWS} jobs at once"));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for (i, row) in body.allocations.iter().enumerate() {
+        if !(0..=100).contains(&row.allocation) {
+            err = err.with_field(format!("allocations[{i}].allocation"), "must be between 0 and 100");
+        }
+        if !seen.insert(row.job_id) {
+            err = err.with_field(format!("allocations[{i}].job_id"), "names a job named before it");
+        }
+    }
+    if !err.fields.is_empty() {
+        return Err(err);
+    }
+
+    let mut purges = std::collections::HashMap::new();
+    for row in &body.allocations {
+        purges.insert(row.job_id, refuse_while_purging(&state, row.job_id)?);
+    }
+
+    // What activation does first, for each job this activates: a leave job's
+    // generation-0 KLV, and its derived files under this deployment's
+    // builder. Outside the transaction, as there.
+    for row in body.allocations.iter().filter(|r| r.allocation > 0) {
+        let unlocked = match crate::jobstats::load_job(&state.pool, row.job_id).await {
+            Ok(job) => job,
+            // Named below, with the rest of what is wrong.
+            Err(_) => continue,
+        };
+        if unlocked.status == JobStatus::Active || unlocked.status == JobStatus::Completed {
+            continue;
+        }
+        if !registry::job_artifacts_ready(&state.pool, &unlocked).await? {
+            registry::initialize_job_artifacts(&state, &unlocked).await?;
+        }
+        request_derived_data(&state, row.job_id).await?;
+    }
+
+    let mut tx = state.pool.begin().await?;
+    // Every row first, in id order, then the activation lock: the order
+    // `activate_job` takes them in (a row, then the lock), so the two never
+    // wait on each other the wrong way round.
+    let mut ids: Vec<Uuid> = body.allocations.iter().map(|r| r.job_id).collect();
+    ids.sort();
+    let locked: Vec<Job> = sqlx::query_as::<_, Job>(
+        "SELECT * FROM jobs WHERE id = ANY($1) ORDER BY id FOR UPDATE",
+    )
+    .bind(&ids)
+    .fetch_all(&mut *tx)
+    .await?;
+    let before: std::collections::HashMap<Uuid, Job> =
+        locked.into_iter().map(|job| (job.id, job)).collect();
+    let mut err = AppError::bad_request("allocations are invalid");
+    for (i, row) in body.allocations.iter().enumerate() {
+        match before.get(&row.job_id) {
+            None => err = err.with_field(format!("allocations[{i}].job_id"), "no such job"),
+            Some(job) if job.status == JobStatus::Completed => {
+                err = err.with_field(
+                    format!("allocations[{i}].job_id"),
+                    "the job is completed, and a completed job cannot be reactivated",
+                )
+            }
+            Some(_) => refuse_if_purged_since(&state, row.job_id, purges[&row.job_id])?,
+        }
+    }
+    if !err.fields.is_empty() {
+        return Err(err);
+    }
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('birdtest.activate'))")
+        .execute(&mut *tx)
+        .await?;
+
+    let others = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT SUM(allocation) FROM jobs WHERE status = 'active' AND id <> ALL($1)",
+    )
+    .bind(&ids)
+    .fetch_one(&mut *tx)
+    .await?
+    .unwrap_or(0);
+    let named: i64 = body.allocations.iter().map(|r| i64::from(r.allocation)).sum();
+    if others + named > 100 {
+        return Err(AppError::conflict(format!(
+            "the active jobs would allocate {}% between them; the most is 100%{}",
+            others + named,
+            if others > 0 {
+                format!(" (the jobs not named here already allocate {others}%)")
+            } else {
+                String::new()
+            }
+        )));
+    }
+
+    let mut activated = Vec::new();
+    let mut changed = Vec::new();
+    for row in &body.allocations {
+        let job = &before[&row.job_id];
+        let active = job.status == JobStatus::Active;
+        if row.allocation > 0 {
+            if active && job.allocation == Some(row.allocation) {
+                continue;
+            }
+            sqlx::query(
+                "UPDATE jobs SET status = 'active', allocation = $1, activated_at = now() WHERE id = $2",
+            )
+            .bind(row.allocation)
+            .bind(row.job_id)
+            .execute(&mut *tx)
+            .await?;
+            // As activation does, and for the same reason: a new allocation
+            // rescales the job's ratio, so it joins level with the jobs being
+            // served rather than with a deficit to work off.
+            crate::scheduler::join_at_parity(&mut tx, row.job_id, state.cfg.heartbeat_timeout).await?;
+            if !active {
+                audit::log_status_change(
+                    &mut tx,
+                    "job.activated",
+                    admin.0.id,
+                    row.job_id,
+                    status_name(job.status),
+                    "active",
+                )
+                .await?;
+                activated.push(row.job_id);
+            }
+            if job.allocation != Some(row.allocation) {
+                let from = job.allocation.map_or("none".to_string(), |a| format!("{a}%"));
+                audit::log_detail(
+                    &mut tx,
+                    "job.allocation_changed",
+                    admin.0.id,
+                    "job",
+                    row.job_id.to_string(),
+                    Some(row.job_id),
+                    format!("{from} -> {}%", row.allocation),
+                )
+                .await?;
+            }
+            changed.push(row.job_id);
+        } else if active {
+            sqlx::query("UPDATE jobs SET status = 'inactive', deactivated_at = now() WHERE id = $1")
+                .bind(row.job_id)
+                .execute(&mut *tx)
+                .await?;
+            audit::log_status_change(
+                &mut tx,
+                "job.deactivated",
+                admin.0.id,
+                row.job_id,
+                status_name(job.status),
+                "inactive",
+            )
+            .await?;
+            changed.push(row.job_id);
+        }
+    }
+
+    let after: std::collections::HashMap<Uuid, Job> =
+        sqlx::query_as::<_, Job>("SELECT * FROM jobs WHERE id = ANY($1)")
+            .bind(&ids)
+            .fetch_all(&mut *tx)
+            .await?
+            .into_iter()
+            .map(|job| (job.id, job))
+            .collect();
+    tx.commit().await?;
+    for id in &activated {
+        state.finish_checks.rearm_idle(*id);
+    }
+    for id in &changed {
+        super::worker::push_after_change(&state, *id);
+    }
+    let mut jobs = Vec::with_capacity(body.allocations.len());
+    for row in &body.allocations {
+        if let Some(job) = after.get(&row.job_id) {
+            jobs.push(job.clone());
+        }
+    }
+    Ok(Json(AllocationsResult { jobs }))
+}
+
 async fn deactivate_job(
     State(state): State<AppState>,
     admin: AdminUser,
@@ -2018,6 +2618,225 @@ async fn complete_job(
     state.finish_checks.forget(id);
     super::worker::push_after_change(&state, id);
     Ok(Json(job))
+}
+
+#[derive(Deserialize)]
+struct ConsensusBody {
+    consensus_pct: Option<f64>,
+    min_results_per_rack: Option<i32>,
+    max_results_per_rack: Option<i32>,
+}
+
+#[derive(Serialize)]
+struct ConsensusResult {
+    /// The job as it now stands: reopened, when the change unsettled racks of
+    /// a completed job; completed, when it settled the last of an active one's.
+    job: Job,
+    /// Its opening-rack settings as they now stand.
+    config: OpeningRackConfig,
+    /// How many of its racks the settings leave unsettled.
+    unsettled_racks: i64,
+    /// Whether the change took a completed job back out of completed.
+    reopened: bool,
+    /// Why a reopened job is inactive rather than active: the other active
+    /// jobs leave no room for its allocation.
+    reopened_inactive_reason: Option<String>,
+}
+
+/// Changes an opening-rack job's consensus settings -- the fewest and most
+/// analyses a rack gets, and the share of them that must agree on its best
+/// move -- and restates every rack under them (`opening_rack::restate_racks`).
+/// The only part of a job's configuration that changes after creation. Only
+/// the fields given change; none that differ is a `200` that writes nothing.
+///
+/// The job then starts or stops to match. A completed job the change leaves
+/// with unsettled racks is reopened: active at its allocation if the other
+/// active jobs leave room for it, inactive otherwise (the admin then makes
+/// room and activates it), and its final exports become snapshots, since the
+/// job will have a new final corpus once it completes again. An active job
+/// the change leaves with every rack settled completes now, or with its last
+/// in-flight claim's submission. An inactive job keeps its status, and
+/// completes when next activated if there is nothing left for it to do.
+///
+/// Under the locks a purge takes, in its order: the job's dispatch lock, so
+/// no claim is issued under the old settings; every open claim, so no
+/// submission is storing analyses while the racks are restated (a submission
+/// takes its claim first, so one already storing is waited for, and one that
+/// starts after reads the new settings once this commits); then the job's
+/// row. Claims and submissions read the settings fresh rather than from the
+/// job's cached template, which keeps them as the job was created.
+async fn update_consensus(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    Path(id): Path<Uuid>,
+    method: Method,
+    headers: HeaderMap,
+    jar: CookieJar,
+    ApiJson(body): ApiJson<ConsensusBody>,
+) -> AppResult<Json<ConsensusResult>> {
+    csrf::verify(&method, &headers, &jar)?;
+    let purges = refuse_while_purging(&state, id)?;
+
+    let mut tx = state.pool.begin().await?;
+    crate::jobs::lock_job_dispatch(&mut tx, id).await?;
+    lock_open_claims(&mut tx, id).await?;
+    let job = load_job_for_update(&mut tx, id).await?;
+    refuse_if_purged_since(&state, id, purges)?;
+    if job.job_type != JobType::OpeningRack {
+        return Err(AppError::bad_request("only an opening-rack job has consensus settings"));
+    }
+    let before = sqlx::query_as::<_, OpeningRackConfig>(
+        "SELECT * FROM job_opening_rack_config WHERE job_id = $1 FOR UPDATE",
+    )
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await?;
+    let old = before.consensus();
+    let new = ConsensusSettings {
+        consensus_pct: body.consensus_pct.unwrap_or(old.consensus_pct),
+        min_results_per_rack: body.min_results_per_rack.unwrap_or(old.min_results_per_rack),
+        max_results_per_rack: body.max_results_per_rack.unwrap_or(old.max_results_per_rack),
+    };
+    let err = consensus_problems(
+        AppError::bad_request("consensus settings are invalid"),
+        new.consensus_pct,
+        new.min_results_per_rack,
+        new.max_results_per_rack,
+    );
+    if !err.fields.is_empty() {
+        return Err(err);
+    }
+    validate_opening_rack_player(&mut tx, before.player_config_id, new.max_results_per_rack).await?;
+
+    if new == old {
+        let unsettled: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM opening_rack_progress WHERE job_id = $1 AND NOT settled",
+        )
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+        return Ok(Json(ConsensusResult {
+            job,
+            config: before,
+            unsettled_racks: unsettled,
+            reopened: false,
+            reopened_inactive_reason: None,
+        }));
+    }
+
+    let config = sqlx::query_as::<_, OpeningRackConfig>(
+        "UPDATE job_opening_rack_config
+         SET consensus_pct = $2, min_results_per_rack = $3, max_results_per_rack = $4
+         WHERE job_id = $1 RETURNING *",
+    )
+    .bind(id)
+    .bind(new.consensus_pct)
+    .bind(new.min_results_per_rack)
+    .bind(new.max_results_per_rack)
+    .fetch_one(&mut *tx)
+    .await?;
+    let unsettled = crate::jobs::opening_rack::restate_racks(&mut tx, id, &new).await?;
+
+    let mut changes = Vec::new();
+    if new.min_results_per_rack != old.min_results_per_rack {
+        changes.push(format!("min {} -> {}", old.min_results_per_rack, new.min_results_per_rack));
+    }
+    if new.max_results_per_rack != old.max_results_per_rack {
+        changes.push(format!("max {} -> {}", old.max_results_per_rack, new.max_results_per_rack));
+    }
+    if new.consensus_pct != old.consensus_pct {
+        changes.push(format!("consensus {}% -> {}%", old.consensus_pct, new.consensus_pct));
+    }
+    audit::log_detail(
+        &mut tx,
+        "job.consensus_changed",
+        admin.0.id,
+        "job",
+        id.to_string(),
+        Some(id),
+        format!("{}; {unsettled} racks unsettled", changes.join(", ")),
+    )
+    .await?;
+
+    // A completed job with racks to analyse again goes back to work. The
+    // first pass is covered (a job completes only once every rack is
+    // settled), so what it hands out now are the unsettled racks.
+    let mut reopened_inactive_reason = None;
+    let reopened = job.status == JobStatus::Completed && unsettled > 0;
+    if reopened {
+        // Serialized with activations, which check the same sum.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext('birdtest.activate'))")
+            .execute(&mut *tx)
+            .await?;
+        let others = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT SUM(allocation) FROM jobs WHERE status = 'active' AND id <> $1",
+        )
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?
+        .unwrap_or(0);
+        // A job never activated has no allocation, and one at 0% is offered to
+        // nobody: either way it comes back inactive, for the admin to give
+        // it one.
+        let allocation = job.allocation.unwrap_or(0);
+        let fits = allocation > 0 && others + i64::from(allocation) <= 100;
+        if fits {
+            sqlx::query("UPDATE jobs SET status = 'active', activated_at = now() WHERE id = $1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            crate::scheduler::join_at_parity(&mut tx, id, state.cfg.heartbeat_timeout).await?;
+        } else {
+            sqlx::query("UPDATE jobs SET status = 'inactive' WHERE id = $1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            reopened_inactive_reason = Some(if allocation == 0 {
+                "it has no allocation: activate it with one".to_string()
+            } else {
+                format!(
+                    "the other active jobs allocate {others}%, which leaves no room for its \
+                     {allocation}%: free some and activate it"
+                )
+            });
+        }
+        audit::log_status_change(
+            &mut tx,
+            if fits { "job.activated" } else { "job.deactivated" },
+            admin.0.id,
+            id,
+            "completed",
+            if fits { "active" } else { "inactive" },
+        )
+        .await?;
+        crate::exports::unfinalize(&mut tx, id).await?;
+    }
+    let job = sqlx::query_as::<_, Job>("SELECT * FROM jobs WHERE id = $1")
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+    tx.commit().await?;
+
+    if job.status == JobStatus::Active {
+        if reopened {
+            // As activation does: the builder may have moved since the job
+            // last dispatched.
+            request_derived_data(&state, id).await?;
+        }
+        // A check paced out under the old settings must not delay the one
+        // that can now complete it -- or wait on racks they unsettled.
+        state.finish_checks.rearm_idle(id);
+        if unsettled == 0 {
+            // Every rack is settled: complete it now if nothing is in flight.
+            // With claims out, the last one's submission completes it.
+            if let Err(err) = super::worker::finish_idle_job(&state, id).await {
+                tracing::error!(job_id = %id, error = %err.message, "finish check after a consensus change failed");
+            }
+        }
+    }
+    super::worker::push_after_change(&state, id);
+    let job = crate::jobstats::load_job(&state.pool, id).await?;
+    Ok(Json(ConsensusResult { job, config, unsettled_racks: unsettled, reopened, reopened_inactive_reason }))
 }
 
 /// What a job is about to lose, as a single line for `audit_log.reason`.
@@ -2121,74 +2940,100 @@ struct PurgeResult {
 /// that only ever moves forward; a purge can leave it pointing at a time whose
 /// task is gone.
 struct Contributions {
-    users: Vec<(Uuid, i64)>,
-    anonymous: Vec<(Uuid, i64)>,
+    users: Earned,
+    anonymous: Earned,
+}
+
+/// One kind of identity's share of a job, as parallel arrays in id order:
+/// claims completed, the milliseconds they were held, the games they played
+/// and the racks they analysed -- every counter the submit path adds to.
+#[derive(Default)]
+struct Earned {
+    ids: Vec<Uuid>,
+    tasks: Vec<i64>,
+    compute_ms: Vec<i64>,
+    games: Vec<i64>,
+    racks: Vec<i64>,
+}
+
+impl Earned {
+    /// Each identity of `column`'s kind with a completed claim of the job, and
+    /// what those claims added, summed as the submit path added it.
+    async fn count(conn: &mut sqlx::PgConnection, job_id: Uuid, column: &str) -> AppResult<Self> {
+        let rows = sqlx::query_as::<_, (Uuid, i64, i64, i64, i64)>(&format!(
+            "SELECT c.{column}, COUNT(*)::bigint,
+                    COALESCE(SUM({compute}), 0)::bigint,
+                    COALESCE(SUM(c.games_played), 0)::bigint,
+                    COALESCE(SUM(c.racks_analyzed), 0)::bigint
+             FROM task_claims c JOIN tasks t ON t.id = c.task_id
+             WHERE t.job_id = $1 AND c.state = 'completed' AND c.{column} IS NOT NULL
+             GROUP BY 1 ORDER BY 1",
+            compute = super::worker::CLAIM_COMPUTE_MS,
+        ))
+        .bind(job_id)
+        .fetch_all(&mut *conn)
+        .await?;
+        let mut earned = Earned::default();
+        for (id, tasks, compute_ms, games, racks) in rows {
+            earned.ids.push(id);
+            earned.tasks.push(tasks);
+            earned.compute_ms.push(compute_ms);
+            earned.games.push(games);
+            earned.racks.push(racks);
+        }
+        Ok(earned)
+    }
+
+    /// Takes it back from `table`, whose `key` the ids are: locked in id order
+    /// first, since the update locks rows in whatever order its plan visits
+    /// them, which a sorted array does not decide.
+    async fn give_back(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        table: &str,
+        key: &str,
+    ) -> AppResult<()> {
+        sqlx::query(&format!(
+            "SELECT 1 FROM {table} WHERE {key} = ANY($1) ORDER BY {key} FOR NO KEY UPDATE"
+        ))
+        .bind(&self.ids)
+        .execute(&mut *conn)
+        .await?;
+        sqlx::query(&format!(
+            "UPDATE {table} x
+             SET tasks_completed = GREATEST(x.tasks_completed - d.tasks, 0),
+                 compute_ms = GREATEST(x.compute_ms - d.compute_ms, 0),
+                 games_played = GREATEST(x.games_played - d.games, 0),
+                 racks_analyzed = GREATEST(x.racks_analyzed - d.racks, 0)
+             FROM UNNEST($1::uuid[], $2::bigint[], $3::bigint[], $4::bigint[], $5::bigint[])
+                  AS d(id, tasks, compute_ms, games, racks)
+             WHERE x.{key} = d.id"
+        ))
+        .bind(&self.ids)
+        .bind(&self.tasks)
+        .bind(&self.compute_ms)
+        .bind(&self.games)
+        .bind(&self.racks)
+        .execute(&mut *conn)
+        .await?;
+        Ok(())
+    }
 }
 
 impl Contributions {
     async fn count(conn: &mut sqlx::PgConnection, job_id: Uuid) -> AppResult<Self> {
-        let users = sqlx::query_as::<_, (Uuid, i64)>(
-            "SELECT c.claimed_by_user_id, COUNT(*)::bigint
-             FROM task_claims c JOIN tasks t ON t.id = c.task_id
-             WHERE t.job_id = $1 AND c.state = 'completed'
-               AND c.claimed_by_user_id IS NOT NULL
-             GROUP BY 1 ORDER BY 1",
-        )
-        .bind(job_id)
-        .fetch_all(&mut *conn)
-        .await?;
-        let anonymous = sqlx::query_as::<_, (Uuid, i64)>(
-            "SELECT c.claimed_by_anon_uuid, COUNT(*)::bigint
-             FROM task_claims c JOIN tasks t ON t.id = c.task_id
-             WHERE t.job_id = $1 AND c.state = 'completed'
-               AND c.claimed_by_anon_uuid IS NOT NULL
-             GROUP BY 1 ORDER BY 1",
-        )
-        .bind(job_id)
-        .fetch_all(&mut *conn)
-        .await?;
-        Ok(Contributions { users, anonymous })
+        Ok(Contributions {
+            users: Earned::count(conn, job_id, "claimed_by_user_id").await?,
+            anonymous: Earned::count(conn, job_id, "claimed_by_anon_uuid").await?,
+        })
     }
 
     /// The caller's last statement before it commits, so the rows are held
     /// for milliseconds. In id order, so two purges sharing contributors lock
     /// them in the same order rather than deadlocking at the end of both.
     async fn give_back(self, conn: &mut sqlx::PgConnection) -> AppResult<()> {
-        let (ids, counts): (Vec<Uuid>, Vec<i64>) = self.users.into_iter().unzip();
-        // Locked in id order first: the update below locks rows in whatever
-        // order its plan visits them, which a sorted array does not decide.
-        sqlx::query("SELECT 1 FROM users WHERE id = ANY($1) ORDER BY id FOR NO KEY UPDATE")
-            .bind(&ids)
-            .execute(&mut *conn)
-            .await?;
-        sqlx::query(
-            "UPDATE users u
-             SET tasks_completed = GREATEST(u.tasks_completed - d.n, 0)
-             FROM UNNEST($1::uuid[], $2::bigint[]) AS d(id, n)
-             WHERE u.id = d.id",
-        )
-        .bind(&ids)
-        .bind(&counts)
-        .execute(&mut *conn)
-        .await?;
-        let (uuids, counts): (Vec<Uuid>, Vec<i64>) = self.anonymous.into_iter().unzip();
-        sqlx::query(
-            "SELECT 1 FROM anonymous_workers WHERE uuid = ANY($1) ORDER BY uuid FOR NO KEY UPDATE",
-        )
-        .bind(&uuids)
-        .execute(&mut *conn)
-        .await?;
-        sqlx::query(
-            "UPDATE anonymous_workers w
-             SET tasks_completed = GREATEST(w.tasks_completed - d.n, 0)
-             FROM UNNEST($1::uuid[], $2::bigint[]) AS d(uuid, n)
-             WHERE w.uuid = d.uuid",
-        )
-        .bind(&uuids)
-        .bind(&counts)
-        .execute(&mut *conn)
-        .await?;
-        Ok(())
+        self.users.give_back(conn, "users", "id").await?;
+        self.anonymous.give_back(conn, "anonymous_workers", "uuid").await
     }
 }
 
@@ -2363,9 +3208,10 @@ async fn purge_body(
     // meant to start it over. Active and inactive jobs keep their state.
     sqlx::query(
         "UPDATE jobs SET claims_issued = 0, games_completed = 0, racks_analyzed = 0,
+                         racks_settled = 0, racks_without_consensus = 0,
                          tasks_total = 0, tasks_completed = 0, last_completed_at = NULL,
-                         sprt_decided_status = NULL, sprt_decided_llr = NULL,
-                         sprt_decided_units = NULL,
+                         test_decided_status = NULL, test_decided_lower = NULL,
+                         test_decided_upper = NULL, test_decided_units = NULL,
                          status = CASE WHEN status = 'completed' THEN 'inactive'::job_status
                                        ELSE status END
          WHERE id = $1",
@@ -2374,6 +3220,12 @@ async fn purge_body(
     .execute(&mut *tx)
     .await?;
     sqlx::query("DELETE FROM leave_rack_progress WHERE job_id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    // An opening-rack consensus job's per-rack standings describe analyses
+    // the claims above took with them.
+    sqlx::query("DELETE FROM opening_rack_progress WHERE job_id = $1")
         .bind(id)
         .execute(&mut *tx)
         .await?;
@@ -2578,6 +3430,11 @@ struct ExportRow {
     positions_bytes: Option<i64>,
     positions_sha256: Option<String>,
     positions_row_count: Option<i64>,
+    /// Whether this is the completed job's final corpus, rather than a
+    /// snapshot of a job still taking results (`exports`). False until built.
+    is_final: bool,
+    /// When the snapshot it was read in was taken; `None` until built.
+    snapshot_at: Option<chrono::DateTime<chrono::Utc>>,
     error: Option<String>,
     requested_at: chrono::DateTime<chrono::Utc>,
     completed_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -2596,10 +3453,11 @@ struct ExportDetail {
     positions_download_url: Option<String>,
 }
 
-/// Build a completed job's results into one downloadable artifact.
+/// Build a job's results into one downloadable artifact: the final corpus of a
+/// completed job, or a snapshot of one still running.
 ///
 /// Returns immediately with an id; the work runs on a spawned task and the
-/// admin polls `GET`. Only completed jobs qualify — see `exports::start`.
+/// admin polls `GET`. See `exports::start`.
 async fn start_export(
     State(state): State<AppState>,
     admin: AdminUser,
@@ -2621,7 +3479,8 @@ async fn start_export(
     ))
 }
 
-/// The newest export for a job, with a download URL once it is ready.
+/// The newest export for a job, with a download URL once it is ready, and
+/// whether it is the final corpus or a snapshot.
 async fn get_export(
     State(state): State<AppState>,
     _admin: AdminUser,
@@ -2629,7 +3488,7 @@ async fn get_export(
 ) -> AppResult<Json<ExportDetail>> {
     let mut export = sqlx::query_as::<_, ExportRow>(
         "SELECT id, state, bytes, sha256, row_count, positions_bytes, positions_sha256,
-                positions_row_count, error, requested_at, completed_at
+                positions_row_count, is_final, snapshot_at, error, requested_at, completed_at
          FROM job_exports WHERE job_id = $1
          ORDER BY requested_at DESC LIMIT 1",
     )
@@ -2638,9 +3497,11 @@ async fn get_export(
     .await?
     .ok_or_else(|| AppError::not_found("this job has never been exported"))?;
 
+    // This export's own objects, snapshot or final: the stream serves only a
+    // final one, but the admin page offers whichever it shows, labelled.
     let (download_url, positions_download_url) =
-        match crate::exports::newest_ready(&state.pool, id).await? {
-            Some(ready) if ready.id == export.id => {
+        match crate::exports::ready_objects(&state.pool, export.id).await? {
+            Some(ready) => {
                 let ttl = crate::exports::DOWNLOAD_URL_TTL;
                 let results = state.artifacts.presigned_get(&ready.artifact_key, ttl).await?;
                 let positions = match &ready.positions_artifact_key {
@@ -2981,8 +3842,7 @@ async fn rebuild_artifacts(
 /// tombstones, the password becomes unusable, API keys, confirmation codes and
 /// reset tokens are deleted, and every session is revoked. Contributions stay:
 /// the account's claims and results are kept under the tombstone, and no
-/// counter is rolled back, so no donated compute is lost -- including captured
-/// positions other redundant claims deduplicated against. Open claims are left
+/// counter is rolled back, so no donated compute is lost. Open claims are left
 /// to time out; nothing can submit for them once the keys are gone.
 async fn delete_user(
     State(state): State<AppState>,
@@ -3356,6 +4216,7 @@ mod tests {
             "job_type": "game_pairs",
             "player1_config_id": Uuid::nil(),
             "player2_config_id": Uuid::nil(),
+            "test_enabled": true,
             "min_pairs": 100,
             "max_pairs": 1000,
         });
@@ -3370,6 +4231,73 @@ mod tests {
     #[test]
     fn ordinary_settings_are_accepted() {
         assert!(validate_job_body(&game_pairs(serde_json::json!({}))).is_ok());
+    }
+
+    /// A games or pairs job without a word about the test runs none: it
+    /// needs only its target, and stores the defaults, which nothing reads.
+    #[test]
+    fn a_job_runs_no_test_unless_it_asks_for_one() {
+        let target_only = |job_type: &str, target: &str| {
+            let mut config = serde_json::json!({
+                "job_type": job_type,
+                "player1_config_id": Uuid::nil(),
+                "player2_config_id": Uuid::nil(),
+            });
+            config[target] = serde_json::json!(500);
+            body(config)
+        };
+        for (job_type, target) in [("games", "max_games"), ("game_pairs", "max_pairs")] {
+            let body = target_only(job_type, target);
+            assert!(validate_job_body(&body).is_ok(), "{job_type}");
+            let (JobTypeConfig::Game { min_games: min, test, .. }
+            | JobTypeConfig::GamePair { min_pairs: min, test, .. }) = &body.config
+            else {
+                panic!("{job_type} read as another job type");
+            };
+            let stored = test.settings(*min);
+            assert!(!stored.enabled, "{job_type}");
+            assert_eq!((stored.min_units, stored.confidence_pct), (0, 95.0));
+        }
+    }
+
+    /// Settings for a test that is off are refused, each by name, rather than
+    /// dropped: the job would otherwise play to its cap with no test and no
+    /// word said.
+    #[test]
+    fn test_settings_without_the_test_are_refused() {
+        let off = serde_json::json!({
+            "test_enabled": false, "min_pairs": 100, "confidence_pct": 99.0
+        });
+        assert_eq!(fields(validate_job_body(&game_pairs(off))), ["min_pairs", "confidence_pct"]);
+        // Left out, the flag is off too: a pre-flag script's body.
+        let unflagged = body(serde_json::json!({
+            "job_type": "game_pairs",
+            "player1_config_id": Uuid::nil(),
+            "player2_config_id": Uuid::nil(),
+            "min_pairs": 100,
+            "max_pairs": 1000,
+        }));
+        assert_eq!(fields(validate_job_body(&unflagged)), ["min_pairs"]);
+    }
+
+    /// With the test on, its floor is stated, at least 1 and at most the cap:
+    /// the interval is asymptotic, and holds once enough units are in.
+    #[test]
+    fn the_test_needs_its_floor() {
+        let mut config = serde_json::json!({
+            "job_type": "game_pairs",
+            "player1_config_id": Uuid::nil(),
+            "player2_config_id": Uuid::nil(),
+            "test_enabled": true,
+            "max_pairs": 1000,
+        });
+        assert_eq!(fields(validate_job_body(&body(config.clone()))), ["min_pairs"]);
+        config["min_pairs"] = serde_json::json!(0);
+        assert_eq!(fields(validate_job_body(&body(config.clone()))), ["min_pairs"]);
+        config["min_pairs"] = serde_json::json!(1001);
+        assert_eq!(fields(validate_job_body(&body(config.clone()))), ["min_pairs"]);
+        config["min_pairs"] = serde_json::json!(1000);
+        assert!(validate_job_body(&body(config)).is_ok());
     }
 
     /// A batch of zero makes every claim regenerate the seed the last claim
@@ -3391,6 +4319,7 @@ mod tests {
                 "job_type": "games",
                 "player1_config_id": Uuid::nil(),
                 "player2_config_id": Uuid::nil(),
+                "test_enabled": true,
                 "min_games": 100,
                 "max_games": 1000,
             });
@@ -3418,6 +4347,7 @@ mod tests {
                 "job_type": "games",
                 "player1_config_id": Uuid::nil(),
                 "player2_config_id": Uuid::nil(),
+                "test_enabled": true,
                 "min_games": 100,
                 "max_games": 100_000,
                 "games_per_batch": batch,
@@ -3438,58 +4368,68 @@ mod tests {
         assert_eq!(fields(validate_job_body(&pairs(5_001, false))), ["pairs_per_batch"]);
     }
 
-    /// Past a thousand Elo both hypotheses are an expected score of 1: the
-    /// LLR is always 0 and the job runs to its cap without a verdict.
+    /// A confidence of 100% never closes the interval, and one of half or
+    /// less is no test; everything strictly between is a test.
     #[test]
-    fn elo_hypotheses_past_a_thousand_are_refused() {
-        assert_eq!(
-            fields(validate_job_body(&game_pairs(
-                serde_json::json!({ "elo_low": 7000.0, "elo_high": 8000.0 })
-            ))),
-            ["elo_low", "elo_high"]
-        );
-        assert!(validate_job_body(&game_pairs(
-            serde_json::json!({ "elo_low": -1000.0, "elo_high": 1000.0 })
-        ))
-        .is_ok());
-    }
-
-    /// Inverted hypotheses flip the LLR's sign: SPRT would accept the wrong one.
-    #[test]
-    fn inverted_elo_hypotheses_are_rejected() {
-        assert_eq!(
-            fields(validate_job_body(&game_pairs(
-                serde_json::json!({ "elo_low": 10.0, "elo_high": -10.0 })
-            ))),
-            ["elo_high"]
-        );
+    fn a_confidence_outside_half_to_all_is_refused() {
+        for bad in [100.0, 50.0, 0.0, -5.0, 101.0] {
+            assert_eq!(
+                fields(validate_job_body(&game_pairs(serde_json::json!({ "confidence_pct": bad })))),
+                ["confidence_pct"],
+                "{bad}"
+            );
+        }
+        for good in [50.5, 80.0, 95.0, 99.9] {
+            assert!(validate_job_body(&game_pairs(serde_json::json!({ "confidence_pct": good }))).is_ok());
+        }
     }
 
     #[test]
-    fn degenerate_error_rates_are_rejected_and_every_problem_is_reported() {
+    fn every_problem_is_reported() {
         let got = fields(validate_job_body(&game_pairs(serde_json::json!({
-            "sprt_alpha": 0.0, "sprt_beta": 1.0, "max_pairs": 0, "redundancy": 0
+            "confidence_pct": 100.0, "max_pairs": 0, "pairs_per_batch": 0
         }))));
-        for expected in ["sprt_alpha", "sprt_beta", "max_pairs", "redundancy"] {
+        for expected in ["confidence_pct", "max_pairs", "pairs_per_batch"] {
             assert!(got.iter().any(|f| f == expected), "missing {expected} in {got:?}");
         }
+    }
+
+    /// A leave body names a `player_config_id`, as an opening-rack body does,
+    /// and an untagged enum takes the first variant a body fits: read as an
+    /// opening-rack config it would pass as one on its defaults, and fail as a
+    /// type mismatch after its settings had gone unchecked.
+    #[test]
+    fn a_leave_body_is_read_as_a_leave_config_and_an_opening_rack_body_is_not() {
+        let leave = body(serde_json::json!({
+            "job_type": "leave_generation",
+            "player_config_id": Uuid::nil(),
+            "num_iterations": 10,
+            "target_rack_counts": [10],
+            "racks_per_task": 10,
+        }));
+        assert!(matches!(leave.config, JobTypeConfig::Leave { .. }));
+        let racks = body(serde_json::json!({
+            "job_type": "opening_rack",
+            "player_config_id": Uuid::nil(),
+        }));
+        assert!(matches!(racks.config, JobTypeConfig::OpeningRack { .. }));
     }
 
     #[test]
     fn leave_generation_bounds_are_enforced() {
         let leave = body(serde_json::json!({
             "job_type": "leave_generation",
-            "kwg_id": Uuid::nil(),
+            "player_config_id": Uuid::nil(),
             "num_iterations": 0,
-            "target_rack_count": 10,
+            "target_rack_counts": [10],
             "racks_per_task": 0,
         }));
         assert_eq!(fields(validate_job_body(&leave)), ["num_iterations", "racks_per_task"]);
         let mut leave = serde_json::json!({
             "job_type": "leave_generation",
-            "kwg_id": Uuid::nil(),
+            "player_config_id": Uuid::nil(),
             "num_iterations": 10,
-            "target_rack_count": 10,
+            "target_rack_counts": [10],
             "racks_per_task": MAX_RACKS_PER_TASK,
         });
         assert!(validate_job_body(&body(leave.clone())).is_ok());
@@ -3498,17 +4438,32 @@ mod tests {
     }
 
     #[test]
-    fn leave_generation_runs_at_redundancy_one() {
-        let mut leave = body(serde_json::json!({
-            "job_type": "leave_generation",
-            "kwg_id": Uuid::nil(),
-            "num_iterations": 1,
-            "target_rack_count": 10,
-            "racks_per_task": 1,
-        }));
-        assert!(validate_job_body(&leave).is_ok());
-        leave.redundancy = 2;
-        assert_eq!(fields(validate_job_body(&leave)), ["redundancy"]);
+    fn a_leave_job_lists_between_one_and_the_most_generations_each_with_a_sane_target() {
+        let with_targets = |targets: serde_json::Value| {
+            body(serde_json::json!({
+                "job_type": "leave_generation",
+                "player_config_id": Uuid::nil(),
+                "num_iterations": 10,
+                "target_rack_counts": targets,
+                "racks_per_task": 10,
+            }))
+        };
+        assert!(validate_job_body(&with_targets(serde_json::json!([100, 200, 500, 1000]))).is_ok());
+        let most = vec![MAX_TARGET_RACK_COUNT; MAX_LEAVE_GENERATIONS];
+        assert!(validate_job_body(&with_targets(serde_json::json!(most))).is_ok());
+        for bad in [
+            serde_json::json!([]),
+            serde_json::json!([100, 0, 500]),
+            serde_json::json!([-5]),
+            serde_json::json!([MAX_TARGET_RACK_COUNT + 1]),
+            serde_json::json!(vec![10; MAX_LEAVE_GENERATIONS + 1]),
+        ] {
+            assert_eq!(
+                fields(validate_job_body(&with_targets(bad.clone()))),
+                ["target_rack_counts"],
+                "{bad}"
+            );
+        }
     }
 
     #[test]

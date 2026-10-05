@@ -950,19 +950,9 @@ pub async fn run_import_within(
     match staged {
         Ok(staged) => {
             progress.flush_entries().await;
-            // Guarded on `running`: a process that starts reaps rows left
-            // `running` as failed, and a rollback or a manual restart could
-            // overlap two for a moment. Without the guard this would
-            // flip a reaped row back to `staged` with the reaper's error still
-            // on it, and the admin would confirm a diff nobody was sure of.
-            let _ = sqlx::query(
-                "UPDATE input_data_imports SET state = 'staged', tarball_sha256 = $2
-                 WHERE id = $1 AND state = 'running'",
-            )
-            .bind(import_id)
-            .bind(staged)
-            .execute(&state.pool)
-            .await;
+            if let Err(err) = finish_staging(&state.pool, import_id, &staged).await {
+                tracing::error!(%import_id, error = %err.message, "input data import could not be staged");
+            }
         }
         Err(err) => {
             tracing::warn!(%import_id, error = %err.message, "input data import failed");
@@ -976,6 +966,51 @@ pub async fn run_import_within(
             .await;
         }
     }
+}
+
+/// Moves a staged import out of `running`: to `staged` for the admin to
+/// confirm, or -- when every file is already known -- to `nothing_new`, with
+/// its record, since there is nothing to confirm. Left `staged`, such an import
+/// offered an Insert of 0 rows and waited a day to be expired.
+///
+/// Guarded on `running`: a process that starts reaps rows left `running` as
+/// failed, and a rollback or a manual restart could overlap two for a moment.
+/// Without the guard this would flip a reaped row back to `staged` with the
+/// reaper's error still on it, and the admin would confirm a diff nobody was
+/// sure of.
+async fn finish_staging(pool: &sqlx::PgPool, import_id: Uuid, tarball_sha256: &str) -> AppResult<()> {
+    let mut tx = pool.begin().await?;
+    let finished = sqlx::query_as::<_, (String, Option<Uuid>)>(
+        "UPDATE input_data_imports
+         SET tarball_sha256 = $2,
+             state = CASE WHEN EXISTS (SELECT 1 FROM input_data_import_rows
+                                       WHERE import_id = $1 AND disposition <> 'known')
+                          THEN 'staged' ELSE 'nothing_new' END
+         WHERE id = $1 AND state = 'running'
+         RETURNING state, requested_by",
+    )
+    .bind(import_id)
+    .bind(tarball_sha256)
+    .fetch_optional(&mut *tx)
+    .await?;
+    // A staged import's next record is its confirmation; this one will have
+    // none, so it says here how it ended.
+    if let Some((state, requested_by)) = finished {
+        if state == "nothing_new" {
+            crate::audit::log(
+                &mut tx,
+                "input_data.import_nothing_new",
+                requested_by,
+                None,
+                Some("input_data_import"),
+                Some(import_id.to_string()),
+                None,
+            )
+            .await?;
+        }
+    }
+    tx.commit().await?;
+    Ok(())
 }
 
 /// Puts every lexicon and leaves file into the object store, and takes its

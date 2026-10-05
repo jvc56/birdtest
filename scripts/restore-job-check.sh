@@ -83,7 +83,10 @@ digest() {
                           WHERE r.job_id = '$job'") "
   out+="plies:$(val "$db" "SELECT count(*) || '/' || coalesce(md5(string_agg(p::text, '|' ORDER BY p::text)), '-')
                           FROM position_analysis_plies p JOIN position_analysis_moves m ON m.id = p.move_id
-                          JOIN position_analysis_records r ON r.id = m.record_id WHERE r.job_id = '$job'")"
+                          JOIN position_analysis_records r ON r.id = m.record_id WHERE r.job_id = '$job'") "
+  out+="inference:$(val "$db" "SELECT count(*) || '/' || coalesce(md5(string_agg(i::text, '|' ORDER BY i::text)), '-')
+                          FROM position_analysis_inference i JOIN position_analysis_records r ON r.id = i.record_id
+                          WHERE r.job_id = '$job'")"
   echo "$out"
 }
 
@@ -103,9 +106,9 @@ VALUES ('restorer', 'restorer@example.invalid', 'x', true);
 INSERT INTO input_data (path, role, name, sha256, bytes, tarball_date, content)
 VALUES ('letterdistributions/check.csv', 'letterdist', 'check', repeat('a', 64), 3, '20260101', '\x00ff00'::bytea),
        ('layouts/check.txt', 'layout', 'check', repeat('b', 64), 3, '20260101', '\x010203'::bytea);
-INSERT INTO jobs (id, job_type, status, allocation, redundancy, variant,
+INSERT INTO jobs (id, job_type, status, allocation, variant,
                   letterdist_id, layout_id, created_by, bingo_bonus, sim_cutoff)
-SELECT j.id::uuid, j.kind::job_type, 'inactive', 100, 1, 'classic',
+SELECT j.id::uuid, j.kind::job_type, 'inactive', 100, 'classic',
        (SELECT id FROM input_data WHERE role = 'letterdist'),
        (SELECT id FROM input_data WHERE role = 'layout'),
        (SELECT id FROM users), 50, 0.1
@@ -121,12 +124,15 @@ SELECT t.id, t.job_id, gen_random_uuid(), 'completed', (SELECT id FROM users), n
 INSERT INTO game_results (task_claim_id, task_id, job_id, games, wins, losses, ties,
                           p1_score_mean, p1_score_sd, p2_score_mean, p2_score_sd)
 SELECT c.id, c.task_id, c.job_id, 10, 6, 4, 0, 412.5, 55.25, 398.0, 61.5 FROM task_claims c;
-INSERT INTO position_analysis_records (task_claim_id, task_id, job_id, rack, num_moves)
-SELECT c.id, c.task_id, c.job_id, 'AEINRST', 2 FROM task_claims c WHERE c.job_id = '00000000-0000-0000-0000-00000000000a' LIMIT 20;
+INSERT INTO position_analysis_records (task_claim_id, task_id, job_id, rack, num_moves, analysis)
+SELECT c.id, c.task_id, c.job_id, 'AEINRST', 2, 'sim' FROM task_claims c WHERE c.job_id = '00000000-0000-0000-0000-00000000000a' LIMIT 20;
 INSERT INTO position_analysis_moves (record_id, rank, move, score, equity)
 SELECT r.id, k, 'H8 RETAINS', 70 + k, 40.5 + k FROM position_analysis_records r, generate_series(1, 3) k;
 INSERT INTO position_analysis_plies (move_id, ply, bingo_percentage, average_score)
 SELECT m.id, p, 12.5, 30.25 FROM position_analysis_moves m, generate_series(1, 2) p;
+INSERT INTO position_analysis_inference (record_id, num_leaves, total_draws, average_equity, leaves)
+SELECT r.id, 40, 900, 12.5, '[{"leave": "EIR", "draws": 120, "equity": 18.25}]'::jsonb
+FROM position_analysis_records r;
 INSERT INTO leave_rack_progress (job_id, generation, rack, occurrence_count)
 SELECT '00000000-0000-0000-0000-00000000000b', 1, 'R' || lpad(i::text, 5, '0'), i % 7
 FROM generate_series(1, 250) i;
@@ -142,25 +148,26 @@ INSERT INTO input_data (id, path, role, name, sha256, bytes, tarball_date)
 VALUES ('00000000-0000-0000-0000-0000000000e1', 'lexica/CHECK.kwg', 'kwg', 'CHECK', repeat('e', 64), 3, '20260101'),
        ('00000000-0000-0000-0000-0000000000e2', 'lexica/CHECK.klv2', 'klv', 'CHECK', repeat('f', 64), 3, '20260101');
 INSERT INTO player_configs (id, name, recorder_type, sort_strategy, kwg_id, klv_id, num_plies, num_plays,
-                            num_plies_recorded, num_plays_recorded, use_wordmap, use_rit, movegen_margin, created_by)
+                            num_plies_recorded, num_plays_recorded, use_wordmap, use_rit, use_wit, movegen_margin, created_by)
 VALUES ('00000000-0000-0000-0000-0000000000f1', 'check-static', 'best', 'equity',
         '00000000-0000-0000-0000-0000000000e1', '00000000-0000-0000-0000-0000000000e2', 0, 100, 2, 10,
-        false, false, 5, (SELECT id FROM users));
-INSERT INTO jobs (id, job_type, status, allocation, redundancy, variant,
+        false, false, false, 5, (SELECT id FROM users));
+INSERT INTO jobs (id, job_type, status, allocation, variant,
                   letterdist_id, layout_id, created_by, bingo_bonus, sim_cutoff)
-SELECT '00000000-0000-0000-0000-00000000000d', 'games', 'active', 100, 1, 'classic',
+SELECT '00000000-0000-0000-0000-00000000000d', 'games', 'active', 100, 'classic',
        (SELECT id FROM input_data WHERE role = 'letterdist'), (SELECT id FROM input_data WHERE role = 'layout'),
        (SELECT id FROM users), 50, 0.1;
-INSERT INTO job_game_config (job_id, player1_config_id, player2_config_id, games_per_batch, min_games, max_games)
+INSERT INTO job_game_config (job_id, player1_config_id, player2_config_id, games_per_batch,
+                             test_enabled, min_games, max_games)
 VALUES ('00000000-0000-0000-0000-00000000000d', '00000000-0000-0000-0000-0000000000f1',
-        '00000000-0000-0000-0000-0000000000f1', 10, 100, 1000);
+        '00000000-0000-0000-0000-0000000000f1', 10, true, 100, 1000);
 -- A rating pool whose newest run has seen its evidence: a restore must leave it
 -- to refit.
 INSERT INTO player_configs (id, name, recorder_type, sort_strategy, kwg_id, klv_id, num_plies, num_plays,
-                            num_plies_recorded, num_plays_recorded, use_wordmap, use_rit, movegen_margin, created_by)
+                            num_plies_recorded, num_plays_recorded, use_wordmap, use_rit, use_wit, movegen_margin, created_by)
 VALUES ('00000000-0000-0000-0000-0000000000f2', 'check-anchor', 'best', 'equity',
         '00000000-0000-0000-0000-0000000000e1', '00000000-0000-0000-0000-0000000000e1', 0, 100, 2, 10,
-        false, false, 5, (SELECT id FROM users));
+        false, false, false, 5, (SELECT id FROM users));
 INSERT INTO rating_pools (id, name, variant, letterdist_id, layout_id, anchor_player_config_id)
 SELECT '00000000-0000-0000-0000-0000000000a1', 'check-pool', 'classic',
        (SELECT id FROM input_data WHERE role = 'letterdist'), (SELECT id FROM input_data WHERE role = 'layout'),

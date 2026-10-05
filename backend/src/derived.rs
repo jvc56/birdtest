@@ -1,14 +1,16 @@
-//! Wordmaps and rack info tables: what a job needs, and the reference copies
-//! the server builds so a worker's can be checked.
+//! Wordmaps, rack info tables and word info tables: what a job needs, and the
+//! reference copies the server builds so a worker's can be checked.
 //!
-//! See README.md's "MAGPIE on the server". A worker derives both files
-//! locally from data the job pins, because a wordmap is 179 MB and a rack
-//! info table 1.9 GB and neither can be shipped. Nothing checked them: a rack info table was refused
-//! outright, and a wordmap was covered only by a sidecar naming the `.kwg` it
-//! was built from -- which says a file was built from the right things and
-//! still trusts the builder. A CSW24 wordmap built in December 2025 and one
-//! built nine months later differ in 72,852,152 bytes with the same inputs and
-//! the same format version, so trusting the builder is exactly the gap.
+//! See README.md's "MAGPIE on the server". A worker derives all three files
+//! locally from data the job pins, because a wordmap is 179 MB, a rack info
+//! table 1.9 GB and a word info table 122 MB (each for CSW24), and none of them
+//! can be shipped. Nothing checked them: a rack info table was refused
+//! outright, a word info table was switched off, and a wordmap was covered
+//! only by a sidecar naming the `.kwg` it was built from -- which says a file
+//! was built from the right things and still trusts the builder. A CSW24
+//! wordmap built in December 2025 and one built nine months later differ in
+//! 72,852,152 bytes with the same inputs and the same format version, so
+//! trusting the builder is exactly the gap.
 //!
 //! So the server builds its own copy with a pinned MAGPIE, keeps the hash,
 //! throws the file away, and sends the hash with the claim. The worker builds
@@ -60,12 +62,12 @@ const MAX_ATTEMPTS: i32 = 3;
 /// A derived file some job's tasks will load.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DerivedNeed {
-    /// `wmp` or `rit`.
+    /// `wmp`, `rit` or `wit`.
     pub role: String,
     /// The name the worker loads it under.
     pub name: String,
     pub kwg_id: Uuid,
-    /// `None` for a wordmap.
+    /// `None` for a wordmap and a word info table.
     pub klv_id: Option<Uuid>,
     pub letterdist_id: Uuid,
 }
@@ -103,14 +105,17 @@ const NEEDS_CTE: &str = "WITH players AS (
          SELECT player_config_id FROM job_opening_rack_config WHERE job_id = $1
      ),
      wants AS (
-         SELECT pc.kwg_id, pc.klv_id, pc.use_wordmap, pc.use_rit
+         SELECT pc.kwg_id, pc.klv_id, pc.use_wordmap, pc.use_rit, pc.use_wit
          FROM player_configs pc JOIN players p ON p.id = pc.id
          UNION ALL
-         -- Leave generation has one bot and no player_configs row, and never
-         -- a rack info table: every generation plays with a different KLV,
-         -- which is exactly what a table would cache.
-         SELECT c.kwg_id, NULL::uuid, c.use_wordmap, false
-         FROM job_leave_config c WHERE c.job_id = $1
+         -- A leave job's player, never with a rack info table: every
+         -- generation plays with a different KLV, which is exactly what a
+         -- table would cache. Job creation refuses a player asking for one;
+         -- this says so again rather than trusting it. A word info table is
+         -- the lexicon's, which no generation changes, so it may have one.
+         SELECT pc.kwg_id, NULL::uuid, pc.use_wordmap, false, pc.use_wit
+         FROM job_leave_config c JOIN player_configs pc ON pc.id = c.player_config_id
+         WHERE c.job_id = $1
      ),
      needs AS (
          -- A rack info table is built from the wordmap for its lexicon, so a
@@ -125,6 +130,11 @@ const NEEDS_CTE: &str = "WITH players AS (
          JOIN input_data kwg ON kwg.id = w.kwg_id
          JOIN input_data klv ON klv.id = w.klv_id
          WHERE w.use_rit
+         UNION
+         -- A word info table is built from the .kwg alone: no wordmap.
+         SELECT 'wit', kwg.name, w.kwg_id, NULL::uuid
+         FROM wants w JOIN input_data kwg ON kwg.id = w.kwg_id
+         WHERE w.use_wit
      )";
 
 /// Every derived file the job's tasks will load, deduplicated.
@@ -272,7 +282,7 @@ pub async fn status_for_job(
          FROM needs n
          LEFT JOIN derived_data d
            ON d.role = n.role AND d.name = n.name
-          AND d.builder = CASE n.role WHEN 'wmp' THEN $2 ELSE $3 END
+          AND d.builder = CASE n.role WHEN 'wmp' THEN $2 WHEN 'rit' THEN $3 WHEN 'wit' THEN $5 END
           AND d.kwg_id = n.kwg_id
           AND d.klv_id IS NOT DISTINCT FROM n.klv_id
           AND d.letterdist_id = $4
@@ -282,6 +292,7 @@ pub async fn status_for_job(
     .bind(builders.wmp())
     .bind(builders.rit())
     .bind(letterdist_id)
+    .bind(builders.wit())
     .fetch_all(&mut *conn)
     .await?;
 
@@ -345,7 +356,7 @@ pub async fn files_for_job(
          JOIN jobs j ON j.id = $1
          LEFT JOIN derived_data d
            ON d.role = n.role AND d.name = n.name
-          AND d.builder = CASE n.role WHEN 'wmp' THEN $2 ELSE $3 END
+          AND d.builder = CASE n.role WHEN 'wmp' THEN $2 WHEN 'rit' THEN $3 WHEN 'wit' THEN $4 END
           AND d.kwg_id = n.kwg_id
           AND d.klv_id IS NOT DISTINCT FROM n.klv_id
           AND d.letterdist_id = j.letterdist_id
@@ -354,6 +365,7 @@ pub async fn files_for_job(
     .bind(job_id)
     .bind(builders.wmp())
     .bind(builders.rit())
+    .bind(builders.wit())
     .fetch_all(&mut *conn)
     .await?)
 }
@@ -500,7 +512,7 @@ async fn take_next(pool: &PgPool, builders: &Builders) -> AppResult<Option<Lease
          WHERE ((state = 'pending' AND (leased_until IS NULL OR leased_until < now()))
                 OR (state = 'building' AND leased_until < now()))
            AND attempts < $1
-           AND builder = CASE role WHEN 'wmp' THEN $2 WHEN 'rit' THEN $3 END
+           AND builder = CASE role WHEN 'wmp' THEN $2 WHEN 'rit' THEN $3 WHEN 'wit' THEN $4 END
          ORDER BY requested_at
          FOR UPDATE SKIP LOCKED
          LIMIT 1",
@@ -508,6 +520,7 @@ async fn take_next(pool: &PgPool, builders: &Builders) -> AppResult<Option<Lease
     .bind(MAX_ATTEMPTS)
     .bind(builders.wmp())
     .bind(builders.rit())
+    .bind(builders.wit())
     .fetch_optional(&mut *tx)
     .await?;
     let Some(row) = row else {
@@ -518,10 +531,11 @@ async fn take_next(pool: &PgPool, builders: &Builders) -> AppResult<Option<Lease
         let waiting: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM derived_data
              WHERE state = 'pending'
-               AND builder <> CASE role WHEN 'wmp' THEN $1 WHEN 'rit' THEN $2 END",
+               AND builder <> CASE role WHEN 'wmp' THEN $1 WHEN 'rit' THEN $2 WHEN 'wit' THEN $3 END",
         )
         .bind(builders.wmp())
         .bind(builders.rit())
+        .bind(builders.wit())
         .fetch_one(pool)
         .await?;
         if waiting > 0 {
@@ -529,6 +543,7 @@ async fn take_next(pool: &PgPool, builders: &Builders) -> AppResult<Option<Lease
                 waiting,
                 wmp = %builders.wmp(),
                 rit = %builders.rit(),
+                wit = %builders.wit(),
                 "derived files are queued for a builder this MAGPIE does not have"
             );
         }
@@ -765,12 +780,21 @@ async fn build(
     scratch.write("lexica", &lexicon, ".kwg", &kwg).await?;
     scratch.write("letterdistributions", &letterdist, ".csv", &ld).await?;
 
-    // A rack info table is built from a wordmap, so both roles build one. It
-    // is thrown away with the directory either way.
-    magpie.convert(&scratch, "dawg2wordmap", &lexicon, &letterdist).await?;
+    // A rack info table is built from a wordmap, so both of those roles build
+    // one. It is thrown away with the directory either way.
+    if lease.role == "wmp" || lease.role == "rit" {
+        magpie.convert(&scratch, "dawg2wordmap", &lexicon, &letterdist).await?;
+    }
 
     let built = match lease.role.as_str() {
         "wmp" => scratch.lexicon_path(&lexicon, ".wmp"),
+        // From the .kwg alone, named for the lexicon as MAGPIE's load finds
+        // it. `kwg2wit` rather than `kwg2witifneeded`, as the worker runs it:
+        // the scratch directory is empty, so the two would write the same.
+        "wit" => {
+            magpie.convert(&scratch, "kwg2wit", &lexicon, &letterdist).await?;
+            scratch.lexicon_path(&lexicon, ".wit")
+        }
         "rit" => {
             let klv_id = lease.klv_id.ok_or_else(|| {
                 AppError::internal("a rack info table row has no leaves to build from")

@@ -483,13 +483,12 @@ pub async fn reclaim_expired_for(
          UPDATE tasks t
          SET active_claim_count = GREATEST(t.active_claim_count - counts.n, 0),
              state = CASE
-                 WHEN t.accepted_count >= j.redundancy THEN 'completed'::task_state
-                 WHEN t.accepted_count + GREATEST(t.active_claim_count - counts.n, 0) >= j.redundancy
-                     THEN 'claimed'::task_state
+                 WHEN t.accepted_count > 0 THEN 'completed'::task_state
+                 WHEN GREATEST(t.active_claim_count - counts.n, 0) > 0 THEN 'claimed'::task_state
                  ELSE 'available'::task_state
              END
-         FROM counts, jobs j
-         WHERE t.id = counts.task_id AND j.id = t.job_id",
+         FROM counts
+         WHERE t.id = counts.task_id",
     )
     .bind(job_ids)
     .bind(timeout_secs)
@@ -1211,15 +1210,12 @@ async fn issue_claim(
     .await?;
 
     sqlx::query(
+        // A task has one slot: once claimed it is offered to nobody else
+        // until the claim ends.
         "UPDATE tasks t
          SET active_claim_count = t.active_claim_count + 1,
-             state = CASE
-                 WHEN t.accepted_count + t.active_claim_count + 1 >= j.redundancy
-                     THEN 'claimed'::task_state
-                 ELSE 'available'::task_state
-             END
-         FROM jobs j
-         WHERE t.id = $1 AND j.id = t.job_id",
+             state = 'claimed'::task_state
+         WHERE t.id = $1",
     )
     .bind(task_id)
     .execute(&mut **tx)
@@ -1321,7 +1317,7 @@ const STALE: &str = "COALESCE(last_claimed_at, activated_at)
 /// Release a claim that ended in something other than a submission.
 ///
 /// Decline and expiry are the same operation -- mark the claim terminal, drop
-/// the job's live claim count, recompute the task against `redundancy` -- and
+/// the job's live claim count, recompute the task's state -- and
 /// writing it twice is how the counter drifts. (Expiry does write it twice:
 /// `reclaim_expired_for` releases many claims in one statement with the same
 /// formula. Keep the two in step.) A drifting counter makes the
@@ -1352,13 +1348,12 @@ pub async fn release_claim(
         "UPDATE tasks t
          SET active_claim_count = GREATEST(t.active_claim_count - 1, 0),
              state = CASE
-                 WHEN t.accepted_count >= j.redundancy THEN 'completed'::task_state
-                 WHEN t.accepted_count + GREATEST(t.active_claim_count - 1, 0) >= j.redundancy
-                     THEN 'claimed'::task_state
+                 WHEN t.accepted_count > 0 THEN 'completed'::task_state
+                 WHEN GREATEST(t.active_claim_count - 1, 0) > 0 THEN 'claimed'::task_state
                  ELSE 'available'::task_state
              END
-         FROM jobs j, task_claims c
-         WHERE c.id = $1 AND t.id = c.task_id AND j.id = t.job_id",
+         FROM task_claims c
+         WHERE c.id = $1 AND t.id = c.task_id",
     )
     .bind(claim_id)
     .execute(&mut **tx)

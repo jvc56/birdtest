@@ -24,7 +24,7 @@ const STALE: &str = include_str!("../src/jobs/testdata/fake_worker_stale.json");
 async fn a_stale_mode_submission_is_not_accepted_and_changes_nothing() {
     let db = TestDb::new().await;
     // Ten games a batch: the size the fixture's result reports.
-    let job = db.games_job(1, 10).await;
+    let job = db.games_job(10).await;
     let app = birdtest::app(db.state().await);
 
     let (status, assignment) =

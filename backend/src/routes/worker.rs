@@ -412,8 +412,8 @@ async fn decline_task(
     // `task_failed` is a worker that ran the task and could not produce a
     // result the server accepted. Declining hands the slot straight back, where
     // stopping the heartbeat alone held it for the whole heartbeat timeout.
-    // `derived_mismatch` is a worker that built the wordmap or rack info table
-    // this job pins and got different bytes. Distinct from `missing_data`,
+    // `derived_mismatch` is a worker that built the wordmap, rack info table or
+    // word info table this job pins and got different bytes. Distinct from `missing_data`,
     // which is a file the contributor was supposed to have downloaded: nothing
     // the contributor can do fixes this one, and the two hashes it carries are
     // the evidence that the fleet's builders disagree -- which is exactly what
@@ -642,6 +642,13 @@ struct ResultAck {
     accepted: bool,
 }
 
+/// A completed claim `c`'s compute, as its contributor is credited with it:
+/// the whole milliseconds it was held, claim to submission. One expression for
+/// the submission that adds it and the purge that gives it back, so the two
+/// agree to the millisecond.
+pub(crate) const CLAIM_COMPUTE_MS: &str =
+    "GREATEST((EXTRACT(EPOCH FROM c.completed_at - c.claimed_at) * 1000)::bigint, 0)";
+
 async fn submit_result(
     State(state): State<AppState>,
     RegisteredWorker(identity): RegisteredWorker,
@@ -741,108 +748,93 @@ async fn submit_result(
     let task_id: Uuid = claim.get("task_id");
     let job_id: Uuid = claim.get("job_id");
 
-    // Submissions for the same task serialize here, on the task row, before
-    // anything is stored. Redundant claims of one task hold different claim
-    // rows, so the lock above does not order them, and what a submission
-    // stores depends on what the task's earlier submissions stored: only the
-    // first accepted result adds to the job's running progress totals
-    // (`registry::store_result`). Without this, two submissions arriving
-    // together each saw only their own uncommitted rows and both counted. The
-    // task row is locked by the update below anyway; taking it first keeps the
-    // order every path uses -- claim, then task, then job.
-    //
-    // The lock is also what makes `accepted_count` trustworthy here: every
-    // accepted result increments it in the transaction that stores the result,
-    // and that transaction holds this lock, so a zero read under it means no
-    // result for the task has been accepted before this one. That is what
-    // "first accepted result" means everywhere it is used, and reading it is
-    // one row where counting the stored results was up to 10,000 of them for
-    // an opening-rack batch.
-    let prior_accepted: i32 =
-        sqlx::query_scalar("SELECT accepted_count FROM tasks WHERE id = $1 FOR UPDATE")
-            .bind(task_id)
-            .fetch_one(&mut *tx)
-            .await?;
+    // The task row is locked by the update below anyway; taking it before
+    // anything is stored keeps the order every path uses -- claim, then task,
+    // then job. A task has one slot, and its claim is locked above, so no
+    // other submission for it can be in flight.
+    sqlx::query("SELECT 1 FROM tasks WHERE id = $1 FOR UPDATE")
+        .bind(task_id)
+        .execute(&mut *tx)
+        .await?;
 
     if job_id != job.id {
         return Err(AppError::internal("a claim's task changed job"));
     }
 
-    let progress = crate::jobs::registry::store_result(
+    let (progress, units) = crate::jobs::registry::store_result(
         &mut tx,
         &template,
         task_id,
         claim_id,
-        prior_accepted == 0,
         decoded,
     )
     .await?;
 
-    sqlx::query(
-        "UPDATE task_claims SET state = 'completed', completed_at = now() WHERE id = $1",
-    )
+    // The claim keeps what it did, which is what a purge gives back to its
+    // contributor (`Contributions` in routes/admin.rs), and says how long it
+    // was held: the compute its contributor is credited with. Whole
+    // milliseconds, and never negative (`now()` is this transaction's start,
+    // which follows the claim's).
+    let compute_ms: i64 = sqlx::query_scalar(&format!(
+        "UPDATE task_claims c
+         SET state = 'completed', completed_at = now(), games_played = $2, racks_analyzed = $3
+         WHERE c.id = $1
+         RETURNING {CLAIM_COMPUTE_MS}"
+    ))
     .bind(claim_id)
-    .execute(&mut *tx)
+    .bind(i32::try_from(units.games).map_err(|_| AppError::internal("a claim's games overflow"))?)
+    .bind(i32::try_from(units.racks).map_err(|_| AppError::internal("a claim's racks overflow"))?)
+    .fetch_one(&mut *tx)
     .await?;
 
-    // `RETURNING` the new state is what tells the job's `tasks_completed`
-    // counter that a task has actually *reached* completed. A task makes that
-    // transition exactly once -- once `accepted_count` meets `redundancy` the
-    // task stops being dispatched, and a claim that lapsed before then is
-    // abandoned, so its late submission is refused above -- which is what makes
-    // counting on the transition safe rather than approximate.
+    // A task has one slot, so its one accepted result completes it.
+    // `RETURNING` whether this was that result is what tells the job's
+    // `tasks_completed` counter that a task has actually *reached* completed.
+    // A task makes that transition exactly once -- a completed task is not
+    // dispatched again, and a claim that lapsed before it was submitted is
+    // abandoned, so its late submission is refused above -- which is what
+    // makes counting on the transition safe rather than approximate.
     let task_completed = sqlx::query_scalar::<_, bool>(
         "UPDATE tasks t
          SET accepted_count = t.accepted_count + 1,
              active_claim_count = GREATEST(t.active_claim_count - 1, 0),
-             state = CASE
-                 WHEN t.accepted_count + 1 >= j.redundancy THEN 'completed'::task_state
-                 WHEN t.accepted_count + 1 + GREATEST(t.active_claim_count - 1, 0) >= j.redundancy
-                     THEN 'claimed'::task_state
-                 ELSE 'available'::task_state
-             END,
-             completed_at = CASE
-                 WHEN t.accepted_count + 1 >= j.redundancy THEN now()
-                 ELSE t.completed_at
-             END
-         FROM jobs j
-         WHERE t.id = $1 AND j.id = t.job_id
-         RETURNING t.state = 'completed'",
+             state = 'completed'::task_state,
+             completed_at = COALESCE(t.completed_at, now())
+         WHERE t.id = $1
+         RETURNING t.accepted_count = 1",
     )
     .bind(task_id)
     .fetch_one(&mut *tx)
     .await?;
 
-    // The contributor's own running total, which is what the leaderboards read
-    // instead of counting this identity's claims. One statement, on the row the
-    // identity already owns. Deliberately not rolled back by account deletion:
-    // the account is anonymized in place and keeps its claims, so no donated
-    // compute is lost. `purge_job` and `delete_job` *do* decrement it, because
-    // unlike the counters on `jobs` this one spans every job the identity ever
-    // worked on.
-    match (identity.user_id(), identity.anon_uuid()) {
-        (Some(user_id), _) => {
-            sqlx::query(
-                "UPDATE users SET tasks_completed = tasks_completed + 1,
-                                  last_completed_at = now()
-                 WHERE id = $1",
-            )
-            .bind(user_id)
-            .execute(&mut *tx)
-            .await?;
-        }
-        (None, Some(uuid)) => {
-            sqlx::query(
-                "UPDATE anonymous_workers SET tasks_completed = tasks_completed + 1,
-                                              last_completed_at = now()
-                 WHERE uuid = $1",
-            )
-            .bind(uuid)
-            .execute(&mut *tx)
-            .await?;
-        }
-        (None, None) => {}
-    }
+    // The contributor's own running totals, which are what the leaderboards
+    // read instead of summing this identity's claims: this claim, the time it
+    // was held, and the games and racks it played -- this claim's own, not the
+    // task's first result's (`units`, not `progress`). One statement, on the
+    // row the identity already owns. Deliberately not rolled back by account
+    // deletion: the account is anonymized in place and keeps its claims, so no
+    // donated compute is lost. `purge_job` and `delete_job` *do* decrement
+    // them, because unlike the counters on `jobs` these span every job the
+    // identity ever worked on.
+    let (table, key, id) = match (identity.user_id(), identity.anon_uuid()) {
+        (Some(user_id), _) => ("users", "id", user_id),
+        (None, Some(uuid)) => ("anonymous_workers", "uuid", uuid),
+        (None, None) => return Err(AppError::internal("a submission with no identity")),
+    };
+    sqlx::query(&format!(
+        "UPDATE {table} SET tasks_completed = tasks_completed + 1,
+                            compute_ms = compute_ms + $2,
+                            games_played = games_played + $3,
+                            racks_analyzed = racks_analyzed + $4,
+                            last_completed_at = now()
+         WHERE {key} = $1"
+    ))
+    .bind(id)
+    .bind(compute_ms)
+    .bind(units.games)
+    .bind(units.racks)
+    .execute(&mut *tx)
+    .await?;
 
     // The job's running progress totals, in one statement and last: it takes
     // the job's row lock, which every claim for the job also takes (last, in
@@ -850,20 +842,18 @@ async fn submit_result(
     // They were two separate updates, the first made while storing the result
     // -- a claim for the job then waited on this whole transaction.
     //
-    // `last_completed_at` rides along, at most once a minute when nothing else
-    // changes: a statement whose WHERE matches nothing takes no row lock, so
-    // submissions that change no counter -- the extra copies a redundancy
-    // above 1 asks for -- do not all queue on the job's row for it. (At
-    // redundancy 1, leave generation's included, every submission completes a
-    // task and takes the lock regardless.)
+    // `last_completed_at` rides along. Every accepted submission completes its
+    // task, so every one takes the lock regardless.
     {
         sqlx::query(
             "UPDATE jobs SET games_completed = games_completed + $2,
                              racks_analyzed = racks_analyzed + $3,
                              tasks_completed = tasks_completed + $4,
+                             racks_settled = racks_settled + $5,
+                             racks_without_consensus = racks_without_consensus + $6,
                              last_completed_at = now()
              WHERE id = $1
-               AND ($2 <> 0 OR $3 <> 0 OR $4 <> 0
+               AND ($2 <> 0 OR $3 <> 0 OR $4 <> 0 OR $5 <> 0 OR $6 <> 0
                     OR last_completed_at IS NULL
                     OR last_completed_at < now() - interval '1 minute')",
         )
@@ -871,6 +861,8 @@ async fn submit_result(
         .bind(progress.games_completed)
         .bind(progress.racks_analyzed)
         .bind(i64::from(task_completed))
+        .bind(progress.racks_settled)
+        .bind(progress.racks_without_consensus)
         .execute(&mut *tx)
         .await?;
     }
@@ -910,7 +902,7 @@ async fn submit_result(
 /// Everything that has to happen after a result lands, split by whether the
 /// submitting worker has to wait for it.
 ///
-/// **Inline:** the finish conditions. SPRT gates whether the job keeps
+/// **Inline:** the finish conditions. The match test gates whether the job keeps
 /// dispatching, so it is evaluated on every submission and the aggregates it
 /// needs are read once, here.
 ///
@@ -939,8 +931,8 @@ async fn after_submission(state: &AppState, job: &Job, purges_before: u64) -> Ap
     } else {
         None
     };
-    if let Some(decided) = finished {
-        complete_finished(state, job, decided, purges_before).await?;
+    if let Some(finish) = finished {
+        complete_finished(state, job, finish, purges_before).await?;
     }
 
     // Checked here so a job nobody is watching costs nothing at all; the
@@ -957,7 +949,7 @@ async fn after_submission(state: &AppState, job: &Job, purges_before: u64) -> Ap
 async fn complete_finished(
     state: &AppState,
     job: &Job,
-    decided: Option<(crate::stats::sprt::SprtResult, u64)>,
+    finish: crate::jobs::Finish,
     purges_before: u64,
 ) -> AppResult<bool> {
     let job_id = job.id;
@@ -968,7 +960,7 @@ async fn complete_finished(
             || state.dispatch_holds.claims_held(job_id)
     };
     let completed =
-        crate::jobs::complete_unless_purged(&state.pool, job_id, job.claims_issued, decided, purged_since)
+        crate::jobs::complete_unless_purged(&state.pool, job_id, job.claims_issued, finish, purged_since)
             .await?;
     if completed {
         tracing::info!(job_id = %job_id, "job auto-completed");
@@ -1010,7 +1002,7 @@ pub(crate) async fn finish_idle_job(state: &AppState, job_id: Uuid) -> AppResult
         return Ok(false);
     }
     match finish_condition_met(state, &job).await? {
-        Some(decided) => complete_finished(state, &job, decided, purges_before).await,
+        Some(finish) => complete_finished(state, &job, finish, purges_before).await,
         None => Ok(false),
     }
 }
@@ -1101,8 +1093,8 @@ const MIN_STATS_PUSH_INTERVAL: std::time::Duration = std::time::Duration::from_s
 /// Whether this submission is the one that evaluates the job's finish
 /// conditions.
 ///
-/// Every `SPRT_CHECK_EVERY`th, which bounds how much work a job can do past its
-/// stopping point at `SPRT_CHECK_EVERY - 1` tasks — see the constant for why
+/// Every `TEST_CHECK_EVERY`th, which bounds how much work a job can do past its
+/// stopping point at `TEST_CHECK_EVERY - 1` tasks — see the constant for why
 /// the first several of those cost nothing.
 ///
 /// **Plus, unconditionally, when this job has nothing left in flight.** The
@@ -1128,40 +1120,49 @@ async fn should_check_finish(state: &AppState, job_id: Uuid) -> AppResult<bool> 
     .await?)
 }
 
-/// Either finish condition: SPRT significance (only after `min_units`) or the
-/// hard cap for game jobs; an exhausted and fully completed rack space for
-/// opening racks.
+/// Whether the job is done: for a games or pairs job with a match test, its
+/// decision (only after `min_units`) or the hard cap; for one without, its
+/// target of `max_units` played; for opening racks, an exhausted and fully
+/// completed rack space.
 ///
-/// `None` while the job goes on. `Some` when it is done, carrying for a games
-/// job the verdict that finished it and the units it had, which the completion
-/// stores: later results move the live LLR, but not what was decided.
-async fn finish_condition_met(
-    state: &AppState,
-    job: &Job,
-) -> AppResult<Option<Option<(crate::stats::sprt::SprtResult, u64)>>> {
+/// `None` while the job goes on. `Some` when it is done, saying what on --
+/// for a job with a test the verdict and the units it had, which the
+/// completion stores: later results move the live interval, but not what was
+/// decided.
+async fn finish_condition_met(state: &AppState, job: &Job) -> AppResult<Option<crate::jobs::Finish>> {
+    use crate::jobs::Finish;
     Ok(match job.job_type {
-        JobType::Games | JobType::GamePairs => jobstats::game_stats(&state.pool, job)
-            .await?
-            .filter(|games| games.sprt.status.is_finished())
-            .map(|games| Some((games.sprt, games.units_completed))),
+        JobType::Games | JobType::GamePairs => {
+            jobstats::game_stats(&state.pool, job).await?.and_then(|games| match games.test {
+                Some(test) => {
+                    test.status.is_finished().then_some(Finish::Test(test, games.units_completed))
+                }
+                // The same count the cap gates on for a job with a test, so a
+                // job stops at the same point with the test on or off.
+                None => (games.units_completed >= games.max_units as u64)
+                    .then_some(Finish::ReachedTarget),
+            })
+        }
         JobType::OpeningRack => {
             // Tasks are generated on demand, so "all tasks complete" is not
             // enough -- it is trivially true before anything is dispatched.
-            // The job is done once the rack space is exhausted as well.
+            // The job is done once every rack is settled: analysed, and, for a
+            // job seeking a consensus, agreed on or analysed its most times.
+            // A rack settles in the transaction that stores its analysis, so
+            // the running count is exact.
             sqlx::query_scalar::<_, bool>(
-                "SELECT COALESCE(MAX(t.seed) + c.racks_per_batch, 0) >= c.total_racks
-                        AND COUNT(t.id) > 0
-                        AND COUNT(t.id) FILTER (WHERE t.state <> 'completed') = 0
-                 FROM job_opening_rack_config c
-                 LEFT JOIN tasks t ON t.job_id = c.job_id
-                 WHERE c.job_id = $1
-                 GROUP BY c.racks_per_batch, c.total_racks",
+                "SELECT j.racks_settled >= c.total_racks
+                        AND EXISTS (SELECT 1 FROM tasks t WHERE t.job_id = j.id)
+                        AND NOT EXISTS (SELECT 1 FROM tasks t
+                                        WHERE t.job_id = j.id AND t.state <> 'completed')
+                 FROM jobs j JOIN job_opening_rack_config c ON c.job_id = j.id
+                 WHERE j.id = $1",
             )
             .bind(job.id)
             .fetch_optional(&state.pool)
             .await?
             .unwrap_or(false)
-            .then_some(None)
+            .then_some(Finish::RacksAnalysed)
         }
         // Leave generation completes in `run_transition` once the final
         // generation is aggregated.
@@ -1253,6 +1254,10 @@ mod contract_fixtures {
     const RESULT_GAMES: &str = include_str!("../../../contract-fixtures/result-games.json");
     const RESULT_GAME_PAIRS: &str =
         include_str!("../../../contract-fixtures/result-game-pairs.json");
+    // Written by hand in MAGPIE's key layout, which MAGPIE's own test checks
+    // its output against (see contract-fixtures/README.md).
+    const RESULT_GAMES_INFERENCE: &str =
+        include_str!("../../../contract-fixtures/result-games-inference.json");
     const RESULT_OPENING_RACK: &str =
         include_str!("../../../contract-fixtures/result-opening-rack.json");
     const RESULT_LEAVE_GENERATION: &str =
@@ -1448,6 +1453,24 @@ mod contract_fixtures {
         assert!(record.pentanomial.is_none());
         assert!(!record.positions.is_empty(), "result-games.json captured no positions");
         assert!(record.positions.iter().all(|p| p.position.is_some() && !p.moves.is_empty()));
+    }
+
+    /// C-3b: a games result from simming players that infer: a first-turn
+    /// position with no inference, and a later one with what was inferred of
+    /// the opponent's leave, kept with the position.
+    #[test]
+    fn the_inferring_games_result_is_accepted_and_keeps_its_inference() {
+        let (_, record) = submitted::<crate::jobs::game::GameHandler>(
+            RESULT_GAMES_INFERENCE,
+            "result-games-inference.json",
+        );
+        let first = record.positions.iter().find(|p| p.turn_number == Some(0)).unwrap();
+        assert!(first.inference.is_none(), "nothing to infer from on a game's first turn");
+        let later = record.positions.iter().find(|p| p.inference.is_some()).unwrap();
+        let inference = later.inference.as_ref().unwrap();
+        assert!(inference.num_leaves >= inference.leaves.len() as i64);
+        assert!(!inference.leaves.is_empty());
+        assert!(later.moves.iter().all(|m| m.win_percentage.is_some() && !m.plies.is_empty()));
     }
 
     /// C-4: a pairs result carries the pentanomial, and both of its

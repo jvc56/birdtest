@@ -70,6 +70,8 @@ export function createImportWatcher(hooks: ImportWatchHooks, intervalMs = 1000) 
           hooks.onState(read);
           if (read.state !== 'running') {
             clear();
+            // Only a staged import has anything left to do (confirm it);
+            // one with nothing new is shown, and forgotten like the rest.
             if (read.state !== 'staged') hooks.forget();
           }
         } catch (e) {

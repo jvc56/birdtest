@@ -201,9 +201,11 @@ const ROUTES: &[(&str, &str, Access, &str)] = &[
         Admin,
         r#"{"job_type":"opening_rack","variant":"classic","letterdist_id":"00000000-0000-4000-8000-000000000001","layout_id":"00000000-0000-4000-8000-000000000001","player_config_id":"00000000-0000-4000-8000-000000000001"}"#,
     ),
+    ("PUT", "/api/admin/jobs/allocations", Admin, r#"{"allocations":[{"job_id":"00000000-0000-4000-8000-000000000001","allocation":50}]}"#),
     ("POST", "/api/admin/jobs/:id/activate", Admin, r#"{"allocation":50}"#),
     ("POST", "/api/admin/jobs/:id/deactivate", Admin, ""),
     ("POST", "/api/admin/jobs/:id/complete", Admin, ""),
+    ("PATCH", "/api/admin/jobs/:id/consensus", Admin, r#"{"consensus_pct":80}"#),
     ("POST", "/api/admin/jobs/:id/purge", Admin, ""),
     ("DELETE", "/api/admin/jobs/:id", Admin, ""),
     ("DELETE", "/api/admin/users/:id", Admin, ""),
@@ -239,6 +241,8 @@ const ROUTES: &[(&str, &str, Access, &str)] = &[
         Admin,
         r#"{"name":"pool","variant":"classic","letterdist_id":"00000000-0000-4000-8000-000000000001","layout_id":"00000000-0000-4000-8000-000000000001","anchor_player_config_id":"00000000-0000-4000-8000-000000000001"}"#,
     ),
+    ("PATCH", "/api/admin/rating-pools/:id", Admin, r#"{"anchor_rating":1500}"#),
+    ("DELETE", "/api/admin/rating-pools/:id", Admin, ""),
     (
         "POST",
         "/api/admin/rating-pools/:id/members",
@@ -291,7 +295,9 @@ const ROUTES: &[(&str, &str, Access, &str)] = &[
     ("GET", "/api/rating-pools/:id", Public, ""),
     ("GET", "/api/rating-pools/:id/history", Public, ""),
     ("GET", "/api/jobs/:id/config", Public, ""),
+    ("GET", "/api/jobs/:id/board", Public, ""),
     ("GET", "/api/jobs/:id/positions", Session, ""),
+    ("GET", "/api/jobs/:id/positions/random", Session, ""),
     ("GET", "/api/player-configs", Public, ""),
     ("GET", "/api/player-configs/:id", Public, ""),
 ];
@@ -446,8 +452,8 @@ async fn every_cookie_backed_write_requires_the_csrf_pair() {
         }
         checked += 1;
     }
-    // 22 admin writes, 3 account writes, logout and sign-out-everywhere.
-    assert_eq!(checked, 27);
+    // 26 admin writes, 3 account writes, logout and sign-out-everywhere.
+    assert_eq!(checked, 31);
 
     // Nothing was done under any of them: the admin is still signed in, and
     // the audit log is empty.
@@ -469,7 +475,7 @@ async fn worker_writes_need_no_csrf_token_even_alongside_session_cookies() {
     let db = TestDb::new().await;
     let state = db.state().await;
     let app = birdtest::app(state.clone());
-    db.games_job(1, 2).await;
+    db.games_job(2).await;
     let user = db.user("contributor", false).await;
     let raw_key = birdtest::auth::api_key::generate_raw_key();
     sqlx::query("INSERT INTO api_keys (user_id, key_hash) VALUES ($1, $2)")

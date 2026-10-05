@@ -1,4 +1,4 @@
-use super::dispatch::JobTemplate;
+use super::dispatch::{JobKind, JobTemplate};
 use super::handler::*;
 use super::racks::{LetterDistribution, RackIndex};
 use super::JobData;
@@ -25,15 +25,15 @@ pub async fn insert_request(
     conn: &mut PgConnection,
     task_id: Uuid,
     req: &LeaveRequest,
+    player_config_id: Uuid,
 ) -> AppResult<()> {
     sqlx::query(
         "INSERT INTO leave_requests
-             (task_id, lexicon, variant, letter_distribution, board_layout, generation,
-              seed, forced_racks, num_games, previous_artifact_key, use_wordmap)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+             (task_id, variant, letter_distribution, board_layout, generation,
+              seed, forced_racks, num_games, previous_artifact_key, player_config_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
     )
     .bind(task_id)
-    .bind(&req.lexicon)
     .bind(&req.variant)
     .bind(&req.letter_distribution)
     .bind(&req.board_layout)
@@ -42,7 +42,7 @@ pub async fn insert_request(
     .bind(&req.forced_racks)
     .bind(req.num_games)
     .bind(&req.previous_artifact_key)
-    .bind(req.use_wordmap)
+    .bind(player_config_id)
     .execute(conn)
     .await?;
     Ok(())
@@ -58,11 +58,14 @@ impl JobHandler for LeaveGenHandler {
         template: &JobTemplate,
         task_id: Uuid,
     ) -> AppResult<Self::Request> {
+        let JobKind::LeaveGeneration { player, .. } = &template.kind else {
+            return Err(template.mismatch("leave_generation"));
+        };
         // The artifact's hash is read from the row that names it rather than
         // stored with the request: one source, whichever path sends the task.
         let row = sqlx::query(
-            "SELECT r.lexicon, r.variant, r.letter_distribution, r.board_layout, r.generation,
-                    r.seed, r.forced_racks, r.num_games, r.previous_artifact_key, r.use_wordmap,
+            "SELECT r.variant, r.letter_distribution, r.board_layout, r.generation,
+                    r.seed, r.forced_racks, r.num_games, r.previous_artifact_key,
                     COALESCE(a.served_sha256, a.sha256) AS previous_artifact_sha256
              FROM leave_requests r
              JOIN leave_generation_artifacts a ON a.artifact_key = r.previous_artifact_key
@@ -72,7 +75,7 @@ impl JobHandler for LeaveGenHandler {
         .fetch_one(&mut *conn)
         .await?;
         Ok(LeaveRequest {
-            lexicon: row.get("lexicon"),
+            lexicon: player.lexicon.clone(),
             variant: row.get("variant"),
             letter_distribution: row.get("letter_distribution"),
             board_layout: row.get("board_layout"),
@@ -82,8 +85,8 @@ impl JobHandler for LeaveGenHandler {
             num_games: row.get("num_games"),
             previous_artifact_key: row.get("previous_artifact_key"),
             previous_artifact_sha256: row.get("previous_artifact_sha256"),
-            use_wordmap: row.get("use_wordmap"),
             bingo_bonus: template.data.bingo_bonus,
+            player: player.clone(),
         })
     }
 
@@ -100,8 +103,7 @@ impl JobHandler for LeaveGenHandler {
     }
 
     /// Credits the claim and stages its occurrences for the generation's next
-    /// merge ([`stage_fold`]). Only the first accepted result for a task is
-    /// staged -- see [`credit_claim`] for the others.
+    /// merge ([`stage_fold`]).
     async fn insert_record(
         conn: &mut PgConnection,
         template: &JobTemplate,
@@ -143,17 +145,9 @@ pub fn spell_as_the_universe(rack: &mut String) {
 /// The longest a full rack's string can be: seven letters of up to four bytes.
 const MAX_RACK_BYTES: usize = 7 * 4;
 
-/// Records that a claim did a task's work, without adding its occurrences to
-/// the generation.
-///
-/// This is all a redundant result gets. With redundancy above 1 every claim of
-/// a task plays the same seed, so folding each of them in counted the same
-/// games `redundancy` times -- a generation reached its occurrence target on
-/// a fraction of the coverage it names, and closed early. Every other job
-/// type's aggregates already read one result per task, the first accepted
-/// (PLAN.md, "Redundant task execution"); this is the leave-generation half of
-/// that rule.
-pub async fn credit_claim(
+/// Records that a claim did a task's work: the racks its games drew, which
+/// its contributor is credited with.
+async fn credit_claim(
     conn: &mut PgConnection,
     task_id: Uuid,
     claim_id: Uuid,
@@ -547,8 +541,9 @@ async fn refresh_summary(conn: &mut PgConnection, job_id: Uuid, generation: i32)
              (job_id, generation, racks_total, racks_at_target, min_rack, min_rack_count, merged_at)
          SELECT $1, $2, totals.total, totals.at_target, lowest.rack, lowest.occurrence_count, now()
          FROM (SELECT COUNT(*)::bigint AS total,
-                      COUNT(*) FILTER (WHERE p.occurrence_count >= c.target_rack_count)::bigint
-                          AS at_target
+                      COUNT(*) FILTER (
+                          WHERE p.occurrence_count >= c.target_rack_counts[p.generation]
+                      )::bigint AS at_target
                FROM leave_rack_progress p
                JOIN job_leave_config c ON c.job_id = p.job_id
                WHERE p.job_id = $1 AND p.generation = $2) totals
@@ -725,8 +720,9 @@ pub async fn lock_claim_decisions(conn: &mut PgConnection, job_id: Uuid) -> AppR
 
 /// What the scheduler should do next for a leave-generation job.
 pub enum LeaveGenStep {
-    /// Dispatch this forced-rack partition.
-    Dispatch(LeaveRequest),
+    /// Dispatch this forced-rack partition. Boxed: the request carries its
+    /// player whole, and every other step is a generation number or nothing.
+    Dispatch(Box<LeaveRequest>),
     /// Every rack in this generation hit its target and no claim is in flight;
     /// the generation must be aggregated before any more work exists. Done
     /// outside the claim transaction because it uploads to S3.
@@ -801,7 +797,7 @@ pub async fn current_generation(
     .bind(job_id)
     .fetch_one(&mut *conn)
     .await?;
-    Ok((completed < config.generation_count as i64).then_some(completed as i32 + 1))
+    Ok((completed < i64::from(config.generation_count())).then_some(completed as i32 + 1))
 }
 
 /// A generation has "many" racks below target -- and is selected by sweep --
@@ -837,13 +833,13 @@ pub const SWEEP_WHILE_TASKS_REMAIN: i64 = 100;
 /// a lap in progress runs to its end, and the tail, once begun, runs to the
 /// generation's close.
 ///
-/// `lexicon` is the name of the row the job pins, from its template.
+/// `player` is the job's player, from its template.
 pub async fn next_step(
     conn: &mut PgConnection,
     job_id: Uuid,
     config: &LeaveConfig,
     job_data: &JobData,
-    lexicon: &str,
+    player: &PlayerSpec,
 ) -> AppResult<LeaveGenStep> {
     let Some(generation) = current_generation(&mut *conn, job_id, config).await? else {
         return Ok(LeaveGenStep::Finished);
@@ -889,8 +885,8 @@ pub async fn next_step(
         ))
     })?;
 
-    Ok(LeaveGenStep::Dispatch(LeaveRequest {
-        lexicon: lexicon.to_string(),
+    Ok(LeaveGenStep::Dispatch(Box::new(LeaveRequest {
+        lexicon: player.lexicon.clone(),
         variant: job_data.variant.clone(),
         letter_distribution: job_data.letterdist_name.clone(),
         board_layout: job_data.layout_name.clone(),
@@ -904,9 +900,9 @@ pub async fn next_step(
         previous_artifact_key,
         previous_artifact_sha256,
         num_games: config.num_iterations,
-        use_wordmap: config.use_wordmap,
         bingo_bonus: job_data.bingo_bonus,
-    }))
+        player: player.clone(),
+    })))
 }
 
 /// What a selection came back with: racks to force, or the reason there are
@@ -945,7 +941,7 @@ async fn any_rack_below_target(
     )
     .bind(job_id)
     .bind(generation)
-    .bind(config.target_rack_count as i64)
+    .bind(config.target_for(generation))
     .fetch_one(&mut *conn)
     .await?)
 }
@@ -1063,7 +1059,7 @@ async fn racks_after(
     .bind(job_id)
     .bind(generation)
     .bind(after)
-    .bind(config.target_rack_count as i64)
+    .bind(config.target_for(generation))
     .bind(config.racks_per_task as i64 + 1)
     .fetch_all(&mut *conn)
     .await?;
@@ -1263,7 +1259,7 @@ async fn furthest_below_target(
     )
     .bind(job_id)
     .bind(generation)
-    .bind(config.target_rack_count as i64)
+    .bind(config.target_for(generation))
     .bind(config.racks_per_task as i64)
     .fetch_all(&mut *conn)
     .await?;
@@ -1540,7 +1536,7 @@ pub async fn close_generation(
     // who deactivated the job during its last transition decided something,
     // and it stands. Reactivated, its first claim finds the last generation
     // closed and completes it then.
-    if generation >= config.generation_count {
+    if generation >= config.generation_count() {
         let completed = sqlx::query("UPDATE jobs SET status = 'completed' WHERE id = $1 AND status = 'active'")
             .bind(job_id)
             .execute(&mut *tx)
@@ -1564,16 +1560,6 @@ pub async fn close_generation(
     // and the copy stood or fell together. Seeded at the other end it happens
     // while workers are busy, and a failure costs a retry of the seeding alone.
     Ok(())
-}
-
-/// The lexicon name a leave job's bot plays with, from the row it pins.
-pub async fn lexicon_name(conn: &mut PgConnection, kwg_id: Uuid) -> AppResult<String> {
-    Ok(
-        sqlx::query_scalar::<_, String>("SELECT name FROM input_data WHERE id = $1")
-            .bind(kwg_id)
-            .fetch_one(conn)
-            .await?,
-    )
 }
 
 /// The zeroed KLV generation 1 plays with, stored as generation 0's artifact.

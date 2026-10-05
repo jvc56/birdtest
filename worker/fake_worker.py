@@ -4,7 +4,7 @@
 **Test tooling only.** The one production client is MAGPIE itself (`magpie
 contribute`). This script submits *invented* results, and the server cannot
 tell them from real ones: pointed at a production server, every result it
-submits is recorded as a genuine contribution, feeds SPRT verdicts and rating
+submits is recorded as a genuine contribution, feeds match-test verdicts and rating
 fits, and has to be found and deleted by hand. Never run it against anything
 but a disposable test stack.
 
@@ -12,9 +12,9 @@ It exists so server-side behaviour can be tested at speed and on purpose.
 Real games take real time and produce results nobody chose; almost every
 interesting server property is about something else:
 
-  * scheduling — deficit-based allocation, redundancy
+  * scheduling — deficit-based allocation
   * the claim lifecycle — heartbeat timeouts, stale tokens, reclamation
-  * SPRT and ratings — which need a *chosen* win rate to reach a known verdict
+  * match tests and ratings — which need a *chosen* win rate to reach a known verdict
   * submission validation and the plausibility checks — which need a client
     that misbehaves deliberately
 
@@ -83,7 +83,7 @@ def _aggregate(rng: random.Random, games: int, p1_win_probability: float) -> dic
     """One synthetic `autoplay` summary — the shape MAGPIE actually reports.
 
     Draws each game's outcome so the counts have realistic sampling noise
-    rather than being the exact expectation, which is what makes SPRT runs
+    rather than being the exact expectation, which is what makes match-test runs
     interesting.
     """
     wins = losses = ties = 0
@@ -105,56 +105,326 @@ def _aggregate(rng: random.Random, games: int, p1_win_probability: float) -> dic
     }
 
 
+# The letter distributions a synthetic game knows, by the name a task request
+# gives (`letter_distribution`): each letter, its count and its score, in the
+# file's order, which is MAGPIE's machine-letter order. The blank is `?`. A
+# name not listed plays with English; the fixture's is the e2e suite's own
+# (fixtures/versions/*/letterdistributions/english_fixture.csv), so its boards
+# show only letters that job can score.
+DISTRIBUTIONS = {
+    "english": [
+        ("?", 2, 0), ("A", 9, 1), ("B", 2, 3), ("C", 2, 3), ("D", 4, 2), ("E", 12, 1),
+        ("F", 2, 4), ("G", 3, 2), ("H", 2, 4), ("I", 9, 1), ("J", 1, 8), ("K", 1, 5),
+        ("L", 4, 1), ("M", 2, 3), ("N", 6, 1), ("O", 8, 1), ("P", 2, 3), ("Q", 1, 10),
+        ("R", 6, 1), ("S", 4, 1), ("T", 6, 1), ("U", 4, 1), ("V", 2, 4), ("W", 2, 4),
+        ("X", 1, 8), ("Y", 2, 4), ("Z", 1, 10),
+    ],
+    "english_fixture": [
+        ("?", 1, 0), ("A", 3, 1), ("B", 2, 3), ("C", 2, 3), ("D", 2, 2), ("E", 3, 1),
+    ],
+}
+BOARD_DIM = 15
+RACK_SIZE = 7
+
+
+class _SyntheticGame:
+    """A game played by placing random tiles, not words, on a 15x15 board.
+
+    Nothing about it is Scrabble but its bookkeeping, which is what a captured
+    position has to get right for the site to draw it: tiles are dealt from a
+    bag and drawn back to seven, a play is a straight line through a tile
+    already down (the first covers the centre), a blank is played as a lower
+    case letter, the scores add up, and each position is written exactly as
+    MAGPIE writes one -- the board as CGP, the racks in machine-letter order
+    with blanks last, a play as `8G HUH` or `E9 (E)RUVIM`.
+    """
+
+    def __init__(self, rng: random.Random, distribution: str, first_seat: int):
+        self.rng = rng
+        rows = DISTRIBUTIONS.get(distribution, DISTRIBUTIONS["english"])
+        self.order = {letter: i for i, (letter, _, _) in enumerate(rows)}
+        self.scores = {letter: score for letter, _, score in rows}
+        self.letters = [letter for letter, _, _ in rows if letter != "?"]
+        # A small distribution is repeated to about a full bag, so a game
+        # still runs its twenty-odd turns.
+        bag = [letter for letter, count, _ in rows for _ in range(count)]
+        self.bag = bag * max(1, -(-100 // len(bag)))
+        rng.shuffle(self.bag)
+        self.board: List[List[Optional[str]]] = [[None] * BOARD_DIM for _ in range(BOARD_DIM)]
+        self.racks: List[List[str]] = [[], []]
+        for seat in (0, 1):
+            self._draw(seat)
+        self.game_scores = [0, 0]
+        self.zeros = 0
+        self.on_turn = first_seat
+
+    def _draw(self, seat: int) -> None:
+        while len(self.racks[seat]) < RACK_SIZE and self.bag:
+            self.racks[seat].append(self.bag.pop())
+
+    def rack_string(self, seat: int) -> str:
+        return "".join(sorted(self.racks[seat], key=lambda l: (l == "?", self.order[l])))
+
+    def cgp(self) -> str:
+        rows = []
+        for row in self.board:
+            text, empty = "", 0
+            for square in row:
+                if square is None:
+                    empty += 1
+                    continue
+                if empty:
+                    text += str(empty)
+                    empty = 0
+                text += square
+            rows.append(text + (str(empty) if empty else ""))
+        return (f"{'/'.join(rows)} {self.rack_string(0)}/{self.rack_string(1)} "
+                f"{self.game_scores[0]}/{self.game_scores[1]} {self.zeros}")
+
+    def over(self) -> bool:
+        return self.zeros >= 6 or (not self.bag and not all(self.racks))
+
+    def _placement(self, rack: List[str]) -> Optional[dict]:
+        """One random play from `rack`, or None if this draw found no room."""
+        rng = self.rng
+        vertical = rng.random() < 0.5
+        # Mostly a few tiles, as real plays are, and now and then the rack.
+        count = len(rack) if rng.random() < 0.05 else min(len(rack), rng.choice((1, 2, 2, 3, 3, 3, 4, 4, 5)))
+        down = [(r, c) for r in range(BOARD_DIM) for c in range(BOARD_DIM) if self.board[r][c]]
+        if down:
+            row, col = rng.choice(down)
+            back = rng.randint(0, count)
+        else:
+            # The opening play covers the centre square.
+            row = col = BOARD_DIM // 2
+            count = max(count, 2)
+            back = rng.randint(0, count - 1)
+        dr, dc = (1, 0) if vertical else (0, 1)
+        row, col = row - dr * back, col - dc * back
+        if not (0 <= row < BOARD_DIM and 0 <= col < BOARD_DIM):
+            return None
+        before = (row - dr, col - dc)
+        if 0 <= before[0] < BOARD_DIM and 0 <= before[1] < BOARD_DIM and self.board[before[0]][before[1]]:
+            return None
+        tiles = rng.sample(rack, count)
+        squares = []  # (row, col, letter, placed)
+        r, c = row, col
+        while tiles or (0 <= r < BOARD_DIM and 0 <= c < BOARD_DIM and self.board[r][c]):
+            if not (0 <= r < BOARD_DIM and 0 <= c < BOARD_DIM):
+                return None
+            if self.board[r][c]:
+                squares.append((r, c, self.board[r][c], False))
+            else:
+                # Nothing alongside a new tile, so the board reads as a
+                # crossword rather than a heap.
+                for nr, nc in ((r + dc, c + dr), (r - dc, c - dr)):
+                    if 0 <= nr < BOARD_DIM and 0 <= nc < BOARD_DIM and self.board[nr][nc]:
+                        return None
+                tile = tiles.pop()
+                letter = rng.choice(self.letters).lower() if tile == "?" else tile
+                squares.append((r, c, letter, True))
+            r, c = r + dr, c + dc
+        if down and all(placed for *_, placed in squares):
+            return None
+        if len(squares) < 2:
+            return None
+        word = ""
+        for i, (_, _, letter, placed) in enumerate(squares):
+            opens = not placed and (i == 0 or squares[i - 1][3])
+            closes = not placed and (i == len(squares) - 1 or squares[i + 1][3])
+            word += ("(" if opens else "") + letter + (")" if closes else "")
+        start = (f"{chr(65 + col)}{row + 1}" if vertical else f"{row + 1}{chr(65 + col)}")
+        score = sum(0 if letter.islower() else self.scores[letter] for _, _, letter, _ in squares)
+        used = [sq for sq in squares if sq[3]]
+        if len(used) == RACK_SIZE:
+            score += 50
+        return {
+            "move": f"{start} {word}",
+            "score": score,
+            "squares": used,
+            "tiles": ["?" if letter.islower() else letter for _, _, letter, _ in used],
+        }
+
+    def ranked_moves(self, wanted: int) -> List[dict]:
+        """Up to `wanted` distinct plays for the player on turn, best first."""
+        rack = self.racks[self.on_turn]
+        plays = {}
+        for _ in range(wanted * 20):
+            if len(plays) >= wanted:
+                break
+            play = self._placement(rack)
+            if play and play["move"] not in plays:
+                play["equity"] = round(play["score"] + self.rng.uniform(-6, 6), 3)
+                plays[play["move"]] = play
+        ranked = sorted(plays.values(), key=lambda p: -p["equity"])
+        if len(ranked) < wanted and rack and self.bag:
+            swapped = self.rng.sample(rack, self.rng.randint(1, min(len(rack), len(self.bag))))
+            ranked.append({
+                "move": f"(exch {''.join(sorted(swapped, key=lambda l: (l == '?', self.order[l])))})",
+                "score": 0,
+                "equity": round(self.rng.uniform(-10, 5), 3),
+                "tiles": swapped,
+                "squares": [],
+            })
+        if not ranked:
+            ranked.append({"move": "pass", "score": 0, "equity": 0.0, "tiles": [], "squares": []})
+        return ranked
+
+    def play(self, move: dict) -> None:
+        seat = self.on_turn
+        for r, c, letter, _ in move["squares"]:
+            self.board[r][c] = letter
+        for tile in move["tiles"]:
+            self.racks[seat].remove(tile)
+        if move["move"].startswith("(exch"):
+            self._draw(seat)
+            self.bag.extend(move["tiles"])
+            self.rng.shuffle(self.bag)
+        else:
+            self._draw(seat)
+        self.game_scores[seat] += move["score"]
+        self.zeros = 0 if move["score"] else self.zeros + 1
+        self.on_turn = 1 - seat
+
+
+def _synthetic_position(game: "_SyntheticGame", rng: random.Random, game_index: int,
+                        turn: int, ranked: List[dict], previous: Optional[dict]) -> dict:
+    """One captured position of `game` as it stands, its moves `ranked`."""
+    position = {
+        "game_index": game_index,
+        "turn_number": turn,
+        "rack": game.rack_string(game.on_turn),
+        "position": game.cgp(),
+        "num_moves": rng.randint(len(ranked), 400),
+        # Every move below carries a simulation's statistics.
+        "analysis": "sim",
+        "moves": [
+            {
+                "move": move["move"],
+                "score": move["score"],
+                "equity": move["equity"],
+                # How often the simulation played this move out: most for
+                # the leaders.
+                "iterations": rng.randint(20, 400),
+                # Absent for a static player, which simulates nothing.
+                "win_percentage": round(rng.uniform(20, 80), 3),
+                # Same nullability as win_percentage: the win%+spread
+                # blend, sometimes used to rank moves instead.
+                "blended_utility": round(rng.uniform(0, 1), 3),
+                "plies": [
+                    {
+                        "ply": p,
+                        "bingo_percentage": round(rng.uniform(0, 25), 3),
+                        "average_score": round(rng.uniform(25, 45), 3),
+                    }
+                    for p in range(2)
+                ],
+            }
+            for move in ranked
+        ],
+    }
+    # Absent on the first turn of a game: nothing preceded it.
+    if previous is not None:
+        position["previous_move"] = previous["move"]
+        position["previous_move_score"] = previous["score"]
+        # What the simmer inferred the opponent kept, from that move: MAGPIE
+        # infers only from a move, so never on a game's first turn or after
+        # a pass.
+        if previous["score"] or "exch" in previous["move"]:
+            position["inference"] = _synthetic_inference(rng)
+    # The move played from here: the top of the ranking, which is what the
+    # synthetic game plays.
+    position["played_move"] = ranked[0]["move"]
+    position["played_move_score"] = ranked[0]["score"]
+    return position
+
+
+def _synthetic_inference(rng: random.Random) -> dict:
+    """An inference as MAGPIE reports it: how many distinct leaves it found, how
+    many it drew, their mean equity, and the most drawn (at most ten), most
+    drawn first."""
+    found = rng.randint(1, 300)
+    total = rng.randint(found, found * 40)
+    leaves = []
+    draws = total
+    for _ in range(min(10, found)):
+        draws = rng.randint(1, max(1, min(draws, total // 3 or 1)))
+        tiles = rng.randint(0, 6)
+        leaves.append({
+            "leave": "".join(sorted(rng.choice("AEINORSTLD?") for _ in range(tiles))),
+            "draws": draws,
+            "equity": round(rng.uniform(-10, 30), 3),
+        })
+    return {"num_leaves": found, "total_draws": total,
+            "average_equity": round(rng.uniform(0, 20), 3), "leaves": leaves}
+
+
+def _add_first_divergences(result: dict, request: dict, rng: random.Random,
+                           divergent_pairs: List[int]) -> None:
+    """A pairs task keeping first divergences: from each pair that diverged,
+    both games' positions at the turn they first disagree.
+
+    Before that turn a pair's two games are one game with the seats swapped, so
+    the two positions share the board and the mover's tiles; the second game's
+    CGP has the racks and scores the other way round, its mover in the other
+    seat. Its player ranks the moves differently, so the pair diverges here.
+    """
+    top_moves = (request.get("player1") or {}).get("num_plays_recorded") or 10
+    distribution = request.get("letter_distribution", "english")
+    positions = []
+    for pair in divergent_pairs:
+        game = _SyntheticGame(rng, distribution, first_seat=pair % 2)
+        previous = None
+        turn = 0
+        # The turns both games played alike, before they diverge.
+        alike = rng.randint(0, 14)
+        while turn < alike and not game.over():
+            previous = game.ranked_moves(1)[0]
+            game.play(previous)
+            turn += 1
+        ranked = game.ranked_moves(top_moves)
+        first = _synthetic_position(game, rng, pair * 2, turn, ranked, previous)
+        # The other game: the same position from the other seat, and another
+        # player's ranking, which puts a different move first.
+        second_ranked = ranked[1:] + ranked[:1] if len(ranked) > 1 else ranked
+        second = _synthetic_position(game, rng, pair * 2 + 1, turn, second_ranked, previous)
+        board, racks, scores, *rest = second["position"].split(" ")
+        swapped_racks = "/".join(reversed(racks.split("/")))
+        swapped_scores = "/".join(reversed(scores.split("/")))
+        second["position"] = " ".join([board, swapped_racks, swapped_scores, *rest])
+        positions += [first, second]
+    result["positions"] = positions
+
+
 def _add_captured_positions(result: dict, request: dict, rng: random.Random,
                             games: int) -> None:
     """Synthesize the per-turn analyses a real worker would capture.
 
     Only when the job asked for them, so the default path stays the shape every
-    existing client produces.
+    existing client produces. Each game is a `_SyntheticGame`, so every
+    position is one the site can draw: the board, both racks and scores
+    agreeing with the plays before it, the play before it highlighted where it
+    was put down.
     """
     if not request.get("capture_positions"):
         return
     top_moves = (request.get("player1") or {}).get("num_plays_recorded") or 10
+    distribution = request.get("letter_distribution", "english")
     positions = []
     for game_index in range(games):
+        # MAGPIE alternates the seat that starts; player 1's rack is first in
+        # the CGP either way.
+        game = _SyntheticGame(rng, distribution, first_seat=game_index % 2)
+        previous = None
         # Real games run about 22 turns; varying it exercises the turn bound.
         for turn in range(rng.randint(18, 26)):
-            ranked = rng.randint(top_moves, 400)
-            position = {
-                "game_index": game_index,
-                "turn_number": turn,
-                # Sorted, as MAGPIE writes a rack: the positions search
-                # canonicalises what it is asked for the same way.
-                "rack": "".join(sorted(rng.choice("AEINRSTLOU") for _ in range(7))),
-                "position": "15/15/15/15/15/15/15/15/15/15/15/15/15/15/15 AEINRST/ 0/0 0",
-                "num_moves": ranked,
-                "moves": [
-                    {
-                        "move": f"8{chr(ord('D') + i % 8)} WORD{i}",
-                        "score": rng.randint(10, 90),
-                        "equity": round(rng.uniform(-5, 60), 3),
-                        # Absent for a static player, which simulates nothing.
-                        "win_percentage": round(rng.uniform(20, 80), 3),
-                        # Same nullability as win_percentage: the win%+spread
-                        # blend, sometimes used to rank moves instead.
-                        "blended_utility": round(rng.uniform(0, 1), 3),
-                        "plies": [
-                            {
-                                "ply": p,
-                                "bingo_percentage": round(rng.uniform(0, 25), 3),
-                                "average_score": round(rng.uniform(25, 45), 3),
-                            }
-                            for p in range(2)
-                        ],
-                    }
-                    for i in range(top_moves)
-                ],
-            }
-            # Absent on the first turn of a game: nothing preceded it.
-            if turn > 0:
-                position["previous_move"] = f"7C WORD{rng.randint(0, top_moves)}"
-                position["previous_move_score"] = rng.randint(10, 90)
-            positions.append(position)
+            if game.over():
+                break
+            ranked = game.ranked_moves(top_moves)
+            positions.append(_synthetic_position(game, rng, game_index, turn, ranked, previous))
+            # The player plays their top move, as a static player does.
+            previous = ranked[0]
+            game.play(previous)
     result["positions"] = positions
 
 
@@ -182,8 +452,10 @@ def _result_for(request: dict, rng: random.Random, p1_win_probability: float) ->
         wins = losses = ties = 0
         divergent_games = divergent_wins = divergent_losses = divergent_ties = 0
 
-        for _ in range(pairs):
+        divergent_pairs = []
+        for pair in range(pairs):
             if rng.random() < divergence_rate:
+                divergent_pairs.append(pair)
                 # Divergent: the two games are played out independently.
                 outcomes = [_game_outcome(rng, p1_win_probability) for _ in range(2)]
                 divergent_games += 2
@@ -227,7 +499,10 @@ def _result_for(request: dict, rng: random.Random, p1_win_probability: float) ->
                 "p2_score_sd": all_games["p2_score_sd"],
             },
         }
-        _add_captured_positions(result, request, rng, pairs * 2)
+        if request.get("capture_positions") and request.get("capture_first_divergence"):
+            _add_first_divergences(result, request, rng, divergent_pairs)
+        else:
+            _add_captured_positions(result, request, rng, pairs * 2)
         return result
 
     if job_type == "opening_rack":
@@ -250,6 +525,11 @@ def _result_for(request: dict, rng: random.Random, p1_win_probability: float) ->
                         "move": f"8{chr(ord('D') + i)} {rack[:tiles]}",
                         "score": rng.randint(12, 90),
                         "equity": round(equity, 3),
+                        # A simulation's, as the plies below are: the server
+                        # stores a rack with them as a simulated analysis.
+                        "iterations": rng.randint(20, 400),
+                        "win_percentage": round(rng.uniform(20, 80), 3),
+                        "blended_utility": round(rng.uniform(0, 1), 3),
                         "plies": [
                             {
                                 "ply": p,
@@ -636,7 +916,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--p1-win-rate", type=float, default=0.5,
-        help="bias player 1's results, to drive SPRT to a chosen verdict",
+        help="bias player 1's results, to drive the match test to a chosen verdict",
     )
     parser.add_argument("--seed", default="birdtest", help="makes a run reproducible")
     parser.add_argument("--delay", type=float, default=0.0, help="seconds between tasks")

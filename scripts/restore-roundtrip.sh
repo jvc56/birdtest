@@ -81,9 +81,9 @@ VALUES ('letterdistributions/roundtrip.csv', 'letterdist', 'roundtrip',
         repeat('b', 64), 3, '20260101', '\x010203'::bytea)
 ON CONFLICT (path, sha256) DO NOTHING;
 
-INSERT INTO jobs (job_type, status, allocation, redundancy, variant,
+INSERT INTO jobs (job_type, status, allocation, variant,
                   letterdist_id, layout_id, created_by, bingo_bonus, sim_cutoff)
-SELECT 'games', 'active', 100, 1, 'classic',
+SELECT 'games', 'active', 100, 'classic',
        (SELECT id FROM input_data WHERE name = 'roundtrip' AND role = 'letterdist'),
        (SELECT id FROM input_data WHERE name = 'roundtrip' AND role = 'layout'),
        (SELECT id FROM users WHERE username = 'roundtrip'), 50, 0.1

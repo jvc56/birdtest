@@ -78,7 +78,7 @@ fn row(action: &str) -> AuditRow {
 #[tokio::test]
 async fn each_audit_helper_records_who_did_what_to_which_target() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 1).await;
+    let job = db.games_job(1).await;
     let actor = db.user("auditor", true).await;
     let anon = Uuid::new_v4();
     let mut conn = db.pool.acquire().await.unwrap();
@@ -264,10 +264,11 @@ async fn with_history(app: &Router) {
 /// I-AUDIT-3: every destructive admin action -- deactivating, completing,
 /// purging and deleting a job, deleting a user, banning and unbanning a
 /// worker, deleting an input file, deleting a player config, removing a
-/// rating-pool member -- writes exactly one row naming what it did, who did
-/// it and to what. The three that destroy recorded work (purge, job delete,
-/// user delete) also write their census (I-JOB-10), so they write exactly that
-/// pair and nothing more.
+/// rating-pool member, moving a pool's anchor, deleting a pool -- writes
+/// exactly one row naming what it did, who did it and to what. The four that
+/// destroy recorded work (purge, job delete, user delete, pool delete) also
+/// write their census (I-JOB-10), so they write exactly that pair and nothing
+/// more; an anchor move that brings a new member in writes that addition too.
 ///
 /// Bug: deleting an input file and deleting a player config wrote nothing, so
 /// the log could not say who removed a file a restore would need, or when.
@@ -279,21 +280,38 @@ async fn every_destructive_admin_action_writes_exactly_its_record() {
     let headers = admin_headers(&state.cfg, admin);
     let app = birdtest::app(state);
 
-    let purged = db.games_job(1, 2).await;
+    let purged = db.games_job(2).await;
     with_history(&app).await;
     sqlx::query("UPDATE jobs SET status = 'inactive' WHERE id = $1")
         .bind(purged)
         .execute(&db.pool)
         .await
         .unwrap();
-    let deleted = db.games_job(1, 2).await;
+    let deleted = db.games_job(2).await;
     with_history(&app).await;
-    let lifecycle = db.games_job(1, 2).await;
+    let lifecycle = db.games_job(2).await;
     let victim = db.user("victim", false).await;
     let banned = db.user("banned", false).await;
     let unused_file = db.input_data("winpct", "unused").await;
     let unused_config = db.static_player("unused", admin).await;
     let (pool, member) = pool_with_member(&db, admin).await;
+    // An opening-rack job analysed by a simmer, whose consensus may change.
+    let racks = db.bare_job("opening_rack", admin).await;
+    let simmer = db.sim_player("simmer", admin).await;
+    sqlx::query(
+        "INSERT INTO job_opening_rack_config
+             (job_id, player_config_id, racks_per_batch, rack_size, total_racks)
+         VALUES ($1, $2, 2, 7, 4)",
+    )
+    .bind(racks)
+    .bind(simmer)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let pool_anchor: Uuid = sqlx::query_scalar("SELECT anchor_player_config_id FROM rating_pools")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
 
     let admin_row = |action: &str, target_type: &str, target: String| AuditRow {
         actor_user_id: Some(admin),
@@ -353,6 +371,15 @@ async fn every_destructive_admin_action_writes_exactly_its_record() {
             ],
         ),
         (
+            "PATCH",
+            format!("/api/admin/jobs/{racks}/consensus"),
+            Some(json!({ "min_results_per_rack": 2, "max_results_per_rack": 3 })),
+            vec![census(
+                "job.consensus_changed", "job", racks.to_string(), Some(racks),
+                "min 1 -> 2, max 1 -> 3; 0 racks unsettled",
+            )],
+        ),
+        (
             "DELETE",
             format!("/api/admin/users/{victim}"),
             None,
@@ -378,6 +405,31 @@ async fn every_destructive_admin_action_writes_exactly_its_record() {
             format!("/api/admin/rating-pools/{pool}/members/{member}"),
             None,
             vec![admin_row("rating_pool.member_removed", "player_config", member.to_string())],
+        ),
+        (
+            // Back as the anchor: added as a member, then the anchor moved.
+            "PATCH",
+            format!("/api/admin/rating-pools/{pool}"),
+            Some(json!({ "anchor_player_config_id": member, "anchor_rating": 1500.0 })),
+            vec![
+                admin_row("rating_pool.member_added", "player_config", member.to_string()),
+                census(
+                    "rating_pool.anchor_changed", "rating_pool", pool.to_string(), None,
+                    &format!("anchor={pool_anchor}@2000 -> {member}@1500"),
+                ),
+            ],
+        ),
+        (
+            "DELETE",
+            format!("/api/admin/rating-pools/{pool}"),
+            None,
+            vec![
+                census(
+                    "rating_pool.deleted.census", "rating_pool", pool.to_string(), None,
+                    "name=pool members=2 runs=2",
+                ),
+                admin_row("rating_pool.deleted", "rating_pool", pool.to_string()),
+            ],
         ),
     ];
 

@@ -94,6 +94,7 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
 const get = <T>(path: string) => request<T>('GET', path);
 const post = <T>(path: string, body?: unknown) => request<T>('POST', path, body ?? {});
 const patch = <T>(path: string, body: unknown) => request<T>('PATCH', path, body);
+const put = <T>(path: string, body: unknown) => request<T>('PUT', path, body);
 const del = <T>(path: string) => request<T>('DELETE', path);
 
 // --- Shared shapes ---------------------------------------------------------
@@ -124,16 +125,125 @@ export interface SavedPosition {
   position: string | null;
   previous_move: string | null;
   previous_move_score: number | null;
+  /**
+   * The move played from this position, and its score: the one chosen, which
+   * need not be the top of `moves` (a simmer's pick, or a solver's).
+   */
+  played_move: string | null;
+  played_move_score: number | null;
   num_moves: number;
+  /** How the move played here was chosen. */
+  analysis: PositionAnalysis;
   submitted_at: string;
+  /**
+   * A game-pairs job's only: the same turn of the pair's other game (the
+   * game index with its low bit flipped), or null when that game has no
+   * position at that turn. Absent for a games job.
+   */
+  partner?: SavedPosition | null;
   moves: {
     rank: number;
     move: string;
     score: number;
     equity: number;
-    /** Null for a static player. */
+    /** How often a simulation played the move out; 0 or null when nothing simulated it. */
+    iterations: number | null;
+    /** A simulation's or a pre-endgame solve's; null for static and endgame. */
     win_percentage: number | null;
+    /** A solve's projected final spread for the mover, in points; null unless solved. */
+    mean_spread: number | null;
+    /** The endgame depth a solve ranked the move at; null unless solved. */
+    fidelity_plies: number | null;
+    /** A simulation's first two plies, in order; empty for a move nothing simulated. */
+    plies: PlyStats[];
   }[];
+  /**
+   * What the simmer inferred of the opponent's leave from their previous
+   * move, before it simmed: null when it did not infer (a static or solved
+   * position, a game's first turn, a pass before it, or a player that does not
+   * infer).
+   */
+  inference: Inference | null;
+}
+
+/** One ply of a move's simulation: ply 0 is the reply to it (shown as P1). */
+export interface PlyStats {
+  ply: number;
+  bingo_percentage: number;
+  average_score: number;
+}
+
+/**
+ * An inference of the opponent's leave: how many distinct leaves it found,
+ * how many it drew in all, their mean equity, and the most drawn of them (at
+ * most ten), most drawn first.
+ */
+export interface Inference {
+  num_leaves: number;
+  total_draws: number;
+  average_equity: number;
+  leaves: { leave: string; draws: number; equity: number }[];
+}
+
+/**
+ * One move of an opening rack's lookup: `analysis` numbers the rack's analyses
+ * from 1 (a job seeking a consensus analyses a rack more than once).
+ */
+export interface RackLookupRow {
+  analysis: number;
+  rank: number;
+  move: string;
+  score: number;
+  equity: number;
+  /** How often the simulation played the move out; 0 or null when nothing simulated it. */
+  iterations: number | null;
+  /** A simulation's; null for a static analysis. */
+  win_percentage: number | null;
+  plies: PlyStats[];
+}
+
+/** Static equity, a simulation, a pre-endgame solve or an endgame solve. */
+export type PositionAnalysis = 'static' | 'sim' | 'peg' | 'endgame';
+
+/** A layout square, by what it multiplies (`#` in MAGPIE's layout is a brick). */
+/** What the contributor list can be ranked by; the server's default is compute time. */
+export type ContributorSort = 'compute' | 'games' | 'racks' | 'tasks';
+
+/** One row of the contributor list (`/api/workers`). */
+export interface Contributor {
+  user_id: string | null;
+  /** An anonymous worker's public pseudonym; its UUID is never published. */
+  anon_id: string | null;
+  /** The anonymous worker's UUID, its credential: the admin list only. */
+  anon_uuid?: string;
+  username: string | null;
+  /** Every accepted claim, held from claim to submission: the compute MAGPIE does not report. */
+  compute_seconds: number;
+  games_played: number;
+  racks_analyzed: number;
+  tasks_completed: number;
+  /** The last task finished. */
+  last_seen_at: string | null;
+}
+
+export type BoardSquare =
+  | 'normal'
+  | 'double_letter'
+  | 'double_word'
+  | 'triple_letter'
+  | 'triple_word'
+  | 'quadruple_letter'
+  | 'quadruple_word'
+  | 'brick';
+
+/** What a job's positions are drawn on: its board layout and what its tiles score. */
+export interface BoardData {
+  /** The square the first play covers, `[row, column]` from zero. */
+  start: [number, number];
+  /** Top row first. */
+  squares: BoardSquare[][];
+  /** In machine-letter order; the blank's own row is `?`. */
+  letters: { letter: string; blank: string; score: number }[];
 }
 
 export interface CursorPage<T> {
@@ -152,7 +262,6 @@ export interface JobListItem {
   status: JobStatus;
   /** The job's share of claims while active (not of worker time: PLAN's KL-88); null until first activated. 0% means what inactive means. */
   allocation: number | null;
-  redundancy: number;
   created_at: string;
   tasks_total: number;
   tasks_completed: number;
@@ -172,16 +281,23 @@ export interface JobRow {
   job_type: JobType;
   status: JobStatus;
   allocation: number | null;
-  redundancy: number;
   variant: string;
   created_at: string;
 }
 
-export interface SprtResult {
-  llr: number;
-  lower_bound: number;
-  upper_bound: number;
-  status: 'running' | 'passed' | 'failed' | 'terminated_at_max';
+/**
+ * A games or pairs job's significance test: a confidence interval for player 1's
+ * score per game (1 a win, ½ a draw) that stays valid however often it is
+ * checked. The job stops once it excludes an even score -- one player is
+ * better -- or at its cap, inconclusive.
+ */
+export interface TestResult {
+  /** Player 1's score per game, ½ before anything is played. */
+  mean: number;
+  lower: number;
+  upper: number;
+  confidence_pct: number;
+  status: 'running' | 'player1_better' | 'player2_better' | 'inconclusive';
 }
 
 export interface GameStats {
@@ -193,7 +309,14 @@ export interface GameStats {
   /** Games for a `games` job, pairs for a `game_pairs` job. */
   units_completed: number;
   /**
-   * Game pairs only: the five pair outcomes the LLR is computed from, indexed
+   * Each player's average score per game and player 1's average spread, over
+   * every game played (batches weighted by their games); null before any.
+   */
+  p1_score_mean: number | null;
+  p2_score_mean: number | null;
+  spread_mean: number | null;
+  /**
+   * Game pairs only: the five pair outcomes the test is computed from, indexed
    * by player 1's half-point score across the pair (0 = lost both, 4 = won
    * both). Every completed pair is in here, including the ones that played
    * identically — they are 1-1 ties in bucket 2, and they are what makes a
@@ -202,26 +325,43 @@ export interface GameStats {
   pentanomial?: [number, number, number, number, number];
   /** Game pairs only: how many pairs diverged. A diagnostic, not the sample. */
   divergent_pairs?: number;
+  /**
+   * Game pairs only: the match score over the games of the pairs that
+   * diverged, where the two configs played differently. A diagnostic beside
+   * the full score.
+   */
+  divergent?: {
+    wins: number;
+    losses: number;
+    draws: number;
+    p1_score_mean: number | null;
+    p2_score_mean: number | null;
+    spread_mean: number | null;
+  };
   min_units: number;
   max_units: number;
   win_pct: number;
   loss_pct: number;
   draw_pct: number;
-  /** The test over every accepted result, recomputed on each read. */
-  sprt: SprtResult;
   /**
-   * What a completed job stopped on, when the finish check completed it. Results
-   * in flight at that moment still land, so `sprt` can move afterwards; this is
-   * the decision that stands.
+   * The significance test over every accepted result, recomputed on each read; null
+   * for a job that runs none, which plays `max_units` and stops.
    */
-  decided?: { status: SprtResult['status']; llr: number; units: number };
+  test: TestResult | null;
+  /**
+   * What a completed job stopped on, when the finish check completed it, with
+   * player 1's interval then. Results in flight at that moment still land, so
+   * `test` can move afterwards; this is the decision that stands.
+   */
+  decided?: { status: TestResult['status']; lower: number; upper: number; units: number };
 }
 
 /**
  * How a job was completed. `forced` is an admin's force-complete; otherwise
- * `reason` is the server's: the SPRT verdict (`passed`, `failed`,
- * `terminated_at_max`), `last generation built`, or none for an opening-rack
- * job whose racks were all analysed.
+ * `reason` is the server's: the significance test's verdict (`player1_better`,
+ * `player2_better`, `inconclusive`), `reached_target` for a games or pairs job without a
+ * test, `last generation built`, or none for an opening-rack job whose racks
+ * were all analysed.
  */
 export interface Completion {
   at: string;
@@ -237,8 +377,7 @@ export interface JobStats {
     job_type: JobType;
     status: JobStatus;
     allocation: number | null;
-    redundancy: number;
-    min_magpie_version: string;
+      min_magpie_version: string;
     created_at: string;
     created_by: string | null;
     /** The lexicons in play. A games job comparing two reads "CSW21 vs NWL23". */
@@ -253,6 +392,13 @@ export interface JobStats {
   games?: GameStats;
   opening_racks?: {
     racks_analyzed: number;
+    /**
+     * Racks needing no more analysis -- the job is done once all are -- and
+     * those of them settled at their most analyses without a consensus. For a
+     * job wanting one analysis per rack, `racks_settled` is `racks_analyzed`.
+     */
+    racks_settled: number;
+    racks_without_consensus: number;
     /** Size of the rack space — the denominator for progress. */
     racks_total: number;
   };
@@ -261,7 +407,9 @@ export interface JobStats {
     /** Generations whose KLV is built; `current_generation` stops at the last one. */
     generations_closed: number;
     generation_count: number;
+    /** The in-progress generation's occurrence target, from `target_rack_counts` (every generation's, in order). */
     target_rack_count: number;
+    target_rack_counts: number[];
     /** Live: accepted tasks of the in-progress generation, and the games they played. */
     tasks_completed: number;
     games_played: number;
@@ -278,6 +426,8 @@ export interface JobStats {
     anon_id: string | null;
     username: string | null;
     tasks_completed: number;
+    /** Those claims held from claim to submission. */
+    compute_seconds: number;
   }[];
   /** Contributors beyond the ones listed; the list is capped. */
   other_workers: number;
@@ -313,6 +463,7 @@ export interface PlayerConfig {
   time_limit_secs: number | null;
   use_wordmap: boolean;
   use_rit: boolean;
+  use_wit: boolean;
   min_play_iterations: number | null;
   threshold: string | null;
   sampling_rule: string | null;
@@ -321,6 +472,21 @@ export interface PlayerConfig {
   utility_w_spread: number | null;
   utility_spread_scale: number | null;
   movegen_margin: number;
+  /**
+   * Endgame and pre-endgame solving, for games and game-pairs jobs.
+   * endgame_plies 0 solves nothing (and so no pre-endgame either); the PEG
+   * settings are null unless peg_max_bag is above 0, and the nested ones
+   * unless peg_nested is set.
+   */
+  endgame_plies: number;
+  peg_max_bag: number;
+  peg_stage_top_k: number[] | null;
+  peg_scenario_stride: number | null;
+  peg_opp_model: 'rational' | 'pessimistic' | null;
+  peg_nested: boolean | null;
+  peg_nested_cand_caps: number[] | null;
+  peg_nested_max_depth: number | null;
+  peg_nested_strides: number[] | null;
   created_at: string;
 }
 
@@ -344,7 +510,8 @@ export interface ImportDetail {
   tarball_date: string;
   commit_sha: string;
   tarball_sha256: string | null;
-  state: 'running' | 'staged' | 'confirmed' | 'cancelled' | 'failed';
+  /** `nothing_new`: staged, but every file was already known. */
+  state: 'running' | 'staged' | 'nothing_new' | 'confirmed' | 'cancelled' | 'failed';
   progress_bytes: number;
   progress_entries: number;
   error: string | null;
@@ -399,9 +566,9 @@ export interface BackupStatus {
   recent: BackupRun[];
 }
 
-/** One wordmap or rack info table a job needs, and where its build stands. */
+/** One wordmap, rack info table or word info table a job needs, and where its build stands. */
 export interface JobDerivedFile {
-  /** `wmp` or `rit`. */
+  /** `wmp`, `rit` or `wit`. */
   role: string;
   name: string;
   /** `pending` | `building` | `built` | `failed`. */
@@ -411,15 +578,16 @@ export interface JobDerivedFile {
 }
 
 /**
- * A wordmap or rack info table the server builds a reference copy of.
+ * A wordmap, rack info table or word info table the server builds a reference
+ * copy of.
  *
- * Neither file is shipped — 179 MB and 1.9 GB for CSW24 — so what travels to a
- * worker is the SHA-256 the server's own pinned MAGPIE got from the same
+ * None of them is shipped — 179 MB, 1.9 GB and 122 MB for CSW24 — so what
+ * travels to a worker is the SHA-256 the server's own pinned MAGPIE got from the same
  * inputs. A job that needs one is not dispatched until it is `built`, which is
  * why this page exists: an active job doing nothing usually has a row here.
  */
 export interface DerivedData {
-  /** `wmp` or `rit`. */
+  /** `wmp`, `rit` or `wit`. */
   role: string;
   /** What the worker loads it as: a lexicon, or `<lexicon>.<leaves>`. */
   name: string;
@@ -469,6 +637,13 @@ export interface JobExport {
   positions_bytes: number | null;
   positions_sha256: string | null;
   positions_row_count: number | null;
+  /**
+   * True for a completed job's final corpus; false for a snapshot read while
+   * the job was still taking results (and for an export not yet built).
+   */
+  is_final: boolean;
+  /** When the snapshot it was read in was taken; null until built. */
+  snapshot_at: string | null;
   error: string | null;
   requested_at: string;
   completed_at: string | null;
@@ -560,20 +735,28 @@ export const api = {
         Object.entries(params).map(([k, v]) => [k, String(v)])
       )}`
     ),
-  /** Signed-in users only: a games or pairs job's captured positions. */
-  jobPositions: (id: string, params: Record<string, string | number> = {}) =>
+  /** One rack's ranked moves in an opening-rack job, every analysis of it, in one page. */
+  rackLookup: (id: string, rack: string) =>
+    get<CursorPage<RackLookupRow>>(`/api/jobs/${id}/results?${new URLSearchParams({ rack })}`),
+  /** Signed-in users only: a games or pairs job's captured positions with one rack, newest first. */
+  jobPositions: (id: string, rack: string, params: { per_page?: number; cursor?: string } = {}) =>
     get<CursorPage<SavedPosition>>(
-      `/api/jobs/${id}/positions?${new URLSearchParams(
-        Object.entries(params).map(([k, v]) => [k, String(v)])
-      )}`
+      `/api/jobs/${id}/positions?${new URLSearchParams({
+        rack,
+        ...Object.fromEntries(Object.entries(params).map(([k, v]) => [k, String(v)]))
+      })}`
     ),
+  /** Signed-in users only: one captured position at random, or `null` before any. */
+  randomPosition: (id: string) => get<SavedPosition | null>(`/api/jobs/${id}/positions/random`),
+  jobBoard: (id: string) => get<BoardData>(`/api/jobs/${id}/board`),
   publicPlayerConfigs: () => get<import('$lib/jobSettings').PublicPlayerConfig[]>('/api/player-configs'),
   publicPlayerConfig: (id: string) => get<import('$lib/jobSettings').PublicPlayerConfig>(`/api/player-configs/${id}`),
   ratingPools: () => get<RatingPoolListItem[]>('/api/rating-pools'),
   ratingPool: (id: string) => get<RatingPoolDetail>(`/api/rating-pools/${id}`),
 
   users: (page = 0) => get<Page<Record<string, unknown>>>(`/api/users?page=${page}`),
-  workers: (page = 0) => get<Page<Record<string, unknown>>>(`/api/workers?page=${page}`),
+  workers: (page = 0, sort: ContributorSort = 'compute') =>
+    get<Page<Contributor>>(`/api/workers?page=${page}&sort=${sort}`),
 
   clientVersion: () =>
     get<{ min_magpie_version: string; download_url: string }>('/api/worker/client-version'),
@@ -600,6 +783,13 @@ export const api = {
     del<{ run_id: string }>(`/api/admin/rating-pools/${poolId}/members/${configId}`),
   recomputeRatingPool: (poolId: string) =>
     post<{ run_id: string }>(`/api/admin/rating-pools/${poolId}/recompute`),
+  /** Moves the anchor (added as a member if it is not one) or its rating, and
+   *  refits; `run_id` is null when nothing changed. */
+  updateRatingPool: (
+    poolId: string,
+    body: { anchor_player_config_id?: string; anchor_rating?: number }
+  ) => patch<{ run_id: string | null }>(`/api/admin/rating-pools/${poolId}`, body),
+  deleteRatingPool: (poolId: string) => del<void>(`/api/admin/rating-pools/${poolId}`),
   inputData: () => get<InputData[]>('/api/admin/input-data'),
   deleteInputData: (id: string) => del<void>(`/api/admin/input-data/${id}`),
   startImport: (body: { tarball_date: string; git_ref?: string }) =>
@@ -639,13 +829,36 @@ export const api = {
   activateJob: (id: string, allocation: number) =>
     post<JobRow>(`/api/admin/jobs/${id}/activate`, { allocation }),
   deactivateJob: (id: string) => post<JobRow>(`/api/admin/jobs/${id}/deactivate`),
+  /**
+   * Several jobs' allocations at once, the active jobs checked against 100%
+   * as they will stand: above 0% activates a job, 0% deactivates one, and a
+   * job not named keeps what it has. Nothing changes unless all of it does.
+   */
+  setAllocations: (rows: { job_id: string; allocation: number }[]) =>
+    put<{ jobs: JobRow[] }>('/api/admin/jobs/allocations', { allocations: rows }),
   completeJob: (id: string) => post<JobRow>(`/api/admin/jobs/${id}/complete`),
+  /**
+   * An opening-rack job's consensus settings, changed: only the fields given.
+   * The job follows -- a completed one with racks unsettled again reopens
+   * (inactive, with the reason, when its allocation no longer fits), and an
+   * active one with every rack settled completes.
+   */
+  updateConsensus: (
+    id: string,
+    body: { min_results_per_rack?: number; max_results_per_rack?: number; consensus_pct?: number }
+  ) =>
+    patch<{
+      job: JobRow;
+      unsettled_racks: number;
+      reopened: boolean;
+      reopened_inactive_reason: string | null;
+    }>(`/api/admin/jobs/${id}/consensus`, body),
   purgeJob: (id: string) => post<{ tasks_reset: number }>(`/api/admin/jobs/${id}/purge`),
   deleteJob: (id: string) => del<void>(`/api/admin/jobs/${id}`),
   deleteUser: (id: string) => del<void>(`/api/admin/users/${id}`),
   /** Like `workers`, plus anonymous workers' UUIDs, which a ban needs. */
   adminWorkers: (page = 0) =>
-    get<Page<Record<string, unknown>>>(`/api/admin/workers?page=${page}`),
+    get<Page<Contributor>>(`/api/admin/workers?page=${page}`),
   banWorker: (body: { user_id?: string; anon_uuid?: string; reason?: string }) =>
     post<{ id: string }>('/api/admin/workers/ban', body),
   unbanWorker: (id: string) => del<void>(`/api/admin/workers/ban/${id}`),

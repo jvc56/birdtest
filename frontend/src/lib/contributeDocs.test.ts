@@ -37,11 +37,10 @@ describe('F-DOCS-1 contributor instructions', () => {
     expect(offenders).toEqual([]);
   });
 
-  it('run a second process on a file of its own in the same directory', () => {
+  it('never send a second process to a directory of its own', () => {
     // MAGPIE loads its default board from ./data before it parses anything,
-    // so a directory holding only a contribute.txt cannot start.
-    const home = readFileSync(join(routes, '+page.svelte'), 'utf8');
-    expect(home).toContain('./bin/magpie contribute second.txt');
+    // so a directory holding only a contribute.txt cannot start. (Running a
+    // second process, on a settings file of its own, is the README's.)
     const offenders = svelteFiles(routes).filter((f) => /directory of its own/.test(readFileSync(f, 'utf8')));
     expect(offenders).toEqual([]);
   });

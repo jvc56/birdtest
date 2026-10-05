@@ -41,7 +41,7 @@
   Contribution stats are shown publicly at <a href="/users">/users</a>. Deleting an account
   anonymizes it — its name, address, password and keys go, and every session ends — but keeps
   its claims and results, so no donated work is lost. Its open claims lapse by timeout. It does not
-  take results out of SPRT or ratings: purging or deleting a job discards what it holds. A ban
+  take results out of significance tests or ratings: purging or deleting a job discards what it holds. A ban
   binds an identity, not a person (see <a href="/admin/workers">workers</a>).
 </p>
 {#if error}<p class="mb-4 text-destructive">{error}</p>{/if}

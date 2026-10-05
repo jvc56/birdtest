@@ -88,6 +88,10 @@ pub struct PlayerSpec {
     /// full rack on NWL23's leaves instead. This is the same name the server
     /// pinned a hash for in `expected_data.derived`.
     pub rit_name: Option<String>,
+    /// Whether the player loads the word info table for its lexicon. Named
+    /// for the lexicon, as MAGPIE's load finds it: it is built from the
+    /// `.kwg` alone, so unlike a rack info table it needs no name of its own.
+    pub use_wit: bool,
     pub min_play_iterations: Option<i32>,
     pub threshold: Option<String>,
     pub sampling_rule: Option<String>,
@@ -98,6 +102,20 @@ pub struct PlayerSpec {
     /// `None` for a static player, which never loads a win% model.
     pub win_pct_model: Option<String>,
     pub movegen_margin: f64,
+    /// Endgame and pre-endgame solving. Stated by every player, if only as 0:
+    /// `endgame_plies` 0 solves nothing. The PEG keys are null unless
+    /// `peg_max_bag` is above 0, and the nested ones unless `peg_nested` is
+    /// set -- MAGPIE refuses a key a player does not use, so they are sent as
+    /// null rather than left out.
+    pub endgame_plies: i32,
+    pub peg_max_bag: i32,
+    pub peg_stage_top_k: Option<Vec<i32>>,
+    pub peg_scenario_stride: Option<i32>,
+    pub peg_opp_model: Option<String>,
+    pub peg_nested: Option<bool>,
+    pub peg_nested_cand_caps: Option<Vec<i32>>,
+    pub peg_nested_max_depth: Option<i32>,
+    pub peg_nested_strides: Option<Vec<i32>>,
 }
 
 impl From<NamedPlayerConfig> for PlayerSpec {
@@ -123,6 +141,7 @@ impl From<NamedPlayerConfig> for PlayerSpec {
             rit_name: c
                 .use_rit
                 .then(|| crate::derived::rack_info_table_name(&lexicon, &leaves)),
+            use_wit: c.use_wit,
             min_play_iterations: c.min_play_iterations,
             threshold: c.threshold,
             sampling_rule: c.sampling_rule,
@@ -132,6 +151,15 @@ impl From<NamedPlayerConfig> for PlayerSpec {
             utility_spread_scale: c.utility_spread_scale,
             win_pct_model: winpct_name,
             movegen_margin: c.movegen_margin,
+            endgame_plies: c.endgame_plies,
+            peg_max_bag: c.peg_max_bag,
+            peg_stage_top_k: c.peg_stage_top_k,
+            peg_scenario_stride: c.peg_scenario_stride,
+            peg_opp_model: c.peg_opp_model,
+            peg_nested: c.peg_nested,
+            peg_nested_cand_caps: c.peg_nested_cand_caps,
+            peg_nested_max_depth: c.peg_nested_max_depth,
+            peg_nested_strides: c.peg_nested_strides,
         }
     }
 }
@@ -211,6 +239,10 @@ pub struct GameRequest {
     /// reports them. How many ranked moves come back per position is the
     /// player config's `num_plays_recorded`.
     pub capture_positions: bool,
+    /// Game pairs with capture only: keep each pair's first divergence and
+    /// nothing else. Always stated, `false` for a games task, which MAGPIE
+    /// refuses to read as anything else.
+    pub capture_first_divergence: bool,
     /// See [`OpeningRackRequest::bingo_bonus`].
     pub bingo_bonus: i32,
     pub sim_cutoff: f64,
@@ -220,6 +252,8 @@ pub struct GameRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LeaveRequest {
+    /// The player's lexicon, stated at the top as well: MAGPIE names the KLV it
+    /// fetches after it, and loads the two together.
     pub lexicon: String,
     pub variant: String,
     /// Stated by the job rather than inferred from the lexicon name.
@@ -252,12 +286,14 @@ pub struct LeaveRequest {
     /// early at the forced racks' target would discard coverage the server
     /// would have folded in. The target stays server-only state.
     pub num_games: i32,
-    /// Leave generation has one bot rather than a player pair, so its wordmap
-    /// setting sits on the request instead of on a player spec.
-    pub use_wordmap: bool,
     /// The job's bingo bonus. No cutoff: the leave-generating bot plays
     /// statically.
     pub bingo_bonus: i32,
+    /// The player the bot plays as, in both seats, and so the one wordmap
+    /// setting. Its leaves are stated, as every player's are, and never
+    /// loaded: the bot plays the KLV at `previous_artifact_key`, whose values
+    /// are what the job measures.
+    pub player: PlayerSpec,
 }
 
 /// What actually goes over the wire to the worker. Internally tagged so the
@@ -286,6 +322,11 @@ pub struct MoveEntry {
     pub play: String,
     pub score: i32,
     pub equity: f64,
+    /// How many times the simulation played the move out: its own iterations,
+    /// which a simulation spends unevenly, most on the leaders. 0 for a move
+    /// nothing simulated; absent from a client that does not send it.
+    #[serde(default)]
+    pub iterations: Option<i64>,
     /// The simulated win percentage. Absent for a static player, which ranks on
     /// equity alone and simulates nothing.
     #[serde(default)]
@@ -295,6 +336,13 @@ pub struct MoveEntry {
     /// win_percentage.
     #[serde(default)]
     pub blended_utility: Option<f64>,
+    /// A pre-endgame or endgame solve's projected final spread for the mover,
+    /// in points, and the endgame depth the move was ranked at. Absent for a
+    /// static or simulated analysis.
+    #[serde(default)]
+    pub mean_spread: Option<f64>,
+    #[serde(default)]
+    pub fidelity_plies: Option<i16>,
     #[serde(default)]
     pub plies: Vec<PlyStats>,
 }
@@ -354,6 +402,28 @@ impl GameAggregate {
     }
 }
 
+/// One of the leaves an inference found the opponent most likely kept, with
+/// how often it was drawn and its equity.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct InferredLeave {
+    pub leave: String,
+    pub draws: i64,
+    pub equity: f64,
+}
+
+/// What a simming player inferred the opponent kept from their previous move,
+/// before it simmed the position: how many distinct leaves, how many draws in
+/// all, their mean equity, and the most drawn of them (at most ten), most
+/// drawn first.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct InferenceSummary {
+    pub num_leaves: i64,
+    pub total_draws: i64,
+    pub average_equity: f64,
+    #[serde(default)]
+    pub leaves: Vec<InferredLeave>,
+}
+
 /// Shared by games and game pairs.
 /// One position analysed during a game, when capture is on.
 #[derive(Debug, Clone, Deserialize)]
@@ -370,9 +440,55 @@ pub struct CapturedPosition {
     pub previous_move: Option<String>,
     #[serde(default)]
     pub previous_move_score: Option<i32>,
+    /// The move played from this position, and its score: the one chosen
+    /// this turn, which need not be the top of `moves` (a simmer's pick, or
+    /// a solver's). Always stated.
+    pub played_move: String,
+    pub played_move_score: i32,
     /// How many moves were ranked, before truncation to `num_plays_recorded`.
     pub num_moves: i32,
+    /// How the move played here was chosen: `static`, `sim`, `peg` or
+    /// `endgame` ([`Analysis`]).
+    pub analysis: String,
     pub moves: Vec<MoveEntry>,
+    /// What the player inferred of the opponent's leave before simming, when
+    /// it did: a simmed position past a game's first turn whose opponent did
+    /// not pass. Absent otherwise.
+    #[serde(default)]
+    pub inference: Option<InferenceSummary>,
+}
+
+/// How a position's move was chosen, which decides what its moves carry:
+/// nothing past score and equity for a static analysis, a win percentage and
+/// per-ply statistics for a simulation, a projected spread and a depth for an
+/// endgame or pre-endgame solve (a pre-endgame's with a win percentage too).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Analysis {
+    Static,
+    Sim,
+    Peg,
+    Endgame,
+}
+
+impl Analysis {
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "static" => Some(Self::Static),
+            "sim" => Some(Self::Sim),
+            "peg" => Some(Self::Peg),
+            "endgame" => Some(Self::Endgame),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Static => "static",
+            Self::Sim => "sim",
+            Self::Peg => "peg",
+            Self::Endgame => "endgame",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -432,13 +548,21 @@ pub struct PositionAnalysis {
     /// `None` for turn 0 of a game and for opening racks.
     pub previous_move: Option<String>,
     pub previous_move_score: Option<i32>,
+    /// The move played from this position, and its score. `None` for an
+    /// opening rack, from which nothing is played.
+    pub played_move: Option<String>,
+    pub played_move_score: Option<i32>,
     /// How many moves the worker ranked, which is generally far more than the
     /// number kept in `moves`. The only part of the analysis the stored moves
     /// cannot recover, since they are truncated.
     pub num_moves: i32,
+    pub analysis: Analysis,
     /// Truncated by the caller to the job's cap. The best move is simply the
     /// first of these, so it is not carried separately.
     pub moves: Vec<MoveEntry>,
+    /// In-game simmed positions only: what was inferred of the opponent's
+    /// leave first. `None` for an opening rack, which has no opponent move.
+    pub inference: Option<InferenceSummary>,
 }
 
 impl PositionAnalysis {
@@ -447,16 +571,28 @@ impl PositionAnalysis {
     /// `num_moves` is what the worker says it ranked, which is generally more
     /// than it reported. A client that does not send it reported everything it
     /// ranked, so the list's own length is the honest answer.
+    ///
+    /// Its analysis is a simulation's when its moves carry win percentages,
+    /// and static otherwise: an opening rack never reaches a solver.
     pub fn opening_rack(rack: String, moves: Vec<MoveEntry>, num_moves: Option<i32>) -> Self {
+        let analysis = if moves.iter().any(|m| m.win_percentage.is_some()) {
+            Analysis::Sim
+        } else {
+            Analysis::Static
+        };
         Self {
+            analysis,
             rack,
             position: None,
             game_index: None,
             turn_number: None,
             previous_move: None,
             previous_move_score: None,
+            played_move: None,
+            played_move_score: None,
             num_moves: num_moves.unwrap_or(moves.len() as i32),
             moves,
+            inference: None,
         }
     }
 }
@@ -617,9 +753,9 @@ mod tests {
         assert_eq!(analysis.num_moves, None);
 
         let position: CapturedPosition = serde_json::from_value(json!({
-            "game_index": 0, "turn_number": 0, "rack": "AEINRST",
+            "game_index": 0, "turn_number": 0, "played_move": "8D PLAYED", "played_move_score": 10, "rack": "AEINRST",
             "position": "15/15/15/15/15/15/15/15/15/15/15/15/15/15/15 AEINRST/ 0/0 0",
-            "num_moves": 40, "moves": [bare_move],
+            "num_moves": 40, "analysis": "static", "moves": [bare_move],
         }))
         .unwrap();
         assert_eq!((position.previous_move, position.previous_move_score), (None, None));
@@ -652,7 +788,7 @@ mod tests {
         let ply = extra(json!({ "ply": 0, "bingo_percentage": 1.0, "average_score": 30.0 }));
         let entry = extra(json!({ "move": "8D QI", "score": 22, "equity": 30.5, "plies": [ply] }));
         let position = extra(json!({
-            "game_index": 0, "turn_number": 3, "rack": "AEINRST", "position": "cgp",
+            "game_index": 0, "turn_number": 3, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "sim", "rack": "AEINRST", "position": "cgp",
             "num_moves": 40, "moves": [entry.clone()],
         }));
 

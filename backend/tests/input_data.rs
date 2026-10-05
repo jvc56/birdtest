@@ -188,11 +188,18 @@ async fn import_state_without_store(db: &TestDb, base: &str) -> AppState {
 /// Phase 1 of an import, run to completion: the row `start_import` would
 /// insert, then the background task it would spawn, awaited.
 async fn run_import(db: &TestDb, state: &AppState) -> Uuid {
+    run_import_by(db, state, None).await
+}
+
+/// [`run_import`], as started by `requested_by`.
+async fn run_import_by(db: &TestDb, state: &AppState, requested_by: Option<Uuid>) -> Uuid {
     let id: Uuid = sqlx::query_scalar(
-        "INSERT INTO input_data_imports (tarball_date, commit_sha) VALUES ($1, $2) RETURNING id",
+        "INSERT INTO input_data_imports (tarball_date, commit_sha, requested_by)
+         VALUES ($1, $2, $3) RETURNING id",
     )
     .bind(DATE)
     .bind(COMMIT)
+    .bind(requested_by)
     .fetch_one(&db.pool)
     .await
     .unwrap();
@@ -489,8 +496,10 @@ async fn lexica_and_leaves_are_stored_once_by_digest() {
     for key in &stored {
         state.artifacts.put(key, b"already here".to_vec()).await.unwrap();
     }
+    // Every file is already known, so there is nothing to confirm; the upload
+    // happens all the same, before the diff.
     let again = run_import(&db, &state).await;
-    assert_eq!(import_state_row(&db, again).await.0, "staged");
+    assert_eq!(import_state_row(&db, again).await.0, "nothing_new");
     for key in &stored {
         assert_eq!(state.artifacts.get(key).await.unwrap(), b"already here", "{key} re-uploaded");
     }
@@ -500,8 +509,11 @@ async fn lexica_and_leaves_are_stored_once_by_digest() {
 }
 
 /// I-INPUT-4: importing the same tarball a second time changes nothing:
-/// every file stages as `known`, confirming inserts nothing, and the
-/// vocabulary is exactly what the first import left.
+/// every file stages as `known`, so the import goes straight to `nothing_new`
+/// -- not `staged`, where it offered an Insert of 0 rows and waited a day to
+/// be expired -- with an audit record naming the admin who started it; it
+/// cannot be confirmed, and the vocabulary is exactly what the first import
+/// left.
 #[tokio::test]
 async fn a_second_import_of_the_same_tarball_is_a_no_op() {
     let db = TestDb::new().await;
@@ -520,10 +532,31 @@ async fn a_second_import_of_the_same_tarball_is_a_no_op() {
     assert_eq!(admin.confirm(first).await, (StatusCode::OK, json!({ "inserted": 5 })));
     let before = snapshot().await;
 
-    let second = run_import(&db, &state).await;
-    assert_eq!(staged(&db, second).await, expected_staged("known"));
-    assert_eq!(admin.confirm(second).await, (StatusCode::OK, json!({ "inserted": 0 })));
+    let second = run_import_by(&db, &state, Some(admin.id)).await;
+    let (import_state, error, digest) = import_state_row(&db, second).await;
+    assert_eq!((import_state.as_str(), error, digest.is_some()), ("nothing_new", None, true));
+    assert_eq!(staged(&db, second).await, expected_staged("known"), "the diff is still there to read");
+    let (status, body) = admin.confirm(second).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["message"], "this import has nothing new to insert");
     assert_eq!(snapshot().await, before);
+
+    let audit: Vec<(String, Option<Uuid>, Option<String>)> = sqlx::query_as(
+        "SELECT action, actor_user_id, target_id FROM audit_log
+         WHERE action = 'input_data.import_nothing_new'",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(audit, vec![("input_data.import_nothing_new".into(), Some(admin.id), Some(second.to_string()))]);
+    // Not swept as unconfirmed, however old: it was never waiting for a
+    // confirmation.
+    sqlx::query("UPDATE input_data_imports SET requested_at = now() - interval '25 hours'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(birdtest::inputdata::expire_unconfirmed_imports(&db.pool).await.unwrap(), 0);
+    assert_eq!(import_state_row(&db, second).await.0, "nothing_new");
 }
 
 /// I-INPUT-5: the startup reaper fails every import left `running` -- its
@@ -536,6 +569,7 @@ async fn a_restart_fails_running_imports_and_leaves_the_rest() {
     for (state, error) in [
         ("running", None),
         ("staged", None),
+        ("nothing_new", None),
         ("confirmed", None),
         ("failed", Some("earlier failure")),
         ("cancelled", Some("expired")),
@@ -566,6 +600,7 @@ async fn a_restart_fails_running_imports_and_leaves_the_rest() {
         vec![
             ("failed".into(), Some("the server restarted while this import was running".into())),
             ("staged".into(), None),
+            ("nothing_new".into(), None),
             ("confirmed".into(), None),
             ("failed".into(), Some("earlier failure".into())),
             ("cancelled".into(), Some("expired".into())),
@@ -720,13 +755,14 @@ async fn an_import_is_started_polled_while_running_and_confirmed_over_http() {
 }
 
 /// A-ADMIN-6: only a `staged` import can be confirmed. One running, failed,
-/// cancelled or already confirmed is refused with its state, and inserts
-/// nothing even when it has rows; one that does not exist is a 404.
+/// cancelled or already confirmed is refused with its state, and one with
+/// nothing new says so, and none inserts anything even when it has rows; one
+/// that does not exist is a 404.
 #[tokio::test]
 async fn only_a_staged_import_can_be_confirmed() {
     let db = TestDb::new().await;
     let admin = Admin::new(&db, db.state().await).await;
-    for state in ["running", "failed", "cancelled", "confirmed"] {
+    for state in ["running", "failed", "cancelled", "confirmed", "nothing_new"] {
         let id: Uuid = sqlx::query_scalar(
             "INSERT INTO input_data_imports (tarball_date, commit_sha, state)
              VALUES ($1, $2, $3) RETURNING id",
@@ -749,7 +785,11 @@ async fn only_a_staged_import_can_be_confirmed() {
 
         let (status, body) = admin.confirm(id).await;
         assert_eq!(status, StatusCode::CONFLICT, "{state}: {body}");
-        assert_eq!(body["message"], format!("this import is {state}, not staged"));
+        let expected = match state {
+            "nothing_new" => "this import has nothing new to insert".to_string(),
+            _ => format!("this import is {state}, not staged"),
+        };
+        assert_eq!(body["message"], expected);
         assert_eq!(import_state_row(&db, id).await.0, state, "unchanged");
     }
     assert_eq!(input_data_count(&db).await, 0);
@@ -761,8 +801,8 @@ async fn only_a_staged_import_can_be_confirmed() {
 
 /// I-INPUT-6 and A-ADMIN-7: the list reports, per file, how many jobs, player
 /// configs and rating pools pin it; a file pinned by any of them -- a job's
-/// distribution or board, a player's lexicon, leaves or win% model, a leave
-/// job's lexicon, a rating pool's distribution or board -- cannot be deleted
+/// distribution or board, a player's lexicon, leaves or win% model (a leave
+/// job's player's among them), a rating pool's distribution or board -- cannot be deleted
 /// and stays; an unpinned one can, once.
 #[tokio::test]
 async fn an_input_file_in_use_cannot_be_deleted() {
@@ -778,7 +818,7 @@ async fn an_input_file_in_use_cannot_be_deleted() {
             .await
             .unwrap()
     };
-    let (job_ld, job_layout) = board(db.bare_job("games", 1, admin.id).await).await;
+    let (job_ld, job_layout) = board(db.bare_job("games", admin.id).await).await;
     // A simming player's lexicon, leaves and win% model.
     let kwg = db.input_data("kwg", "NWL23").await;
     let klv = db.input_data("klv", "NWL23").await;
@@ -796,17 +836,23 @@ async fn an_input_file_in_use_cannot_be_deleted() {
         .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
     let player: Uuid = body["id"].as_str().unwrap().parse().unwrap();
-    // A leave job's lexicon.
-    let leave = db.bare_job("leave_generation", 1, admin.id).await;
+    // A leave job's player, whose config pins its lexicon and leaves.
+    let leave = db.bare_job("leave_generation", admin.id).await;
     let (leave_ld, leave_layout) = board(leave).await;
     let leave_kwg = db.input_data("kwg", "CSW21").await;
+    let leave_player = db.leave_player(leave_kwg, true, admin.id).await;
+    let leave_klv: Uuid = sqlx::query_scalar("SELECT klv_id FROM player_configs WHERE id = $1")
+        .bind(leave_player)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
     sqlx::query(
         "INSERT INTO job_leave_config
-             (job_id, kwg_id, num_iterations, target_rack_count, racks_per_task)
-         VALUES ($1, $2, 10, 10, 10)",
+             (job_id, player_config_id, num_iterations, target_rack_counts, racks_per_task)
+         VALUES ($1, $2, 10, ARRAY[10], 10)",
     )
     .bind(leave)
-    .bind(leave_kwg)
+    .bind(leave_player)
     .execute(&db.pool)
     .await
     .unwrap();
@@ -826,7 +872,8 @@ async fn an_input_file_in_use_cannot_be_deleted() {
     let unused = db.input_data("kwg", "unused").await;
 
     let pinned = [
-        job_ld, job_layout, kwg, klv, winpct, leave_ld, leave_layout, leave_kwg, pool_ld, pool_layout,
+        job_ld, job_layout, kwg, klv, winpct, leave_ld, leave_layout, leave_kwg, leave_klv, pool_ld,
+        pool_layout,
     ];
     let (status, list) = admin.call("GET", "/api/admin/input-data", None).await;
     assert_eq!(status, StatusCode::OK, "{list}");
@@ -1031,8 +1078,10 @@ async fn a_damaged_lexicon_object_is_replaced_by_the_next_import() {
     assert!(error.contains("has been deleted") && error.contains("import its tarball again"), "{error}");
     assert!(!state.artifacts.exists(&key).await.unwrap(), "the damaged object is gone");
 
+    // Every file is already known, so there is nothing to confirm; the upload
+    // happens all the same, before the diff.
     let again = run_import(&db, &state).await;
-    assert_eq!(import_state_row(&db, again).await.0, "staged");
+    assert_eq!(import_state_row(&db, again).await.0, "nothing_new");
     assert_eq!(state.artifacts.get(&key).await.unwrap(), fixture_file(&path), "uploaded again, whole");
 }
 

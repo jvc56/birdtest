@@ -16,6 +16,11 @@ test('E-9: a user resets a forgotten password from the emailed link', async ({ p
   await page.goto('/login');
   await page.getByRole('link', { name: 'Forgot password?' }).click();
   await expect(page).toHaveURL(/\/reset-password$/);
+  // An address registration would refuse is red text under the field, as on
+  // the register form, not the browser's popup.
+  await page.getByLabel('Email').fill('a@b');
+  await page.getByRole('button', { name: 'Send reset link' }).click();
+  await expect(page.locator('.field-error')).toHaveText('must be a valid email address');
   await page.getByLabel('Email').fill(user.email);
   await page.getByRole('button', { name: 'Send reset link' }).click();
   await expect(page.getByText('If that address has a confirmed account, a reset link is on its way.')).toBeVisible();

@@ -14,7 +14,7 @@ use crate::state::AppState;
 use crate::extract::ApiPath as Path;
 use axum::extract::State;
 use axum::http::{HeaderMap, Method, StatusCode};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
 use axum_extra::extract::CookieJar;
 use serde::{Deserialize, Serialize};
@@ -31,6 +31,7 @@ pub fn public_router() -> Router<AppState> {
 pub fn admin_router() -> Router<AppState> {
     Router::new()
         .route("/rating-pools", post(create_pool))
+        .route("/rating-pools/:id", patch(update_pool).delete(delete_pool))
         .route("/rating-pools/:id/members", post(add_member))
         .route("/rating-pools/:id/members/:config_id", delete(remove_member))
         .route("/rating-pools/:id/recompute", post(recompute_pool))
@@ -504,9 +505,11 @@ async fn add_member(
     csrf::verify(&method, &headers, &jar)?;
 
     let mut tx = state.pool.begin().await?;
-    // Pools are never deleted, so a pool seen here is still there for the
-    // insert, and a foreign-key failure on it can only be the config.
-    sqlx::query("SELECT 1 FROM rating_pools WHERE id = $1")
+    // Locked against a delete until this commits, so a pool seen here is still
+    // there for the insert, and a foreign-key failure on it can only be the
+    // config. A plain read let a delete in between, and the insert's failure on
+    // the pool's key came back as a 409 about the config.
+    sqlx::query("SELECT 1 FROM rating_pools WHERE id = $1 FOR KEY SHARE")
         .bind(pool_id)
         .fetch_optional(&mut *tx)
         .await?
@@ -560,23 +563,28 @@ async fn remove_member(
 ) -> AppResult<Json<serde_json::Value>> {
     csrf::verify(&method, &headers, &jar)?;
 
+    let mut tx = state.pool.begin().await?;
+    // Under the fit lock, which an anchor change takes too: checked outside
+    // it, a removal could pass the check, an anchor change make this config
+    // the anchor, and the delete below then leave the pool with an anchor
+    // that is not a member, which no fit accepts.
+    ratings::lock_pool_fit(&mut tx, pool_id).await?;
     let is_anchor = sqlx::query_scalar::<_, bool>(
         "SELECT anchor_player_config_id = $2 FROM rating_pools WHERE id = $1",
     )
     .bind(pool_id)
     .bind(config_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&mut *tx)
     .await?
     .ok_or_else(|| AppError::not_found("rating pool not found"))?;
 
     if is_anchor {
         return Err(AppError::bad_request(
             "cannot remove the pool's anchor: every other rating is measured against it. \
-             A pool's anchor is fixed; to rate against another, create a pool anchored on it.",
+             Make another member the anchor first, then remove this one.",
         ));
     }
 
-    let mut tx = state.pool.begin().await?;
     // A config that is not a member -- a second click -- removes nothing, and
     // is answered so rather than logged and refitted as a removal (the audit's
     // pass 22).
@@ -603,6 +611,180 @@ async fn remove_member(
 
     let run_id = ratings::recompute(&state.pool, pool_id, Trigger::Membership).await?;
     Ok(Json(serde_json::json!({ "run_id": run_id })))
+}
+
+#[derive(Deserialize)]
+struct UpdatePoolBody {
+    anchor_player_config_id: Option<Uuid>,
+    anchor_rating: Option<f64>,
+}
+
+/// Moves a pool's anchor, or the rating it is pinned at, and refits.
+///
+/// The ratings are only defined up to where the anchor pins them, so this
+/// rescales everyone: the refit commits with the change, so the page never
+/// shows the new anchor beside ratings on the old scale. Past runs keep the
+/// scale they were fitted on, and the history chart steps at the change --
+/// which is what happened.
+///
+/// A new anchor that is not yet a member is added first: a pool's fixed point
+/// has to be in the pool, as `create_pool` makes it.
+async fn update_pool(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    Path(pool_id): Path<Uuid>,
+    method: Method,
+    headers: HeaderMap,
+    jar: CookieJar,
+    ApiJson(body): ApiJson<UpdatePoolBody>,
+) -> AppResult<Json<serde_json::Value>> {
+    csrf::verify(&method, &headers, &jar)?;
+
+    if body.anchor_player_config_id.is_none() && body.anchor_rating.is_none() {
+        return Err(AppError::bad_request(
+            "name an anchor_player_config_id, an anchor_rating, or both",
+        ));
+    }
+    if let Some(rating) = body.anchor_rating {
+        if !rating.is_finite() || rating.abs() > MAX_ABS_ANCHOR_RATING {
+            return Err(AppError::bad_request("rating pool details are invalid").with_field(
+                "anchor_rating",
+                format!(
+                    "must be a number between -{MAX_ABS_ANCHOR_RATING} and {MAX_ABS_ANCHOR_RATING}"
+                ),
+            ));
+        }
+    }
+
+    // The lock first, then the read: a fit in flight finishes on the old
+    // anchor before this reads it, and a removal of the new anchor either
+    // lands before (and the anchor is re-added below) or waits and is refused.
+    let mut tx = state.pool.begin().await?;
+    ratings::lock_pool_fit(&mut tx, pool_id).await?;
+    let (old_anchor, old_rating): (Uuid, f64) = sqlx::query_as(
+        "SELECT anchor_player_config_id, anchor_rating FROM rating_pools WHERE id = $1 FOR UPDATE",
+    )
+    .bind(pool_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| AppError::not_found("rating pool not found"))?;
+    let anchor = body.anchor_player_config_id.unwrap_or(old_anchor);
+    let rating = body.anchor_rating.unwrap_or(old_rating);
+    if anchor == old_anchor && rating == old_rating {
+        // A second click: nothing moved, so nothing is logged or refitted.
+        return Ok(Json(serde_json::json!({ "run_id": null })));
+    }
+
+    let added = sqlx::query(
+        "INSERT INTO rating_pool_members (pool_id, player_config_id, added_by)
+         VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+    )
+    .bind(pool_id)
+    .bind(anchor)
+    .bind(admin.0.id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| {
+        unknown_config(
+            e.into(),
+            "rating_pool_members_player_config_id_fkey",
+            "anchor_player_config_id",
+            anchor,
+        )
+    })?
+    .rows_affected();
+    if added > 0 {
+        audit::log(
+            &mut tx,
+            "rating_pool.member_added",
+            Some(admin.0.id),
+            None,
+            Some("player_config"),
+            Some(anchor.to_string()),
+            None,
+        )
+        .await?;
+    }
+    sqlx::query("UPDATE rating_pools SET anchor_player_config_id = $2, anchor_rating = $3 WHERE id = $1")
+        .bind(pool_id)
+        .bind(anchor)
+        .bind(rating)
+        .execute(&mut *tx)
+        .await?;
+    audit::log_detail(
+        &mut tx,
+        "rating_pool.anchor_changed",
+        admin.0.id,
+        "rating_pool",
+        pool_id.to_string(),
+        None,
+        format!("anchor={old_anchor}@{old_rating} -> {anchor}@{rating}"),
+    )
+    .await?;
+    let run_id = ratings::recompute_within(&mut tx, pool_id, Trigger::Anchor).await?;
+    tx.commit().await?;
+    Ok(Json(serde_json::json!({ "run_id": run_id })))
+}
+
+/// Deletes a pool with its members, runs, ratings and residuals (they
+/// cascade). The games stay: they belong to their jobs, and a pool is only a
+/// view over them, so a pool recreated with the same scope and members fits the
+/// same ratings again. What goes is the history, which is why the census says
+/// how much of it there was.
+///
+/// Deleting frees the anchor and member configs, and the pool's letter
+/// distribution and layout, for their own deletes.
+async fn delete_pool(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    Path(pool_id): Path<Uuid>,
+    method: Method,
+    headers: HeaderMap,
+    jar: CookieJar,
+) -> AppResult<StatusCode> {
+    csrf::verify(&method, &headers, &jar)?;
+
+    let mut tx = state.pool.begin().await?;
+    // Waits for a fit in flight: its run would otherwise be written against a
+    // pool whose rows this is cascading away.
+    ratings::lock_pool_fit(&mut tx, pool_id).await?;
+    let census: (String, i64, i64) = sqlx::query_as(
+        "SELECT p.name,
+                (SELECT COUNT(*) FROM rating_pool_members m WHERE m.pool_id = p.id),
+                (SELECT COUNT(*) FROM rating_runs r WHERE r.pool_id = p.id)
+         FROM rating_pools p WHERE p.id = $1 FOR UPDATE",
+    )
+    .bind(pool_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| AppError::not_found("rating pool not found"))?;
+    let (name, members, runs) = census;
+    audit::log_detail(
+        &mut tx,
+        "rating_pool.deleted.census",
+        admin.0.id,
+        "rating_pool",
+        pool_id.to_string(),
+        None,
+        format!("name={name} members={members} runs={runs}"),
+    )
+    .await?;
+    audit::log(
+        &mut tx,
+        "rating_pool.deleted",
+        Some(admin.0.id),
+        None,
+        Some("rating_pool"),
+        Some(pool_id.to_string()),
+        None,
+    )
+    .await?;
+    sqlx::query("DELETE FROM rating_pools WHERE id = $1")
+        .bind(pool_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn recompute_pool(

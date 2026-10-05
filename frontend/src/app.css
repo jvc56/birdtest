@@ -12,6 +12,16 @@
   a {
     @apply text-primary hover:underline;
   }
+  /* No spinner buttons on number boxes: the arrow keys still step them. */
+  input[type='number']::-webkit-inner-spin-button,
+  input[type='number']::-webkit-outer-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+  }
+  input[type='number'] {
+    appearance: textfield;
+    -moz-appearance: textfield;
+  }
 }
 
 @layer components {

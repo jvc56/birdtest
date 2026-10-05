@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
   import { api, errorText, type InputData, type PlayerConfig } from '$lib/api';
-  import { blankFields } from '$lib/format';
+  import { blankFields, unchosenText } from '$lib/format';
 
   let configs: PlayerConfig[] = [];
   let files: InputData[] = [];
@@ -37,10 +37,9 @@
   onMount(async () => {
     try {
       [configs, files] = await Promise.all([api.playerConfigs(), api.inputData()]);
-      // From `files` directly: the `$:` arrays above are not recomputed until
-      // the next update cycle.
-      letterdistId = files.find((f) => f.role === 'letterdist')?.id ?? '';
-      layoutId = files.find((f) => f.role === 'layout')?.id ?? '';
+      // The letter distribution and board are left for the admin to choose,
+      // as on the job form: the first of each was only whichever was
+      // imported first.
       anchorId = configs[0]?.id ?? '';
     } catch (e) {
       error = `Could not load player configs and input data: ${e instanceof Error ? e.message : String(e)}`;
@@ -49,6 +48,17 @@
 
   async function submit() {
     error = '';
+    // As on the job form: the browser holds an empty required select, and
+    // this names one that gets past it.
+    const unchosen = unchosenText({
+      'a letter distribution': letterdistId,
+      'a board layout': layoutId
+    });
+    if (unchosen) {
+      error = unchosen;
+      fromSubmit = true;
+      return;
+    }
     const request = {
       name: name.trim(),
       variant,
@@ -108,12 +118,14 @@
     <div>
       <label class="label" for="ld">Letter distribution</label>
       <select id="ld" class="input" bind:value={letterdistId} required>
+        <option value="" disabled selected>Choose…</option>
         {#each letterdists as file}<option value={file.id}>{label(file)}</option>{/each}
       </select>
     </div>
     <div>
       <label class="label" for="layout">Board layout</label>
       <select id="layout" class="input" bind:value={layoutId} required>
+        <option value="" disabled selected>Choose…</option>
         {#each layouts as file}<option value={file.id}>{label(file)}</option>{/each}
       </select>
     </div>

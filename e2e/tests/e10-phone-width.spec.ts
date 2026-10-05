@@ -50,7 +50,7 @@ test('E-10: a visitor on a phone reads the job list, a job page and the rankings
   expect(page.viewportSize()!.width).toBeLessThan(400);
 
   await page.goto('/');
-  await expect(page.getByRole('heading', { name: 'Crowdsourced word game analysis' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Crowdsourced Crossword Game Analysis' })).toBeVisible();
   await expectNoSidewaysScroll(page);
 
   await page.getByRole('link', { name: 'Browse jobs' }).tap();
@@ -59,14 +59,14 @@ test('E-10: a visitor on a phone reads the job list, a job page and the rankings
   await expectNoSidewaysScroll(page);
 
   await page.locator(`a[href="/jobs/${job.id}"]`).tap();
-  await expect(page.getByRole('heading', { name: 'Game pairs' })).toBeVisible();
-  await expect(page.getByRole('heading', { name: 'SPRT' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Game Pairs' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Significance Test' })).toBeVisible();
   await expectNoSidewaysScroll(page);
 
-  // The four headline figures stack in one column rather than squeezing four
-  // across: each is as wide as the one above it and sits below it.
+  // The three headline figures stack in one column rather than squeezing
+  // three across: each is as wide as the one above it and sits below it.
   const cards = page.locator('.grid > .card');
-  await expect(cards).toHaveCount(4);
+  await expect(cards).toHaveCount(3);
   const boxes = await Promise.all((await cards.all()).map((card) => card.boundingBox()));
   for (let i = 1; i < boxes.length; i++) {
     expect(boxes[i]!.x).toBeCloseTo(boxes[0]!.x, 0);
@@ -78,6 +78,14 @@ test('E-10: a visitor on a phone reads the job list, a job page and the rankings
     const link = page.getByRole('banner').getByRole('link', { name, exact: true });
     await expect(link).toBeInViewport();
   }
+  // Every setting, the players' side by side: the tables wrap, or scroll
+  // inside their card, but never widen the page.
+  const jobSettings = page.locator('.card', { has: page.getByRole('heading', { name: 'Job settings' }) });
+  await expect(jobSettings.getByText('Oldest MAGPIE')).toBeVisible();
+  const settings = page.locator('.card', { has: page.getByRole('heading', { name: 'Player settings' }) });
+  await settings.getByRole('button', { name: 'All settings' }).tap();
+  await expect(settings.getByText('Movegen Margin')).toBeVisible();
+  await expectNoSidewaysScroll(page);
 
   // The same page with the widest name as its creator and as a contributor:
   // "Created by" widened the page, and the contributors' count left its box.
@@ -86,7 +94,7 @@ test('E-10: a visitor on a phone reads the job list, a job page and the rankings
     const body = await response.json();
     body.job.created_by = LONGEST;
     body.workers = [
-      { username: LONGEST, anon_id: null, tasks_completed: 123456789012 },
+      { username: LONGEST, anon_id: null, tasks_completed: 123456789012, compute_seconds: 9.9e10 },
       ...(body.workers ?? [])
     ];
     await route.fulfill({ response, json: body });
@@ -107,11 +115,11 @@ test('E-10: a visitor on a phone reads the job list, a job page and the rankings
   // screen: a pseudonym's sixteen characters pushed it out (thirty-second audit).
   // With a row in it: an empty table fits on any page.
   await page.getByRole('banner').getByRole('link', { name: 'Contributors', exact: true }).tap();
-  await expect(page.getByRole('columnheader', { name: 'Tasks completed' })).toBeVisible();
+  await expect(page.getByRole('columnheader', { name: 'Compute time' })).toBeVisible();
   await expect(page.getByRole('cell', { name: /^Anonymous · [0-9a-f]{16}$/ }).first()).toBeVisible();
   await expectNoSidewaysScroll(page);
   await expectTableFits(page);
-  await expect(page.getByRole('columnheader', { name: 'Tasks completed' })).toBeInViewport();
+  await expect(page.getByRole('columnheader', { name: 'Compute time' })).toBeInViewport();
 
   // And with the widest names either ranking can hold, which the seed has not
   // registered: both lists answered as the server would with them.
@@ -120,9 +128,14 @@ test('E-10: a visitor on a phone reads the job list, a job page and the rankings
     route.fulfill({
       json: {
         items: [
-          { username: LONGEST, anon_id: null, tasks_completed: 123456789012, last_seen_at: now },
-          { username: TOMBSTONE, anon_id: null, tasks_completed: 1, last_seen_at: now },
-          { username: null, anon_id: 'f'.repeat(16), tasks_completed: 1, last_seen_at: now }
+          // Longer than any fleet will run: the compute column at its widest.
+          { user_id: null, username: LONGEST, anon_id: null, compute_seconds: 9.9e10,
+            games_played: 123456789012, racks_analyzed: 123456789012,
+            tasks_completed: 123456789012, last_seen_at: now },
+          { user_id: null, username: TOMBSTONE, anon_id: null, compute_seconds: 1,
+            games_played: 1, racks_analyzed: 1, tasks_completed: 1, last_seen_at: now },
+          { user_id: null, username: null, anon_id: 'f'.repeat(16), compute_seconds: 1,
+            games_played: 1, racks_analyzed: 1, tasks_completed: 1, last_seen_at: now }
         ],
         total: 3,
         page: 0,
@@ -147,7 +160,14 @@ test('E-10: a visitor on a phone reads the job list, a job page and the rankings
   await expect(page.getByRole('cell', { name: LONGEST })).toBeVisible();
   await expectNoSidewaysScroll(page);
   await expectTableFits(page);
-  await expect(page.getByRole('columnheader', { name: 'Tasks completed' })).toBeInViewport();
+  await expect(page.getByRole('columnheader', { name: 'Compute time' })).toBeInViewport();
+  // Ranked by another column, that column is the one shown beside the name.
+  await page.getByRole('button', { name: 'Games' }).tap();
+  await expect(page.getByRole('columnheader', { name: 'Games' })).toHaveAttribute('aria-sort', 'descending');
+  await expect(page.getByRole('columnheader', { name: 'Compute time' })).toBeHidden();
+  await expectNoSidewaysScroll(page);
+  await expectTableFits(page);
+  await expect(page.getByRole('columnheader', { name: 'Games' })).toBeInViewport();
 
   await page.getByRole('banner').getByRole('link', { name: 'Users', exact: true }).tap();
   await expect(page.getByRole('cell', { name: new RegExp(`^${LONGEST}`) })).toBeVisible();

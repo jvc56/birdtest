@@ -52,6 +52,31 @@ pub const UTILITY_W_SPREAD: f64 = 0.5;
 /// `-uspreadscale` (`CONFIG_DEFAULT_UTILITY_SPREAD_SCALE`).
 pub const UTILITY_SPREAD_SCALE: f64 = 100.0;
 
+// Endgame and pre-endgame solving: off unless a config asks for it. When it
+// does, a setting it leaves out takes these, MAGPIE's own CLI defaults
+// (`eplies`, `PEG_MAX_BAG`, and `autoplay_solver_settings_set_defaults` in
+// `src/ent/autoplay_solver_settings.h`).
+
+/// `-eplies1`/`-eplies2` when the endgame is on (MAGPIE's `eplies` default).
+pub const ENDGAME_PLIES: i32 = 6;
+/// `-pegbag1`/`-pegbag2` when PEG is on (`PEG_MAX_BAG`).
+pub const PEG_MAX_BAG: i32 = 4;
+/// `-pegtopk1`/`-pegtopk2`: survivors per halving stage.
+pub const PEG_STAGE_TOP_K: [i32; 5] = [32, 16, 8, 4, 2];
+/// `-pegstride1`/`-pegstride2`: full enumeration.
+pub const PEG_SCENARIO_STRIDE: i32 = 1;
+/// `-pegpess1`/`-pegpess2` false.
+pub const PEG_OPP_MODEL: &str = "rational";
+/// `-pegnested1`/`-pegnested2`.
+pub const PEG_NESTED: bool = true;
+/// `-pegncaps`.
+pub const PEG_NESTED_CAND_CAPS: [i32; 3] = [8, 4, 2];
+/// `-pegndepth` (`PEG_NESTED_DEFAULT_DEPTH`).
+pub const PEG_NESTED_MAX_DEPTH: i32 = 1;
+/// `-pegnstrides`: an inner pre-endgame's stride for a bag of 1, 2, 3 and 4
+/// tiles (peg.c's bag-dependent default).
+pub const PEG_NESTED_STRIDES: [i32; 4] = [1, 1, 5, 7];
+
 // Run-wide settings, stored on the job.
 
 /// `-bb` (`DEFAULT_BINGO_BONUS`).

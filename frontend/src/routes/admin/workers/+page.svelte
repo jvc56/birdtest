@@ -1,10 +1,10 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { api, errorText, type Page, type WorkerBan } from '$lib/api';
-  import { workerLabel } from '$lib/format';
+  import { api, errorText, type Contributor, type Page, type WorkerBan } from '$lib/api';
+  import { computeTime, workerLabel } from '$lib/format';
   import Pagination from '$lib/components/Pagination.svelte';
 
-  let workers: Page<Record<string, any>> | null = null;
+  let workers: Page<Contributor> | null = null;
   let bans: WorkerBan[] = [];
   let target = '';
   // Stated, not guessed: a user id and an anonymous UUID are both UUIDs, and
@@ -135,19 +135,23 @@
 <div class="card overflow-x-auto p-0">
   <table class="table">
     <thead>
-      <tr><th>Contributor</th><th>Identifier</th><th class="text-right">Tasks</th><th></th></tr>
+      <tr>
+        <th>Contributor</th><th>Identifier</th><th class="text-right">Compute time</th>
+        <th class="text-right">Tasks</th><th></th>
+      </tr>
     </thead>
     <tbody>
       {#each workers?.items ?? [] as worker}
         <tr>
           <td>{workerLabel(worker)}</td>
           <td class="font-mono text-xs">{worker.user_id ?? worker.anon_uuid}</td>
-          <td class="text-right tabular-nums">{Number(worker.tasks_completed).toLocaleString()}</td>
+          <td class="whitespace-nowrap text-right tabular-nums">{computeTime(worker.compute_seconds)}</td>
+          <td class="text-right tabular-nums">{worker.tasks_completed.toLocaleString()}</td>
           <td class="text-right">
             <button
               class="btn-secondary"
               on:click={() => {
-                target = worker.user_id ?? worker.anon_uuid;
+                target = worker.user_id ?? worker.anon_uuid ?? '';
                 kind = worker.user_id ? 'user' : 'anon';
               }}
             >
@@ -156,7 +160,7 @@
           </td>
         </tr>
       {:else}
-        <tr><td colspan="4" class="text-muted-foreground">No workers yet.</td></tr>
+        <tr><td colspan="5" class="text-muted-foreground">No workers yet.</td></tr>
       {/each}
     </tbody>
   </table>

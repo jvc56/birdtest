@@ -128,6 +128,7 @@ pub fn test_builders() -> birdtest::magpie::Builders {
         wmp_builder_version: 1,
         rit_builder_version: 1,
         klv_builder_version: 1,
+        wit_builder_version: 1,
     }
 }
 
@@ -205,6 +206,7 @@ impl TestDb {
             // Nothing in these tests touches the object store; an unroutable
             // endpoint makes an accidental call fail fast rather than reach AWS.
             s3_endpoint: Some("http://127.0.0.1:9".into()),
+            s3_public_endpoint: None,
             min_magpie_version: "0.1.1".into(),
             magpie_download_url: "https://example.invalid/magpie".into(),
             // A path that is not a binary. Nothing below tier 6 runs a
@@ -388,8 +390,8 @@ impl TestDb {
             "INSERT INTO player_configs
                  (name, recorder_type, sort_strategy, kwg_id, klv_id, num_plies, num_plays,
                   num_plies_recorded, num_plays_recorded, use_wordmap, use_rit,
-                  movegen_margin, created_by)
-             VALUES ($1, 'best', 'equity', $2, $3, 0, 100, 2, 10, false, false, 5, $4)
+                  use_wit, movegen_margin, created_by)
+             VALUES ($1, 'best', 'equity', $2, $3, 0, 100, 2, 10, false, false, false, 5, $4)
              RETURNING id",
         )
         .bind(name)
@@ -401,16 +403,64 @@ impl TestDb {
         .unwrap()
     }
 
-    /// An active `games` job at 50% allocation, with its config row.
-    pub async fn games_job(&self, redundancy: i32, games_per_batch: i32) -> Uuid {
+    /// A simulating player: [`Self::static_player`] made a 2-ply simmer, with
+    /// every simulation setting the schema requires of one.
+    pub async fn sim_player(&self, name: &str, created_by: Uuid) -> Uuid {
+        let player = self.static_player(name, created_by).await;
+        let winpct = self.input_data("winpct", &format!("winpct{name}")).await;
+        sqlx::query(
+            "UPDATE player_configs
+             SET num_plies = 2, winpct_id = $2, max_iterations = 1000, stopping_pct = 99,
+                 use_inference = false, time_limit_secs = 0, min_play_iterations = 100,
+                 threshold = 'none', sampling_rule = 'round_robin', inference_margin = 0,
+                 utility_w_winpct = 1, utility_w_spread = 0, utility_spread_scale = 1
+             WHERE id = $1",
+        )
+        .bind(player)
+        .bind(winpct)
+        .execute(&self.pool)
+        .await
+        .unwrap();
+        player
+    }
+
+    /// A leave job's player on `kwg`: static, sorting on equity, no rack info
+    /// table, as job creation requires. Its leaves are a row of their own,
+    /// which the job must never pin -- leave generation plays the server's KLV.
+    pub async fn leave_player(&self, kwg: Uuid, use_wordmap: bool, created_by: Uuid) -> Uuid {
+        let name = format!("leave{}", Uuid::new_v4().simple());
+        let klv = self.input_data("klv", &name).await;
+        sqlx::query_scalar(
+            "INSERT INTO player_configs
+                 (name, recorder_type, sort_strategy, kwg_id, klv_id, num_plies, num_plays,
+                  num_plies_recorded, num_plays_recorded, use_wordmap, use_rit,
+                  use_wit, movegen_margin, created_by)
+             VALUES ($1, 'best', 'equity', $2, $3, 0, 100, 2, 10, $4, false, false, 5, $5)
+             RETURNING id",
+        )
+        .bind(name)
+        .bind(kwg)
+        .bind(klv)
+        .bind(use_wordmap)
+        .bind(created_by)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap()
+    }
+
+    /// An active `games` job at 50% allocation, with its config row. It runs
+    /// the match test at the schema's default confidence, which the stats and finish tests read;
+    /// at a floor and cap of a million games it never decides anything else.
+    pub async fn games_job(&self, games_per_batch: i32) -> Uuid {
         let admin = self.user(&format!("admin{}", Uuid::new_v4().simple()), true).await;
         let p1 = self.static_player(&format!("p1{}", Uuid::new_v4().simple()), admin).await;
         let p2 = self.static_player(&format!("p2{}", Uuid::new_v4().simple()), admin).await;
-        let job = self.bare_job("games", redundancy, admin).await;
+        let job = self.bare_job("games", admin).await;
         sqlx::query(
             "INSERT INTO job_game_config
-                 (job_id, player1_config_id, player2_config_id, games_per_batch, min_games, max_games)
-             VALUES ($1, $2, $3, $4, 1000000, 1000000)",
+                 (job_id, player1_config_id, player2_config_id, games_per_batch, test_enabled,
+                  min_games, max_games)
+             VALUES ($1, $2, $3, $4, TRUE, 1000000, 1000000)",
         )
         .bind(job)
         .bind(p1)
@@ -423,17 +473,16 @@ impl TestDb {
     }
 
     /// A `jobs` row and nothing else: active, allocation 50, floor 0.1.0.
-    pub async fn bare_job(&self, job_type: &str, redundancy: i32, created_by: Uuid) -> Uuid {
+    pub async fn bare_job(&self, job_type: &str, created_by: Uuid) -> Uuid {
         let ld = self.input_data("letterdist", "english").await;
         let layout = self.input_data("layout", "standard15").await;
         sqlx::query_scalar(
-            "INSERT INTO jobs (job_type, allocation, redundancy, status, created_by,
+            "INSERT INTO jobs (job_type, allocation, status, created_by,
                                variant, letterdist_id, layout_id, bingo_bonus, sim_cutoff)
-             VALUES ($1::job_type, 50, $2, 'active', $3, 'classic', $4, $5, 50, 0.005)
+             VALUES ($1::job_type, 50, 'active', $2, 'classic', $3, $4, 50, 0.005)
              RETURNING id",
         )
         .bind(job_type)
-        .bind(redundancy)
         .bind(created_by)
         .bind(ld)
         .bind(layout)
@@ -484,6 +533,14 @@ pub async fn send(app: &Router, request: Request<Body>) -> (StatusCode, serde_js
 
 pub fn post_json(path: &str, headers: &[(&str, &str)], body: serde_json::Value) -> Request<Body> {
     let mut builder = Request::post(path).header("content-type", "application/json");
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    builder.body(Body::from(body.to_string())).unwrap()
+}
+
+pub fn put_json(path: &str, headers: &[(&str, &str)], body: serde_json::Value) -> Request<Body> {
+    let mut builder = Request::put(path).header("content-type", "application/json");
     for (name, value) in headers {
         builder = builder.header(*name, *value);
     }

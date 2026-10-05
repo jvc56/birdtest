@@ -18,6 +18,8 @@
   $: newRows = current?.files.filter((f) => f.disposition === 'new') ?? [];
   $: collisions = current?.files.filter((f) => f.disposition === 'collision') ?? [];
   $: knownRows = current?.files.filter((f) => f.disposition === 'known') ?? [];
+  // The server's own test for `nothing_new`: an Insert of 0 rows is no choice.
+  $: nothingToInsert = newRows.length + collisions.length === 0;
 
   async function load() {
     try {
@@ -203,13 +205,16 @@
       <p class="text-sm">
         Confirmed.{inserted !== null ? ` ${inserted} rows inserted.` : ''}
       </p>
-    {:else if current.state === 'staged'}
+    {:else if current.state === 'staged' || current.state === 'nothing_new'}
       <div class="space-y-2 text-sm">
         <p>
           <strong>{newRows.length}</strong> new,
           <strong>{collisions.length}</strong> changed,
           <strong>{knownRows.length}</strong> already known.
         </p>
+        {#if nothingToInsert}
+          <p>No new data to insert.</p>
+        {/if}
         {#if collisions.length}
           <p class="text-muted-foreground">
             A changed file is a path already known under different bytes — either a legitimate data
@@ -217,27 +222,29 @@
             before confirming.
           </p>
         {/if}
-        <div class="max-h-64 overflow-y-auto rounded border">
-          <table class="table">
-            <thead>
-              <tr><th>Path</th><th>Role</th><th>Digest</th><th class="text-right">Bytes</th><th></th></tr>
-            </thead>
-            <tbody>
-              {#each [...collisions, ...newRows] as file}
-                <tr>
-                  <td>{file.path}</td>
-                  <td>{file.role}</td>
-                  <td class="font-mono text-xs">{file.sha256.slice(0, 12)}</td>
-                  <td class="text-right tabular-nums">{file.bytes.toLocaleString()}</td>
-                  <td>{file.disposition}</td>
-                </tr>
-              {/each}
-            </tbody>
-          </table>
-        </div>
-        <button class="btn-primary" disabled={busy} on:click={confirm}>
-          Insert {newRows.length + collisions.length} rows
-        </button>
+        {#if !nothingToInsert}
+          <div class="max-h-64 overflow-y-auto rounded border">
+            <table class="table">
+              <thead>
+                <tr><th>Path</th><th>Role</th><th>Digest</th><th class="text-right">Bytes</th><th></th></tr>
+              </thead>
+              <tbody>
+                {#each [...collisions, ...newRows] as file}
+                  <tr>
+                    <td>{file.path}</td>
+                    <td>{file.role}</td>
+                    <td class="font-mono text-xs">{file.sha256.slice(0, 12)}</td>
+                    <td class="text-right tabular-nums">{file.bytes.toLocaleString()}</td>
+                    <td>{file.disposition}</td>
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          </div>
+          <button class="btn-primary" disabled={busy} on:click={confirm}>
+            Insert {newRows.length + collisions.length} rows
+          </button>
+        {/if}
       </div>
     {/if}
   {/if}

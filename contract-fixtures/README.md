@@ -14,19 +14,20 @@ other then fails a test rather than a contributor's run.
 | File | Direction | What it pins |
 |---|---|---|
 | `claim-request.json` | client → server | The required claim body: version and unsupported set |
-| `assignment-games.json` | server → client | A games assignment with `expected_data`, two lexicons |
+| `assignment-games.json` | server → client | A games assignment with `expected_data`, two lexicons, a player 1 with a rack info table and a word info table (all three derived files pinned), and a player 2 that solves its endgame and a nested pre-endgame (every solver key stated) |
 | `assignment-opening-rack.json` | server → client | A rack batch for a simming player: the one job type whose request carries `racks` and a single `player` |
-| `assignment-leave-generation.json` | server → client | Generation 1, reading the server-built zeroed KLV |
+| `assignment-leave-generation.json` | server → client | Generation 1, reading the server-built zeroed KLV, and the static `player` the bot plays both seats as |
 | `decline-missing-data.json` | client → server | A decline naming a missing file and a mismatched one |
 | `shutdown-data-out-of-date.json` | server → client | Every job unreachable because the data is stale |
 | `shutdown-magpie-too-old.json` | server → client | Every job unreachable because the build is old |
 | `shutdown-both.json` | server → client | Both, leading with the MAGPIE version |
-| `assignment-game-pairs.json` | server → client | A `game_pairs` assignment (`game_pairs: true`) whose players ask for a wordmap |
+| `assignment-game-pairs.json` | server → client | A `game_pairs` assignment (`game_pairs: true`) whose players ask for a wordmap, capturing only first divergences (`capture_first_divergence`) |
 | `anon-uuid-assignment.json` | server → client | The first assignment of a worker with no identity: a games task carrying the minted `worker_uuid`, and a job that pins no derived file (`derived: []`) |
 | `expected-data.json` | server → client | The `expected_data` digest list of an assignment, input files and a derived wordmap |
 | `heartbeat.json` | client → server | A heartbeat |
-| `result-games.json` | client → server | A games result with `capture_positions` on: the tally and every captured position |
-| `result-game-pairs.json` | client → server | A pairs result: the tally, the pentanomial and the divergent subset |
+| `result-games.json` | client → server | A games result with `capture_positions` on, from two players that solve their endgames and small pre-endgames: the tally and every captured position, each with its `analysis` (`static`, `peg`, `endgame`) and a solved one's spreads and depths |
+| `result-games-inference.json` | client → server | A games result from simming players that infer: a first-turn position with no inference, and a later one with its `inference` (leaves found, draws, mean equity, the most drawn leaves), each move with its win% and per-ply statistics. Written by hand in MAGPIE's key layout; MAGPIE's test checks its own output carries every key |
+| `result-game-pairs.json` | client → server | A pairs result: the tally, the pentanomial, the divergent subset, and each diverging pair's two positions at its first divergence |
 | `result-opening-rack.json` | client → server | A simulating player's rack analyses, with win%, blended utility and per-ply statistics |
 | `result-leave-generation.json` | client → server | Every rack a leave-generation task saw, on MAGPIE's two-letter test distribution |
 
@@ -35,8 +36,8 @@ stops matching what an import produces is itself a signal.
 
 ## Capturing
 
-The first nine were written by hand. The rest were **captured from a real
-exchange**: `scripts/capture_contract.py` is a recording proxy that sits
+The first nine, and `result-games-inference.json`, were written by hand. The
+rest were **captured from a real exchange**: `scripts/capture_contract.py` is a recording proxy that sits
 between `magpie contribute` and the backend, forwards everything unchanged, and
 writes the first body of each message type here. Nothing is normalised --
 tokens, ids and timings are the ones that crossed the wire, so a recapture

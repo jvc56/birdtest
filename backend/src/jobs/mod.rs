@@ -11,7 +11,8 @@ pub mod registry;
 use crate::error::AppResult;
 use crate::models::job::NamedPlayerConfig;
 use handler::{
-    GameRequest, GameResultsRecord, MoveEntry, PlayerSpec, PlyStats, PositionAnalysis,
+    GameRequest, GameResultsRecord, InferenceSummary, MoveEntry, PlayerSpec, PlyStats,
+    PositionAnalysis,
 };
 use racks::LetterDistribution;
 use sqlx::{PgConnection, Row};
@@ -299,26 +300,33 @@ pub(crate) async fn try_lock_job_dispatch_now(
 /// is `DispatchHolds::claims_holds_taken` compared with a count read before
 /// the check read anything.
 ///
-/// `decided` is the SPRT verdict the check completed a games job on, with the
-/// units it had, and is stored with the completion (`jobs.sprt_decided_*`).
+/// `finish` is what the check completed the job on. A match-test verdict is
+/// stored with the completion (`jobs.test_decided_*`), and it or
+/// `reached_target` is the audit row's reason.
 pub async fn complete_unless_purged(
     pool: &sqlx::PgPool,
     job_id: Uuid,
     observed_claims_issued: i64,
-    decided: Option<(crate::stats::sprt::SprtResult, u64)>,
+    finish: Finish,
     purged_since: impl Fn() -> bool,
 ) -> AppResult<bool> {
-    let status = decided.map(|(sprt, _)| sprt.status.as_str());
+    let decided = match finish {
+        Finish::Test(test, units) => Some((test, units)),
+        Finish::ReachedTarget | Finish::RacksAnalysed => None,
+    };
+    let status = decided.map(|(test, _)| test.status.as_str());
     let mut tx = pool.begin().await?;
     let completed = sqlx::query(
         "UPDATE jobs SET status = 'completed',
-                         sprt_decided_status = $3, sprt_decided_llr = $4, sprt_decided_units = $5
+                         test_decided_status = $3, test_decided_lower = $4,
+                         test_decided_upper = $5, test_decided_units = $6
          WHERE id = $1 AND status = 'active' AND claims_issued >= $2",
     )
     .bind(job_id)
     .bind(observed_claims_issued)
     .bind(status)
-    .bind(decided.map(|(sprt, _)| sprt.llr))
+    .bind(decided.map(|(test, _)| test.lower))
+    .bind(decided.map(|(test, _)| test.upper))
     .bind(decided.map(|(_, units)| units as i64))
     .execute(&mut *tx)
     .await?
@@ -332,13 +340,42 @@ pub async fn complete_unless_purged(
         return Ok(false);
     }
     if completed {
-        crate::audit::log_server_completion(&mut tx, job_id, status).await?;
+        crate::audit::log_server_completion(&mut tx, job_id, finish.reason()).await?;
     }
     tx.commit().await?;
     Ok(completed)
 }
 
-pub(crate) async fn load_player_spec(
+/// What a job's own finish condition completed it on.
+#[derive(Debug, Clone, Copy)]
+pub enum Finish {
+    /// A games or pairs job's match-test verdict, and the units it had then.
+    /// Kept with the job (`jobs.test_decided_*`): results still in flight
+    /// move the live interval afterwards, and this is the decision that
+    /// stands.
+    Test(crate::stats::match_test::TestResult, u64),
+    /// A games or pairs job that runs no test played its `max_units`. There
+    /// is no verdict to keep, so `test_decided_*` stay NULL and the audit
+    /// row's reason is what says why it stopped.
+    ReachedTarget,
+    /// An opening-rack job's racks were all handed out and analysed.
+    RacksAnalysed,
+}
+
+impl Finish {
+    /// The `job.completed` audit row's reason, which is what the job page
+    /// reads (`jobstats::Completion`). None for the one job type with a single
+    /// way to finish.
+    pub fn reason(self) -> Option<&'static str> {
+        match self {
+            Finish::Test(test, _) => Some(test.status.as_str()),
+            Finish::ReachedTarget => Some("reached_target"),
+            Finish::RacksAnalysed => None,
+        }
+    }
+}
+
+pub async fn load_player_spec(
     conn: &mut PgConnection,
     player_config_id: Uuid,
 ) -> AppResult<PlayerSpec> {
@@ -419,8 +456,8 @@ pub(crate) async fn insert_game_request(
         "INSERT INTO game_requests
              (task_id, variant, seed, num_games, player1_config_id,
               player2_config_id, capture_positions, letter_distribution,
-              board_layout)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+              board_layout, capture_first_divergence)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
     )
     .bind(task_id)
     .bind(&req.variant)
@@ -431,6 +468,7 @@ pub(crate) async fn insert_game_request(
     .bind(req.capture_positions)
     .bind(&req.letter_distribution)
     .bind(&req.board_layout)
+    .bind(req.capture_first_divergence)
     .execute(conn)
     .await?;
     Ok(())
@@ -457,6 +495,7 @@ pub(crate) async fn load_game_request(
         num_games: row.get("num_games"),
         game_pairs,
         capture_positions: row.get("capture_positions"),
+        capture_first_divergence: row.get("capture_first_divergence"),
         bingo_bonus: template.data.bingo_bonus,
         sim_cutoff: template.data.sim_cutoff,
         letter_distribution: row.get("letter_distribution"),
@@ -469,9 +508,9 @@ pub(crate) async fn load_game_request(
 /// Writes analysed positions and their top-ranked moves.
 ///
 /// Shared by opening rack jobs (one position per rack) and by games jobs with
-/// capture on (one per turn). `on_conflict_ignore` is set for in-game positions:
-/// games are deterministic, so redundant claims replay identical games, and the
-/// first accepted claim is the one that lands.
+/// capture on (one per turn). `on_conflict_ignore` is set for in-game positions,
+/// which are unique per (task, game, turn): a task has one slot, so a conflict
+/// is a duplicate that can only be a no-op.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn insert_position_analyses(
     conn: &mut PgConnection,
@@ -503,7 +542,8 @@ pub(crate) async fn insert_position_analyses(
         let mut builder = sqlx::QueryBuilder::new(
             "INSERT INTO position_analysis_records
                  (task_claim_id, task_id, job_id, rack, position, game_index,
-                  turn_number, previous_move, previous_move_score, num_moves) ",
+                  turn_number, previous_move, previous_move_score, played_move,
+                  played_move_score, num_moves, analysis) ",
         );
         builder.push_values(chunk.iter(), |mut b, position| {
             b.push_bind(claim_id)
@@ -515,7 +555,10 @@ pub(crate) async fn insert_position_analyses(
                 .push_bind(position.turn_number)
                 .push_bind(position.previous_move.clone())
                 .push_bind(position.previous_move_score)
-                .push_bind(position.num_moves);
+                .push_bind(position.played_move.clone())
+                .push_bind(position.played_move_score)
+                .push_bind(position.num_moves)
+                .push_bind(position.analysis.as_str());
         });
 
         if on_conflict_ignore {
@@ -572,8 +615,8 @@ pub(crate) async fn insert_position_analyses(
     for chunk in pending.chunks(MOVE_ROWS_PER_STATEMENT) {
         let mut builder = sqlx::QueryBuilder::new(
             "INSERT INTO position_analysis_moves
-                 (record_id, rank, move, score, equity, win_percentage,
-                  blended_utility) ",
+                 (record_id, rank, move, score, equity, iterations, win_percentage,
+                  blended_utility, mean_spread, fidelity_plies) ",
         );
         builder.push_values(chunk.iter(), |mut b, (record_id, rank, entry)| {
             b.push_bind(*record_id)
@@ -581,9 +624,13 @@ pub(crate) async fn insert_position_analyses(
                 .push_bind(entry.play.clone())
                 .push_bind(entry.score)
                 .push_bind(entry.equity)
+                .push_bind(entry.iterations)
                 // NULL for a static player, which simulates nothing.
                 .push_bind(entry.win_percentage)
-                .push_bind(entry.blended_utility);
+                .push_bind(entry.blended_utility)
+                // NULL unless a solver chose the move.
+                .push_bind(entry.mean_spread)
+                .push_bind(entry.fidelity_plies);
         });
         // Returned in insertion order, so the ids line up with `pending` and
         // the per-ply rows can be attached without looking each move up.
@@ -625,14 +672,39 @@ pub(crate) async fn insert_position_analyses(
         builder.push(" ON CONFLICT (move_id, ply) DO NOTHING");
         builder.build().execute(&mut *conn).await?;
     }
+
+    // What a simming player inferred of the opponent's leave, one row per
+    // position that has it; the leaves are at most ten, kept as they came
+    // (checked in `plausibility::check_inference`), most drawn first.
+    let inferences: Vec<(i64, &InferenceSummary)> = positions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, position)| Some((record_ids[index]?, position.inference.as_ref()?)))
+        .collect();
+    for chunk in inferences.chunks(INFERENCE_ROWS_PER_STATEMENT) {
+        let mut builder = sqlx::QueryBuilder::new(
+            "INSERT INTO position_analysis_inference
+                 (record_id, num_leaves, total_draws, average_equity, leaves) ",
+        );
+        builder.push_values(chunk.iter(), |mut b, (record_id, inference)| {
+            b.push_bind(*record_id)
+                .push_bind(inference.num_leaves)
+                .push_bind(inference.total_draws)
+                .push_bind(inference.average_equity)
+                .push_bind(sqlx::types::Json(&inference.leaves));
+        });
+        builder.push(" ON CONFLICT (record_id) DO NOTHING");
+        builder.build().execute(&mut *conn).await?;
+    }
     Ok(())
 }
 
 /// Rows per multi-row insert, keeping each statement well under Postgres's
-/// 65,535-parameter ceiling (10, 7 and 4 binds per row respectively).
+/// 65,535-parameter ceiling (13, 10, 4 and 5 binds per row respectively).
 const RECORD_ROWS_PER_STATEMENT: usize = 2_000;
 const MOVE_ROWS_PER_STATEMENT: usize = 4_000;
 const PLY_ROWS_PER_STATEMENT: usize = 8_000;
+const INFERENCE_ROWS_PER_STATEMENT: usize = 4_000;
 
 pub(crate) async fn insert_game_results(
     conn: &mut PgConnection,
@@ -658,9 +730,9 @@ pub(crate) async fn insert_game_results(
               p1_score_mean, p1_score_sd, p2_score_mean, p2_score_sd,
               pent_0, pent_1, pent_2, pent_3, pent_4,
               divergent_games, divergent_wins, divergent_losses, divergent_ties,
-              submitted_at)
+              divergent_p1_score_mean, divergent_p2_score_mean, submitted_at)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
-                 clock_timestamp())",
+                 $21,$22,clock_timestamp())",
     )
     .bind(claim_id)
     .bind(task_id)
@@ -682,30 +754,24 @@ pub(crate) async fn insert_game_results(
     .bind(divergent.map(|d| d.wins))
     .bind(divergent.map(|d| d.losses))
     .bind(divergent.map(|d| d.ties))
+    .bind(divergent.map(|d| d.p1_score_mean))
+    .bind(divergent.map(|d| d.p2_score_mean))
     .execute(&mut *conn)
     .await?;
 
-    // Deterministic games mean redundant claims replay identical positions, so
-    // the first accepted claim records them and the rest are no-ops.
-    //
     // A job without capture submits no positions, and that is every games job
     // by default.
     if record.positions.is_empty() {
         return Ok(());
     }
-    // How many ranked moves to keep: player 1's num_plays_recorded, which is
-    // also the one MAGPIE reads to decide how many to report. From the job's
-    // template: it is a setting of an immutable player config.
-    //
-    // Plies are kept to the larger of the two players' `num_plies_recorded`: a
-    // position is either player's, and a player that reports fewer (a static
-    // one reports none) is not truncated by the other's cap.
+    // How many ranked moves and plies to keep: player 1's num_plays_recorded
+    // and num_plies_recorded, which are what MAGPIE reads for both seats, and
+    // which job creation holds player 2 to whenever capture is on. From the
+    // job's template: they are settings of an immutable player config.
     let (top_moves, top_plies) = match &template.kind {
-        dispatch::JobKind::Games { player1, player2, .. }
-        | dispatch::JobKind::GamePairs { player1, player2, .. } => (
-            player1.num_plays_recorded,
-            player1.num_plies_recorded.max(player2.num_plies_recorded),
-        ),
+        dispatch::JobKind::Games { player1, .. } | dispatch::JobKind::GamePairs { player1, .. } => {
+            (player1.num_plays_recorded, player1.num_plies_recorded)
+        }
         _ => return Err(template.mismatch("games")),
     };
 
@@ -767,11 +833,12 @@ pub async fn expected_data(
          ids AS (
              SELECT j.letterdist_id AS id FROM jobs j WHERE j.id = $1
              UNION SELECT j.layout_id FROM jobs j WHERE j.id = $1
-             -- Leave generation has one bot and no player_configs row, so its
-             -- lexicon sits on the job config. It needs no klv (every
-             -- generation's leaves are a server-built artifact) and no winpct
-             -- (the bot plays statically).
-             UNION SELECT c.kwg_id FROM job_leave_config c WHERE c.job_id = $1
+             -- A leave job's player pins only its lexicon here: MAGPIE never
+             -- opens its klv (every generation's leaves are a server-built
+             -- artifact) or a winpct (the bot plays statically), so pinning
+             -- them would turn away workers that lack files no task reads.
+             UNION SELECT pc.kwg_id FROM job_leave_config c
+                 JOIN player_configs pc ON pc.id = c.player_config_id WHERE c.job_id = $1
              UNION SELECT pc.kwg_id FROM player_configs pc JOIN players p ON p.id = pc.id
              UNION SELECT pc.klv_id FROM player_configs pc JOIN players p ON p.id = pc.id
              -- NULL for a static player, which never opens a win% model; it

@@ -1,5 +1,6 @@
 use crate::clientip::ClientIp;
 use crate::error::{AppError, AppResult};
+use crate::jobs::racks::LetterDistribution;
 use crate::jobstats;
 use crate::models::job::{Job, JobType};
 use crate::state::AppState;
@@ -25,7 +26,9 @@ pub fn router() -> Router<AppState> {
         .route("/jobs/:id", get(job_detail))
         .route("/jobs/:id/config", get(job_config))
         .route("/jobs/:id/results", get(job_results))
+        .route("/jobs/:id/board", get(job_board))
         .route("/jobs/:id/positions", get(job_positions))
+        .route("/jobs/:id/positions/random", get(random_position))
         .route("/jobs/:id/stream", get(job_stream))
         .route("/player-configs", get(list_player_configs))
         .route("/player-configs/:id", get(player_config))
@@ -58,11 +61,10 @@ struct JobListItem {
     job_type: JobType,
     status: String,
     allocation: Option<i32>,
-    redundancy: i32,
     created_at: chrono::DateTime<chrono::Utc>,
     tasks_total: i64,
     tasks_completed: i64,
-    /// For on-demand SPRT jobs the meaningful denominator is `max_games` /
+    /// For on-demand games and pairs jobs the meaningful denominator is `max_games` /
     /// `max_pairs`, not a task count that grows as work is handed out.
     units_completed: Option<i64>,
     max_units: Option<i64>,
@@ -84,7 +86,7 @@ async fn list_jobs(
 
     let rows = sqlx::query(
         "SELECT j.id, j.name, j.job_type, j.status::text AS status, j.allocation,
-                j.redundancy, j.created_at,
+                j.created_at,
                 -- Running totals, like games_completed below. Counted, these
                 -- were two scans of a job's whole task history for every job on
                 -- the page -- see PLAN.md on what these reads cost.
@@ -101,7 +103,8 @@ async fn list_jobs(
                 -- generation a task count is no denominator: it is only what
                 -- has been handed out so far. Their own units instead: racks
                 -- analysed of the rack space, generations closed of the count.
-                j.racks_analyzed, rc.total_racks, lc.generation_count,
+                j.racks_analyzed, rc.total_racks,
+                cardinality(lc.target_rack_counts) AS generation_count,
                 (SELECT COUNT(*) FROM leave_generation_artifacts a
                   WHERE a.job_id = j.id AND a.generation >= 1) AS generations_closed,
                 -- Stalled: at least one decline and no submission in the last
@@ -165,7 +168,6 @@ async fn list_jobs(
                 job_type,
                 status: row.get("status"),
                 allocation: row.get("allocation"),
-                redundancy: row.get("redundancy"),
                 created_at: row.get("created_at"),
                 tasks_total: row.get("tasks_total"),
                 tasks_completed: row.get("tasks_completed"),
@@ -231,7 +233,6 @@ struct JobSettings {
     layout: String,
     bingo_bonus: i32,
     sim_cutoff: f64,
-    redundancy: i32,
     min_magpie_version: String,
 }
 
@@ -240,23 +241,25 @@ struct GamesSettings {
     /// "game" or "pair": the unit every count here is in.
     unit: &'static str,
     per_batch: i32,
+    /// Off, the job plays `max_units` and stops, and the test's settings
+    /// below are stored defaults it never reads.
+    test_enabled: bool,
     min_units: i32,
     max_units: i32,
-    sprt_alpha: f64,
-    sprt_beta: f64,
-    elo_low: f64,
-    elo_high: f64,
+    confidence_pct: f64,
     capture_positions: bool,
+    /// Game pairs: of the captured positions, only each pair's first
+    /// divergence is kept. Always `false` for a games job.
+    capture_first_divergence: bool,
 }
 
+/// The lexicon and wordmap setting are the player's, and shown with it.
 #[derive(Serialize)]
 struct LeaveSettings {
-    lexicon: String,
     num_iterations: i32,
-    generation_count: i32,
-    target_rack_count: i32,
+    /// One occurrence target per generation, in order.
+    target_rack_counts: Vec<i32>,
     racks_per_task: i32,
-    use_wordmap: bool,
 }
 
 /// A player config's settings, without who made it or when.
@@ -282,6 +285,7 @@ struct PlayerSettings {
     time_limit_secs: Option<i32>,
     use_wordmap: bool,
     use_rit: bool,
+    use_wit: bool,
     min_play_iterations: Option<i32>,
     threshold: Option<String>,
     sampling_rule: Option<String>,
@@ -290,6 +294,15 @@ struct PlayerSettings {
     utility_w_spread: Option<f64>,
     utility_spread_scale: Option<f64>,
     movegen_margin: f64,
+    endgame_plies: i32,
+    peg_max_bag: i32,
+    peg_stage_top_k: Option<Vec<i32>>,
+    peg_scenario_stride: Option<i32>,
+    peg_opp_model: Option<String>,
+    peg_nested: Option<bool>,
+    peg_nested_cand_caps: Option<Vec<i32>>,
+    peg_nested_max_depth: Option<i32>,
+    peg_nested_strides: Option<Vec<i32>>,
 }
 
 fn no_role(role: &&'static str) -> bool {
@@ -318,6 +331,7 @@ impl PlayerSettings {
             time_limit_secs: c.time_limit_secs,
             use_wordmap: c.use_wordmap,
             use_rit: c.use_rit,
+            use_wit: c.use_wit,
             min_play_iterations: c.min_play_iterations,
             threshold: c.threshold,
             sampling_rule: c.sampling_rule,
@@ -326,6 +340,15 @@ impl PlayerSettings {
             utility_w_spread: c.utility_w_spread,
             utility_spread_scale: c.utility_spread_scale,
             movegen_margin: c.movegen_margin,
+            endgame_plies: c.endgame_plies,
+            peg_max_bag: c.peg_max_bag,
+            peg_stage_top_k: c.peg_stage_top_k,
+            peg_scenario_stride: c.peg_scenario_stride,
+            peg_opp_model: c.peg_opp_model,
+            peg_nested: c.peg_nested,
+            peg_nested_cand_caps: c.peg_nested_cand_caps,
+            peg_nested_max_depth: c.peg_nested_max_depth,
+            peg_nested_strides: c.peg_nested_strides,
         }
     }
 }
@@ -410,13 +433,12 @@ async fn job_config(
             games = Some(GamesSettings {
                 unit: "game",
                 per_batch: c.games_per_batch,
+                test_enabled: c.test_enabled,
                 min_units: c.min_games,
                 max_units: c.max_games,
-                sprt_alpha: c.sprt_alpha,
-                sprt_beta: c.sprt_beta,
-                elo_low: c.elo_low,
-                elo_high: c.elo_high,
+                confidence_pct: c.confidence_pct,
                 capture_positions: c.capture_positions,
+                capture_first_divergence: false,
             });
         }
         JobType::GamePairs => {
@@ -429,13 +451,12 @@ async fn job_config(
             games = Some(GamesSettings {
                 unit: "pair",
                 per_batch: c.pairs_per_batch,
+                test_enabled: c.test_enabled,
                 min_units: c.min_pairs,
                 max_units: c.max_pairs,
-                sprt_alpha: c.sprt_alpha,
-                sprt_beta: c.sprt_beta,
-                elo_low: c.elo_low,
-                elo_high: c.elo_high,
+                confidence_pct: c.confidence_pct,
                 capture_positions: c.capture_positions,
+                capture_first_divergence: c.capture_first_divergence,
             });
         }
         JobType::OpeningRack => {
@@ -451,13 +472,11 @@ async fn job_config(
                 .bind(id)
                 .fetch_one(pool)
                 .await?;
+            players.push(PlayerSettings::new("player", player(c.player_config_id).await?));
             leave_generation = Some(LeaveSettings {
-                lexicon: file(c.kwg_id).await?,
                 num_iterations: c.num_iterations,
-                generation_count: c.generation_count,
-                target_rack_count: c.target_rack_count,
+                target_rack_counts: c.target_rack_counts,
                 racks_per_task: c.racks_per_task,
-                use_wordmap: c.use_wordmap,
             });
         }
     }
@@ -472,7 +491,6 @@ async fn job_config(
             layout: file(job.layout_id).await?,
             bingo_bonus: job.bingo_bonus,
             sim_cutoff: job.sim_cutoff,
-            redundancy: job.redundancy,
             min_magpie_version: job.min_magpie_version().to_string(),
         },
         games,
@@ -1002,7 +1020,22 @@ fn micros_to_time(raw: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     chrono::DateTime::from_timestamp_micros(raw.parse().ok()?)
 }
 
-/// The full ranked move list for one rack, from `position_analysis_moves`.
+/// A move's first two plies of simulation statistics, as a JSON array column
+/// `plies` of `{ply, bingo_percentage, average_score}` in ply order, for a
+/// query over `position_analysis_moves m`: what a move list shows beside each
+/// move (P1-S, P1-BP, P2-S, P2-BP). Empty for a move nothing simulated, and
+/// fewer for a job that recorded fewer. A probe of `(move_id, ply)` per move.
+const FIRST_PLIES: &str = "COALESCE((
+        SELECT jsonb_agg(jsonb_build_object('ply', p.ply,
+                                            'bingo_percentage', p.bingo_percentage,
+                                            'average_score', p.average_score)
+                         ORDER BY p.ply)
+        FROM position_analysis_plies p WHERE p.move_id = m.id AND p.ply < 2
+    ), '[]'::jsonb) AS plies";
+
+/// The full ranked move list for one rack, from `position_analysis_moves`,
+/// each move with its win percentage and its first two plies' statistics when
+/// the rack was simulated.
 async fn rack_lookup(
     state: &AppState,
     job_id: Uuid,
@@ -1019,17 +1052,21 @@ async fn rack_lookup(
     // captured in-game position with the same rack out of an opening-rack
     // lookup.
     //
-    // Ordered by record first: under redundancy above 1 a rack has one record
-    // per accepted claim, and ordering by rank alone interleaved the lists --
+    // Ordered by record first: a rack an opening-rack job analysed more than
+    // once, to reach a consensus, has one record per analysis, and ordering by
+    // rank alone interleaved the lists --
     // two rank-1 rows, then two rank-2 rows -- as if one analysis had ranked
     // every move twice.
-    let rows = sqlx::query(
-        "SELECT m.rank, m.move, m.score, m.equity
+    // `analysis` numbers the rack's analyses from 1, so a page can tell them
+    // apart and read their consensus.
+    let rows = sqlx::query(&format!(
+        "SELECT dense_rank() OVER (ORDER BY r.id)::int AS analysis,
+                m.rank, m.move, m.score, m.equity, m.iterations, m.win_percentage, {FIRST_PLIES}
          FROM position_analysis_records r
          JOIN position_analysis_moves m ON m.record_id = r.id
          WHERE r.job_id = $1 AND r.rack = $2 AND r.game_index IS NULL
-         ORDER BY r.id ASC, m.rank ASC",
-    )
+         ORDER BY r.id ASC, m.rank ASC"
+    ))
     .bind(job_id)
     .bind(&canonical)
     .fetch_all(&state.read_pool)
@@ -1039,10 +1076,14 @@ async fn rack_lookup(
         .into_iter()
         .map(|r| {
             serde_json::json!({
+                "analysis": r.get::<i32, _>("analysis"),
                 "rank": r.get::<i16, _>("rank"),
                 "move": r.get::<String, _>("move"),
                 "score": r.get::<i32, _>("score"),
                 "equity": r.get::<f64, _>("equity"),
+                "iterations": r.get::<Option<i64>, _>("iterations"),
+                "win_percentage": r.get::<Option<f64>, _>("win_percentage"),
+                "plies": r.get::<serde_json::Value, _>("plies"),
             })
         })
         .collect();
@@ -1058,110 +1099,58 @@ struct PositionsQuery {
     per_page: Option<i64>,
     cursor: Option<String>,
     /// Only positions where the player to move held this rack, however it is
-    /// typed (canonicalised as the opening-rack lookup does).
+    /// typed ([`LetterDistribution::canonical_rack`]).
     rack: Option<String>,
 }
 
 /// The most positions one page returns: each carries its whole ranked list.
 const MAX_POSITIONS_PER_PAGE: i64 = 20;
 
-/// The positions a games or game-pairs job captured (`capture_positions`),
-/// newest first, each with its ranked moves: for signed-in users, since a job
-/// that captures holds millions of them and the public already has the
-/// results feed. A job that captured nothing is an empty page.
-async fn job_positions(
-    State(state): State<AppState>,
-    _user: crate::auth::CurrentUser,
-    Path(id): Path<Uuid>,
-    Query(query): Query<PositionsQuery>,
-) -> AppResult<Json<super::CursorPage<serde_json::Value>>> {
-    let job = load_job(&state, id).await?;
+/// A saved position's own columns, as every positions route reads them.
+const POSITION_COLUMNS: &str = "r.id, r.task_id, r.rack, r.position, r.game_index, r.turn_number,
+                                r.previous_move, r.previous_move_score, r.played_move,
+                                r.played_move_score, r.num_moves, r.analysis,
+                                r.submitted_at";
+
+/// A games or game-pairs job, or the `400` that says only those save positions.
+async fn capturing_job(state: &AppState, id: Uuid) -> AppResult<Job> {
+    let job = load_job(state, id).await?;
     if !crate::exports::may_capture_positions(job.job_type) {
         return Err(AppError::bad_request(
             "only games and game-pairs jobs save the positions they play",
         ));
     }
-    let limit = query.per_page.unwrap_or(MAX_POSITIONS_PER_PAGE).clamp(1, MAX_POSITIONS_PER_PAGE);
-    let cursor = query.cursor.as_deref().and_then(super::decode_cursor);
-    let rack = query
-        .rack
-        .as_deref()
-        .map(str::trim)
-        .filter(|rack| !rack.is_empty())
-        .map(|rack| {
-            let mut chars: Vec<char> = rack.to_uppercase().chars().collect();
-            chars.sort_unstable();
-            chars.into_iter().collect::<String>()
-        });
+    Ok(job)
+}
 
-    const COLUMNS: &str = "r.id, r.task_id, r.rack, r.position, r.game_index, r.turn_number,
-                           r.previous_move, r.previous_move_score, r.num_moves, r.submitted_at";
-    // One rack: a seek into `position_analysis_records_game_rack_idx`, newest
-    // (highest id) first. Every position: the feed index, as the results feed
-    // reads it.
-    let rows = match &rack {
-        Some(rack) => {
-            let after = match cursor.as_deref() {
-                Some([id]) => id.parse::<i64>().ok(),
-                _ => None,
-            };
-            sqlx::query(&format!(
-                "SELECT {COLUMNS} FROM position_analysis_records r
-                 WHERE r.job_id = $1 AND r.rack = $2 AND r.game_index IS NOT NULL
-                   AND ($3::bigint IS NULL OR r.id < $3)
-                 ORDER BY r.id DESC
-                 LIMIT $4"
-            ))
-            .bind(id)
-            .bind(rack)
-            .bind(after)
-            .bind(limit)
-            .fetch_all(&state.read_pool)
-            .await?
-        }
-        None => {
-            let (after_time, after_id) = opening_rack_cursor(cursor.as_deref());
-            sqlx::query(&format!(
-                "SELECT {COLUMNS} FROM position_analysis_records r
-                 WHERE r.job_id = $1 AND r.game_index IS NOT NULL
-                   AND ($2::timestamptz IS NULL OR (r.submitted_at, r.id) < ($2, $3))
-                 ORDER BY r.submitted_at DESC, r.id DESC
-                 LIMIT $4"
-            ))
-            .bind(id)
-            .bind(after_time)
-            .bind(after_id)
-            .bind(limit)
-            .fetch_all(&state.read_pool)
-            .await?
-        }
-    };
+/// The letter distribution a job pins, parsed.
+async fn job_letters(state: &AppState, job: &Job) -> AppResult<LetterDistribution> {
+    let (name, content): (String, Vec<u8>) =
+        sqlx::query_as("SELECT name, content FROM input_data WHERE id = $1")
+            .bind(job.letterdist_id)
+            .fetch_one(&state.read_pool)
+            .await?;
+    LetterDistribution::parse(&content, &name)
+}
 
-    let next_cursor = (rows.len() as i64 == limit)
-        .then(|| rows.last())
-        .flatten()
-        .map(|last| {
-            let id = last.get::<i64, _>("id").to_string();
-            match rack {
-                Some(_) => super::encode_cursor(&[id]),
-                None => super::encode_cursor(&[
-                    last.get::<chrono::DateTime<chrono::Utc>, _>("submitted_at")
-                        .timestamp_micros()
-                        .to_string(),
-                    id,
-                ]),
-            }
-        });
-
-    // The page's moves in one read of `(record_id, rank)`.
+/// Rows of [`POSITION_COLUMNS`] as the API shows a saved position, each with
+/// its ranked moves, which come in one read of `(record_id, rank)` -- each
+/// with its first two plies' statistics ([`FIRST_PLIES`]) -- and what was
+/// inferred of the opponent's leave first, when anything was (`null`
+/// otherwise), in one primary-key read of `position_analysis_inference`.
+async fn saved_positions(
+    state: &AppState,
+    rows: Vec<sqlx::postgres::PgRow>,
+) -> AppResult<Vec<serde_json::Value>> {
     let ids: Vec<i64> = rows.iter().map(|r| r.get("id")).collect();
     let mut moves: HashMap<i64, Vec<serde_json::Value>> = HashMap::new();
-    for m in sqlx::query(
-        "SELECT record_id, rank, move, score, equity, win_percentage
-         FROM position_analysis_moves
-         WHERE record_id = ANY($1)
-         ORDER BY record_id, rank",
-    )
+    for m in sqlx::query(&format!(
+        "SELECT m.record_id, m.rank, m.move, m.score, m.equity, m.iterations, m.win_percentage,
+                m.mean_spread, m.fidelity_plies, {FIRST_PLIES}
+         FROM position_analysis_moves m
+         WHERE m.record_id = ANY($1)
+         ORDER BY m.record_id, m.rank"
+    ))
     .bind(&ids)
     .fetch_all(&state.read_pool)
     .await?
@@ -1171,11 +1160,34 @@ async fn job_positions(
             "move": m.get::<String, _>("move"),
             "score": m.get::<i32, _>("score"),
             "equity": m.get::<f64, _>("equity"),
+            "iterations": m.get::<Option<i64>, _>("iterations"),
             "win_percentage": m.get::<Option<f64>, _>("win_percentage"),
+            "mean_spread": m.get::<Option<f64>, _>("mean_spread"),
+            "fidelity_plies": m.get::<Option<i16>, _>("fidelity_plies"),
+            "plies": m.get::<serde_json::Value, _>("plies"),
         }));
     }
+    let mut inferences: HashMap<i64, serde_json::Value> = HashMap::new();
+    for i in sqlx::query(
+        "SELECT record_id, num_leaves, total_draws, average_equity, leaves
+         FROM position_analysis_inference WHERE record_id = ANY($1)",
+    )
+    .bind(&ids)
+    .fetch_all(&state.read_pool)
+    .await?
+    {
+        inferences.insert(
+            i.get("record_id"),
+            serde_json::json!({
+                "num_leaves": i.get::<i64, _>("num_leaves"),
+                "total_draws": i.get::<i64, _>("total_draws"),
+                "average_equity": i.get::<f64, _>("average_equity"),
+                "leaves": i.get::<serde_json::Value, _>("leaves"),
+            }),
+        );
+    }
 
-    let items = rows
+    Ok(rows
         .into_iter()
         .map(|r| {
             let record: i64 = r.get("id");
@@ -1187,14 +1199,261 @@ async fn job_positions(
                 "position": r.get::<Option<String>, _>("position"),
                 "previous_move": r.get::<Option<String>, _>("previous_move"),
                 "previous_move_score": r.get::<Option<i32>, _>("previous_move_score"),
+                "played_move": r.get::<Option<String>, _>("played_move"),
+                "played_move_score": r.get::<Option<i32>, _>("played_move_score"),
                 "num_moves": r.get::<i32, _>("num_moves"),
+                "analysis": r.get::<String, _>("analysis"),
                 "submitted_at": r.get::<chrono::DateTime<chrono::Utc>, _>("submitted_at"),
                 "moves": moves.remove(&record).unwrap_or_default(),
+                "inference": inferences.remove(&record).unwrap_or(serde_json::Value::Null),
             })
         })
-        .collect();
+        .collect())
+}
 
+/// Saved positions as the API shows them, and for a game-pairs job each with
+/// its `partner`: the same turn of the pair's other game, or `null` when that
+/// game has no position at that turn (it had ended, or its result is not in).
+///
+/// A pair's two games share their tiles and differ in who moves first, so up
+/// to the turn they first diverge they are one game, played by each player
+/// from the other seat: the partner is the other player's answer to the same
+/// position. That is what a job keeping first divergences
+/// (`capture_first_divergence`) keeps, and the page shows the two side by
+/// side. One read through `position_analysis_records_in_game_idx (task_id,
+/// game_index, turn_number)`.
+async fn saved_positions_with_partners(
+    state: &AppState,
+    job: &Job,
+    rows: Vec<sqlx::postgres::PgRow>,
+) -> AppResult<Vec<serde_json::Value>> {
+    if job.job_type != JobType::GamePairs {
+        return saved_positions(state, rows).await;
+    }
+    let mut tasks = Vec::with_capacity(rows.len());
+    let mut games = Vec::with_capacity(rows.len());
+    let mut turns = Vec::with_capacity(rows.len());
+    for row in &rows {
+        if let (Some(game), Some(turn)) =
+            (row.get::<Option<i16>, _>("game_index"), row.get::<Option<i16>, _>("turn_number"))
+        {
+            tasks.push(row.get::<Uuid, _>("task_id"));
+            games.push(game ^ 1);
+            turns.push(turn);
+        }
+    }
+    let partner_rows = sqlx::query(&format!(
+        "SELECT {POSITION_COLUMNS} FROM position_analysis_records r
+         JOIN unnest($1::uuid[], $2::smallint[], $3::smallint[]) AS k(task_id, game_index, turn_number)
+           ON r.task_id = k.task_id AND r.game_index = k.game_index
+          AND r.turn_number = k.turn_number"
+    ))
+    .bind(&tasks)
+    .bind(&games)
+    .bind(&turns)
+    .fetch_all(&state.read_pool)
+    .await?;
+    let key = |item: &serde_json::Value| {
+        (
+            item["task_id"].as_str().unwrap_or_default().to_string(),
+            item["game_index"].as_i64().unwrap_or(-1),
+            item["turn_number"].as_i64().unwrap_or(-1),
+        )
+    };
+    let mut partners: HashMap<(String, i64, i64), serde_json::Value> =
+        saved_positions(state, partner_rows)
+            .await?
+            .into_iter()
+            .map(|partner| (key(&partner), partner))
+            .collect();
+    let mut items = saved_positions(state, rows).await?;
+    for item in &mut items {
+        let (task, game, turn) = key(item);
+        let partner = partners.remove(&(task, game ^ 1, turn)).unwrap_or(serde_json::Value::Null);
+        item["partner"] = partner;
+    }
+    Ok(items)
+}
+
+/// The positions a games or game-pairs job captured (`capture_positions`)
+/// where the player to move held one rack, newest first, each with its ranked
+/// moves: for signed-in users, since a job that captures holds millions of
+/// them and the public already has the results feed. A rack nothing was
+/// captured with -- or that no tile of the job's distribution spells -- is an
+/// empty page.
+///
+/// A rack is required: the page once listed every position newest first, ten
+/// at a time, and now shows one at a time on a board -- a random one
+/// (`/positions/random`) or one of a rack's -- so the feed had no reader left.
+async fn job_positions(
+    State(state): State<AppState>,
+    _user: crate::auth::CurrentUser,
+    Path(id): Path<Uuid>,
+    Query(query): Query<PositionsQuery>,
+) -> AppResult<Json<super::CursorPage<serde_json::Value>>> {
+    let job = capturing_job(&state, id).await?;
+    let limit = query.per_page.unwrap_or(MAX_POSITIONS_PER_PAGE).clamp(1, MAX_POSITIONS_PER_PAGE);
+    let Some(typed) = query.rack.as_deref().map(str::trim).filter(|rack| !rack.is_empty()) else {
+        return Err(AppError::bad_request(
+            "name the rack to search for (?rack=); /positions/random is any position",
+        ));
+    };
+    // Spelt as MAGPIE spelt the rack it stored, which only the job's own
+    // distribution can say: its machine-letter order, its multi-letter tiles.
+    let Some(rack) = job_letters(&state, &job).await?.canonical_rack(typed) else {
+        let empty = super::CursorPage { items: Vec::new(), total: -1, per_page: limit, next_cursor: None };
+        return Ok(Json(empty));
+    };
+    let after = match query.cursor.as_deref().and_then(super::decode_cursor).as_deref() {
+        Some([id]) => id.parse::<i64>().ok(),
+        _ => None,
+    };
+
+    // A seek into `position_analysis_records_game_rack_idx`, newest (highest
+    // id) first. One row past the page says whether there is a next: the page
+    // shows positions one at a time, and a cursor on every full page offered
+    // "Next" after a rack's only position, to a page saying it had none.
+    //
+    // A game-pairs job shows each position beside its partner, and a pair's
+    // two games hold the same rack at the same turn until they diverge -- at a
+    // first divergence, always. So the second game's position is left out
+    // where the first game's matches the rack too: it is already on the page,
+    // as that one's partner.
+    let mut rows = sqlx::query(&format!(
+        "SELECT {POSITION_COLUMNS} FROM position_analysis_records r
+         WHERE r.job_id = $1 AND r.rack = $2 AND r.game_index IS NOT NULL
+           AND ($3::bigint IS NULL OR r.id < $3)
+           AND NOT ($5 AND r.game_index % 2 = 1 AND EXISTS (
+               SELECT 1 FROM position_analysis_records p
+               WHERE p.task_id = r.task_id AND p.game_index = r.game_index - 1
+                 AND p.turn_number = r.turn_number AND p.rack = r.rack))
+         ORDER BY r.id DESC
+         LIMIT $4"
+    ))
+    .bind(id)
+    .bind(&rack)
+    .bind(after)
+    .bind(limit + 1)
+    .bind(job.job_type == JobType::GamePairs)
+    .fetch_all(&state.read_pool)
+    .await?;
+
+    let more = rows.len() as i64 > limit;
+    rows.truncate(limit as usize);
+    let next_cursor = more
+        .then(|| rows.last())
+        .flatten()
+        .map(|last| super::encode_cursor(&[last.get::<i64, _>("id").to_string()]));
+    let items = saved_positions_with_partners(&state, &job, rows).await?;
     Ok(Json(super::CursorPage { items, total: -1, per_page: limit, next_cursor }))
+}
+
+/// Tasks a random position is looked for in before the newest position is
+/// taken instead: a task still being played has none yet.
+const RANDOM_POSITION_TRIES: usize = 8;
+
+/// One position a games or game-pairs job captured, drawn at random, with its
+/// ranked moves; `null` when the job has captured none. Signed-in users only,
+/// as the search is.
+///
+/// Not `ORDER BY random()`, which reads every position of the job to return
+/// one -- millions, for a job that captures. Two index probes instead: a
+/// random seed in the job's range, and the first task at or after it through
+/// `tasks_seed_unique_idx (job_id, seed)`; then a random turn of that task's
+/// games through `position_analysis_records_in_game_idx (task_id, game_index,
+/// turn_number)`, which holds a batch's few hundred at most. A task's seeds
+/// step evenly through the job's range, so the draw is close to uniform over
+/// tasks. A task without positions -- one being played, or claimed and not
+/// yet returned -- is passed over for another draw, and after a few the
+/// newest position of the job is taken, so a job with any position always
+/// shows one.
+async fn random_position(
+    State(state): State<AppState>,
+    _user: crate::auth::CurrentUser,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<Option<serde_json::Value>>> {
+    use rand::Rng;
+    let job = capturing_job(&state, id).await?;
+    let pool = &state.read_pool;
+    let (low, high): (Option<i64>, Option<i64>) =
+        sqlx::query_as("SELECT min(seed), max(seed) FROM tasks WHERE job_id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await?;
+
+    let mut row = None;
+    if let (Some(low), Some(high)) = (low, high) {
+        for _ in 0..RANDOM_POSITION_TRIES {
+            let (seed, at) = {
+                let mut rng = rand::thread_rng();
+                (rng.gen_range(low..=high), rng.gen::<f64>())
+            };
+            row = sqlx::query(&format!(
+                "WITH task AS (
+                     SELECT id FROM tasks WHERE job_id = $1 AND seed >= $2 ORDER BY seed LIMIT 1
+                 )
+                 SELECT {POSITION_COLUMNS} FROM position_analysis_records r
+                 WHERE r.task_id = (SELECT id FROM task) AND r.game_index IS NOT NULL
+                 ORDER BY r.game_index, r.turn_number
+                 OFFSET floor($3 * (
+                     SELECT count(*) FROM position_analysis_records r
+                     WHERE r.task_id = (SELECT id FROM task) AND r.game_index IS NOT NULL
+                 ))::bigint
+                 LIMIT 1"
+            ))
+            .bind(id)
+            .bind(seed)
+            .bind(at)
+            .fetch_optional(pool)
+            .await?;
+            if row.is_some() {
+                break;
+            }
+        }
+    }
+    if row.is_none() {
+        // The head of `position_analysis_records_feed_idx`.
+        row = sqlx::query(&format!(
+            "SELECT {POSITION_COLUMNS} FROM position_analysis_records r
+             WHERE r.job_id = $1 AND r.game_index IS NOT NULL
+             ORDER BY r.submitted_at DESC, r.id DESC
+             LIMIT 1"
+        ))
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    }
+    Ok(Json(saved_positions_with_partners(&state, &job, row.into_iter().collect()).await?.pop()))
+}
+
+/// What a saved position is drawn on: the job's board and what its tiles
+/// score, parsed from the bytes the job pins -- which until now reached the
+/// site only as the files' names.
+#[derive(Serialize)]
+struct BoardView {
+    #[serde(flatten)]
+    layout: crate::board::BoardLayout,
+    /// Every letter in machine-letter order, the blank's row (`?`) first.
+    letters: Vec<crate::jobs::racks::Letter>,
+}
+
+/// A job's board layout and letter scores. Public, like the settings that
+/// name them: there is nothing in a board to keep from anyone.
+async fn job_board(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<BoardView>> {
+    let job = load_job(&state, id).await?;
+    let layout: Vec<u8> = sqlx::query_scalar("SELECT content FROM input_data WHERE id = $1")
+        .bind(job.layout_id)
+        .fetch_one(&state.read_pool)
+        .await?;
+    // Job creation refuses a layout MAGPIE would, so this is a job made before
+    // that check, or a row changed under it.
+    let layout = crate::board::BoardLayout::parse(&layout)
+        .map_err(|problem| AppError::internal(format!("job {id}'s board layout {problem}")))?;
+    let letters = job_letters(&state, &job).await?.letters().to_vec();
+    Ok(Json(BoardView { layout, letters }))
 }
 
 /// How many live job streams are open at once, across every job.
@@ -1319,8 +1578,8 @@ async fn job_stream(
 /// and the resource it consumes is not CPU but a pool connection, held for as
 /// long as the caller keeps reading, out of twenty. Bulk reads are an admin
 /// operation now; the public gets `GET /api/jobs/:id/results`, which is
-/// paginated. For a completed job this defers to the export, which is the same
-/// corpus read once rather than once per caller.
+/// paginated. For a completed job this defers to its final export, which is the
+/// same corpus read once rather than once per caller.
 #[derive(Deserialize)]
 pub(super) struct StreamQuery {
     /// Games and game-pairs jobs only: stream the positions the job captured
@@ -1346,6 +1605,8 @@ pub(super) async fn job_results_stream(
     // A completed job's results are immutable, so an export of them is a stable
     // artifact: read it instead of re-scanning. The redirect is what puts the
     // cheap path in front of a caller without them having to know about it.
+    // Only a final export: a snapshot taken while the job ran is short of the
+    // corpus, and was once served as it.
     if job.status == crate::models::job::JobStatus::Completed {
         if let Some(ready) = crate::exports::newest_ready(&state.pool, id).await? {
             // The positions' own artifact when that is what was asked for. An
@@ -1514,13 +1775,55 @@ pub(super) struct WorkerListItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     anon_uuid: Option<Uuid>,
     username: Option<String>,
+    /// Every claim this contributor completed, held from claim to submission:
+    /// MAGPIE reports no CPU time, so this is the compute it is credited with.
+    compute_seconds: f64,
+    games_played: i64,
+    racks_analyzed: i64,
     tasks_completed: i64,
     last_seen_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// What the contributor list is ranked by. Each has a partial index per kind
+/// of identity (`users_worker_*_idx`, `anonymous_workers_*_idx`), which is what
+/// keeps every order a merge of two index scans.
+#[derive(Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(super) enum WorkerSort {
+    /// The default: the fairest single measure of what a contributor gave, as
+    /// a machine that plays slow, deep games finishes few tasks in many hours.
+    #[default]
+    Compute,
+    Games,
+    Racks,
+    Tasks,
+}
+
+impl WorkerSort {
+    /// The counter column, on either table. From this closed set only, since
+    /// it is spliced into the statement.
+    fn column(self) -> &'static str {
+        match self {
+            WorkerSort::Compute => "compute_ms",
+            WorkerSort::Games => "games_played",
+            WorkerSort::Racks => "racks_analyzed",
+            WorkerSort::Tasks => "tasks_completed",
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub(super) struct WorkerPageQuery {
+    #[serde(default)]
+    page: i64,
+    per_page: Option<i64>,
+    #[serde(default)]
+    sort: WorkerSort,
+}
+
 async fn list_workers(
     State(state): State<AppState>,
-    Query(query): Query<PageQuery>,
+    Query(query): Query<WorkerPageQuery>,
 ) -> AppResult<Json<super::Page<WorkerListItem>>> {
     worker_page(&state, query, false).await
 }
@@ -1529,17 +1832,18 @@ async fn list_workers(
 pub(super) async fn list_workers_admin(
     State(state): State<AppState>,
     _admin: crate::auth::AdminUser,
-    Query(query): Query<PageQuery>,
+    Query(query): Query<WorkerPageQuery>,
 ) -> AppResult<Json<super::Page<WorkerListItem>>> {
     worker_page(&state, query, true).await
 }
 
 async fn worker_page(
     state: &AppState,
-    query: PageQuery,
+    query: WorkerPageQuery,
     with_credentials: bool,
 ) -> AppResult<Json<super::Page<WorkerListItem>>> {
     let (limit, offset) = super::paginate(query.page, query.per_page);
+    let rank = query.sort.column();
 
     // Counted first, so a page past the end is answered without its query:
     // each arm reads `offset + limit` rows of its index before the merge, and
@@ -1553,8 +1857,10 @@ async fn worker_page(
     .await?;
 
     // Both kinds of contributor in one ranking, each from its own running
-    // total. Each arm is an ordered scan of its own partial index, cut off at
-    // the end of the requested page, and the two are merged. The arms must be
+    // total -- whichever `rank` is. Each arm is an ordered scan of its own
+    // partial index for that counter (every one has the list's predicate,
+    // `tasks_completed > 0`, so every order lists the same contributors), cut
+    // off at the end of the requested page, and the two are merged. The arms must be
     // limited themselves: with the LIMIT only outside the UNION, Postgres
     // sorted every contributor of both kinds on each view (the constant NULL
     // column in each arm defeats a merge of the index orders). Within a count,
@@ -1578,30 +1884,34 @@ async fn worker_page(
     let rows = if offset >= total {
         Vec::new()
     } else {
-        sqlx::query(
+        sqlx::query(&format!(
             "SELECT c.user_id, c.anon_uuid,
                     CASE WHEN c.anon_uuid IS NOT NULL
                          THEN left(encode(sha256(convert_to(c.anon_uuid::text, 'UTF8')), 'hex'), 16)
                     END AS anon_id,
-                    c.username, c.tasks_completed, c.last_seen_at
+                    c.username, c.compute_ms, c.games_played, c.racks_analyzed,
+                    c.tasks_completed, c.last_seen_at
              FROM (
                  SELECT * FROM (
-                     (SELECT u.id AS user_id, NULL::uuid AS anon_uuid,
-                             u.username, u.tasks_completed, u.last_completed_at AS last_seen_at
+                     (SELECT u.id AS user_id, NULL::uuid AS anon_uuid, u.username,
+                             u.compute_ms, u.games_played, u.racks_analyzed, u.tasks_completed,
+                             u.last_completed_at AS last_seen_at
                       FROM users u WHERE u.tasks_completed > 0
-                      ORDER BY u.tasks_completed DESC, u.id
+                      ORDER BY u.{rank} DESC, u.id
                       LIMIT $3)
                      UNION ALL
-                     (SELECT NULL::uuid, w.uuid, NULL::text, w.tasks_completed, w.last_completed_at
+                     (SELECT NULL::uuid, w.uuid, NULL::text,
+                             w.compute_ms, w.games_played, w.racks_analyzed, w.tasks_completed,
+                             w.last_completed_at
                       FROM anonymous_workers w WHERE w.tasks_completed > 0
-                      ORDER BY w.tasks_completed DESC, w.uuid
+                      ORDER BY w.{rank} DESC, w.uuid
                       LIMIT $3)
                  ) contributors
-                 ORDER BY tasks_completed DESC, user_id, anon_uuid
+                 ORDER BY {rank} DESC, user_id, anon_uuid
                  LIMIT $1 OFFSET $2
              ) c
-             ORDER BY c.tasks_completed DESC, c.user_id, c.anon_uuid",
-        )
+             ORDER BY c.{rank} DESC, c.user_id, c.anon_uuid"
+        ))
         .bind(limit)
         .bind(offset)
         .bind(offset.saturating_add(limit))
@@ -1617,6 +1927,9 @@ async fn worker_page(
                 anon_id: r.get("anon_id"),
                 anon_uuid: if with_credentials { r.get("anon_uuid") } else { None },
                 username: r.get("username"),
+                compute_seconds: r.get::<i64, _>("compute_ms") as f64 / 1000.0,
+                games_played: r.get("games_played"),
+                racks_analyzed: r.get("racks_analyzed"),
                 tasks_completed: r.get("tasks_completed"),
                 last_seen_at: r.get("last_seen_at"),
             })

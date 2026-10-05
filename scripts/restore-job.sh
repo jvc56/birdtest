@@ -123,9 +123,9 @@ MOVES="SELECT id FROM position_analysis_moves WHERE record_id IN ($RECORDS)"
 # hangs off a claim.
 PLAYERS="SELECT unnest(ARRAY[player1_config_id, player2_config_id]) FROM job_game_config WHERE job_id = '$job'
          UNION SELECT unnest(ARRAY[player1_config_id, player2_config_id]) FROM job_game_pair_config WHERE job_id = '$job'
-         UNION SELECT player_config_id FROM job_opening_rack_config WHERE job_id = '$job'"
+         UNION SELECT player_config_id FROM job_opening_rack_config WHERE job_id = '$job'
+         UNION SELECT player_config_id FROM job_leave_config WHERE job_id = '$job'"
 INPUTS="SELECT letterdist_id FROM jobs WHERE id = '$job' UNION SELECT layout_id FROM jobs WHERE id = '$job'
-        UNION SELECT kwg_id FROM job_leave_config WHERE job_id = '$job'
         UNION SELECT unnest(ARRAY[kwg_id, klv_id, winpct_id]) FROM player_configs WHERE id IN ($PLAYERS)"
 
 # What a deleted job needs back before its rows: what it names first, then the
@@ -167,6 +167,8 @@ TABLES=(
   "position_analysis_records|job_id = '$job'"
   "position_analysis_moves|record_id IN ($RECORDS)"
   "position_analysis_plies|move_id IN ($MOVES)"
+  "position_analysis_inference|record_id IN ($RECORDS)"
+  "opening_rack_progress|job_id = '$job'"
   "leave_rack_progress|job_id = '$job'"
   "leave_rack_staging|job_id = '$job'"
   "leave_generation_progress|job_id = '$job'"

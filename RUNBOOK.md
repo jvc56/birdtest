@@ -681,8 +681,9 @@ BEGIN;
 -- A purged job that completed again since -- a small job, or a force-complete --
 -- cannot be deactivated from the admin page, and its verdict is from the
 -- results about to be deleted: back to inactive, with no verdict.
-UPDATE jobs SET status = 'inactive', sprt_decided_status = NULL,
-                sprt_decided_llr = NULL, sprt_decided_units = NULL
+UPDATE jobs SET status = 'inactive', test_decided_status = NULL,
+                test_decided_lower = NULL, test_decided_upper = NULL,
+                test_decided_units = NULL
  WHERE id = :'job' AND status = 'completed';
 -- And an export of those results: once §2.3 completes the job again it would be
 -- served as the restored job's corpus. (A purge deletes exports for this
@@ -690,6 +691,7 @@ UPDATE jobs SET status = 'inactive', sprt_decided_status = NULL,
 DELETE FROM job_exports WHERE job_id = :'job';
 DELETE FROM task_claims c USING tasks t WHERE c.task_id = t.id AND t.job_id = :'job';
 DELETE FROM tasks WHERE job_id = :'job';
+DELETE FROM opening_rack_progress       WHERE job_id = :'job';
 DELETE FROM leave_rack_progress         WHERE job_id = :'job';
 DELETE FROM leave_rack_staging          WHERE job_id = :'job';
 DELETE FROM leave_generation_progress   WHERE job_id = :'job';
@@ -858,8 +860,8 @@ Postgres through each of these cases, nightly.
 | 2 | `opening_rack_requests` / `game_requests` / `leave_requests` | `task_id IN (...)` |
 | 3 | `task_claims`, then `worker_data_gaps` | `task_id IN (...)` / `job_id = :job` |
 | 4 | `game_results`, `leave_records` | `job_id = :job` / `task_id IN (...)` |
-| 5 | `position_analysis_records` → `_moves` → `_plies` | `job_id = :job`, then by parent id |
-| 6 | `leave_rack_progress`, `leave_rack_staging`, `leave_generation_progress`, `leave_selection_cursors`, `leave_generation_artifacts`, `leave_generation_transitions` | `job_id = :job` |
+| 5 | `position_analysis_records` → `_moves` → `_plies`, and `_records` → `_inference` | `job_id = :job`, then by parent id |
+| 6 | `opening_rack_progress`, `leave_rack_progress`, `leave_rack_staging`, `leave_generation_progress`, `leave_selection_cursors`, `leave_generation_artifacts`, `leave_generation_transitions` | `job_id = :job` |
 
 `worker_data_gaps` is what the admin page's data gaps and the job list's
 `stalled` flag read: left out, a job's declines are forgotten.
@@ -938,21 +940,21 @@ UPDATE tasks t
    -- seconds of writes and as many dead tuples, for rows already right.
    AND (t.accepted_count, t.active_claim_count) IS DISTINCT FROM (actual.accepted, actual.active);
 
--- State and completed_at follow from the counters and the job's redundancy,
--- exactly as the submit path computes them.
+-- State and completed_at follow from the counters, exactly as the submit
+-- path computes them: a task has one slot, so an accepted result completes
+-- it and a live claim holds it.
 UPDATE tasks t
    SET state = CASE
-         WHEN t.accepted_count >= j.redundancy THEN 'completed'::task_state
-         WHEN t.accepted_count + t.active_claim_count >= j.redundancy THEN 'claimed'::task_state
+         WHEN t.accepted_count > 0 THEN 'completed'::task_state
+         WHEN t.active_claim_count > 0 THEN 'claimed'::task_state
          ELSE 'available'::task_state
        END,
-       completed_at = CASE WHEN t.accepted_count >= j.redundancy
+       completed_at = CASE WHEN t.accepted_count > 0
                            THEN COALESCE(t.completed_at, now()) ELSE NULL END
-  FROM jobs j
- WHERE j.id = t.job_id AND t.job_id = :'job'
+ WHERE t.job_id = :'job'
    AND t.state IS DISTINCT FROM CASE
-         WHEN t.accepted_count >= j.redundancy THEN 'completed'::task_state
-         WHEN t.accepted_count + t.active_claim_count >= j.redundancy THEN 'claimed'::task_state
+         WHEN t.accepted_count > 0 THEN 'completed'::task_state
+         WHEN t.active_claim_count > 0 THEN 'claimed'::task_state
          ELSE 'available'::task_state
        END;
 
@@ -963,8 +965,7 @@ UPDATE tasks t
 -- rest are the dashboard's progress totals; they
 -- are maintained one task at a time in the claim and submit paths, so a row
 -- copy leaves them describing the results the job had before. Each is
--- recomputed here exactly as the read it replaced computed it: one result per
--- task, because redundant claims replay the same work.
+-- recomputed here exactly as the read it replaced computed it.
 -- The claims are read once, for both of their columns: a second subquery for
 -- last_completed_at was a second pass over them.
 UPDATE jobs j
@@ -973,15 +974,18 @@ UPDATE jobs j
        tasks_total = (SELECT count(*) FROM tasks t WHERE t.job_id = j.id),
        tasks_completed = (SELECT count(*) FROM tasks t
                            WHERE t.job_id = j.id AND t.state = 'completed'),
-       games_completed = (SELECT COALESCE(sum(g.games), 0) FROM (
-                            SELECT DISTINCT ON (r.task_id) r.games
-                              FROM game_results r
-                             WHERE r.job_id = j.id
-                             ORDER BY r.task_id, r.submitted_at, r.task_claim_id
-                          ) g),
+       games_completed = (SELECT COALESCE(sum(r.games), 0)
+                            FROM game_results r WHERE r.job_id = j.id),
        racks_analyzed = (SELECT count(DISTINCT p.rack)
                            FROM position_analysis_records p
-                          WHERE p.job_id = j.id AND p.game_index IS NULL)
+                          WHERE p.job_id = j.id AND p.game_index IS NULL),
+       -- An opening-rack job's settled racks are its settled progress rows:
+       -- every opening-rack job keeps one per rack, and one wanting a single
+       -- analysis per rack settles each at its first.
+       racks_settled = (SELECT count(*) FROM opening_rack_progress p
+                         WHERE p.job_id = j.id AND p.settled),
+       racks_without_consensus = (SELECT count(*) FROM opening_rack_progress p
+                                   WHERE p.job_id = j.id AND p.without_consensus)
   FROM (SELECT count(*) AS issued,
                max(c.completed_at) FILTER (WHERE c.state = 'completed') AS last
           FROM task_claims c JOIN tasks t ON t.id = c.task_id
@@ -1010,7 +1014,8 @@ UPDATE jobs j
 COMMIT;
 ```
 
-`racks_analyzed` is meaningful only for an opening-rack job and
+`racks_analyzed`, `racks_settled` and `racks_without_consensus` are meaningful
+only for an opening-rack job and
 `games_completed` only for a games or game-pairs job; the statement above leaves
 each at 0 for the job types that do not use it, which is what they hold anyway.
 
@@ -1019,7 +1024,7 @@ not between the two `UPDATE tasks` statements above: `tasks_completed` counts
 tasks whose `state` is `completed`, which the second of those recomputes.
 
 **A purged job that had completed** comes back inactive with no verdict: a
-purge returns a completed job to inactive and clears the SPRT verdict it was
+purge returns a completed job to inactive and clears the match-test verdict it was
 completed on, and neither is a row the copy brings back. **A deleted job that
 had completed** comes back inactive too: §2.2 restores its `jobs` row with its
 verdict but made `inactive`. Put the status (and, for a purged job, the
@@ -1027,14 +1032,16 @@ verdict) back from the scratch copy's `jobs` row:
 
 ```sql
 -- Set each variable from the scratch copy's row
---   SELECT status, sprt_decided_status, sprt_decided_llr, sprt_decided_units
+--   SELECT status, test_decided_status, test_decided_lower, test_decided_upper,
+--          test_decided_units
 --   FROM jobs WHERE id = :'job';
 -- and to the empty string where it is NULL (a job an admin completed has no
 -- verdict): :'var' always quotes, so NULLIF is what turns empty back into NULL.
 UPDATE jobs SET status = :'old_status',
-               sprt_decided_status = NULLIF(:'old_verdict', ''),
-               sprt_decided_llr    = NULLIF(:'old_llr', '')::float8,
-               sprt_decided_units  = NULLIF(:'old_units', '')::bigint
+               test_decided_status = NULLIF(:'old_verdict', ''),
+               test_decided_lower  = NULLIF(:'old_lower', '')::float8,
+               test_decided_upper  = NULLIF(:'old_upper', '')::float8,
+               test_decided_units  = NULLIF(:'old_units', '')::bigint
  WHERE id = :'job';
 ```
 
@@ -1073,13 +1080,22 @@ SET temp_buffers = '64MB';
 
 -- 1. Count. Reads only; nothing waits on this. `recount` is kept whole for
 --    the rest of the procedure (step 2 reads it); step 3 works through a copy.
+--    Compute is each claim's whole milliseconds held, claim to submission,
+--    exactly as the submit path adds it (`CLAIM_COMPUTE_MS` in
+--    routes/worker.rs); games and racks are what each claim recorded.
 CREATE TEMP TABLE recount AS
-SELECT 'u' AS kind, c.claimed_by_user_id AS id, count(*) AS n, max(c.completed_at) AS last
+SELECT 'u' AS kind, c.claimed_by_user_id AS id, count(*) AS n,
+       sum(GREATEST((EXTRACT(EPOCH FROM c.completed_at - c.claimed_at) * 1000)::bigint, 0))::bigint
+         AS ms,
+       sum(c.games_played)::bigint AS games, sum(c.racks_analyzed)::bigint AS racks,
+       max(c.completed_at) AS last
   FROM task_claims c
  WHERE c.state = 'completed' AND c.claimed_by_user_id IS NOT NULL
  GROUP BY 2
 UNION ALL
-SELECT 'a', c.claimed_by_anon_uuid, count(*), max(c.completed_at)
+SELECT 'a', c.claimed_by_anon_uuid, count(*),
+       sum(GREATEST((EXTRACT(EPOCH FROM c.completed_at - c.claimed_at) * 1000)::bigint, 0))::bigint,
+       sum(c.games_played)::bigint, sum(c.racks_analyzed)::bigint, max(c.completed_at)
   FROM task_claims c
  WHERE c.state = 'completed' AND c.claimed_by_anon_uuid IS NOT NULL
  GROUP BY 2;
@@ -1103,7 +1119,8 @@ DECLARE zeroed int;
 BEGIN
   LOOP
     WITH z AS (
-      UPDATE users SET tasks_completed = 0, last_completed_at = NULL
+      UPDATE users SET tasks_completed = 0, compute_ms = 0, games_played = 0,
+                       racks_analyzed = 0, last_completed_at = NULL
        WHERE id IN (SELECT u.id FROM users u
                      WHERE u.tasks_completed > 0
                        AND NOT EXISTS (SELECT 1 FROM recount r
@@ -1111,7 +1128,8 @@ BEGIN
                      LIMIT 1000)
       RETURNING 1),
     za AS (
-      UPDATE anonymous_workers SET tasks_completed = 0, last_completed_at = NULL
+      UPDATE anonymous_workers SET tasks_completed = 0, compute_ms = 0, games_played = 0,
+                                   racks_analyzed = 0, last_completed_at = NULL
        WHERE uuid IN (SELECT w.uuid FROM anonymous_workers w
                        WHERE w.tasks_completed > 0
                          AND NOT EXISTS (SELECT 1 FROM recount r
@@ -1131,18 +1149,25 @@ BEGIN
     WITH batch AS (
       DELETE FROM pending
        WHERE ctid IN (SELECT ctid FROM pending LIMIT 1000)
-      RETURNING kind, id, n, last),
+      RETURNING kind, id, n, ms, games, racks, last),
     u AS (
-      UPDATE users u SET tasks_completed = b.n, last_completed_at = b.last
+      UPDATE users u SET tasks_completed = b.n, compute_ms = b.ms, games_played = b.games,
+                         racks_analyzed = b.racks, last_completed_at = b.last
         FROM batch b
        WHERE b.kind = 'u' AND u.id = b.id
-         AND (u.tasks_completed, u.last_completed_at) IS DISTINCT FROM (b.n, b.last)
+         AND (u.tasks_completed, u.compute_ms, u.games_played, u.racks_analyzed,
+              u.last_completed_at)
+             IS DISTINCT FROM (b.n, b.ms, b.games, b.racks, b.last)
       RETURNING 1),
     a AS (
-      UPDATE anonymous_workers w SET tasks_completed = b.n, last_completed_at = b.last
+      UPDATE anonymous_workers w SET tasks_completed = b.n, compute_ms = b.ms,
+                                     games_played = b.games, racks_analyzed = b.racks,
+                                     last_completed_at = b.last
         FROM batch b
        WHERE b.kind = 'a' AND w.uuid = b.id
-         AND (w.tasks_completed, w.last_completed_at) IS DISTINCT FROM (b.n, b.last)
+         AND (w.tasks_completed, w.compute_ms, w.games_played, w.racks_analyzed,
+              w.last_completed_at)
+             IS DISTINCT FROM (b.n, b.ms, b.games, b.racks, b.last)
       RETURNING 1)
     SELECT count(*) INTO taken FROM batch;
     EXIT WHEN taken = 0;
@@ -1179,7 +1204,7 @@ leaderboard visible.
   to copy. Runs older than a month are thinned to one a day in any case
   (PLAN.md, "Ratings"), so a restored history is at that resolution past the
   month whatever the backup's age.
-- **SPRT**: computed from `game_results` on read, so it corrects itself once
+- **Match test**: computed from `game_results` on read, so it corrects itself once
   the results are back.
 - **Leave-generation artifacts**: run `POST /api/admin/jobs/:id/rebuild-artifacts`
   (the "Check artifacts" button on the admin job page) on every restored
@@ -1321,18 +1346,29 @@ SELECT count(*) AS counter_disagreements
   ) actual ON actual.task_id = t.id
  WHERE t.accepted_count <> COALESCE(actual.accepted, 0)
     OR t.active_claim_count <> COALESCE(actual.active, 0);
--- 3b. Contributor counters (§2.3b's result). Must be zero.
+-- 3b. Contributor counters (§2.3b's result): tasks, compute, games and
+--     racks. Must be zero.
 SELECT
   (SELECT count(*) FROM users u
-     LEFT JOIN (SELECT claimed_by_user_id AS id, count(*) AS n FROM task_claims
+     LEFT JOIN (SELECT claimed_by_user_id AS id, count(*) AS n,
+                       sum(GREATEST((EXTRACT(EPOCH FROM completed_at - claimed_at) * 1000)::bigint,
+                                    0))::bigint AS ms,
+                       sum(games_played)::bigint AS games, sum(racks_analyzed)::bigint AS racks
+                  FROM task_claims
                  WHERE state = 'completed' AND claimed_by_user_id IS NOT NULL
                  GROUP BY 1) c ON c.id = u.id
-    WHERE u.tasks_completed <> COALESCE(c.n, 0))
+    WHERE (u.tasks_completed, u.compute_ms, u.games_played, u.racks_analyzed)
+          <> (COALESCE(c.n, 0), COALESCE(c.ms, 0), COALESCE(c.games, 0), COALESCE(c.racks, 0)))
 + (SELECT count(*) FROM anonymous_workers w
-     LEFT JOIN (SELECT claimed_by_anon_uuid AS id, count(*) AS n FROM task_claims
+     LEFT JOIN (SELECT claimed_by_anon_uuid AS id, count(*) AS n,
+                       sum(GREATEST((EXTRACT(EPOCH FROM completed_at - claimed_at) * 1000)::bigint,
+                                    0))::bigint AS ms,
+                       sum(games_played)::bigint AS games, sum(racks_analyzed)::bigint AS racks
+                  FROM task_claims
                  WHERE state = 'completed' AND claimed_by_anon_uuid IS NOT NULL
                  GROUP BY 1) c ON c.id = w.uuid
-    WHERE w.tasks_completed <> COALESCE(c.n, 0))
+    WHERE (w.tasks_completed, w.compute_ms, w.games_played, w.racks_analyzed)
+          <> (COALESCE(c.n, 0), COALESCE(c.ms, 0), COALESCE(c.games, 0), COALESCE(c.racks, 0)))
   AS contributor_disagreements;
 ```
 
@@ -1344,7 +1380,7 @@ SELECT
 
    **Never use `worker/fake_worker.py` for this.** It submits invented
    results, the server records them as real contributions to real jobs, and
-   they skew SPRT verdicts and rating fits until the jobs they went to are
+   they skew match-test verdicts and rating fits until the jobs they went to are
    purged (§2.0) — no route deletes a single result, and one deleted by hand
    leaves the job's counters, and so its pools' fits, as they were. It is test
    tooling for disposable stacks only.

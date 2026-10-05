@@ -2,8 +2,8 @@ import { test, expect } from '@playwright/test';
 
 /**
  * E-14: player configs are public. A signed-out visitor finds the seeded
- * configs from the nav, opens one, reads its key settings, and can open
- * every setting.
+ * configs from the nav, opens one, reads its key settings in a table, and
+ * can open every setting in the same table.
  */
 test('E-14: a visitor reads a player config and all of its settings', async ({ page }) => {
   await page.goto('/');
@@ -12,10 +12,14 @@ test('E-14: a visitor reads a player config and all of its settings', async ({ p
   await page.getByRole('link', { name: 'static-equity', exact: true }).click();
 
   await expect(page.getByRole('heading', { name: 'static-equity' })).toBeVisible();
+  // How it searches, in a few words, beside its name.
+  await expect(page.getByText(/^static, by equity · created/)).toBeVisible();
   const settings = page.locator('.card', { has: page.getByRole('heading', { name: 'Settings' }) });
-  await expect(settings.locator('dd').first()).toHaveText('static, by equity');
-  const everySetting = settings.locator('details');
-  await expect(everySetting.getByText('Move-gen margin')).toBeHidden();
-  await everySetting.locator('summary').click();
-  await expect(everySetting.getByText('Move-gen margin')).toBeVisible();
+  await expect(settings.getByText('Movegen Margin')).toBeHidden();
+  await settings.getByRole('button', { name: 'All settings' }).click();
+  await expect(settings.getByText('Movegen Margin')).toBeVisible();
+  // The key rows stay first when the table grows.
+  await expect(settings.getByRole('row').first().getByRole('cell').first()).toHaveText('Lexicon');
+  await settings.getByRole('button', { name: 'Key settings only' }).click();
+  await expect(settings.getByText('Movegen Margin')).toBeHidden();
 });

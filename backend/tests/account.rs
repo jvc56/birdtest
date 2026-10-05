@@ -344,9 +344,12 @@ async fn scrub(db: &TestDb) {
 async fn a_scrubbed_dump_keeps_no_worker_credential() {
     let db = TestDb::new().await;
     let admin = db.user("root", true).await;
-    let job = db.games_job(1, 10).await;
+    let job = db.games_job(10).await;
     let worker = Uuid::new_v4();
-    sqlx::query("INSERT INTO anonymous_workers (uuid, tasks_completed) VALUES ($1, 7)")
+    sqlx::query(
+        "INSERT INTO anonymous_workers (uuid, tasks_completed, compute_ms, games_played, racks_analyzed)
+         VALUES ($1, 7, 8000, 9, 10)",
+    )
         .bind(worker)
         .execute(&db.pool)
         .await
@@ -389,10 +392,14 @@ async fn a_scrubbed_dump_keeps_no_worker_credential() {
         scrub(&db).await;
     }
 
-    let (uuid, tasks_completed): (Uuid, i64) =
-        sqlx::query_as("SELECT uuid, tasks_completed FROM anonymous_workers").fetch_one(&db.pool).await.unwrap();
+    let (uuid, tasks_completed, compute_ms, games, racks): (Uuid, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT uuid, tasks_completed, compute_ms, games_played, racks_analyzed FROM anonymous_workers",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
     assert_ne!(uuid, worker, "the credential is gone");
-    assert_eq!(tasks_completed, 7, "what it did is kept");
+    assert_eq!((tasks_completed, compute_ms, games, racks), (7, 8000, 9, 10), "what it did is kept");
     let (claimed_by, claim_token): (Uuid, Uuid) =
         sqlx::query_as("SELECT claimed_by_anon_uuid, claim_token FROM task_claims").fetch_one(&db.pool).await.unwrap();
     assert_eq!(claimed_by, uuid, "its claim follows it");
@@ -423,7 +430,13 @@ async fn a_scrubbed_dump_keeps_no_worker_credential() {
     .fetch_all(&db.pool)
     .await
     .unwrap();
-    assert_eq!(columns, ["uuid", "first_seen_at", "last_seen_at", "tasks_completed", "last_completed_at"]);
+    assert_eq!(
+        columns,
+        [
+            "uuid", "first_seen_at", "last_seen_at", "tasks_completed", "compute_ms",
+            "games_played", "racks_analyzed", "last_completed_at",
+        ]
+    );
 }
 
 /// A-ACCOUNT-8: a key's whole life is on record. Issuing, suspending, resuming

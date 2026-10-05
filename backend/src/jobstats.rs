@@ -3,32 +3,24 @@
 //! stream is byte-for-byte what a page reload would produce.
 
 use crate::error::AppResult;
-use crate::models::job::{GameConfig, GamePairConfig, Job, JobType, LeaveConfig, SprtParams};
-use crate::stats::sprt::{self, Pentanomial, Sample, SprtResult, Tally};
+use crate::models::job::{GameConfig, GamePairConfig, Job, JobType, LeaveConfig, TestParams};
+use crate::stats::match_test::{self, TestResult};
+use crate::stats::outcomes::{Pentanomial, Sample, Tally};
 use serde::Serialize;
 use sqlx::{PgConnection, PgPool, Row};
 use uuid::Uuid;
 
-/// One `game_results` row per task of job `$1`: the first accepted.
-///
-/// With redundancy above 1 a task has one row per accepted claim, and since
-/// games are seeded and deterministic those rows describe the *same* games.
-/// Summing all of them would count every game `redundancy` times -- SPRT would
-/// see `redundancy` times the evidence it has and stop early on noise, and
-/// `min`/`max` gates would trip at a fraction of the games they name. Which
-/// copy is used is arbitrary but fixed; reconciling copies that disagree is a
-/// cross-check this read deliberately does not attempt (PLAN.md, "Worker
-/// Integrity").
+/// Every `game_results` row of job `$1`: one per task, since a task has one
+/// slot.
 ///
 /// Reads the job's rows through `game_results.job_id` rather than by joining
 /// `tasks` to find out which rows belong to it. This is the query the finish
 /// check runs on the submission path, so it is the one place where dropping a
 /// join is worth the most.
-pub const FIRST_GAME_RESULT_PER_TASK: &str = "
-    SELECT DISTINCT ON (r.task_id) r.*
+pub const GAME_RESULTS: &str = "
+    SELECT r.*
     FROM game_results r
-    WHERE r.job_id = $1
-    ORDER BY r.task_id, r.submitted_at, r.task_claim_id";
+    WHERE r.job_id = $1";
 
 #[derive(Debug, Serialize)]
 pub struct JobStats {
@@ -68,9 +60,11 @@ pub struct Completion {
     pub at: chrono::DateTime<chrono::Utc>,
     /// Completed by an admin (force-complete) rather than by its own rule.
     pub forced: bool,
-    /// The server's reason, when it completed the job: the SPRT verdict
-    /// (`passed`, `failed`, `terminated_at_max`) or `last generation built`.
-    /// None for an opening-rack job whose racks were all analysed.
+    /// The server's reason, when it completed the job: the match test's
+    /// verdict (`player1_better`, `player2_better`, `inconclusive`),
+    /// `reached_target` for a games or pairs job that runs no test and played
+    /// its games, or `last generation built`. None for an opening-rack job whose racks were all
+    /// analysed.
     pub reason: Option<String>,
 }
 
@@ -82,7 +76,6 @@ pub struct JobSummary {
     pub job_type: JobType,
     pub status: String,
     pub allocation: Option<i32>,
-    pub redundancy: i32,
     pub min_magpie_version: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub created_by: Option<String>,
@@ -92,7 +85,7 @@ pub struct JobSummary {
 
 #[derive(Debug, Serialize)]
 pub struct GameStats {
-    /// "game" for `games` jobs, "pair" for `game_pairs` — the SPRT unit.
+    /// "game" for `games` jobs, "pair" for `game_pairs` — the test's unit.
     pub unit: &'static str,
     pub wins: u64,
     pub losses: u64,
@@ -100,7 +93,13 @@ pub struct GameStats {
     /// Games for a `games` job, pairs for a `game_pairs` job — the unit the
     /// job's min/max thresholds are stated in.
     pub units_completed: u64,
-    /// Game pairs only: the five pair-outcome counts the LLR is computed from,
+    /// Each player's score per game, and player 1's spread (the difference),
+    /// over every game played: the batches' means weighted by their games.
+    /// `None` before any game is.
+    pub p1_score_mean: Option<f64>,
+    pub p2_score_mean: Option<f64>,
+    pub spread_mean: Option<f64>,
+    /// Game pairs only: the five pair-outcome counts the test is computed from,
     /// indexed by player 1's half-point score across the pair.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pentanomial: Option<[u64; 5]>,
@@ -108,25 +107,34 @@ pub struct GameStats {
     /// two configs actually differ — and not part of the test.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub divergent_pairs: Option<u64>,
+    /// Game pairs only: the match score over the games of the pairs that
+    /// diverged -- where the two configs actually played differently. A
+    /// diagnostic beside the full score, like `divergent_pairs`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub divergent: Option<MatchTally>,
     pub min_units: i32,
     pub max_units: i32,
     pub win_pct: f64,
     pub loss_pct: f64,
     pub draw_pct: f64,
-    /// The test over every accepted result, recomputed on each read.
-    pub sprt: SprtResult,
+    /// The match test over every accepted result, recomputed on each read.
+    /// `None` for a job that runs no test: it plays `max_units` and stops, and
+    /// an interval nobody acts on would read as a verdict.
+    pub test: Option<TestResult>,
     /// What the job was completed on, when the finish check completed it
-    /// (`jobs.sprt_decided_*`). The claims in flight at that moment are still
-    /// played and accepted, so `sprt` can move after it -- even back inside
-    /// the bounds -- and this is the decision that stands.
+    /// (`jobs.test_decided_*`). The claims in flight at that moment are still
+    /// played and accepted, so `test` can move after it -- even back around
+    /// an even score -- and this is the decision that stands.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub decided: Option<SprtDecided>,
+    pub decided: Option<TestDecided>,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct SprtDecided {
+pub struct TestDecided {
     pub status: String,
-    pub llr: f64,
+    /// Player 1's score interval when it was decided.
+    pub lower: f64,
+    pub upper: f64,
     pub units: i64,
 }
 
@@ -135,9 +143,7 @@ pub struct SprtDecided {
 /// This used to also carry the average best equity and a breakdown of what the
 /// best opening play was (placement, exchange or pass). Both aggregated over
 /// every stored move row of the job, which was the most expensive read in the
-/// whole payload and grew without bound; and both counted per *claim* while
-/// `racks_analyzed` counts per task, so at `redundancy > 1` the page showed a
-/// move-type total of twice the racks it was displayed beside.
+/// whole payload and grew without bound.
 ///
 /// Nothing is lost from storage: every ranked move is still there, the results
 /// listing still returns the best move, score and equity per rack, `?rack=`
@@ -148,6 +154,12 @@ pub struct SprtDecided {
 pub struct OpeningRackStats {
     /// Distinct racks with at least one accepted analysis.
     pub racks_analyzed: i64,
+    /// Racks that need no more analysis -- the job is done once every rack
+    /// is -- and those of them settled at their most analyses without a
+    /// consensus. A job wanting one analysis per rack settles each at its
+    /// first, so for it `racks_settled` is `racks_analyzed`.
+    pub racks_settled: i64,
+    pub racks_without_consensus: i64,
     /// Size of the rack space; the denominator for progress.
     pub racks_total: i64,
 }
@@ -169,7 +181,10 @@ pub struct LeaveGenStats {
     /// Generations whose KLV is built. `current_generation` stops at the last
     /// generation, so it cannot say a finished job's last one closed.
     pub generations_closed: i32,
-    pub target_rack_count: i32,
+    /// The in-progress generation's occurrence target, from
+    /// `target_rack_counts`, which is every generation's in order.
+    pub target_rack_count: i64,
+    pub target_rack_counts: Vec<i32>,
     /// Accepted tasks of the in-progress generation, and the games they played.
     pub tasks_completed: i64,
     pub games_played: i64,
@@ -191,6 +206,9 @@ pub struct WorkerContribution {
     pub anon_id: Option<String>,
     pub username: Option<String>,
     pub tasks_completed: i64,
+    /// Those claims held from claim to submission, as the contributor list
+    /// counts compute (`routes::worker::CLAIM_COMPUTE_MS`).
+    pub compute_seconds: f64,
 }
 
 pub async fn load_job(pool: &PgPool, job_id: Uuid) -> AppResult<Job> {
@@ -500,7 +518,6 @@ async fn compute_inner(conn: &mut PgConnection, job: &Job) -> AppResult<JobStats
             job_type: job.job_type,
             status: status_label(job).to_string(),
             allocation: job.allocation,
-            redundancy: job.redundancy,
             min_magpie_version: job.min_magpie_version().to_string(),
             created_at: job.created_at,
             created_by,
@@ -535,8 +552,7 @@ fn status_label(job: &Job) -> &'static str {
 /// It is no longer a single job-level setting: it lives on the player configs,
 /// and a games job may legitimately compare two different lexicons. Distinct
 /// names are joined so the dashboard says what is actually being played rather
-/// than picking one arbitrarily. Leave generation is the exception -- one bot,
-/// one lexicon, on the job config.
+/// than picking one arbitrarily. Leave generation has one player, so one.
 async fn lexicon_and_variant(
     conn: &mut PgConnection,
     job: &Job,
@@ -568,7 +584,8 @@ async fn lexicon_and_variant(
         JobType::LeaveGeneration => {
             "SELECT DISTINCT d.name
              FROM job_leave_config c
-             JOIN input_data d ON d.id = c.kwg_id
+             JOIN player_configs pc ON pc.id = c.player_config_id
+             JOIN input_data d ON d.id = pc.kwg_id
              WHERE c.job_id = $1"
         }
     };
@@ -581,7 +598,7 @@ async fn lexicon_and_variant(
     Ok((lexicon, Some(job.variant.clone())))
 }
 
-/// The SPRT-relevant statistics for a games or game-pairs job, and `None` for
+/// The match test's statistics for a games or game-pairs job, and `None` for
 /// every other job type.
 ///
 /// This is also what the submission path evaluates the finish conditions on,
@@ -597,15 +614,15 @@ async fn game_stats_on(conn: &mut PgConnection, job: &Job) -> AppResult<Option<G
         JobType::GamePairs => game_pair_stats(&mut *conn, job).await?,
         JobType::OpeningRack | JobType::LeaveGeneration => return Ok(None),
     };
-    if let (Some(status), Some(llr), Some(units)) =
-        (&job.sprt_decided_status, job.sprt_decided_llr, job.sprt_decided_units)
+    if let (Some(status), Some(lower), Some(upper), Some(units)) =
+        (&job.test_decided_status, job.test_decided_lower, job.test_decided_upper, job.test_decided_units)
     {
-        stats.decided = Some(SprtDecided { status: status.clone(), llr, units });
+        stats.decided = Some(TestDecided { status: status.clone(), lower, upper, units });
     }
     Ok(Some(stats))
 }
 
-/// Sum the per-task aggregates for a plain `games` job. The SPRT unit is a
+/// Sum the per-task aggregates for a plain `games` job. The test's unit is a
 /// game, so the tally and the unit count are the same number.
 async fn plain_game_stats(conn: &mut PgConnection, job: &Job) -> AppResult<GameStats> {
     let config = sqlx::query_as::<_, GameConfig>("SELECT * FROM job_game_config WHERE job_id = $1")
@@ -617,8 +634,9 @@ async fn plain_game_stats(conn: &mut PgConnection, job: &Job) -> AppResult<GameS
         "SELECT COALESCE(SUM(r.games), 0)::bigint  AS games,
                 COALESCE(SUM(r.wins), 0)::bigint   AS wins,
                 COALESCE(SUM(r.losses), 0)::bigint AS losses,
-                COALESCE(SUM(r.ties), 0)::bigint   AS ties
-         FROM ({FIRST_GAME_RESULT_PER_TASK}) r"
+                COALESCE(SUM(r.ties), 0)::bigint   AS ties,
+                {SCORE_MEANS}
+         FROM ({GAME_RESULTS}) r"
     ))
     .bind(job.id)
     .fetch_one(&mut *conn)
@@ -631,7 +649,16 @@ async fn plain_game_stats(conn: &mut PgConnection, job: &Job) -> AppResult<GameS
     };
     let games = row.get::<i64, _>("games") as u64;
     let sample = Sample::from_games(&tally);
-    Ok(build_game_stats("game", tally, sample, games, None, None, &SprtParams::from(&config)))
+    Ok(build_game_stats(
+        "game",
+        tally,
+        sample,
+        games,
+        ScoreMeans::from_row(&row),
+        None,
+        None,
+        &TestParams::from(&config),
+    ))
 }
 
 /// A game-pairs job is evaluated on the **pentanomial**: every completed pair,
@@ -648,6 +675,18 @@ async fn plain_game_stats(conn: &mut PgConnection, job: &Job) -> AppResult<GameS
 ///
 /// The per-game win/loss/tie tally is still reported for display, and the
 /// divergent counts alongside it as a diagnostic. Neither drives the test.
+/// Player 1's record over some games, and each player's mean score and player
+/// 1's spread over them (`None` before any).
+#[derive(Debug, Serialize)]
+pub struct MatchTally {
+    pub wins: u64,
+    pub losses: u64,
+    pub draws: u64,
+    pub p1_score_mean: Option<f64>,
+    pub p2_score_mean: Option<f64>,
+    pub spread_mean: Option<f64>,
+}
+
 async fn game_pair_stats(conn: &mut PgConnection, job: &Job) -> AppResult<GameStats> {
     let config =
         sqlx::query_as::<_, GamePairConfig>("SELECT * FROM job_game_pair_config WHERE job_id = $1")
@@ -665,8 +704,16 @@ async fn game_pair_stats(conn: &mut PgConnection, job: &Job) -> AppResult<GameSt
                 COALESCE(SUM(r.pent_2), 0)::bigint           AS pent_2,
                 COALESCE(SUM(r.pent_3), 0)::bigint           AS pent_3,
                 COALESCE(SUM(r.pent_4), 0)::bigint           AS pent_4,
-                COALESCE(SUM(r.divergent_games), 0)::bigint  AS divergent_games
-         FROM ({FIRST_GAME_RESULT_PER_TASK}) r"
+                COALESCE(SUM(r.divergent_games), 0)::bigint  AS divergent_games,
+                COALESCE(SUM(r.divergent_wins), 0)::bigint   AS divergent_wins,
+                COALESCE(SUM(r.divergent_losses), 0)::bigint AS divergent_losses,
+                COALESCE(SUM(r.divergent_ties), 0)::bigint   AS divergent_ties,
+                SUM(r.divergent_games * r.divergent_p1_score_mean)
+                    / NULLIF(SUM(r.divergent_games), 0)      AS divergent_p1_mean,
+                SUM(r.divergent_games * r.divergent_p2_score_mean)
+                    / NULLIF(SUM(r.divergent_games), 0)      AS divergent_p2_mean,
+                {SCORE_MEANS}
+         FROM ({GAME_RESULTS}) r"
     ))
     .bind(job.id)
     .fetch_one(&mut *conn)
@@ -687,15 +734,49 @@ async fn game_pair_stats(conn: &mut PgConnection, job: &Job) -> AppResult<GameSt
     // could.
     let pairs_played = pentanomial.pairs();
     let sample = Sample::from_pentanomial(&pentanomial);
-    Ok(build_game_stats(
+    let (p1, p2): (Option<f64>, Option<f64>) =
+        (row.get("divergent_p1_mean"), row.get("divergent_p2_mean"));
+    let divergent = MatchTally {
+        wins: row.get::<i64, _>("divergent_wins") as u64,
+        losses: row.get::<i64, _>("divergent_losses") as u64,
+        draws: row.get::<i64, _>("divergent_ties") as u64,
+        p1_score_mean: p1,
+        p2_score_mean: p2,
+        spread_mean: p1.zip(p2).map(|(p1, p2)| p1 - p2),
+    };
+    let mut stats = build_game_stats(
         "pair",
         tally,
         sample,
         pairs_played,
+        ScoreMeans::from_row(&row),
         Some(counts),
         Some(row.get::<i64, _>("divergent_games") as u64 / 2),
-        &SprtParams::from(&config),
-    ))
+        &TestParams::from(&config),
+    );
+    stats.divergent = Some(divergent);
+    Ok(stats)
+}
+
+/// Each player's mean score per game over the rows of
+/// [`GAME_RESULTS`] aliased `r`, as columns `p1_mean` and
+/// `p2_mean`. A batch reports its own means, so they are weighted by its
+/// games: an average of the batches' means would count a batch of 2 games as
+/// much as one of 200. NULL before any game is played.
+const SCORE_MEANS: &str = "
+    SUM(r.games * r.p1_score_mean) / NULLIF(SUM(r.games), 0) AS p1_mean,
+    SUM(r.games * r.p2_score_mean) / NULLIF(SUM(r.games), 0) AS p2_mean";
+
+/// The two columns [`SCORE_MEANS`] reads.
+struct ScoreMeans {
+    p1: Option<f64>,
+    p2: Option<f64>,
+}
+
+impl ScoreMeans {
+    fn from_row(row: &sqlx::postgres::PgRow) -> Self {
+        Self { p1: row.get("p1_mean"), p2: row.get("p2_mean") }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -704,12 +785,13 @@ fn build_game_stats(
     tally: Tally,
     sample: Sample,
     units_completed: u64,
+    scores: ScoreMeans,
     pentanomial: Option<[u64; 5]>,
     divergent_pairs: Option<u64>,
-    params: &SprtParams,
+    params: &TestParams,
 ) -> GameStats {
     // Percentages describe every game played, for both job types: the sample
-    // the LLR runs on is now the same games, viewed as pairs.
+    // the test runs on is the same games, viewed as pairs.
     let total = tally.total();
     let pct = |n: u64| {
         if total == 0 {
@@ -718,44 +800,51 @@ fn build_game_stats(
             100.0 * n as f64 / total as f64
         }
     };
-    let sprt = sprt::evaluate(
-        &sample,
-        units_completed,
-        params.min_units as u64,
-        params.max_units as u64,
-        params.alpha,
-        params.beta,
-        params.elo_low,
-        params.elo_high,
-    );
+    let test = params.enabled.then(|| {
+        match_test::evaluate(
+            &sample,
+            if unit == "pair" { match_test::Unit::Pair } else { match_test::Unit::Game },
+            units_completed,
+            params.confidence_pct,
+            params.min_units as u64,
+            params.max_units as u64,
+        )
+    });
     GameStats {
         unit,
         wins: tally.wins,
         losses: tally.losses,
         draws: tally.draws,
         units_completed,
+        p1_score_mean: scores.p1,
+        p2_score_mean: scores.p2,
+        spread_mean: scores.p1.zip(scores.p2).map(|(p1, p2)| p1 - p2),
         pentanomial,
         divergent_pairs,
+        divergent: None,
         min_units: params.min_units,
         max_units: params.max_units,
         win_pct: pct(tally.wins),
         loss_pct: pct(tally.losses),
         draw_pct: pct(tally.draws),
-        sprt,
+        test,
         decided: None,
     }
 }
 
 async fn opening_rack_stats(conn: &mut PgConnection, job_id: Uuid) -> AppResult<OpeningRackStats> {
-    // Two single-row reads, constant time at any job size. `racks_analyzed` is
-    // `jobs.racks_analyzed`, maintained one task at a time in the submit
-    // transaction; the aggregates that used to sit beside it here scanned the
-    // job's whole history on every detail view and every live push.
-    let racks_analyzed =
-        sqlx::query_scalar::<_, i64>("SELECT racks_analyzed FROM jobs WHERE id = $1")
-            .bind(job_id)
-            .fetch_one(&mut *conn)
-            .await?;
+    // Two single-row reads, constant time at any job size. The rack counts
+    // are `jobs`' running totals, maintained one result at a time in the
+    // submit transaction; the aggregates that used to sit beside them here
+    // scanned the job's whole history on every detail view and every live
+    // push.
+    let (racks_analyzed, racks_settled, racks_without_consensus) =
+        sqlx::query_as::<_, (i64, i64, i64)>(
+            "SELECT racks_analyzed, racks_settled, racks_without_consensus FROM jobs WHERE id = $1",
+        )
+        .bind(job_id)
+        .fetch_one(&mut *conn)
+        .await?;
 
     let racks_total = sqlx::query_scalar::<_, i64>(
         "SELECT total_racks FROM job_opening_rack_config WHERE job_id = $1",
@@ -765,7 +854,7 @@ async fn opening_rack_stats(conn: &mut PgConnection, job_id: Uuid) -> AppResult<
     .await?
     .unwrap_or(0);
 
-    Ok(OpeningRackStats { racks_analyzed, racks_total })
+    Ok(OpeningRackStats { racks_analyzed, racks_settled, racks_without_consensus, racks_total })
 }
 
 async fn leave_gen_stats(conn: &mut PgConnection, job_id: Uuid) -> AppResult<LeaveGenStats> {
@@ -785,7 +874,7 @@ async fn leave_gen_stats(conn: &mut PgConnection, job_id: Uuid) -> AppResult<Lea
     .fetch_one(&mut *conn)
     .await?;
     let generations_closed = completed as i32;
-    let current_generation = (generations_closed + 1).min(config.generation_count);
+    let current_generation = (generations_closed + 1).min(config.generation_count());
 
     // One row, kept by the submit path (the live counters) and by each merge
     // (the rack summary). Absent until the generation's universe is seeded.
@@ -801,8 +890,8 @@ async fn leave_gen_stats(conn: &mut PgConnection, job_id: Uuid) -> AppResult<Lea
 
     Ok(LeaveGenStats {
         current_generation,
-        generation_count: config.generation_count,
-        target_rack_count: config.target_rack_count,
+        generation_count: config.generation_count(),
+        target_rack_count: config.target_for(current_generation),
         generations_closed,
         tasks_completed: row.as_ref().map_or(0, |r| r.get("tasks_completed")),
         games_played: row.as_ref().map_or(0, |r| r.get("games_played")),
@@ -811,6 +900,7 @@ async fn leave_gen_stats(conn: &mut PgConnection, job_id: Uuid) -> AppResult<Lea
         min_rack: row.as_ref().and_then(|r| r.get("min_rack")),
         min_rack_count: row.as_ref().and_then(|r| r.get("min_rack_count")),
         progress_as_of: row.as_ref().and_then(|r| r.get("merged_at")),
+        target_rack_counts: config.target_rack_counts,
     })
 }
 
@@ -840,14 +930,15 @@ async fn worker_contributions_on(
     // the pseudonym, the SHA-256 was computed for every completed claim of the
     // job -- a hundred thousand of them for a long job, on every detail view
     // and every live push -- to name at most fifty-one.
-    let rows = sqlx::query(
+    let rows = sqlx::query(&format!(
         "SELECT w.user_id,
                 left(encode(sha256(convert_to(w.anon_uuid::text, 'UTF8')), 'hex'), 16) AS anon_id,
                 u.username,
-                w.tasks_completed, w.contributors
+                w.tasks_completed, w.compute_ms, w.contributors
          FROM (
              SELECT c.claimed_by_user_id AS user_id, c.claimed_by_anon_uuid AS anon_uuid,
                     COUNT(*)::bigint AS tasks_completed,
+                    SUM({compute})::bigint AS compute_ms,
                     COUNT(*) OVER ()::bigint AS contributors
              FROM task_claims c
              JOIN tasks t ON t.id = c.task_id
@@ -858,7 +949,8 @@ async fn worker_contributions_on(
          ) w
          LEFT JOIN users u ON u.id = w.user_id
          ORDER BY w.tasks_completed DESC, w.user_id, w.anon_uuid",
-    )
+        compute = crate::routes::worker::CLAIM_COMPUTE_MS,
+    ))
     .bind(job_id)
     .bind(MAX_WORKER_CONTRIBUTIONS + 1)
     .fetch_all(&mut *conn)
@@ -881,15 +973,17 @@ async fn worker_contributions_on(
                 anon_id: r.get("anon_id"),
                 username: r.get("username"),
                 tasks_completed: r.get("tasks_completed"),
+                compute_seconds: r.get::<i64, _>("compute_ms") as f64 / 1000.0,
             })
             .collect(),
         other_workers,
     ))
 }
 
-/// Throughput over the last hour, extrapolated to whatever is left. For SPRT
-/// jobs "what's left" is the distance to `max_units`, which is a ceiling — the
-/// job may well stop earlier when the LLR crosses.
+/// Throughput over the last hour, extrapolated to whatever is left. For games
+/// and pairs jobs "what's left" is the distance to `max_units`: the target of
+/// a job without a test, and a ceiling for one with it -- that job may well
+/// stop earlier when the test decides.
 async fn estimate_eta(
     conn: &mut PgConnection,
     job: &Job,
@@ -940,24 +1034,28 @@ async fn estimate_eta(
 
     // Tasks are made on demand, so `tasks_total - tasks_completed` is only what
     // is in flight: a 3.2-million-rack job 1% done read "three minutes left".
-    // An opening-rack job counts what is left of its rack space instead, at
-    // the rate racks have been finishing; a leave job's remaining work is
+    // An opening-rack job counts the analyses it still wants instead, at the
+    // rate racks have been analysed; a leave job's remaining work is
     // generations whose size depends on the draws, so it has no estimate.
     if job.job_type == crate::models::job::JobType::LeaveGeneration {
         return Ok(None);
     }
     if job.job_type == crate::models::job::JobType::OpeningRack {
-        let (total_racks, racks_per_batch): (i64, i32) = sqlx::query_as(
-            "SELECT total_racks, racks_per_batch FROM job_opening_rack_config WHERE job_id = $1",
+        let (total_racks, racks_per_batch, min_results): (i64, i32, i32) = sqlx::query_as(
+            "SELECT total_racks, racks_per_batch, min_results_per_rack
+             FROM job_opening_rack_config WHERE job_id = $1",
         )
         .bind(job.id)
         .fetch_one(&mut *conn)
         .await?;
-        let remaining_racks = (total_racks - job.racks_analyzed).max(0) as f64;
-        // A claim is one copy of a task, and a task's racks count once.
-        let racks_per_second = per_second * f64::from(racks_per_batch.max(1))
-            / f64::from(job.redundancy.max(1));
-        return Ok(Some(remaining_racks / racks_per_second));
+        // Racks not yet analysed want at least their fewest analyses each;
+        // racks analysed and not yet settled at least one more. A consensus
+        // that is slow to come makes this an underestimate.
+        let unanalysed = (total_racks - job.racks_analyzed).max(0) as f64;
+        let unsettled = (job.racks_analyzed - job.racks_settled).max(0) as f64;
+        let remaining = unanalysed * f64::from(min_results.max(1)) + unsettled;
+        let racks_per_second = per_second * f64::from(racks_per_batch.max(1));
+        return Ok(Some(remaining / racks_per_second));
     }
 
     if let Some(stats) = games {
@@ -966,11 +1064,8 @@ async fn estimate_eta(
         if done >= target {
             return Ok(Some(0.0));
         }
-        // Units per claim from the job's batch size, over the redundancy: a
-        // claim is one copy of a task, and a task's units count once. (From
-        // the observed units per completed task it was neither -- `done`
-        // counts a task's first result, `tasks_completed` only tasks with all
-        // of theirs -- and at redundancy 2 the page read half the time left.)
+        // Units per claim from the job's batch size: a task has one slot, and
+        // its units count once.
         let per_batch: i32 = if job.job_type == crate::models::job::JobType::GamePairs {
             sqlx::query_scalar("SELECT pairs_per_batch FROM job_game_pair_config WHERE job_id = $1")
         } else {
@@ -979,8 +1074,7 @@ async fn estimate_eta(
         .bind(job.id)
         .fetch_one(&mut *conn)
         .await?;
-        let units_per_second =
-            per_second * f64::from(per_batch.max(1)) / f64::from(job.redundancy.max(1));
+        let units_per_second = per_second * f64::from(per_batch.max(1));
         return Ok(Some((target - done) / units_per_second));
     }
 

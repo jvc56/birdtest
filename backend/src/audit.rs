@@ -62,7 +62,7 @@ pub async fn log_account(
     Ok(())
 }
 
-/// A job the server completed itself -- its stopping rule, SPRT, its last
+/// A job the server completed itself -- its stopping rule, its match test, its last
 /// generation -- with the verdict in `reason` when there is one. Only the admin
 /// path logged `job.completed`, and `jobs` keeps no completion time, so nothing
 /// said when such a job finished (the audit's pass 22). No actor: the server.

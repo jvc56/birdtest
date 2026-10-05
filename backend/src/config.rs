@@ -36,6 +36,12 @@ pub struct Config {
     pub stats_cache: Duration,
     pub s3_bucket: String,
     pub s3_endpoint: Option<String>,
+    /// The object store as a browser reaches it, when that is not
+    /// `s3_endpoint`: presigned download links are signed for this host. Only
+    /// the compose stack needs it, whose backend reaches MinIO as
+    /// `minio:9000`, a name no browser resolves; unset, links name
+    /// `s3_endpoint` (or S3 itself), as production's do.
+    pub s3_public_endpoint: Option<String>,
     /// The oldest MAGPIE that may contribute at all. Enforced, not advisory:
     /// a client below it is offered nothing and told to update, without any
     /// job being consulted (`scheduler::claim`), and it is the default floor
@@ -281,6 +287,7 @@ impl Config {
             stats_cache: Duration::from_secs(parsed_u64("JOB_STATS_CACHE_SECONDS", 10)?),
             s3_bucket: var_or("S3_BUCKET", "birdtest-artifacts"),
             s3_endpoint: var("S3_ENDPOINT"),
+            s3_public_endpoint: var("S3_PUBLIC_ENDPOINT"),
             // 0.1.1 is the `birdtest-contribute` version the backend image
             // pins. The branch's version moves whenever a change can alter
             // what a task computes, and this floor moves with it: it is the
@@ -359,6 +366,9 @@ mod tests {
             ("S3_BUCKET", "birdtest-artifacts", "other", |c| c.s3_bucket.clone()),
             ("S3_ENDPOINT", "None", "http://minio:9000", |c| {
                 c.s3_endpoint.clone().unwrap_or_else(|| "None".into())
+            }),
+            ("S3_PUBLIC_ENDPOINT", "None", "http://localhost:9000", |c| {
+                c.s3_public_endpoint.clone().unwrap_or_else(|| "None".into())
             }),
             ("MIN_MAGPIE_VERSION", "0.1.1", "1.10.0", |c| c.min_magpie_version.clone()),
             ("MAGPIE_DOWNLOAD_URL", "https://github.com/jvc56/MAGPIE", "https://d", |c| {

@@ -12,7 +12,7 @@ test.use({ storageState: ADMIN_STATE });
 test('E-15: the player-config form refuses a stopping % of 0 or 100', async ({ page }) => {
   await page.goto('/admin/player-configs/new');
   await page.getByLabel('Name').fill(`e15-${crypto.randomUUID().slice(0, 8)}`);
-  await page.getByLabel('Simming player').check();
+  await page.getByLabel('Simming Player').check();
   const stopping = page.getByLabel('Stopping % (-sc)');
   const create = page.getByRole('button', { name: 'Create' });
   const valid = () => stopping.evaluate((el) => (el as HTMLInputElement).checkValidity());

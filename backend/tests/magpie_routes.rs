@@ -39,6 +39,7 @@ struct Stack {
     bucket: TestBucket,
     app: axum::Router,
     headers: Vec<(String, String)>,
+    admin: Uuid,
 }
 
 impl Stack {
@@ -50,7 +51,7 @@ impl Stack {
         let admin = db.user("root", true).await;
         let headers = admin_headers(&state.cfg, admin);
         let app = birdtest::app(state.clone());
-        Stack { db, state, bucket, app, headers }
+        Stack { db, state, bucket, app, headers, admin }
     }
 
     async fn post(&self, path: &str, body: Value) -> (axum::http::StatusCode, Value) {
@@ -61,13 +62,13 @@ impl Stack {
     /// A leave-generation job created through the API, over the test
     /// distribution.
     async fn leave_job(&self) -> Value {
+        let kwg = self.db.input_data("kwg", "NWL23").await;
         let body = json!({
             "job_type": "leave_generation", "variant": "classic",
             "letterdist_id": self.db.input_data("letterdist", "english").await,
             "layout_id": self.db.input_data("layout", "standard15").await,
-            "kwg_id": self.db.input_data("kwg", "NWL23").await,
-            "num_iterations": 100, "generation_count": 2,
-            "target_rack_count": 10, "racks_per_task": 5,
+            "player_config_id": self.db.leave_player(kwg, false, self.admin).await,
+            "num_iterations": 100, "target_rack_counts": [10, 10], "racks_per_task": 5,
         });
         let (status, created) = self.post("/api/admin/jobs", body).await;
         assert_eq!(status, axum::http::StatusCode::CREATED, "{created}");

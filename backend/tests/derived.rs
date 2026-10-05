@@ -1,4 +1,4 @@
-//! Derived files (wordmaps and rack info tables) and the pinned-row invariant,
+//! Derived files (wordmaps, rack info tables and word info tables) and the pinned-row invariant,
 //! driven through `birdtest::derived` and `birdtest::scheduler` directly: what
 //! a job queues, how the build queue hands out rows, what a build that cannot
 //! start leaves behind, and what a claim states. Nothing here runs MAGPIE: the
@@ -29,8 +29,8 @@ async fn player(db: &TestDb, kwg: Uuid, klv: Uuid, use_wordmap: bool, use_rit: b
         "INSERT INTO player_configs
              (name, recorder_type, sort_strategy, kwg_id, klv_id, num_plies, num_plays,
               num_plies_recorded, num_plays_recorded, use_wordmap, use_rit,
-              movegen_margin, created_by)
-         VALUES ($1, 'best', 'equity', $2, $3, 0, 100, 2, 10, $4, $5, 5, $6)
+              use_wit, movegen_margin, created_by)
+         VALUES ($1, 'best', 'equity', $2, $3, 0, 100, 2, 10, $4, $5, false, 5, $6)
          RETURNING id",
     )
     .bind(format!("p{}", Uuid::new_v4().simple()))
@@ -50,9 +50,9 @@ async fn player(db: &TestDb, kwg: Uuid, klv: Uuid, use_wordmap: bool, use_rit: b
 async fn games_job_on(db: &TestDb, ld: Uuid, layout: Uuid, p1: Uuid, p2: Uuid) -> Uuid {
     let admin = db.user(&format!("admin{}", Uuid::new_v4().simple()), true).await;
     let job: Uuid = sqlx::query_scalar(
-        "INSERT INTO jobs (job_type, allocation, redundancy, status, created_by,
+        "INSERT INTO jobs (job_type, allocation, status, created_by,
                            variant, letterdist_id, layout_id, bingo_bonus, sim_cutoff)
-         VALUES ('games', 50, 1, 'active', $1, 'classic', $2, $3, 50, 0.005)
+         VALUES ('games', 50, 'active', $1, 'classic', $2, $3, 50, 0.005)
          RETURNING id",
     )
     .bind(admin)
@@ -516,8 +516,8 @@ async fn two_distributions_with_one_name_size_two_different_rack_spaces() {
         "INSERT INTO player_configs
              (name, recorder_type, sort_strategy, kwg_id, klv_id, num_plies, num_plays,
               num_plies_recorded, num_plays_recorded, use_wordmap, use_rit,
-              movegen_margin, created_by)
-         VALUES ('analyst', 'all', 'equity', $1, $2, 0, 100, 1, 10, false, false, 5, $3)
+              use_wit, movegen_margin, created_by)
+         VALUES ('analyst', 'all', 'equity', $1, $2, 0, 100, 1, 10, false, false, false, 5, $3)
          RETURNING id",
     )
     .bind(kwg)
@@ -568,13 +568,14 @@ async fn a_leave_job_queues_its_wordmap_and_never_a_table() {
     let admin = db.user("root", true).await;
     let kwg = db.input_data("kwg", "NWL23").await;
     let klv = db.input_data("klv", "NWL23").await;
-    let leave = db.bare_job("leave_generation", 1, admin).await;
+    let leave = db.bare_job("leave_generation", admin).await;
+    let leave_player = db.leave_player(kwg, true, admin).await;
     sqlx::query(
-        "INSERT INTO job_leave_config (job_id, kwg_id, num_iterations, target_rack_count, racks_per_task)
-         VALUES ($1, $2, 10, 10, 2)",
+        "INSERT INTO job_leave_config (job_id, player_config_id, num_iterations, target_rack_counts, racks_per_task)
+         VALUES ($1, $2, 10, ARRAY[10], 2)",
     )
     .bind(leave)
-    .bind(kwg)
+    .bind(leave_player)
     .execute(&db.pool)
     .await
     .unwrap();
@@ -608,4 +609,88 @@ async fn a_leave_job_queues_its_wordmap_and_never_a_table() {
         .map(|n| n.role)
         .collect();
     assert_eq!(roles, ["wmp"]);
+}
+
+/// I-DERIVED-9: a player asking for a word info table queues one, named for its
+/// lexicon and built from the `.kwg` alone -- no wordmap, no leaves -- and its
+/// job is not dispatched until it is built. Then a claim pins its hash and
+/// tells only that player to load it. A leave job's player may ask for one
+/// too: the table is the lexicon's, which no generation changes.
+#[tokio::test]
+async fn a_word_info_table_is_the_lexicons_and_waits_like_the_others() {
+    let db = TestDb::new().await;
+    let state = db.state().await;
+    let admin = db.user("root", true).await;
+    let ld = db.input_data("letterdist", "english").await;
+    let layout = db.input_data("layout", "standard15").await;
+    let kwg = db.input_data("kwg", "NWL23").await;
+    let klv = db.input_data("klv", "NWL23").await;
+
+    let with_wit = player(&db, kwg, klv, false, false).await;
+    sqlx::query("UPDATE player_configs SET use_wit = true WHERE id = $1")
+        .bind(with_wit)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let without = player(&db, kwg, klv, false, false).await;
+    let job = games_job_on(&db, ld, layout, with_wit, without).await;
+    assert_eq!(request_for(&db, job).await, 1, "the table, and no wordmap with it");
+    assert_eq!(
+        derived_rows(&db).await,
+        vec![("wit".into(), "NWL23".into(), "wit-1".into(), kwg, None, ld, "pending".into())]
+    );
+
+    let mut conn = db.pool.acquire().await.unwrap();
+    let status = birdtest::derived::status_for_job(&mut conn, job, &test_builders()).await.unwrap();
+    drop(conn);
+    assert_eq!(status.pending, ["wit NWL23"]);
+    assert!(!status.dispatchable());
+
+    let sha = "c".repeat(64);
+    sqlx::query(
+        "UPDATE derived_data SET state = 'built', sha256 = $1, bytes = 1, build_target = 'nehalem',
+                built_at = now()
+         WHERE role = 'wit'",
+    )
+    .bind(&sha)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let claim = claim_from(&db, &state, Uuid::nil()).await;
+    assert_eq!(claim.job_id, job);
+    let stated: Vec<(String, String, String, String)> = claim
+        .derived_data
+        .iter()
+        .map(|d| (d.role.clone(), d.name.clone(), d.sha256.clone(), d.builder.clone()))
+        .collect();
+    assert_eq!(stated, vec![("wit".into(), "NWL23".into(), sha, "wit-1".into())]);
+    let request = serde_json::to_value(&claim.request).unwrap();
+    assert_eq!(request["player1"]["use_wit"], json!(true), "{request}");
+    assert_eq!(request["player2"]["use_wit"], json!(false), "{request}");
+
+    // A leave job's player: its wordmap and its table, never a rack info table.
+    let leave = db.bare_job("leave_generation", admin).await;
+    let leave_player = db.leave_player(kwg, true, admin).await;
+    sqlx::query("UPDATE player_configs SET use_wit = true WHERE id = $1")
+        .bind(leave_player)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO job_leave_config (job_id, player_config_id, num_iterations, target_rack_counts, racks_per_task)
+         VALUES ($1, $2, 10, ARRAY[10], 2)",
+    )
+    .bind(leave)
+    .bind(leave_player)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let mut conn = db.pool.acquire().await.unwrap();
+    let roles: Vec<String> = birdtest::derived::needs_for_job(&mut conn, leave)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|n| n.role)
+        .collect();
+    assert_eq!(roles, ["wit", "wmp"]);
 }

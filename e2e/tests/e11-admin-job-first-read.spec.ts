@@ -23,6 +23,7 @@ test('E-11: an admin job page whose first read fails shows only what the server 
       player1_config_id: a,
       player2_config_id: b,
       pairs_per_batch: 1,
+      test_enabled: true,
       min_pairs: 100000,
       max_pairs: 200000
     },
@@ -106,6 +107,7 @@ test('E-11b: a slow read does not undo what the stream has since said', async ({
       player1_config_id: a,
       player2_config_id: b,
       pairs_per_batch: 1,
+      test_enabled: true,
       min_pairs: 100000,
       max_pairs: 200000
     },
@@ -153,10 +155,10 @@ test('E-11b: a slow read does not undo what the stream has since said', async ({
   // The held read did carry the old status, or this proves nothing.
   expect(heldStatus).toBe('active');
   await expect(page.getByText(/Could not load all of this job/)).toBeHidden({ timeout: 10_000 });
-  const jobHeader = page.locator('header', { has: page.getByRole('heading', { level: 1 }) });
-  await expect(jobHeader.getByText('completed', { exact: true })).toBeVisible();
+  const status = page.getByTestId('job-status');
+  await expect(status.getByText('completed', { exact: true })).toBeVisible();
   await page.waitForTimeout(1000);
-  await expect(jobHeader.getByText('completed', { exact: true })).toBeVisible();
+  await expect(status.getByText('completed', { exact: true })).toBeVisible();
   await api.dispose();
 });
 
@@ -176,6 +178,7 @@ test('E-11c: a job deleted while its page is open offers nothing more', async ({
       player1_config_id: a,
       player2_config_id: b,
       pairs_per_batch: 1,
+      test_enabled: true,
       min_pairs: 100000,
       max_pairs: 200000
     },

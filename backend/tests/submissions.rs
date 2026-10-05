@@ -52,7 +52,10 @@ async fn game_result_row(db: &TestDb, job: Uuid) -> serde_json::Map<String, Valu
 }
 
 const PENTANOMIAL: [&str; 5] = ["pent_0", "pent_1", "pent_2", "pent_3", "pent_4"];
-const DIVERGENT: [&str; 4] = ["divergent_games", "divergent_wins", "divergent_losses", "divergent_ties"];
+const DIVERGENT: [&str; 6] = [
+    "divergent_games", "divergent_wins", "divergent_losses", "divergent_ties",
+    "divergent_p1_score_mean", "divergent_p2_score_mean",
+];
 
 /// I-SUBMIT-1: a `games` result inserts exactly one `game_results` row with
 /// its counts, and NULL in every pentanomial and divergent column -- even when
@@ -60,7 +63,7 @@ const DIVERGENT: [&str; 4] = ["divergent_games", "divergent_wins", "divergent_lo
 #[tokio::test]
 async fn a_games_result_stores_one_row_with_no_pair_columns() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     let app = birdtest::app(db.state().await);
 
     let mut result = games_result(2, 1);
@@ -94,7 +97,7 @@ async fn pairs_job(db: &TestDb) -> Uuid {
     let admin = db.user(&format!("admin{}", Uuid::new_v4().simple()), true).await;
     let p1 = db.static_player(&format!("p1{}", Uuid::new_v4().simple()), admin).await;
     let p2 = db.static_player(&format!("p2{}", Uuid::new_v4().simple()), admin).await;
-    let job = db.bare_job("game_pairs", 1, admin).await;
+    let job = db.bare_job("game_pairs", admin).await;
     sqlx::query(
         "INSERT INTO job_game_pair_config
              (job_id, player1_config_id, player2_config_id, pairs_per_batch, min_pairs, max_pairs)
@@ -151,8 +154,8 @@ async fn a_pairs_result_stores_its_pentanomial_and_the_schema_refuses_a_contradi
     for (column, expected) in PENTANOMIAL.iter().zip([0, 0, 1, 0, 1]) {
         assert_eq!(row[*column], expected, "{column}: {row:?}");
     }
-    for (column, expected) in DIVERGENT.iter().zip([2, 2, 0, 0]) {
-        assert_eq!(row[*column], expected, "{column}: {row:?}");
+    for (column, expected) in DIVERGENT.iter().zip([2.0, 2.0, 0.0, 0.0, 420.0, 410.0]) {
+        assert_eq!(row[*column].as_f64(), Some(expected), "{column}: {row:?}");
     }
 
     // One extra pair in a bucket: three pairs for four games.
@@ -215,49 +218,38 @@ async fn tasks_completed(db: &TestDb, job: Uuid) -> i64 {
         .unwrap()
 }
 
-/// I-SUBMIT-3: each accepted result increments the task's `accepted_count`
-/// and gives back its live claim; the task stays on offer while redundancy is
-/// unfilled, and completes -- with `completed_at`, and the job's
-/// `tasks_completed` bumped once -- at the result that reaches `redundancy`.
+/// I-SUBMIT-3: a claim takes its task's one slot, and its accepted result
+/// completes the task -- with `completed_at`, and the job's `tasks_completed`
+/// bumped once, on the transition.
 #[tokio::test]
-async fn accepted_results_move_the_task_counters_and_complete_it_at_redundancy() {
+async fn an_accepted_result_completes_its_task() {
     let db = TestDb::new().await;
-    let job = db.games_job(3, 2).await;
+    let job = db.games_job(2).await;
     let app = birdtest::app(db.state().await);
 
     let (first, first_uuid) = first_claim(&app).await;
-    let (second, second_uuid) = first_claim(&app).await;
-    assert_eq!(first["task_request"]["seed"], second["task_request"]["seed"], "one task");
     let task: Uuid = sqlx::query_scalar("SELECT id FROM tasks WHERE job_id = $1")
         .bind(job)
         .fetch_one(&db.pool)
         .await
         .unwrap();
-    assert_eq!(task_counters(&db, task).await, (0, 2, "available".into(), false));
+    assert_eq!(task_counters(&db, task).await, (0, 1, "claimed".into(), false));
+    assert_eq!(tasks_completed(&db, job).await, 0);
 
     let (_, body) = submit(&app, &first, &first_uuid, games_result(2, 1)).await;
     assert_eq!(body, json!({ "accepted": true }));
-    assert_eq!(task_counters(&db, task).await, (1, 1, "available".into(), false));
-
-    let (_, body) = submit(&app, &second, &second_uuid, games_result(2, 1)).await;
-    assert_eq!(body, json!({ "accepted": true }));
-    assert_eq!(task_counters(&db, task).await, (2, 0, "available".into(), false));
-    assert_eq!(tasks_completed(&db, job).await, 0);
-
-    // The third slot: claimed, the task is at capacity; accepted, it is done.
-    let (third, third_uuid) = first_claim(&app).await;
-    assert_eq!(third["task_request"]["seed"], first["task_request"]["seed"], "the same task");
-    assert_eq!(task_counters(&db, task).await, (2, 1, "claimed".into(), false));
-    let (_, body) = submit(&app, &third, &third_uuid, games_result(2, 1)).await;
-    assert_eq!(body, json!({ "accepted": true }));
-    assert_eq!(task_counters(&db, task).await, (3, 0, "completed".into(), true));
+    assert_eq!(task_counters(&db, task).await, (1, 0, "completed".into(), true));
     assert_eq!(tasks_completed(&db, job).await, 1, "counted once, on the transition");
+
+    // The next worker gets the next task, not this one.
+    let (second, _) = first_claim(&app).await;
+    assert_ne!(second["task_request"]["seed"], first["task_request"]["seed"]);
 }
 
 /// A games job capturing positions, whose player 1 keeps `keep` moves per
 /// position.
 async fn capturing_job(db: &TestDb, keep: i32) -> Uuid {
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     sqlx::query("UPDATE job_game_config SET capture_positions = true WHERE job_id = $1")
         .bind(job)
         .execute(&db.pool)
@@ -281,7 +273,7 @@ fn position(game_index: i32, num_moves: i32, moves: usize) -> Value {
         .map(|i| json!({ "move": format!("move-{i}"), "score": 60 - i as i32, "equity": 70.0 - i as f64 }))
         .collect();
     json!({
-        "game_index": game_index, "turn_number": 0, "rack": "AEINRST", "position": "cgp",
+        "game_index": game_index, "turn_number": 0, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "AEINRST", "position": "cgp",
         "num_moves": num_moves, "moves": moves,
     })
 }
@@ -320,6 +312,79 @@ async fn captured_positions_keep_the_configured_moves_and_the_full_count() {
         ],
         "five sent, three kept, forty ranked; a shorter list is kept whole"
     );
+}
+
+/// I-SUBMIT-9: a position a solver decided keeps how it was analysed and
+/// each move's projected spread and ranking depth -- a pre-endgame's with its
+/// win percentage -- and a position whose moves do not match its analysis is
+/// refused: an endgame position with two moves, or a pre-endgame move with no
+/// spread, would read as an analysis that never ran.
+#[tokio::test]
+async fn solved_positions_keep_their_analysis_spread_and_depth() {
+    let db = TestDb::new().await;
+    let job = capturing_job(&db, 5).await;
+    let app = birdtest::app(db.state().await);
+
+    let solved = |index: i32, analysis: &str, moves: Value| {
+        json!({
+            "game_index": index, "turn_number": 20, "played_move": "8D PLAYED", "played_move_score": 10, "rack": "AEINRST", "position": "cgp",
+            "num_moves": 12, "analysis": analysis, "moves": moves,
+        })
+    };
+    let mut result = games_result(2, 1);
+    result["positions"] = json!([
+        solved(0, "peg", json!([
+            { "move": "8D RETAINS", "score": 74, "equity": 80.5, "win_percentage": 87.5,
+              "mean_spread": 31.25, "fidelity_plies": 4 },
+            { "move": "8D STAINER", "score": 70, "equity": 79.0, "win_percentage": 50.0,
+              "mean_spread": -2.5, "fidelity_plies": 0 },
+        ])),
+        solved(1, "endgame", json!([
+            { "move": "8D RETAINS", "score": 74, "equity": 82.0, "mean_spread": 18.0,
+              "fidelity_plies": 6 },
+        ])),
+    ]);
+    claim_and_submit(&app, result).await;
+
+    /// A stored move: its position's game and analysis, its rank, win %, spread and depth.
+    type Stored = (i16, String, i16, Option<f64>, Option<f64>, Option<i16>);
+    let rows: Vec<Stored> = sqlx::query_as(
+        "SELECT r.game_index, r.analysis, m.rank, m.win_percentage, m.mean_spread, m.fidelity_plies
+         FROM position_analysis_records r
+         JOIN position_analysis_moves m ON m.record_id = r.id
+         WHERE r.job_id = $1 ORDER BY r.game_index, m.rank",
+    )
+    .bind(job)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            (0, "peg".into(), 1, Some(87.5), Some(31.25), Some(4)),
+            (0, "peg".into(), 2, Some(50.0), Some(-2.5), Some(0)),
+            (1, "endgame".into(), 1, None, Some(18.0), Some(6)),
+        ]
+    );
+
+    let refused = [
+        solved(0, "endgame", json!([
+            { "move": "8D RETAINS", "score": 74, "equity": 82.0, "mean_spread": 18.0, "fidelity_plies": 6 },
+            { "move": "8D STAINER", "score": 70, "equity": 79.0, "mean_spread": 10.0, "fidelity_plies": 6 },
+        ])),
+        solved(0, "peg", json!([{ "move": "8D RETAINS", "score": 74, "equity": 82.0, "win_percentage": 50.0 }])),
+        solved(0, "static", json!([
+            { "move": "8D RETAINS", "score": 74, "equity": 82.0, "mean_spread": 18.0, "fidelity_plies": 6 },
+        ])),
+        solved(0, "rollout", json!([{ "move": "8D RETAINS", "score": 74, "equity": 82.0 }])),
+    ];
+    for position in refused {
+        let mut result = games_result(2, 1);
+        result["positions"] = json!([position]);
+        let (assignment, uuid) = first_claim(&app).await;
+        let (status, body) = submit(&app, &assignment, &uuid, result).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{position}: {body}");
+    }
 }
 
 /// I-SUBMIT-7: rank 1 is the best move -- the first of the worker's

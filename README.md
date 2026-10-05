@@ -1,6 +1,6 @@
 # birdtest
 
-Crowdsourced word game analysis, modelled after Fishnet. Admins define jobs;
+Crowdsourced crossword game analysis, modelled after Fishnet. Admins define jobs;
 contributors run [MAGPIE](https://github.com/jvc56/MAGPIE) itself — `magpie
 contribute` claims tasks, executes them locally, and submits results. The site
 aggregates everything onto a live dashboard.
@@ -23,7 +23,7 @@ swallows the rest of the paste.
 
 | Path | What it is |
 |---|---|
-| `backend/` | Axum + SQLx server. Owns scheduling, validation, SPRT, ratings and aggregation. |
+| `backend/` | Axum + SQLx server. Owns scheduling, validation, the match test, ratings and aggregation. |
 | `frontend/` | SvelteKit SPA (dark mode only), built statically and served by Nginx in production. |
 | `worker/` | `fake_worker.py`, a synthetic client used by the **end-to-end suite only** — see [TESTING.md](TESTING.md). Local development uses real MAGPIE; the contributor client is MAGPIE itself, see [Worker Client](PLAN.md#worker-client-1). |
 | `infra/` | Terraform: VPC, ALB, ECS Fargate, RDS Postgres, S3, SES, SSM, backups. |
@@ -39,13 +39,41 @@ One command brings up the stack, seeds it, starts real MAGPIE contributors and
 opens the site:
 
 ```bash
-./scripts/dev.py
+./scripts/dev.py --pairs-job
 ```
 
 That is the whole setup. It waits for the backend, imports the MAGPIE-DATA
-tarball your own checkout installed, creates two player configs and an active
-game-pairs job, launches four `magpie contribute` workers, and opens
-**http://localhost:5173** signed in as the seeded admin.
+tarball your own checkout installed, creates the jobs its job flags ask for
+(here one game-pairs job, and its two player configs), launches four `magpie
+contribute` workers, and opens **http://localhost:5173** signed in as the
+seeded admin.
+
+**It starts with no job.** Each job flag adds one, created and activated -- or
+reused, when an active job of its name is already running -- and they stack:
+
+| Flag | The job |
+|---|---|
+| `--leavegen-job` | "dev leave generation": six generations, targets 100, 200, 500, 1,000, 1,000 and 1,000 occurrences per rack, played by `static-equity-no-rit` |
+| `--opening-rack-job` | "dev opening racks": every rack, 20 to a task, every play ranked by the 2-ply simmer `sim-2ply-rack`; each rack is analysed until 80% of its analyses agree on the best move, 2 to 5 analyses |
+| `--games-job` | "dev games (positions saved)": `static-equity` against `static-score`, saving every position played |
+| `--pairs-job` | "dev game pairs (first divergences saved)": the same two players in pairs, saving the positions where each pair first diverges |
+| `--sim-games-job` | "dev sim games (positions saved)": `sim-2ply` against `sim-1ply` (10 plays considered, an iteration budget of 200), two games to a task, saving every position played |
+| `--sim-pairs-job` | "dev sim game pairs (first divergences saved)": the same two simmers in pairs, one to a task, saving the positions where each pair first diverges |
+
+Each runs on `--lexicon` (CSW24 by default) and the english distribution.
+Append `_ab` to a flag (`--leavegen-job_ab`, or `--leavegen-job-ab`) to run
+that job on the two-letter test data below instead: "dev leave generation
+(english_ab)" and the others, played by `ab-` player configs. There are only
+eight racks, so the leave-generation and opening-rack jobs finish in minutes
+(the opening-rack one two racks to a task).
+
+New jobs share the allocation the active ones leave free, so four on a fresh
+database get 25% each. The games and pairs jobs stop at 100,000 games or pairs
+if their test has not decided first, and neither test is acted on before
+50,000 games or pairs. Their players use a
+wordmap and a rack info table; the workers share one ~1.9 GB copy of the
+table (dev.py runs them with `-ritmmap true`, so it is mapped rather than read
+into each), and `--no-rit` seeds players without one.
 
 The workers run in the background and write to
 `.dev-workers/worker-NN/contribute.log`. With `--worker-windows` each runs in
@@ -56,7 +84,7 @@ identity, and a second Ctrl-C, or closing the window, leaves it stopped.
 Either way, Ctrl-C in dev.py stops every worker.
 
 **A small data set to import.** While it runs, `dev.py` also serves MAGPIE's
-two-letter test data — the `english_ab` distribution and the `CSW21_ab`
+two-letter test data, which the `_ab` job flags are seeded on — the `english_ab` distribution and the `CSW21_ab`
 lexicon, eight possible racks — as MAGPIE-DATA version `20000101` on branch
 `two-letter`, which the **Input data** page imports like any other. It stands in
 for GitHub on Docker's bridge address (port 8482) and passes every other
@@ -72,8 +100,8 @@ toolchain in the loop — that is a property of an assertion harness, not of a
 place you develop. Watching synthetic numbers move a dashboard tells you
 nothing about what your change did.
 
-**A job whose players ask for a wordmap or a rack info table waits for the
-builder.** The server publishes the hash of a copy it built itself, and nothing
+**A job whose players ask for a wordmap, a rack info table or a word info
+table waits for the builder.** The server publishes the hash of a copy it built itself, and nothing
 in the compose stack builds one on its own — production runs the builder as a
 scheduled task ([infra/derived.tf](infra/derived.tf)). `scripts/dev.py` runs
 it for you, after seeding and then whenever something is queued while it
@@ -104,7 +132,7 @@ Everything worth varying is a flag; `./scripts/dev.py --help` is the full list.
 ```bash
 ./scripts/dev.py --workers 6                  # six contributors instead of four
 ./scripts/dev.py --workers 1 --threads 12     # one contributor, more threads each
-./scripts/dev.py --job-type games             # seed a plain games job
+./scripts/dev.py --games-job --leavegen-job    # start with a games job and a small leave job
 ./scripts/dev.py --no-browser                 # SSH sessions and CI (prints the sign-in link)
 ./scripts/dev.py --login-as alice             # open the site signed in as another account
 ./scripts/dev.py --hot-reload                 # add the Vite dev server on :5174
@@ -120,21 +148,10 @@ drops the schema so the backend rebuilds it; the database's data goes, the
 MinIO bucket stays, and `scripts/dev-dump.sh` snapshots both first if you want
 them. Add `--rebuild` when the images predate the change.
 
-The fresh database is seeded with a full set, all on CSW24 (`--lexicon`):
+The fresh database is seeded with:
 
-- the `dev` admin;
-- six jobs at equal allocation: games, opening racks, a small leave
-  generation, and three game-pairs jobs among three players — `static-equity`,
-  `static-score` and `sim-1ply` (a 1-ply sim, 100 iterations) — one for each
-  pair of them. The static-equity vs sim-1ply job saves the positions its
-  games analyse (`capture_positions`). Every player uses a wordmap and a rack
-  info table. The workers share one ~1.9 GB copy of the table (dev.py runs
-  them with `-ritmmap true`, so it is mapped rather than read into each), and
-  `--no-rit` seeds players without one. Games jobs stop at 100,000 games
-  and pairs jobs at 100,000 pairs, if their test has not decided first; a
-  pairs job's test is not acted on before 50,000 pairs (a games job's before
-  100 games). A rating pool of the
-  three players rates them from whatever pairs have been played so far;
+- the `dev` admin and the input data;
+- the jobs the job flags ask for, and none without one;
 - two contributor accounts, `dev-contributor-1` and `-2`, each with a new API
   key that workers 3 and 4 run under and keep in their `contribute.txt` for
   later runs. Workers 1 and 2 contribute anonymously.
@@ -147,8 +164,8 @@ The fresh database is seeded with a full set, all on CSW24 (`--lexicon`):
 | `--idle-wait` | 5 | Seconds a contributor waits when there is no work |
 | `--build-threads` | `$MAGPIE_THREADS`, or every core | Threads the server's wordmap / rack info table builder gives MAGPIE |
 | `--api-key` | anonymous | Contribute under an account instead of anonymously |
-| `--job-type` | `game_pairs` | `game_pairs`, `games` or `opening_rack` |
-| `--lexicon`, `--variant` | NWL23, classic | What the seeded job plays |
+| `--leavegen-job`, `--opening-rack-job`, `--games-job`, `--pairs-job` | none | The jobs to start with, which stack: see above |
+| `--lexicon`, `--variant` | CSW24, classic | What the games and pairs jobs play |
 | `--tarball-date` | your `DATA_VERSION` | Which MAGPIE-DATA version to import |
 | `--min-magpie-version` | your build's version | The version floor, on the server and on the job |
 | `--web-port`, `--backend-port` | 5173, 8080 | Host ports |
@@ -156,10 +173,10 @@ The fresh database is seeded with a full set, all on CSW24 (`--lexicon`):
 | `--workdir` | `.dev-workers` | Where per-worker directories live |
 | `--reset-workers` | off | Delete them first, so each starts as a brand-new anonymous worker (the keyed workers lose their keys until the next `--reset-db`) |
 | `--rebuild` | off | Rebuild images before starting |
-| `--reset-db` | off | Drop the database's schema before starting, so the backend rebuilds it (after a schema change), and seed the fresh database with six jobs (three of them game pairs among three players) and the two contributor accounts: see below |
+| `--reset-db` | off | Drop the database's schema before starting, so the backend rebuilds it (after a schema change), and seed the fresh database with the admin, the input data, the jobs the job flags ask for and the two contributor accounts: see below |
 | `--fresh` | off | Start as a new deployment does: `--reset-db` and `--reset-workers` without the seed, so no accounts, data imports or jobs; opens signed out and prints how to become the first admin |
 | `--keep-up` | off | Leave the stack running on exit instead of stopping it |
-| `--no-seed` | off | Skip seeding (the stack already has an active job) |
+| `--no-seed` | off | Skip seeding: no admin, data import or job (refused beside a job flag) |
 | `--no-up` | off | Assume the stack is already running |
 | `--login-as` | the seeded admin (`--username`) | Open the site signed in as this account |
 | `--no-login` | off | Open the site signed out |
@@ -268,7 +285,10 @@ one progress row per full 7-tile rack — 3,199,724 rows for a real English bag 
 when its first claim finds the universe missing (seeded off the claim path, so
 that claim is answered at once). Worth knowing before you create one by hand.
 Opening-rack jobs only *count* their rack space (3,199,724 racks for English)
-and address it by range, so they are cheap to create.
+and address it by range, so they are cheap to create. As racks are analysed,
+each gets a progress row (`opening_rack_progress`), whatever the job's
+consensus settings, so those settings can be changed later from the job's
+admin page.
 
 ### Contributing with MAGPIE
 
@@ -292,11 +312,12 @@ MAGPIE's `data/`, or a link to it: MAGPIE loads its default board from
 go on the command line, so an API
 key stays out of shell history and `ps` output. A job's players decide whether
 a wordmap (`.wmp`) and a rack info table (`.rit`) are used — both are on by
-default, since they make game play much faster. MAGPIE builds each from files
-it already has the first time a job asks (a wordmap in a couple of seconds, a
-table in one to three minutes and about 2.4 GB of memory, 1.9 GB on disk and
-in memory after), checks it against the hash the server published, and never
-transmits either. Workers sharing a data directory build each file once
+default, since they make game play much faster — and a word info table
+(`.wit`), which is off by default, as it is in MAGPIE. MAGPIE builds each from
+files it already has the first time a job asks (a wordmap or a word info table
+in a couple of seconds, a rack info table in one to three minutes and about
+2.4 GB of memory, 1.9 GB on disk and in memory after), checks it against the
+hash the server published, and never transmits any of them. Workers sharing a data directory build each file once
 between them -- the others wait, saying so -- and map the table
 (`-ritmmap`, on unless `magpie contribute ... -ritmmap false`), so they share
 one copy of it in memory; see [MAGPIE on the server](#magpie-on-the-server). See
@@ -375,9 +396,10 @@ your checkout (mounted) locally. It uses it for two things, and only on the
 path where a worker's results are mixed into everyone else's — a wrong answer
 there passes every plausibility check and lands in a job's totals.
 
-1. **Wordmaps and rack info tables are checked, not trusted.** For every
-   wordmap (`.wmp`) and rack info table (`.rit`) a job needs, the server builds
-   its own copy from the exact `.kwg` and `.klv2` bytes the job pins, keeps the
+1. **Wordmaps, rack info tables and word info tables are checked, not
+   trusted.** For every wordmap (`.wmp`), rack info table (`.rit`) and word
+   info table (`.wit`) a job needs, the server builds its own copy from the
+   exact `.kwg` and `.klv2` bytes the job pins, keeps the
    SHA-256, and throws the file away. Workers build their own copy from inputs
    they have already verified and use it only if the hashes match.
 2. **Leave-generation KLVs are MAGPIE's.** The zeroed generation-0 KLV and
@@ -410,10 +432,12 @@ Linux):
 |---|---|---|---|---|---|
 | `CSW24.wmp` (`convert dawg2wordmap`) | 2.4 s | 1.7 s | **yes** | 179 MB | 710 MB |
 | `CSW24.rit` (`convert klvwmp2rit`) | 169 s | 59 s | **yes** | 1.9 GB | 2.4 GB |
+| `CSW24.wit` (`convert kwg2wit`, MAGPIE `birdtest-contribute`, 2026-10) | — | 2.8 s at 2 threads | **yes** (`NWL23`, 1 and 4 threads) | 122 MB | 310 MB |
 
 | Comparison | `CSW21_ab.wmp` | `NWL23.wmp` | `CSW21_ab.rit` |
 |---|---|---|---|
 | `-march=native` vs `-march=nehalem` | identical | identical | identical |
+| `CSW21_ab.wit`, `-march=native` vs `-march=nehalem` | identical | — | — |
 | `dawg2wordmap` vs `dawg2text` + `text2wordmap` | — | identical | — |
 
 A rack info table built by an earlier MAGPIE commit eight days before also
@@ -429,15 +453,16 @@ compared" below.
    and `.klv2` in the object store, keyed by SHA-256, so the server holds the
    exact inputs a job pins.
 2. **A job that needs a derived file queues a build** in `derived_data`: a
-   wordmap for a `.kwg` when a player (or a leave job) uses one, a table for a
-   `(.kwg, .klv2)` pair when a player uses one. Files are queued when the job
+   wordmap for a `.kwg` when a player (or a leave job) uses one, a rack info
+   table for a `(.kwg, .klv2)` pair when a player uses one, and a word info
+   table for a `.kwg` when a player (or a leave job) uses one. Files are queued when the job
    is created, when it is activated, and by the first claim that finds one with
    no row under the running binary's builder — which is what rebuilds
    everything after a deploy that bumps a builder version. Not at player-config
    creation: a config has no letter distribution until a job gives it one.
 3. **A builder task runs MAGPIE**: it writes the inputs and the job's letter
-   distribution into a scratch data directory, runs `convert dawg2wordmap` or
-   `convert klvwmp2rit`, records the hash, and deletes the directory (in a
+   distribution into a scratch data directory, runs `convert dawg2wordmap`,
+   `convert klvwmp2rit` or `convert kwg2wit`, records the hash, and deletes the directory (in a
    `Drop`, deliberately blocking, so an early return cannot leak 1.9 GB).
 4. **Dispatch waits for the hash**, the same way a leave-generation job waits
    for its rack universe. `/admin/derived-data` shows what is waiting, what
@@ -490,7 +515,8 @@ compared" below.
   moves on leaves the job never pinned. That needed `klvwmp2rit` to take the
   KLV's and the wordmap's names separately — `convert klvwmp2rit <output> <ld>
   <klv_name> <wmp_name>`, both optional, so the CLI's `convert klvwmp2rit
-  CSW24` is unchanged. Wordmaps depend only on the `.kwg` and keep its name.
+  CSW24` is unchanged. Wordmaps and word info tables depend only on the `.kwg`
+  and keep its name.
 - **The server runs a binary, not a library.** `libmagpie.so` exists, but its
   API is the CLI's command strings, and in-process MAGPIE would put a 2.4 GB
   build and any crash inside the web server.
@@ -515,7 +541,7 @@ compared" below.
 
 | Build | Where | Why |
 |---|---|---|
-| Wordmap (about 2 s, 710 MB peak) and rack info table (1 to 3 min, 2.4 GB peak, 1.9 GB file) | the `birdtest-derived-builder` scheduled task ([infra/derived.tf](infra/derived.tf)): 4 vCPU, 8 GB, 30 GB of ephemeral storage, every five minutes, up to eight files a run under a lease | neither fits the web task's 1 vCPU and 2 GB |
+| Wordmap (about 2 s, 710 MB peak), word info table (about 3 s, 310 MB peak, 122 MB file) and rack info table (1 to 3 min, 2.4 GB peak, 1.9 GB file) | the `birdtest-derived-builder` scheduled task ([infra/derived.tf](infra/derived.tf)): 4 vCPU, 8 GB, 30 GB of ephemeral storage, every five minutes, up to eight files a run under a lease | neither fits the web task's 1 vCPU and 2 GB |
 | A generation's KLV (`convert rackequity2klv`) | the web task, off the claim path | the same derivation the Rust port did in about 13 s for English; the transition already runs on its own task |
 | The generation-0 KLV (`createdata klv`) | the web task, at job creation | built from the letter distribution alone |
 
@@ -572,14 +598,14 @@ every one of the 431 leave values.
 ### What it costs a contributor
 
 - **Time, once per file and builder version:** about 2 s to build a wordmap and
-  0.8 s to hash it; one to three minutes and about 2.4 GB of memory to build a
+  0.8 s to hash it, about 3 s to build a word info table; one to three minutes and about 2.4 GB of memory to build a
   rack info table, and about 9 s to hash it. The heartbeat is already running,
   so a long build does not lose the claim.
 - **Memory:** a process that plays with a rack info table holds it — about
   1.9 GB for CSW24 — so several `magpie contribute` processes on one machine
   hold one copy each.
-- **Disk, still unbounded:** 179 MB per wordmap and 1.9 GB per `(.kwg, .klv2)`
-  pair with a table, and nothing evicts them. Player configs use both by
+- **Disk, still unbounded:** 179 MB per wordmap, 122 MB per word info table and
+  1.9 GB per `(.kwg, .klv2)` pair with a rack info table, and nothing evicts them. Player configs use both by
   default, so a contributor on many lexicons accumulates tables; one who runs
   out of disk gets a failed build and a declined task, not a wrong result. The
   fix is a size cap with least-recently-used eviction in `contribute.txt`,
@@ -599,7 +625,8 @@ every one of the 431 leave values.
   through a real server and a real `magpie contribute` on MAGPIE's two-letter
   test data (`CSW21_ab`, `english_ab`), so its table is tiny; nothing tests a
   real 1.9 GB one. `M-11` forces a `derived_mismatch` by altering the recorded
-  hash, standing in for a server whose builder differs.
+  hash, standing in for a server whose builder differs. `M-13` does both for
+  a word info table, on the same two-letter data.
 
 ### Alternatives considered
 
@@ -623,7 +650,8 @@ every one of the 431 leave values.
 - **MAGPIE (`birdtest-contribute`):** `src/def/builder_defs.h` and `magpie
   builders`, `test/builder_hash_test.c`, contribute's derived-file check and
   build (`config_contribute_ensure_wordmap`,
-  `config_contribute_ensure_rack_info_table`), `convert rackequity2klv`,
+  `config_contribute_ensure_rack_info_table`,
+  `config_contribute_ensure_word_info_table`), `convert rackequity2klv`,
   `klvwmp2rit`'s separate input names, and `BUILD=portable_release`.
 
 ## Deploying
@@ -894,13 +922,13 @@ that has to be accepted once.
 
 The backend image carries a pinned MAGPIE, built from a commit the image
 records. The server runs it to build the reference copy of every wordmap, rack
-info table and leave-generation KLV, publishes the SHA-256 for workers to
+info table, word info table and leave-generation KLV, publishes the SHA-256 for workers to
 reproduce, and throws the file away — see
 [MAGPIE on the server](#magpie-on-the-server). It still carries no data
 directory: every conversion runs against a throwaway directory written from the
 bytes a job pins, so nothing server-side reads a data file off its own disk.
 
-Wordmap and rack info table builds run in a separate scheduled task
+Wordmap, rack info table and word info table builds run in a separate scheduled task
 (`birdtest-derived-builder`), because a table peaks at about 2.4 GB of memory
 and writes a 1.9 GB file — neither of which fits the web task's 1 vCPU and
 2 GB. A job whose derived files are not built yet is not dispatched; the admin

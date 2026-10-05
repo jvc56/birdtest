@@ -15,15 +15,16 @@ use uuid::Uuid;
 /// generation-0 artifact row so it can dispatch.
 async fn leave_job(db: &TestDb, racks_per_task: i32) -> (Uuid, i64) {
     let admin = db.user(&format!("admin{}", Uuid::new_v4().simple()), true).await;
-    let job = db.bare_job("leave_generation", 1, admin).await;
+    let job = db.bare_job("leave_generation", admin).await;
     let kwg = db.input_data("kwg", "NWL23").await;
+    let player = db.leave_player(kwg, true, admin).await;
     sqlx::query(
         "INSERT INTO job_leave_config
-             (job_id, kwg_id, num_iterations, generation_count, target_rack_count, racks_per_task)
-         VALUES ($1, $2, 100, 2, 1000, $3)",
+             (job_id, player_config_id, num_iterations, target_rack_counts, racks_per_task)
+         VALUES ($1, $2, 100, ARRAY[1000, 1000], $3)",
     )
     .bind(job)
-    .bind(kwg)
+    .bind(player)
     .bind(racks_per_task)
     .execute(&db.pool)
     .await
@@ -38,10 +39,10 @@ async fn leave_job(db: &TestDb, racks_per_task: i32) -> (Uuid, i64) {
     .await
     .unwrap();
 
-    // A leave job's bot plays with a wordmap by default, and a job whose
-    // derived files are not built is not dispatched. Creation through the API
-    // queues those builds; this job was assembled with plain SQL, so the gate
-    // is satisfied here the same way the generation-0 artifact row above is.
+    // This job's player plays with a wordmap, and a job whose derived files
+    // are not built is not dispatched. Creation through the API queues those
+    // builds; this job was assembled with plain SQL, so the gate is satisfied
+    // here the same way the generation-0 artifact row above is.
     assert_eq!(db.derived_ready(job).await, 1, "a leave job needs one wordmap");
 
     let row = sqlx::query_as::<_, birdtest::models::job::Job>("SELECT * FROM jobs WHERE id = $1")
@@ -591,9 +592,9 @@ async fn next_step(db: &TestDb, job: Uuid) -> Step {
     .await
     .unwrap();
     let job_data = birdtest::jobs::load_job_data(&mut tx, job_row.id).await.unwrap();
-    let lexicon = leave_gen::lexicon_name(&mut tx, config.kwg_id).await.unwrap();
+    let player = birdtest::jobs::load_player_spec(&mut tx, config.player_config_id).await.unwrap();
     leave_gen::lock_claim_decisions(&mut tx, job).await.unwrap();
-    let step = leave_gen::next_step(&mut tx, job, &config, &job_data, &lexicon).await.unwrap();
+    let step = leave_gen::next_step(&mut tx, job, &config, &job_data, &player).await.unwrap();
     let step = match step {
         LeaveGenStep::Transition { .. } => Step::Transition,
         LeaveGenStep::TransitionInProgress { .. } => Step::InProgress,
@@ -916,71 +917,6 @@ async fn a_leave_task_carries_its_seed_and_a_reissue_replays_it() {
         send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
     assert_eq!(status, StatusCode::OK, "{other}");
     assert_ne!(other["task_request"]["seed"], first["task_request"]["seed"]);
-}
-
-/// With redundancy above 1 every claim of a leave task replays the same seed,
-/// so only the first accepted result folds into the generation; the others are
-/// credited and nothing more.
-#[tokio::test]
-async fn only_the_first_result_for_a_leave_task_is_folded() {
-    let db = TestDb::new().await;
-    let (job, _) = leave_job(&db, 2).await;
-    sqlx::query("UPDATE jobs SET redundancy = 2 WHERE id = $1")
-        .bind(job)
-        .execute(&db.pool)
-        .await
-        .unwrap();
-    let app = birdtest::app(db.state().await);
-
-    let mut claims = Vec::new();
-    for _ in 0..2 {
-        let (status, body) =
-            send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        claims.push(body);
-    }
-    assert_eq!(
-        claims[0]["task_request"]["seed"], claims[1]["task_request"]["seed"],
-        "both slots of one task: {claims:?}"
-    );
-    let rack = forced_racks(&claims[0])[0].clone();
-
-    for claim in &claims {
-        let (status, body) = send(
-            &app,
-            post_json(
-                "/api/worker/result",
-                &[("x-worker-uuid", claim["worker_uuid"].as_str().unwrap())],
-                json!({ "claim_token": claim["claim_token"], "result": { "racks": [
-                    { "rack": rack, "count": 3, "mean": 10.0 }
-                ]}}),
-            ),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body["accepted"], json!(true));
-    }
-
-    birdtest::jobs::leave_gen::merge_staged(&db.pool, job, 1, true).await.unwrap();
-    let count: i64 = sqlx::query_scalar(
-        "SELECT occurrence_count FROM leave_rack_progress
-         WHERE job_id = $1 AND generation = 1 AND rack = $2",
-    )
-    .bind(job)
-    .bind(&rack)
-    .fetch_one(&db.pool)
-    .await
-    .unwrap();
-    assert_eq!(count, 3, "the same games are counted once, not once per claim");
-
-    let credited: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM leave_records r JOIN tasks t ON t.id = r.task_id WHERE t.job_id = $1",
-    )
-    .bind(job)
-    .fetch_one(&db.pool)
-    .await
-    .unwrap();
-    assert_eq!(credited, 2, "both claims are credited");
 }
 
 /// Generation 1's universe is seeded by the first claim, like every later

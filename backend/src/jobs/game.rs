@@ -60,20 +60,45 @@ pub(super) fn validate_positions(
             position.previous_move_score,
             "captured position",
         )?;
+        super::plausibility::check_played_move(
+            &position.played_move,
+            position.played_move_score,
+            "captured position",
+        )?;
         super::plausibility::check_moves(
             &position.moves,
             Some(position.num_moves),
             "captured position",
         )?;
+        let analysis = Analysis::parse(&position.analysis).ok_or_else(|| {
+            AppError::bad_request(format!(
+                "captured position has an unknown analysis {:?}",
+                position.analysis
+            ))
+        })?;
+        super::plausibility::check_analysis(analysis, &position.moves, "captured position")?;
+        if let Some(inference) = &position.inference {
+            super::plausibility::check_inference(
+                inference,
+                analysis,
+                position.turn_number,
+                position.previous_move.is_some(),
+                "captured position",
+            )?;
+        }
         out.push(PositionAnalysis {
+            analysis,
             rack: position.rack,
             position: Some(position.position),
             game_index: Some(position.game_index),
             turn_number: Some(position.turn_number),
             previous_move: position.previous_move,
             previous_move_score: position.previous_move_score,
+            played_move: Some(position.played_move),
+            played_move_score: Some(position.played_move_score),
             num_moves: position.num_moves,
             moves: position.moves,
+            inference: position.inference,
         });
     }
     Ok(out)
@@ -174,6 +199,7 @@ pub async fn next_request(
             num_games: config.games_per_batch,
             game_pairs: false,
             capture_positions: config.capture_positions,
+            capture_first_divergence: false,
             bingo_bonus: job_data.bingo_bonus,
             sim_cutoff: job_data.sim_cutoff,
             player1: player1.clone(),
@@ -202,7 +228,8 @@ pub(super) async fn load_game_request_row(
 ) -> AppResult<sqlx::postgres::PgRow> {
     Ok(sqlx::query(
         "SELECT variant, letter_distribution, board_layout, seed, num_games,
-                player1_config_id, player2_config_id, capture_positions
+                player1_config_id, player2_config_id, capture_positions,
+                capture_first_divergence
          FROM game_requests WHERE task_id = $1",
     )
     .bind(task_id)
@@ -224,9 +251,10 @@ mod tests {
     fn one_captured_position_a_turn() {
         let position = |turn: i16| -> crate::jobs::handler::CapturedPosition {
             serde_json::from_value(serde_json::json!({
-                "game_index": 0, "turn_number": turn, "rack": "AEINRST",
+                "game_index": 0, "turn_number": turn, "played_move": "8D PLAYED", "played_move_score": 10, "rack": "AEINRST",
                 "position": "15/15/15/15/15/15/15/15/15/15/15/15/15/15/15 AEINRST/ 0/0 0",
-                "num_moves": 1, "moves": [{ "move": "8D RETAINS", "score": 70, "equity": 70.0 }]
+                "num_moves": 1, "analysis": "static",
+                "moves": [{ "move": "8D RETAINS", "score": 70, "equity": 70.0 }]
             }))
             .unwrap()
         };

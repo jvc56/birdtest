@@ -34,6 +34,19 @@ Each case is selectable with `--cases` (default: every M case):
 - `M-11` A worker whose wordmap does not match the hash the server recorded
   declines with `derived_mismatch`, and both digests reach
   `worker_data_gaps`.
+- `M-12` Players that solve their endgames and pre-endgames.
+- `M-13` A `use_wit` job is not dispatched until its word info table is
+  built. A worker whose table does not match the server's hash declines with
+  `derived_mismatch`; with the right hash it builds a table with the server's
+  bytes, from the lexicon alone (no wordmap), and plays with it. On the
+  two-letter data, like M-10.
+- `M-14` A game-pairs job keeping first divergences stores, from each pair
+  that diverged, both games' positions at one turn of one position, each with
+  that player's own best move, and nothing from pairs played identically.
+- `M-15` An opening-rack job seeking a consensus, with a real simmer on the
+  two-letter data: it covers its eight racks, then reissues them -- as lists,
+  from seeds past the end of the space -- until each is settled, and
+  completes once all are; every rack has at least its fewest analyses.
 
 And one case that is not a test: `capture` runs one job of each type through
 `scripts/capture_contract.py`'s recording proxy and writes the contract
@@ -243,6 +256,9 @@ def create_player(ctx: Context, data: dict, name: str, body: dict) -> str:
     created = ctx.post("/api/admin/player-configs", f"create player config {name}", {
         "name": name, "recorder_type": "best", "sort_strategy": "equity",
         "kwg_id": data["kwg"], "klv_id": data["klv"], "num_plays_recorded": 5,
+        # No word info table unless a case asks for one: the server's default
+        # is on, and a table makes a job wait for the derived-file builder.
+        "use_wit": False,
         **body,
     })
     return created["id"]
@@ -494,6 +510,12 @@ def wordmap_players(ctx: Context) -> dict:
     }
 
 
+def leave_player(ctx: Context, data: dict, name: str) -> str:
+    # What job creation holds a leave job's player to: static, sorting on
+    # equity, no rack info table. With a wordmap, so the job pins one.
+    return create_player(ctx, data, name, {"use_wordmap": True, "use_rit": False})
+
+
 def simming_player(ctx: Context) -> str:
     # `all`, not `best`: -r best is MOVE_RECORD_BEST, which leaves movegen with
     # one play, so a simmer configured that way has nothing to choose between
@@ -516,8 +538,20 @@ def static_best_player(ctx: Context) -> str:
                          {"num_plays_recorded": 1, "use_wordmap": True, "use_rit": False})
 
 
+def solving_player(ctx: Context) -> str:
+    # A static player that solves its endgames and a small pre-endgame: two
+    # plies of endgame, PEG at a bag of one or two, a two-play schedule and no
+    # nested lookahead. Small on purpose: a pre-endgame solve has no time
+    # limit, and at a bag of four even this schedule took a minute a game on
+    # two threads, where at two a game takes about a second.
+    return create_player(ctx, ctx.data, "e2e-solving", {
+        "use_wordmap": False, "use_rit": False,
+        "endgame_plies": 2, "peg_max_bag": 2, "peg_stage_top_k": [2], "peg_nested": False,
+    })
+
+
 def games_body(players: dict, batch: int, **extra) -> dict:
-    return {"job_type": "games", **players, "games_per_batch": batch,
+    return {"job_type": "games", **players, "games_per_batch": batch, "test_enabled": True,
             "min_games": 1_000_000, "max_games": 1_000_000, **extra}
 
 
@@ -596,7 +630,8 @@ def case_pairs(ctx: Context) -> None:
                f"pentanomial {penta} does not count every pair: {stats['games']}")
 
     run_job(ctx, ctx.data, {"job_type": "game_pairs", **static_players(ctx),
-                            "pairs_per_batch": 2, "min_pairs": 1000, "max_pairs": 1000},
+                            "pairs_per_batch": 2, "test_enabled": True,
+                            "min_pairs": 1000, "max_pairs": 1000},
             pairs_counted)
 
 
@@ -700,11 +735,12 @@ def case_leave(ctx: Context) -> None:
         stray = [name for name in written if "_gen_" in name or name.endswith("_report.txt")]
         expect(not stray, f"leave generation wrote into MAGPIE's data directory: {stray}")
 
-    # With the wordmap a leave job asks for by default: the builder finds the
+    # With the wordmap the job's player asks for: the builder finds the
     # wordmap already built if M-3 ran, and the worker its own copy matching.
-    run_job(ctx, ctx.data, {"job_type": "leave_generation", "kwg_id": ctx.data["kwg"],
-                            "num_iterations": 20, "generation_count": 1,
-                            "target_rack_count": 1, "racks_per_task": 50},
+    run_job(ctx, ctx.data, {"job_type": "leave_generation",
+                            "player_config_id": leave_player(ctx, ctx.data, "e2e-leave"),
+                            "num_iterations": 20, "target_rack_counts": [1],
+                            "racks_per_task": 50},
             leave_occurrences, needs_build=True)
 
 
@@ -834,6 +870,136 @@ def case_positions(ctx: Context) -> None:
         worker.remove()
 
 
+def case_inference(ctx: Context) -> None:
+    """M-16: a simmer that infers reports what it inferred on each position it
+    captures past a game's first turn, and the server keeps it beside the
+    position: a leave count, draws, a mean equity and at most ten leaves, most
+    drawn first -- and none on a first turn."""
+    deactivate_everything(ctx)
+    inferring = {
+        "recorder_type": "all", "winpct_id": ctx.winpct, "num_plies": 2, "num_plays": 5,
+        "num_plies_recorded": 2, "num_plays_recorded": 5, "max_iterations": 20,
+        "stopping_pct": 99, "time_limit_secs": 0, "use_inference": True,
+        "use_wordmap": False, "use_rit": False,
+    }
+    players = {
+        "player1_config_id": create_player(ctx, ctx.data, "e2e-inferring-1", inferring),
+        "player2_config_id": create_player(ctx, ctx.data, "e2e-inferring-2", inferring),
+    }
+    job_id = create_and_activate(ctx, ctx.data, games_body(players, 2, capture_positions=True))
+    worker = Worker(ctx, "m16")
+    try:
+        worker.run(tasks=1)
+        rows = ctx.psql(
+            "SELECT r.turn_number, i.num_leaves, i.total_draws, "
+            "       jsonb_array_length(i.leaves), "
+            "       (SELECT COUNT(*) FROM jsonb_array_elements(i.leaves) WITH ORDINALITY a(l, n) "
+            "        JOIN jsonb_array_elements(i.leaves) WITH ORDINALITY b(l, n) ON b.n = a.n + 1 "
+            "        WHERE (b.l->>'draws')::bigint > (a.l->>'draws')::bigint) "
+            "FROM position_analysis_records r "
+            "JOIN position_analysis_inference i ON i.record_id = r.id "
+            f"WHERE r.job_id = '{job_id}'")
+        inferred = [line.split("|") for line in rows.split("\n")] if rows else []
+        expect(inferred, "no captured position kept an inference")
+        # An inference can find no leave at all: at the default margin of 0, a
+        # simmer's move is often one no rack makes the static best. It is
+        # kept, saying so, with nothing listed.
+        with_leaves = 0
+        for turn, found, draws, listed, out_of_order in inferred:
+            expect(int(turn) > 0, f"an inference on turn {turn}")
+            expect(int(listed) <= 10 and int(found) >= int(listed)
+                   and (int(listed) > 0) == (int(found) > 0),
+                   f"{listed} leaves listed of {found} found")
+            expect((int(draws) > 0) == (int(found) > 0) and int(out_of_order) == 0,
+                   f"draws {draws} for {found} leaves, {out_of_order} leaves out of order")
+            with_leaves += int(found) > 0
+        positions = int(ctx.psql(f"SELECT COUNT(*) FROM position_analysis_records "
+                                 f"WHERE job_id = '{job_id}' AND turn_number > 0"))
+        log(f"M-16: {len(inferred)} of {positions} positions past a first turn kept an "
+            f"inference, {with_leaves} of them with leaves")
+    finally:
+        delete_job(ctx, job_id)
+        worker.remove()
+
+
+def case_first_divergences(ctx: Context) -> None:
+    """M-14: a game-pairs job keeping first divergences stores, from each pair
+    that diverged, both games' positions at one turn of one position, each
+    player's own answer first; from a pair played identically, nothing."""
+    deactivate_everything(ctx)
+    # Equity against score, which disagree within a few turns, in pairs: four
+    # tasks of five pairs.
+    job_id = create_and_activate(ctx, ctx.data, {
+        "job_type": "game_pairs", **static_players(ctx), "pairs_per_batch": 5,
+        "test_enabled": True, "min_pairs": 1_000_000, "max_pairs": 1_000_000,
+        "capture_positions": True, "capture_first_divergence": True})
+    worker = Worker(ctx, "m14")
+    try:
+        worker.run(tasks=4)
+        divergent_pairs = int(ctx.psql(
+            "SELECT COALESCE(SUM(divergent_games), 0) / 2 FROM game_results "
+            f"WHERE job_id = '{job_id}'"))
+        rows = ctx.psql(
+            "SELECT r.task_id, r.game_index, r.turn_number, r.rack, "
+            "split_part(r.position, ' ', 1), m.move "
+            "FROM position_analysis_records r JOIN position_analysis_moves m "
+            "ON m.record_id = r.id AND m.rank = 1 "
+            f"WHERE r.job_id = '{job_id}' ORDER BY r.task_id, r.game_index")
+        pairs: Dict[tuple, list] = {}
+        for row in (rows.split("\n") if rows else []):
+            task, game, turn, rack, board, best = row.split("|")
+            pairs.setdefault((task, int(game) // 2), []).append((int(game), turn, rack, board, best))
+        expect(divergent_pairs > 0, "no pair diverged; equity and score should disagree")
+        expect(len(pairs) == divergent_pairs,
+               f"{len(pairs)} pairs kept positions, {divergent_pairs} diverged")
+        for (task, pair), kept in pairs.items():
+            expect(len(kept) == 2, f"pair {pair} of task {task} kept {len(kept)} positions: {kept}")
+            (g1, t1, r1, b1, m1), (g2, t2, r2, b2, m2) = kept
+            expect((g1, g2) == (2 * pair, 2 * pair + 1), f"pair {pair}'s games are {g1} and {g2}")
+            expect(t1 == t2 and r1 == r2 and b1 == b2,
+                   f"pair {pair} of task {task}: not one turn of one position: {kept}")
+            expect(m1 != m2, f"pair {pair} of task {task} diverged on one best move, {m1}")
+        log(f"M-14: {divergent_pairs} divergent pairs, each kept as one position "
+            "with each player's answer")
+    finally:
+        delete_job(ctx, job_id)
+        worker.remove()
+
+
+def case_solvers(ctx: Context) -> None:
+    """M-12: a player that solves plays its pre-endgame and endgame turns with
+    the solvers, and the positions it captures there say so."""
+    deactivate_everything(ctx)
+    # Both seats solve, and four games, so a pre-endgame turn (a bag of one or
+    # two on a solving player's turn) is all but certain to come up.
+    solver = solving_player(ctx)
+    players = {"player1_config_id": solver, "player2_config_id": solver}
+    job_id = create_and_activate(ctx, ctx.data, games_body(players, 4, capture_positions=True))
+    worker = Worker(ctx, "m12")
+    try:
+        worker.run(tasks=1)
+        expect(completed_claims(ctx, job_id) == 1, "the solving task did not complete")
+        rows = ctx.psql(
+            "SELECT r.analysis, count(*) FILTER (WHERE m.mean_spread IS NOT NULL "
+            "AND m.fidelity_plies IS NOT NULL), count(*) "
+            "FROM position_analysis_records r JOIN position_analysis_moves m "
+            f"ON m.record_id = r.id WHERE r.job_id = '{job_id}' GROUP BY r.analysis")
+        counts = {line.split("|")[0]: (int(line.split("|")[1]), int(line.split("|")[2]))
+                  for line in rows.split("\n") if line}
+        expect("endgame" in counts, f"no endgame position was captured: {counts}")
+        expect("peg" in counts, f"no pre-endgame position was captured: {counts}")
+        expect("static" in counts, f"no static position was captured: {counts}")
+        for analysis in ("endgame", "peg"):
+            solved, total = counts[analysis]
+            expect(solved == total,
+                   f"{total - solved} {analysis} moves lack a spread or a depth: {counts}")
+        expect(counts["static"][0] == 0, f"a static position carries a solver's spread: {counts}")
+        log(f"M-12: positions by analysis {counts}")
+    finally:
+        delete_job(ctx, job_id)
+        worker.remove()
+
+
 def case_concurrent(ctx: Context) -> None:
     """M-9: two contributors at once, no duplicate seeds."""
     deactivate_everything(ctx)
@@ -934,6 +1100,76 @@ def case_rack_info_table(ctx: Context) -> None:
             worker.remove()
 
 
+def case_word_info_table(ctx: Context) -> None:
+    """M-13"""
+    deactivate_everything(ctx)
+    remove_small_data(ctx)
+    worker = None
+    where = "role = 'wit' AND name = 'CSW21_ab' AND state = 'built'"
+    try:
+        data = small_data(ctx)
+        # Player 1 alone asks for the table, and neither asks for a wordmap:
+        # the table is built from the .kwg alone.
+        players = {
+            "player1_config_id": create_player(ctx, data, "e2e-ab-wit-equity",
+                                               {"use_wit": True, "use_wordmap": False,
+                                                "use_rit": False}),
+            "player2_config_id": create_player(ctx, data, "e2e-ab-wit-score",
+                                               {"sort_strategy": "score", "use_wordmap": False,
+                                                "use_rit": False}),
+        }
+        mismatched = create_and_activate(ctx, data, games_body(players, 2))
+        roles = ctx.psql("SELECT string_agg(role || ' ' || name || ' ' || state, ', ') "
+                         "FROM derived_data WHERE kwg_id = "
+                         f"'{data['kwg']}'")
+        expect(roles == "wit CSW21_ab pending", f"derived rows before any build: {roles!r}")
+        claim = requests.post(f"{ctx.args.api}/api/worker/task",
+                              json={"magpie_version": "0.1.1", "unsupported_jobs": []},
+                              timeout=30)
+        expect(claim.status_code == 204,
+               f"a job waiting on its table dispatched: {claim.status_code} {claim.text[:300]}")
+
+        build_derived(ctx)
+        server_hash = ctx.psql(f"SELECT sha256 FROM derived_data WHERE {where}")
+        expect(len(server_hash) == 64, f"no built word info table recorded: {server_hash!r}")
+
+        # A server whose builder differs: some other hash, written before the
+        # job's first claim (the claim path remembers a job's hashes).
+        altered = server_hash[:-1] + ("0" if server_hash[-1] != "0" else "1")
+        ctx.psql(f"UPDATE derived_data SET sha256 = '{altered}' WHERE {where}")
+        worker = Worker(ctx, "m13", small=True)
+        output = worker.run(tasks=1, succeed=False)
+        expect("declining this task: a file built here does not match" in output,
+               f"MAGPIE did not decline over the word info table:\n{output[-2000:]}")
+        expect(decline_reasons(ctx, mismatched) == ["derived_mismatch"],
+               f"decline reasons: {decline_reasons(ctx, mismatched)}")
+        gaps = data_gaps(ctx, mismatched)
+        expect(gaps == [["wit", "CSW21_ab", altered, server_hash]],
+               f"worker_data_gaps: {gaps}, expected wit CSW21_ab {altered} / {server_hash}")
+        ctx.psql(f"UPDATE derived_data SET sha256 = '{server_hash}' "
+                 "WHERE role = 'wit' AND name = 'CSW21_ab'")
+        delete_job(ctx, mismatched)
+
+        # The same players in a new job, with the server's own hash.
+        job_id = create_and_activate(ctx, data, games_body(players, 2))
+        worker.run(tasks=2)
+        built = list(worker.data.rglob("CSW21_ab.wit"))
+        expect(len(built) == 1, f"the worker built no CSW21_ab.wit: {built}")
+        expect(sha256_file(built[0]) == server_hash,
+               f"the worker's table {sha256_file(built[0])} is not the server's {server_hash}")
+        expect(not list(worker.data.rglob("CSW21_ab.wmp")),
+               "the worker built a wordmap nobody asked for")
+        expect(completed_claims(ctx, job_id) == 2, "the word-info-table job completed no tasks")
+        stats = ctx.get(f"/api/jobs/{job_id}", "job stats")
+        expect(stats["games"]["units_completed"] == 4, f"games: {stats['games']}")
+        log(f"M-13: dispatched only after the build; a wrong hash is declined; the worker's "
+            f"CSW21_ab.wit matches {server_hash[:12]} and played 4 games with it")
+    finally:
+        remove_small_data(ctx)
+        if worker:
+            worker.remove()
+
+
 def case_derived_mismatch(ctx: Context) -> None:
     """M-11: the server's recorded wordmap hash is not what this build makes."""
     deactivate_everything(ctx)
@@ -978,6 +1214,53 @@ def case_derived_mismatch(ctx: Context) -> None:
 # --- capturing the contract fixtures ----------------------------------------
 
 
+def case_consensus(ctx: Context) -> None:
+    """M-15"""
+    deactivate_everything(ctx)
+    remove_small_data(ctx)
+    worker = None
+    try:
+        data = small_data(ctx)
+        simmer = create_player(ctx, data, "e2e-ab-consensus", {
+            "recorder_type": "all", "winpct_id": ctx.winpct, "num_plies": 1, "num_plays": 5,
+            "num_plies_recorded": 1, "max_iterations": 40, "stopping_pct": 99,
+            "time_limit_secs": 0, "use_wordmap": False, "use_rit": False,
+        })
+        job_id = create_and_activate(ctx, data, {
+            "job_type": "opening_rack", "player_config_id": simmer, "racks_per_batch": 4,
+            "rack_size": 7, "min_results_per_rack": 2, "max_results_per_rack": 3,
+            "consensus_pct": 100,
+        })
+        # One task a run: how many the consensus takes depends on how often
+        # the simulations agree, and a worker asked for more than there are
+        # would wait for them.
+        worker = Worker(ctx, "m15", small=True)
+        for _ in range(12):
+            if ctx.get(f"/api/jobs/{job_id}", "job stats")["job"]["status"] == "completed":
+                break
+            worker.run(tasks=1)
+        stats = ctx.get(f"/api/jobs/{job_id}", "job stats")
+        racks = stats["opening_racks"]
+        expect(stats["job"]["status"] == "completed", f"the job did not complete: {stats['job']}")
+        expect(racks["racks_total"] == 8 and racks["racks_settled"] == 8
+               and racks["racks_analyzed"] == 8, f"rack counts: {racks}")
+        fewest = int(ctx.psql(
+            f"SELECT MIN(results) FROM opening_rack_progress WHERE job_id = '{job_id}'"))
+        rows = int(ctx.psql(
+            f"SELECT COUNT(*) FROM opening_rack_progress WHERE job_id = '{job_id}' AND settled"))
+        expect(rows == 8 and fewest >= 2, f"{rows} racks settled, fewest analyses {fewest}")
+        reissues = int(ctx.psql(
+            "SELECT COUNT(*) FROM tasks t JOIN opening_rack_requests r ON r.task_id = t.id "
+            f"WHERE t.job_id = '{job_id}' AND t.seed >= 8 AND r.racks IS NOT NULL"))
+        expect(reissues >= 2, f"{reissues} reissue tasks")
+        log(f"M-15: 8 racks settled after {reissues} reissues, "
+            f"{racks['racks_without_consensus']} without a consensus")
+    finally:
+        remove_small_data(ctx)
+        if worker:
+            worker.remove()
+
+
 def case_capture(ctx: Context) -> None:
     """Runs one job of each type through the recording proxy."""
     out = ctx.args.capture_out
@@ -999,17 +1282,27 @@ def case_capture(ctx: Context) -> None:
 
     try:
         # First, from a worker with no identity yet: the assignment that mints
-        # one. A games job capturing positions, so its result carries them.
-        one(games_body(static_players(ctx), 2, capture_positions=True), ctx.data)
+        # one. A games job capturing positions, so its result carries them,
+        # whose players solve their endgames and pre-endgames: the assignment
+        # carries the solver keys, and the result positions of all three kinds
+        # -- static, pre-endgame and endgame.
+        solver = solving_player(ctx)
+        one(games_body({"player1_config_id": solver, "player2_config_id": solver}, 2,
+                       capture_positions=True), ctx.data)
         expect(worker.uuid() is not None, "the first assignment minted no worker UUID")
-        # Players with a wordmap, so the assignment pins a derived file.
+        # Players with a wordmap, so the assignment pins a derived file, and
+        # first divergences kept, so the result carries a pair's two positions.
+        # Equity against score: the pairs diverge.
         one({"job_type": "game_pairs", **wordmap_players(ctx), "pairs_per_batch": 2,
-             "min_pairs": 1_000_000, "max_pairs": 1_000_000}, ctx.data, needs_build=True)
+             "test_enabled": True, "min_pairs": 1_000_000, "max_pairs": 1_000_000,
+             "capture_positions": True, "capture_first_divergence": True}, ctx.data,
+            needs_build=True)
         one({"job_type": "opening_rack", "player_config_id": simming_player(ctx),
              "racks_per_batch": 2, "rack_size": 7}, ctx.data)
         small = small_data(ctx)
-        one({"job_type": "leave_generation", "kwg_id": small["kwg"], "num_iterations": 20,
-             "generation_count": 1, "target_rack_count": 1, "racks_per_task": 50},
+        one({"job_type": "leave_generation",
+             "player_config_id": leave_player(ctx, small, "e2e-small-leave"),
+             "num_iterations": 20, "target_rack_counts": [1], "racks_per_task": 50},
             small, needs_build=True)
 
         # A heartbeat goes out thirty seconds into a task, so the last one is a
@@ -1057,6 +1350,11 @@ CASES = {
     "M-9": case_concurrent,
     "M-10": case_rack_info_table,
     "M-11": case_derived_mismatch,
+    "M-12": case_solvers,
+    "M-13": case_word_info_table,
+    "M-14": case_first_divergences,
+    "M-15": case_consensus,
+    "M-16": case_inference,
     "capture": case_capture,
 }
 DEFAULT_CASES = [name for name in CASES if name.startswith("M-")]

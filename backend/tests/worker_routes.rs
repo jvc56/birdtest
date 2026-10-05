@@ -110,15 +110,16 @@ fn edit(mut value: Value, change: impl FnOnce(&mut Value)) -> Value {
 /// it: 100 games a task, so a task's rack occurrences are bounded by 100,000.
 async fn leave_job(db: &TestDb, racks_per_task: i32) -> Uuid {
     let admin = db.user(&format!("admin{}", Uuid::new_v4().simple()), true).await;
-    let job = db.bare_job("leave_generation", 1, admin).await;
+    let job = db.bare_job("leave_generation", admin).await;
     let kwg = db.input_data("kwg", "NWL23").await;
+    let player = db.leave_player(kwg, true, admin).await;
     sqlx::query(
         "INSERT INTO job_leave_config
-             (job_id, kwg_id, num_iterations, generation_count, target_rack_count, racks_per_task)
-         VALUES ($1, $2, 100, 2, 1000, $3)",
+             (job_id, player_config_id, num_iterations, target_rack_counts, racks_per_task)
+         VALUES ($1, $2, 100, ARRAY[1000, 1000], $3)",
     )
     .bind(job)
-    .bind(kwg)
+    .bind(player)
     .bind(racks_per_task)
     .execute(&db.pool)
     .await
@@ -151,7 +152,7 @@ async fn leave_job(db: &TestDb, racks_per_task: i32) -> Uuid {
 #[tokio::test]
 async fn a_malformed_magpie_version_is_refused_rather_than_assumed() {
     let db = TestDb::new().await;
-    db.games_job(1, 2).await;
+    db.games_job(2).await;
     let state = db.state().await;
     let app = birdtest::app(state.clone());
 
@@ -189,7 +190,7 @@ async fn a_malformed_magpie_version_is_refused_rather_than_assumed() {
 #[tokio::test]
 async fn an_oversized_unsupported_list_is_truncated_not_rejected() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     let app = birdtest::app(db.state().await);
 
     let mut listed: Vec<Uuid> = (0..250).map(|_| Uuid::new_v4()).collect();
@@ -210,7 +211,7 @@ async fn an_oversized_unsupported_list_is_truncated_not_rejected() {
 #[tokio::test]
 async fn an_invented_worker_uuid_is_refused_with_the_fix() {
     let db = TestDb::new().await;
-    db.games_job(1, 2).await;
+    db.games_job(2).await;
     let app = birdtest::app(db.state().await);
     let invented = Uuid::new_v4().to_string();
 
@@ -254,7 +255,7 @@ async fn idle_and_each_shutdown_reason_are_distinct_answers() {
     assert_eq!((status, &body), (StatusCode::NO_CONTENT, &Value::Null));
 
     // A job on offer with nothing left to hand out: its one batch is out.
-    let capped = db.games_job(1, 2).await;
+    let capped = db.games_job(2).await;
     sqlx::query("UPDATE job_game_config SET max_games = 2 WHERE job_id = $1")
         .bind(capped)
         .execute(&db.pool)
@@ -270,7 +271,7 @@ async fn idle_and_each_shutdown_reason_are_distinct_answers() {
         .unwrap();
     let claims_before = count(&db, "SELECT COUNT(*) FROM task_claims").await;
 
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
 
     // Below the server-wide floor: no job need be consulted.
     let (status, body) = claim(&app, &[], claim_body("0.0.9", &[])).await;
@@ -292,7 +293,7 @@ async fn idle_and_each_shutdown_reason_are_distinct_answers() {
     assert!(message(shutdown).contains("input data you do not have"), "{body}");
 
     // And a second job this worker is too old for: both, led by the version.
-    let newer = db.games_job(1, 2).await;
+    let newer = db.games_job(2).await;
     sqlx::query(
         "UPDATE jobs SET min_magpie_major = 2, min_magpie_minor = 0, min_magpie_patch = 0
          WHERE id = $1",
@@ -337,7 +338,7 @@ async fn idle_and_each_shutdown_reason_are_distinct_answers() {
 #[tokio::test]
 async fn a_claim_states_its_digests_and_a_missing_data_decline_releases_it_at_once() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     let app = birdtest::app(db.state().await);
 
     let (assignment, uuid) = first_claim(&app).await;
@@ -417,6 +418,83 @@ async fn a_claim_states_its_digests_and_a_missing_data_decline_releases_it_at_on
     );
 }
 
+/// A-WORKER-7 (leave generation): a leave task carries its job's player, whole,
+/// as every other job type's request carries its players -- and the lexicon
+/// and wordmap setting it plays with are that player's. What the assignment
+/// pins is the player's lexicon, the bag and the board, and the wordmap it
+/// asks for; never the player's leaves, which leave generation does not load
+/// (it plays the server's KLV), so a worker without them is not turned away.
+#[tokio::test]
+async fn a_leave_claim_carries_its_player_and_pins_only_its_lexicon() {
+    let db = TestDb::new().await;
+    let job = leave_job(&db, 2).await;
+    let app = birdtest::app(db.state().await);
+
+    let (assignment, _) = first_claim(&app).await;
+    let request = &assignment["task_request"];
+    let (player_id, leaves): (Uuid, String) = sqlx::query_as(
+        "SELECT pc.id, klv.name FROM job_leave_config c
+         JOIN player_configs pc ON pc.id = c.player_config_id
+         JOIN input_data klv ON klv.id = pc.klv_id
+         WHERE c.job_id = $1",
+    )
+    .bind(job)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let name: String = sqlx::query_scalar("SELECT name FROM player_configs WHERE id = $1")
+        .bind(player_id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(request["player"]["name"], json!(name), "{request}");
+    assert_eq!(request["player"]["lexicon"], "NWL23", "{request}");
+    assert_eq!(request["player"]["leaves"], json!(leaves), "{request}");
+    assert_eq!(request["player"]["num_plies"], 0, "{request}");
+    assert_eq!(request["player"]["sort_strategy"], "equity", "{request}");
+    assert_eq!(request["player"]["use_wordmap"], true, "{request}");
+    assert_eq!(request["lexicon"], "NWL23", "the top-level lexicon is the player's: {request}");
+    assert!(request.get("use_wordmap").is_none(), "the player states it: {request}");
+
+    let expected = &assignment["expected_data"];
+    let mut files: Vec<(&str, &str)> = expected["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| (f["role"].as_str().unwrap(), f["name"].as_str().unwrap()))
+        .collect();
+    files.sort_unstable();
+    assert_eq!(
+        files,
+        [("kwg", "NWL23"), ("layout", "standard15"), ("letterdist", "english")],
+        "{assignment}"
+    );
+    let derived: Vec<&str> =
+        expected["derived"].as_array().unwrap().iter().map(|d| d["role"].as_str().unwrap()).collect();
+    assert_eq!(derived, ["wmp"], "the player's wordmap, and no rack info table: {assignment}");
+
+    // A re-dispatched task carries the same player: it comes from the job,
+    // not from the stored request.
+    let task = sqlx::query_scalar::<_, Uuid>("SELECT id FROM tasks WHERE job_id = $1")
+        .bind(job)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE task_claims SET state = 'abandoned' WHERE task_id = $1")
+        .bind(task)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE tasks SET state = 'available', active_claim_count = 0 WHERE id = $1")
+        .bind(task)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let (again, _) = first_claim(&app).await;
+    assert_eq!(again["task_request"]["seed"], request["seed"], "the same task: {again}");
+    assert_eq!(again["task_request"]["player"], request["player"], "{again}");
+}
+
 /// A-WORKER-8: a decline must give one of the five reasons the protocol knows.
 /// Anything else is a `400` listing them, and leaves the claim held; each of
 /// `missing_data`, `magpie_version`, `unknown_job_type`, `derived_mismatch` and
@@ -425,7 +503,7 @@ async fn a_claim_states_its_digests_and_a_missing_data_decline_releases_it_at_on
 #[tokio::test]
 async fn only_the_five_known_decline_reasons_are_accepted() {
     let db = TestDb::new().await;
-    db.games_job(1, 2).await;
+    db.games_job(2).await;
     let app = birdtest::app(db.state().await);
 
     let (assignment, uuid) = first_claim(&app).await;
@@ -473,7 +551,7 @@ async fn only_the_five_known_decline_reasons_are_accepted() {
 #[tokio::test]
 async fn a_heartbeat_extends_only_a_live_claim_of_the_caller() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     let app = birdtest::app(db.state().await);
 
     let (alive, alive_uuid) = first_claim(&app).await;
@@ -530,7 +608,7 @@ async fn a_heartbeat_extends_only_a_live_claim_of_the_caller() {
 #[tokio::test]
 async fn an_accepted_result_is_published_to_the_jobs_live_stream() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     let state = db.state().await;
     let app = birdtest::app(state.clone());
     let mut watching = state.sse.subscribe(job);
@@ -580,13 +658,13 @@ async fn assert_each_refused(db: &TestDb, app: &axum::Router, valid: Build, case
 fn games_with_position(_: &Value) -> Value {
     let mut result = games_result(2, 1);
     result["positions"] = json!([{
-        "game_index": 1, "turn_number": 3, "rack": "AEINRST", "position": "cgp",
+        "game_index": 1, "turn_number": 3, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "sim", "rack": "AEINRST", "position": "cgp",
         "num_moves": 5,
         "moves": [{ "move": "8D RETAINS", "score": 74, "equity": 81.2,
                     "win_percentage": 61.5, "blended_utility": 0.6 }],
     }, {
         // A capturing job's result has positions from every game of its batch.
-        "game_index": 0, "turn_number": 0, "rack": "AEINRST", "position": "cgp",
+        "game_index": 0, "turn_number": 0, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "AEINRST", "position": "cgp",
         "num_moves": 5,
         "moves": [{ "move": "8D RETAINS", "score": 74, "equity": 81.2 }],
     }]);
@@ -601,7 +679,7 @@ fn games_with_position(_: &Value) -> Value {
 #[tokio::test]
 async fn every_implausible_games_result_is_a_400_that_says_why() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     sqlx::query("UPDATE job_game_config SET capture_positions = true WHERE job_id = $1")
         .bind(job)
         .execute(&db.pool)
@@ -653,6 +731,13 @@ async fn every_implausible_games_result_is_a_400_that_says_why() {
             "is not a percentage"),
         ("a utility outside [0, 1]", |a| edit(games_with_position(a), |v| v["positions"][0]["moves"][0]["blended_utility"] = json!(1.5)),
             "outside [0, 1]"),
+        ("no move played from it", |a| edit(games_with_position(a), |v| {
+            v["positions"][0].as_object_mut().unwrap().remove("played_move");
+        }), "missing field `played_move`"),
+        ("an empty move played from it", |a| edit(games_with_position(a), |v| v["positions"][0]["played_move"] = json!(" ")),
+            "no play made from it is stated"),
+        ("a played move no play scores", |a| edit(games_with_position(a), |v| v["positions"][0]["played_move_score"] = json!(-3)),
+            "the play made from it scores -3"),
         ("not a games result at all", |a| edit(games_with_position(a), |v| {
             v.as_object_mut().unwrap().remove("all_games");
         }), "malformed task response"),
@@ -675,7 +760,7 @@ async fn every_implausible_game_pairs_result_is_a_400_that_says_why() {
     let admin = db.user("admin", true).await;
     let p1 = db.static_player("pairs-p1", admin).await;
     let p2 = db.static_player("pairs-p2", admin).await;
-    let job = db.bare_job("game_pairs", 1, admin).await;
+    let job = db.bare_job("game_pairs", admin).await;
     sqlx::query(
         "INSERT INTO job_game_pair_config
              (job_id, player1_config_id, player2_config_id, pairs_per_batch, min_pairs, max_pairs)
@@ -739,7 +824,7 @@ async fn every_implausible_opening_rack_result_is_a_400_that_says_why() {
     let db = TestDb::new().await;
     let admin = db.user("admin", true).await;
     let player = db.static_player("solver", admin).await;
-    let job = db.bare_job("opening_rack", 1, admin).await;
+    let job = db.bare_job("opening_rack", admin).await;
     sqlx::query(
         "INSERT INTO job_opening_rack_config
              (job_id, player_config_id, racks_per_batch, rack_size, total_racks)
@@ -813,7 +898,7 @@ async fn an_artifact_is_served_only_under_a_key_the_server_minted() {
     let (state, _bucket) = db.state_with_object_store().await;
     let app = birdtest::app(state.clone());
     let admin = db.user("admin", true).await;
-    let job = db.bare_job("leave_generation", 1, admin).await;
+    let job = db.bare_job("leave_generation", admin).await;
 
     let minted = birdtest::jobs::leave_gen::artifact_key(job, 0);
     let leaves: Vec<u8> = (0..70_000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 11) as u8).collect();

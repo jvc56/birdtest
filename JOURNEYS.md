@@ -30,10 +30,12 @@ in and signed out at once.
 ### Start the site
 
 ```bash
-./scripts/dev.py --reset-db --worker-windows
+./scripts/dev.py --reset-db --worker-windows \
+    --leavegen-job_ab --opening-rack-job_ab --games-job --pairs-job
 ```
 
-That drops any earlier local database, starts the stack, seeds it, starts four
+That drops any earlier local database, starts the stack, seeds it with the
+four jobs the job flags ask for (dev.py starts with none otherwise), starts four
 MAGPIE workers — each in its own terminal window, where Ctrl-C stops it and
 Enter starts it again — and opens **http://localhost:5173** (or the
 `WEB_PORT` in your `.env`) signed in as the admin. Ctrl-C in dev.py stops the
@@ -50,14 +52,13 @@ needs a separate run with `--fresh`. Do it last: it empties the database.
 | **Admin** | `dev`, password `devpassword123!` |
 | **Contributor accounts** | `dev-contributor-1` and `dev-contributor-2`, same password; workers 3 and 4 run under their API keys |
 | **Anonymous workers** | Workers 1 and 2 |
-| **Data** | The MAGPIE-DATA version your MAGPIE checkout installed; every job is on CSW24 |
-| **Player configs** | `static-equity`, `static-score`, `sim-1ply` (a 1-ply simmer) and `static-equity-all` |
-| **Jobs**, each active at 16% | "dev games"; three game-pairs jobs, one for each pair of the three players, of which "static equity vs 1-ply sim" saves its positions; "dev opening racks"; "dev leave generation" |
+| **Data** | The MAGPIE-DATA version your MAGPIE checkout installed, and MAGPIE's two-letter test data (version `20000101`: distribution `english_ab`, lexicon `CSW21_ab`, eight possible full racks) |
+| **Player configs** | `static-equity` and `static-score` on CSW24; `ab-static-equity-no-rit` (the leave job's player) and `ab-sim-2ply-rack` (the opening-rack job's, a 2-ply simmer seeking 80% agreement) on CSW21_ab |
+| **Jobs**, each active at 25% | "dev games (positions saved)" and "dev game pairs (first divergences saved)", `static-equity` against `static-score` on CSW24; "dev opening racks (english_ab)"; "dev leave generation (english_ab)", six generations |
 
-The seeded games and pairs jobs run for hours: their cap is 100,000, and a
-pairs job's test is not acted on before 50,000 pairs. The seeded leave
-generation covers all 3,199,724 English racks and does not finish in a
-session. Journeys that need a job to *finish* have you make a small one.
+The games and pairs jobs run for hours: their cap is 100,000, and neither
+test is acted on before 50,000 games or pairs. The two english_ab jobs finish
+within minutes -- there are only eight racks -- and stay listed as completed.
 
 ### Useful locally
 
@@ -74,7 +75,7 @@ session. Journeys that need a job to *finish* have you make a small one.
   (distribution `english_ab`, lexicon `CSW21_ab`, eight possible racks). See
   [A-3](#a-3-import-data) and
   [A-12](#a-12-a-leave-generation-job-start-to-finish).
-- **Wordmaps and rack info tables** are built by dev.py itself, within about
+- **Wordmaps, rack info tables and word info tables** are built by dev.py itself, within about
   fifteen seconds of a job needing one; on the real site a scheduled task does
   it every five minutes.
 
@@ -82,10 +83,10 @@ Job types, as the site names them:
 
 | Type | What it computes | Progress is counted in |
 |---|---|---|
-| Games | Two players play each other; an SPRT test decides which is stronger | games |
-| Game pairs | The same, in pairs of games with the first move swapped; also feeds ratings | pairs |
-| Opening rack analysis | The ranked moves for every opening rack | racks |
-| Leave generation | Leave values, built generation by generation from self-play | generations |
+| Games | Two players play each other; a significance test can decide which is better | games |
+| Game Pairs | The same, in pairs of games with the first move swapped; also feeds ratings | pairs |
+| Opening Rack Analysis | The ranked moves for every opening rack | racks |
+| Leave Generation | Leave values, built generation by generation from self-play | generations |
 
 ---
 
@@ -106,49 +107,70 @@ Use a signed-out window for the V journeys unless one says otherwise.
 
 ### V-2 The home page
 
-- [ ] **Expect** "Crowdsourced word game analysis", the buttons **Browse jobs**
-  and **Create an account**, and a "Contribute" card with a MAGPIE link and a
-  sample `contribute.txt` whose `server` line is this site's own address.
-- [ ] **Expect** "Active jobs" listing the six seeded jobs as cards: name,
-  status badge, "16% allocation". Clicking one opens its job page.
-- [ ] (With every job deactivated, A-8) **expect** the section gone rather than
-  an error.
+- [ ] **Expect** "Crowdsourced Crossword Game Analysis" and the buttons **Browse
+  jobs** and **Create an account**.
+- [ ] **Expect** next "Active Jobs" listing the seeded jobs still running as
+  cards: name, status badge, "25% allocation". Clicking one opens its job page.
+- [ ] **Expect** after it a "Contribute" section (not a card, like "Active
+  Jobs") of four numbered steps: **Install MAGPIE** (linking MAGPIE's
+  getting-started section), **Create a contribute.txt file** (a sample whose
+  `server` line is this site's own address, and a table of its settings --
+  `server` required; `apikey`, `threads`, `maxtasks`, `idlewait` optional),
+  **(Optional) Create an account** (to contribute under a username, else
+  anonymously) and **Run the contribute command** (`./bin/magpie contribute`).
+- [ ] (With every job deactivated, A-8) **expect** the Active Jobs section gone
+  rather than an error.
 
 ### V-3 Browse the jobs
 
 - [ ] **Do** open **Jobs**. **Expect** a table, newest first, with Name, Type,
-  Status, Allocation ("16%"), Redundancy ("1×") and Progress ("value / max
+  Status, Allocation ("25%") and Progress ("value / max
   unit": games, pairs, racks or generations).
 - [ ] **Expect** the progress to have moved when you reload a minute later.
 - [ ] A job that workers keep declining, and none has completed in 24 hours,
   shows a red **stalled** pill with a tooltip saying so. (Hard to stage
   locally; note it if you see it.)
+- [ ] Signed out, **expect** no **New job** button; as an admin, **expect** one
+  beside the title, opening the job form.
 
 ### V-4 A job's page: what every job shows
 
-Open "dev game pairs: static equity vs static score".
+Open "dev game pairs (first divergences saved)".
 
-- [ ] **Expect** the job's name as the title with "Game pairs" beside it, a
-  status badge, then "CSW24 · classic · static, by equity vs static, by
-  score".
-- [ ] **Expect** cards for Allocation, Redundancy, Results accepted and
+- [ ] **Expect** the job's name as the title with "Game Pairs" beside it, then
+  "CSW24 · classic · static, by equity vs static, by score".
+- [ ] **Expect** a full-width Status card: the badge ("active") and nothing
+  beside it -- the badge says it plainly, and its allocation has its own card.
+  (Inactive: "Paused: no worker is offered its tasks until it is activated
+  again." and "Its significance test is paused while the job is inactive (see the
+  Significance Test card).")
+- [ ] **Expect** under it three cards in a row: Allocation, Tasks completed and
   Estimated time left.
-- [ ] **Expect** a Progress card: a bar of "pairs completed (hard cap)", the
-  Available / Claimed / Completed task counts, when it was created, "Created
-  by dev" and "requires MAGPIE ≥ …".
-- [ ] **Expect** a Settings card with one line per player: its name, linking to
-  the player config's page, and how it searches.
-- [ ] **Do** open **All settings**. **Expect** a "Job" group (variant, letter
-  distribution, board, bingo bonus, sim cutoff, redundancy, oldest MAGPIE), a
-  "Game pairs and the test" group (pairs per task; fewest pairs before the
-  test is acted on, 50,000; cap, 100,000; α, β, Elo H0 and H1; records
-  positions), and every player setting side by side, those the players differ
-  in bold.
-- [ ] **Do** **Download every setting as JSON**. **Expect** the same settings,
-  with no user ids and no creator.
+- [ ] **Expect** a Progress card: a bar of "pairs completed", then **Tasks**
+  with Waiting to be reissued / In progress / Done counts and no explanation
+  under them; then "Created by dev, <date>" and "requires MAGPIE ≥ …".
+- [ ] **Expect** a **Job settings** card showing every row, with no **All
+  settings** button, each label in Title Case: Type "Game Pairs", Variant,
+  Letter Distribution, Board, Bingo Bonus 50, Maximum Pairs 100,000,
+  Significance Test "yes (95%)" (one row, no separate Confidence %), Position
+  Recorder "yes (first divergences)", Sim Cutoff, Minimum Pairs (50,000),
+  Pairs Per Task and Oldest MAGPIE, and no download link.
+- [ ] **Expect** after it a **Player settings** card: the players side by side,
+  headed "Player 1" and "Player 2" with each name linking to its config's
+  page, and nothing else under it: Lexicon, Leaves, Sorted By, Move Recorder,
+  Moves Generated, Plies, Uses Inference "—", Uses Preendgame "no" and Uses
+  Endgame "no", the rows they differ in (Sorted By) bold.
+- [ ] **Do** press **All settings** on the Player settings card. **Expect**
+  every setting after the key rows (no simulation rows: neither simulates),
+  Moves Recorded, Plies Recorded "—" (both are static) and Movegen Margin "—"
+  (neither recorder keeps moves by equity). The button now reads **Key
+  settings only** and puts the card back. On a job that records no positions
+  ("tester no test", A-7), Moves Recorded is in grey: it never reads it.
+- [ ] At phone width, **expect** the tables to wrap (or scroll inside the
+  card), never the page.
 - [ ] **Expect** a Contributors table: `dev-contributor-1`,
-  `dev-contributor-2` and "Anonymous · <16 characters>" rows, with tasks
-  completed.
+  `dev-contributor-2` and "Anonymous · <16 characters>" rows, with compute time
+  (on a wide screen) and tasks completed.
 - [ ] **Expect** a link to the results as **paginated JSON**.
 - [ ] **Do** open `/jobs/00000000-0000-4000-8000-000000000000`. **Expect** "no
   such job".
@@ -160,44 +182,79 @@ Open "dev game pairs: static equity vs static score".
 - [ ] **Do** `docker compose restart backend` and wait. **Expect** the page to
   recover by itself within a minute.
 
-### V-6 Games and game-pairs jobs: the test
+### V-6 Games and game-pairs jobs: the score and the test
 
 On the same job:
 
-- [ ] **Expect** an SPRT card: "running — LLR …, bounds [a, b]. SPRT is not
-  acted on until 50,000 pairs are complete."
-- [ ] **Expect** a win/loss/draw bar chart and "Player 1: W W (x%) · L L (y%) ·
-  D D (z%)".
-- [ ] **Expect** the pentanomial table — "P1 lost both", "Lost one, drew one",
-  "Split 1-1", "Won one, drew one", "P1 won both" — with counts and shares,
-  and a line on how many pairs diverged.
-- [ ] On "dev games", **expect** the same test card and chart, and no
-  pentanomial.
+- [ ] **Expect**, after the settings, a **Match score** card with two tables,
+  **All games** and **Games that diverged**, each a column per player
+  (`static-equity`, `static-score`) and rows Wins, Losses (each player's are
+  the other's wins), Draws, Average score and Average spread (signed, "+3.2"
+  and "-3.2"); in each row the better value green and the worse red -- the
+  fewer losses green -- equal values (Draws) neither; no chart. Under the
+  first "Over N games, both games of every pair.", under the second just
+  "Over M games: both games of the K pairs whose games did not play
+  identically." The figures count games, not pairs.
+- [ ] **Expect** after it a **Significance Test** card with a "running" badge and
+  one sentence: "static-equity scores x% per game (95% interval a% to b%)." --
+  nothing in Elo anywhere on the card. Then "The test is not acted on until 50,000 pairs
+  are complete." and a bar: the interval shaded on a scale of player 1's
+  score, a dashed line at 50% and a mark at the score, labelled "even at
+  50%, static-equity's score x%". No W/L/D line of its own.
+- [ ] **Do** open **What does the interval mean?**. **Expect** the question
+  -- is one player better, at 95% confidence -- each pair one observation,
+  scored by player 1's result across its two games, that the interval stays
+  valid however often it is checked, and that the chance of naming a winner
+  between two equal players is at most about 5%.
+- [ ] **Expect** the pair-outcome table in the Significance Test card, a column per player:
+  "Won both", "Won one, drew one", "Even", each cell "count (share%)", the
+  higher of a row green and the lower red, "Even" the same for both; and a
+  line on how many pairs diverged.
+- [ ] On "dev games (positions saved)", **expect** one match-score table (no
+  divergent one), the explanation per game (0, ½ or 1), no "both games of
+  every pair" note, and no pair-outcome table.
 - [ ] On a job an admin has deactivated (A-8), **expect** "paused while the job
   is inactive: no pairs are being played, so the test is not moving".
+- [ ] On "tester no test" (A-7), **expect** the Match score card and no
+  Significance Test card, and settings rows "Pairs To Play 20" and
+  "Significance Test no" in place of the test's settings.
+- [ ] On a games or pairs job's **Manage** page, **expect** the same Settings,
+  Match score and (with a test) Significance Test cards after Progress, and no
+  one-line summary of the test in Progress.
 
 ### V-7 A finished job says why it finished
 
-A finished job shows a note under its title beginning "Finished <date>:".
+A finished job's Status card says, beside its badge, "Finished <date>:" and why.
 Make the jobs in [A-7](#a-7-create-jobs), [A-9](#a-9-finish-purge-and-delete)
 and [A-12](#a-12-a-leave-generation-job-start-to-finish), then check:
 
-- [ ] a job stopped at its cap: "it reached its cap of 20 pairs before the
-  SPRT decided (LLR …, bounds […])";
-- [ ] a job whose test decided: "the SPRT passed (H1 accepted) after N pairs:
-  LLR x reached the upper bound y" (or failed, and the lower bound);
+- [ ] a job stopped at its cap: "it reached its cap of 20 pairs before its
+  significance test decided: player 1 scored a% to b% per game, at 95%
+  confidence";
+- [ ] a job whose test decided: "its significance test found player 1 better
+  at 95% confidence after N pairs: player 1 scored a% to b% per game" (or player 2);
 - [ ] a job an admin forced: "an admin force-completed it before its test
   decided";
+- [ ] a job without a test: "it played the 20 pairs it was set to";
 - [ ] a leave-generation job: "its last generation was built".
 
 ### V-8 Opening-rack jobs: look up a rack
 
-Open "dev opening racks".
+Open "dev opening racks (english_ab)".
 
-- [ ] **Expect** "Racks analyzed N / 3,199,724", a **Look up a rack** box, and
-  under it "Analysed racks to try:" with ten racks as buttons.
-- [ ] **Do** click one. **Expect** it fills the box and shows its ranked moves
-  (#, Move, Score, Equity).
+- [ ] **Expect** a "racks settled" bar, and once it has finished (within
+  minutes) "Racks analyzed 8 / 8", Racks settled 8 and Settled without a
+  consensus figures, and "Each rack is analysed 2 to 5, until 80% agree on the
+  best move; …" (its player, `ab-sim-2ply-rack`, simulates; its Job settings
+  say Minimum Analyses Per Rack 2, Maximum Analyses Per Rack 5, Consensus %
+  80%, and no Racks in all or Rack size rows), a **Look up a rack** box, and
+  under it "Analysed racks to try:" with its racks as buttons, each of A and B
+  only.
+- [ ] **Do** click one. **Expect** it fills the box, says which move is best
+  in how many of its analyses, and shows each analysis's ranked moves
+  (Analysis, #, Move, Score, Equity, Win %, and P1-S, P1-BP, P2-S and P2-BP:
+  the reply's and the next turn's average score and bingo percentage, each
+  header explained on hover), every cell on one line.
 - [ ] **Do** type that rack in lower case and in another order. **Expect** the
   same moves.
 - [ ] **Do** search `QQQQQQQ`. **Expect** "No analysis stored for that rack
@@ -205,32 +262,89 @@ Open "dev opening racks".
 
 ### V-9 Leave-generation jobs
 
-Open "dev leave generation".
+Open "dev leave generation (english_ab)" as soon as dev.py has started: it
+finishes within minutes.
 
-- [ ] **Expect** "Generation 1 of 1 — target 1 occurrences per rack", "N tasks
-  and M games played this generation — live.", a bar of racks at target out of
-  3,199,724, and "Fewest occurrences so far: …" with when the rack figures
-  were last merged (or "not computed yet"), and a note that totals are merged
-  in batches.
+- [ ] While it runs, **expect** "Generation g of 6 — target … occurrences per
+  rack", "N tasks and M games played this generation — live.", a bar of racks
+  at target out of 8, and "Fewest occurrences so far: …" with when the rack
+  figures were last merged (or "not computed yet"), and a note that totals are
+  merged in batches. **Expect** a table of the six generations -- Generation,
+  Target per rack (100, 200, 500, 1,000, 1,000, 1,000), State ("closed",
+  "playing now" in bold, "to come"). Once done, "Finished …: its last
+  generation was built", and every generation "closed".
+- [ ] **Expect** a Settings card: Type "Leave Generation", Generations 6,
+  Target Per Rack "100 → 200 → 500 → 1,000 → 1,000 → 1,000", Games Per Task
+  1,000 and Racks Per Task, with no lexicon or wordmap row of
+  its own; then one column headed "Player", `ab-static-equity-no-rit` linking to its
+  config: search "static, by equity", Lexicon CSW21_ab -- and
+  its leaves, recorder, Uses Preendgame and Uses Endgame in grey, under
+  "Settings in grey are the player config's, and this job does not use
+  them." **Do** **All settings** on the player card. **Expect** Wordmap "yes"
+  and Rack Info Table "no", and Moves Recorded, Plies Recorded and Movegen
+  Margin grey too.
 
 ### V-10 Saved positions
 
-Open "dev game pairs: static equity vs 1-ply sim (positions saved)".
+Open "dev game pairs (first divergences saved)".
 
 - [ ] Signed out, **expect** a "Saved positions" card: "This job keeps the
-  position analysed on every turn of its games. Sign in to search them."
+  turn where each game pair's two games first diverged. Sign in to search
+  them."
   **Do** follow **Sign in**, as `dev-contributor-1`. **Expect** to land back on
   this job.
-- [ ] Signed in, **expect** the ten newest positions, each "Game G, turn T ·
-  rack … · after MOVE (score) · N moves ranked", its board as a CGP string,
-  and its ranked moves, with a **Win %** column on the simmer's turns.
-- [ ] **Do** **Load more**. **Expect** ten more.
-- [ ] **Do** search a rack shown on the page, typed in lower case and another
-  order. **Expect** only positions with that rack, and **Show all** to clear
-  the search.
+- [ ] On a job just activated that has saved nothing yet, **expect** "No
+  positions saved yet: one appears here as soon as the job has saved one.",
+  and a position to appear by itself, without a reload, once one is saved.
+- [ ] Signed in, **expect** one turn of a game pair: "Turn T of a game pair,
+  where the players first chose differently", then "Showing:" and a button
+  per player ("static-equity's move", "static-score's move", each with its
+  colour dot), the first pressed. Under them one game: "Game 1 of the pair ·
+  PLAYER to move", "rack … · after MOVE (score) · played PLAY (score) · N
+  moves ranked by static equity", the PLAY underlined in its player's colour;
+  its board -- premium squares (TW, DW, TL, DL and a star on the centre),
+  tiles each with a letter and a score (a blank a red lower-case letter with
+  none), the tiles MOVE placed outlined, the tiles PLAY puts down drawn
+  dashed in its player's colour, both racks and scores with **to move** on the
+  player whose rack it is, and no CGP text -- and its ranked moves, the one
+  played tinted and marked **played**. **Do** press the other button.
+  **Expect** "Game 2 of the pair · OTHER PLAYER to move", the same board and
+  rack, the other player's move drawn instead, and its own ranked moves, the
+  top differing from the first's. (A pairs job saving every turn toggles the
+  same way; a turn one game never reached alone has no buttons and says the
+  other game has no position at that turn; a simmer's turns add **Win %**,
+  **P1-S**, **P1-BP**, **P2-S** and **P2-BP** columns, the first two plies'
+  average score and bingo percentage, P1 the reply; a solved turn's depth is
+  **Solved Plies**.)
+- [ ] On a wide screen (1920 × 1080), **expect** each game's moves beside its
+  board with no gap between them, every cell on one line (a simmer's list
+  with an **Iters** column after Win %), and nothing scrolling sideways.
+  **Do** press **Random position** a few times. **Expect** the board the same
+  size every time. Narrower than 1280 pixels, **expect** the moves under the
+  board.
+- [ ] On "dev sim games (positions saved)" (`--sim-games-job`), whose simmers
+  infer, **expect** on a position past the first turn whose previous move was
+  not a pass, under its moves, "Inferred from MOVE: N possible leaves, average
+  equity E." and a table of up to ten leaves the opponent may have kept:
+  Leave, Draws ("count (share%)") and Equity.
+- [ ] On "dev games (positions saved)", **expect** one game's position: its
+  board with the previous move outlined and the move played drawn dashed in
+  green, both racks and scores under it, "played PLAY (score)" in the summary,
+  and the played move marked in the list.
+- [ ] **Do** **Random position** a few times. **Expect** another position
+  each time (now and then the same one again), the board, racks and scores agreeing with each other; on a turn 1
+  position an empty board and nothing outlined, and after an exchange
+  (`(exch …)`) or a pass nothing outlined either.
+- [ ] **Do** search the rack on the board, typed in lower case and another
+  order. **Expect** "Position 1 with the rack …, newest first" and a pair
+  whose first game (or, if only the second holds it, whose second) has that
+  rack -- a pair whose two games both hold it once, not twice; where there are more, **Next** and **Previous** step through
+  them.
 - [ ] **Do** search `QQQQQQQ`. **Expect** "No saved position has the rack
   QQQQQQQ."
-- [ ] On the other pairs jobs, **expect** no such section.
+- [ ] Narrow the window to phone width. **Expect** the board to shrink with
+  it, nothing scrolling sideways.
+- [ ] On "tester no test" (A-7), which saves no positions, **expect** no such section.
 
 ### V-11 Ratings
 
@@ -238,7 +352,7 @@ Open "dev game pairs: static equity vs 1-ply sim (positions saved)".
   explanation.
 - [ ] After [A-13](#a-13-rating-pools), **do** open **Ratings** → the pool.
   **Expect** "classic · english · standard15 — anchored at 1500", "Last fit
-  <time> (membership) over N pairs from 3 jobs, K iterations", and a warning
+  <time> (membership) over N pairs from 1 job, K iterations", and a warning
   if the fit did not converge.
 - [ ] **Expect** a dot plot with ±1 standard-error bars and the anchor in
   amber, an "All configs" table (rating, ± SE, pairs; the anchor tagged), and
@@ -251,23 +365,36 @@ Open "dev game pairs: static equity vs 1-ply sim (positions saved)".
 ### V-12 Player configs
 
 - [ ] **Do** open **Players**. **Expect** the four seeded configs, newest first:
-  name, how it searches ("1-ply sim, 100 iterations", "static, by score"),
-  lexicon CSW24, leaves, created.
-- [ ] **Do** open `sim-1ply`. **Expect** Search, Lexicon, Leaves, Win %,
-  Plays considered, Recorder ("best, 10 plays kept"), Wordmap "yes" and Rack
-  info table "yes", then every setting behind **All settings**, with a JSON
-  download.
+  name, how it searches ("static, by equity", "static, by score", "2-ply sim,
+  200 iterations"), lexicon (CSW24, or CSW21_ab for the `ab-` ones), leaves,
+  created.
+- [ ] **Do** open `static-equity`. **Expect** "static, by equity" beside its
+  name, and a table of Lexicon, Leaves, Sorted By, Move Recorder, Moves
+  Generated, Plies, Uses Inference "—", Uses Preendgame "no" and Uses Endgame
+  "no", and a JSON download; a simmer's (A-4) has the same rows, Uses
+  Inference "yes" or "no". **Do** press **All settings**. **Expect** every
+  setting in the same table, Lexicon still first; a simmer's with Win %
+  Model, Maximum Total Iterations and Stopping % among them.
 - [ ] **Do** open `/player-configs/00000000-0000-4000-8000-000000000000`.
   **Expect** "no such player config".
+- [ ] Signed out, **expect** no **New player config** button on **Players**; as
+  an admin, **expect** one beside the title, opening the player-config form.
 
 ### V-13 Users and contributors
 
 - [ ] **Do** open **Users**. **Expect** "Registered users": `dev` with an
   **admin** tag and the two contributor accounts, with tasks completed and when
   they joined — and no email addresses anywhere.
-- [ ] **Do** open **Contributors**. **Expect** all four workers ranked by tasks:
-  the two accounts by name, the two anonymous ones as "Anonymous · <16
-  characters>", never as their UUID.
+- [ ] **Do** open **Contributors**. **Expect** all four workers ranked by
+  compute time, most first, the column marked ↓: the two accounts by name, the
+  two anonymous ones as "Anonymous · <16 characters>", never as their UUID;
+  each with its compute time read as "5h 20m" or "3d 4h" (the exact hours on
+  hover), games, racks, tasks and last result.
+- [ ] **Do** click **Games**, then **Racks**, then **Tasks**. **Expect** the
+  list re-ranked by each, most first, the arrow moving with it; still all four.
+- [ ] At phone width, **expect** a "Rank by" row of the four columns above the
+  list and only the ranked column beside the name. **Do** choose **Games**.
+  **Expect** the games column in its place, and no sideways scroll.
 
 ### U-1 Register
 
@@ -275,8 +402,10 @@ Use a signed-out window.
 
 - [ ] **Do** open **Register** with a 2-character username. **Expect** "must be
   between 3 and 32 characters".
-- [ ] **Do** try `alice@` and `a..b@example.org` as the email. **Expect** "must
-  be a valid email address".
+- [ ] **Do** try `alice@`, `a@b` and `a..b@example.org` as the email. **Expect**
+  "must be a valid email address".
+- [ ] **Do** submit the form empty. **Expect** each error in red under its field
+  ("must not be empty" under Password) — and never the browser's own popup.
 - [ ] **Do** try the password `password123`. **Expect** "too weak — choose a
   longer, less predictable password". (The strength hint under the field is
   only a guide.)
@@ -311,6 +440,8 @@ Use a signed-out window.
   **Account**, not another site.
 - [ ] **Do** fail sign-in eleven times within a minute. **Expect** "too many
   requests".
+- [ ] **Do** **Sign in** with both fields empty. **Expect** "must not be empty"
+  in red under each, not the browser's popup.
 - [ ] **Do** **Sign out**. **Expect** the home page, with **Sign in** back in
   the header.
 
@@ -322,6 +453,8 @@ Use a signed-out window.
   alice.
 - [ ] **Do** the same with `nobody@example.org`. **Expect** the same message, and
   no mail.
+- [ ] **Do** the same with `a@b`. **Expect** "must be a valid email address" in
+  red under the field, and nothing sent.
 - [ ] **Do** open the link and set `password123`. **Expect** "too weak — …" and
   the link still usable. **Then** set a strong password. **Expect** the sign-in
   page; the old password fails and the new one works.
@@ -374,7 +507,8 @@ As alice:
 
 - [ ] **Do** open `/admin/jobs/new`. **Expect** to be sent to the home page.
 - [ ] **Expect** no **Admin** link, no **Manage** button on job pages, no **New
-  rating pool** button, and no membership controls on a pool.
+  job** button on **Jobs**, no **New player config** button on **Players**, no
+  **New rating pool** button, and no membership controls on a pool.
 
 ---
 
@@ -415,12 +549,14 @@ Do this last: it empties the database.
   no data-19990101.tgz …".
 - [ ] **Do** version `2026`. **Expect** "tarball_date must be YYYYMMDD". **Do**
   branch `../x`. **Expect** "that is not a git ref name …".
-- [ ] **Do** version `20000101`, branch `two-letter`. **Expect** "3 new, 0
-  changed, 0 already known." — `CSW21_ab.kwg`, `CSW21_ab.klv2` and
-  `english_ab.csv`. **Do** **Insert 3 rows**. **Expect** "Confirmed. 3 rows
-  inserted." and the three files in the list.
+- [ ] **Expect** the two-letter files the english_ab jobs were seeded on --
+  `CSW21_ab.kwg`, `CSW21_ab.klv2` and `english_ab.csv`, version `20000101`.
+  (Started without an `_ab` job flag, importing
+  `20000101` / `two-letter` gives "3 new, 0 changed, 0 already known." and
+  **Insert 3 rows** "Confirmed. 3 rows inserted.")
 - [ ] **Do** import `20000101` / `two-letter` again. **Expect** "0 new, 0
-  changed, 3 already known." and **Insert 0 rows**.
+  changed, 3 already known." and "No new data to insert.", with no **Insert**
+  button, and `input_data.import_nothing_new` in the audit log.
 - [ ] **Do** re-import the seeded version (its date is in the file list) on
   branch `main`, and leave the page while it downloads; come back. **Expect**
   the import picked up where it was, and every file "already known".
@@ -431,21 +567,42 @@ Do this last: it empties the database.
 
 ### A-4 Create player configs
 
-- [ ] **Do** **Player configs** → **New**: `tester-static`, recorder **best**,
-  the CSW24 lexicon and leaves, sort **equity**. **Expect** it listed, and on
-  the public **Players** page.
-- [ ] **Do** a simmer: tick **Simming player**, choose the win% model, 1 ply,
-  100 iterations. **Expect** it saved and described "1-ply sim, 100
+- [ ] **Do** **Player configs** → **New**: `tester-static`, **Move Recorder
+  (-r)** best, the CSW24 lexicon and leaves, **Sorted By (-s)** equity.
+  **Expect** it listed, and on the public **Players** page. **Expect** every
+  field named as the settings tables name it, in Title Case, with its MAGPIE
+  argument beside it, and no spinner arrows on any number box (the arrow keys
+  still step it).
+- [ ] **Do** `tester-static-all`: the same, with **Move Recorder (-r)** all
+  (A-7's opening-rack job uses it).
+- [ ] **Do** a simmer: tick **Simming Player**, choose the win% model, **Plies
+  (-pl)** 1, **Maximum Total Iterations (-i)** 100. **Expect** it saved and described "1-ply sim, 100
   iterations".
-- [ ] **Do** tick **Simming player** without a win% model. **Expect** the
+- [ ] **Do** tick **Simming Player** without a win% model. **Expect** the
   browser to insist on one.
 - [ ] **Do** set Stopping % to 100, then 0. **Expect** the browser to hold the
   form: "Stopping % must be above 0 and below 100."
-- [ ] **Do** **Show advanced options**. **Expect** **Use wordmap** and **Use
-  rack info table** ticked, with a note that a table costs a contributor about
-  1.9 GB.
+- [ ] **Do** **Show advanced options**. **Expect** **Wordmap (-w)** and **Rack
+  Info Table (-rit)** ticked, with a note that a table costs a contributor
+  about 1.9 GB, and **Word Info Table (-wit)** ticked too, with a note that
+  the server builds it once per lexicon; unticking it hides the note.
 - [ ] **Do** pair the CSW24 lexicon with the `FRA20` leaves. **Expect** "leaves
   … are not compatible with lexicon …".
+- [ ] **Do** look at **Endgame and Preendgame**. **Expect** **Uses
+  Preendgame** greyed out until **Uses Endgame** is ticked, and unticked
+  again when the endgame is.
+- [ ] **Do** `tester-solver`: static, tick **Uses Endgame** (**Endgame Plies
+  (-eplies1)** 6) and **Uses Preendgame** (**Preendgame Maximum Bag
+  (-pegbag1)** 2). **Expect** it saved and described "static, by equity ·
+  6-ply endgame · PEG ≤2"; on its page Uses Endgame "yes (6 plies)", Uses
+  Preendgame "yes (bag ≤ 2)", and with **All settings** the PEG Schedule
+  MAGPIE defaults to (32, 16, 8, 4, 2; Nested Caps 8, 4, 2; Nested Strides 1,
+  1, 5, 7).
+- [ ] **Do** **Show pre-endgame schedule** and type `4, x` as the **PEG
+  Schedule (-pegtopk1)**. **Expect** "PEG Schedule: "x" is not a whole
+  number." and nothing saved.
+- [ ] **Do** make a leave job with `tester-solver` as its player. **Expect** the
+  form to say it "solves endgames" before the submit.
 - [ ] **Expect** no way to edit a config: they never change once made.
 
 ### A-5 Delete a player config
@@ -454,56 +611,128 @@ Do this last: it empties the database.
 - [ ] **Do** delete `static-equity`. **Expect** "a job, a rating pool, a rating
   history or a clone references this player config".
 
-### A-6 Wordmaps and rack info tables
+### A-6 Wordmaps, rack info tables and word info tables
 
 - [ ] **Do** open **Derived data**. **Expect** the CSW24 wordmap and rack info
   table the seeded jobs use, "built", with size and SHA-256.
 - [ ] After making a job on a new lexicon (A-12), **expect** its wordmap
   "pending", then "built" within about fifteen seconds, and the job handing
   out work only then.
+- [ ] **Do** keep **Derived data** open, with nothing building, while you make
+  that job in another tab. **Expect** its new rows to appear within about ten
+  seconds, without a reload.
+- [ ] **Do** make a player config, leaving **Word Info Table (-wit)** ticked, and a
+  games job with it. **Expect** a "Word info table" row named for the lexicon
+  on **Derived data** and on the job's page, built within seconds, and the
+  config's page to say "Word Info Table: yes" under **All settings**.
 
 ### A-7 Create jobs
 
 **New job**, then **Create job**; each lands on the job's admin page,
-**inactive**, with no allocation.
+**inactive**, with no allocation. The fields are named as the settings tables
+name them (**Job Name**, **Job Type**, **Letter Distribution**, **Board**,
+**Pairs Per Task**, …), and the job types read "Opening Rack Analysis",
+"Games", "Game Pairs" and "Leave Generation". The letter distribution and
+board start on "Choose…": pick `english` and `standard15` each time.
 
-- [ ] **Game pairs** "tester cap": `static-equity` vs `static-score`, 10 pairs
-  per batch, min before SPRT 20, hard cap 20. It finishes at its cap (V-7).
-- [ ] **Game pairs** "tester decided": `static-equity` vs `static-score`, 10 per
-  batch, min before SPRT 0, cap 5,000, Elo low 0, Elo high 50. Its test should
-  decide once it runs (V-7); if it has not after an hour, note how far the LLR
-  got.
-- [ ] **Games** "tester positions": the same two players, 2 per batch, cap 20,
-  **Save the positions played** ticked. **Expect** the batch's maximum to drop
-  to 1,000, and, once it runs, a saved-positions section on its page (V-10).
+- [ ] **Game Pairs** "tester no test": `static-equity` vs `static-score`, 10
+  pairs per task. **Expect** **Significance Test** unticked, no Confidence % or
+  Minimum Pairs fields, and the target labelled "Pairs To Play": set it to 20.
+  It finishes once it has played them (V-7).
+- [ ] **Game Pairs** "tester cap": the same, with **Significance Test** ticked:
+  **expect** Confidence % (95) and Minimum Pairs to appear and the target to
+  read "Maximum Pairs". Minimum Pairs 20, Maximum Pairs 20. It finishes at
+  its cap (V-7).
+- [ ] **Game Pairs** "tester decided": `static-equity` vs `static-score`, 10 per
+  task, **Significance Test** ticked, Confidence % 95, Minimum Pairs 100, Maximum
+  Pairs 5,000. Equity against score is a large difference, so its test should
+  decide for `static-equity` once it runs (V-7); if it has not after an hour,
+  note where its interval got to.
+- [ ] **Games** "tester positions": the same two players, 2 per task, 20 Games
+  To Play, **Position Recorder** ticked. **Expect** the batch's maximum to
+  drop to 1,000, and, once it runs, a saved-positions section on its page
+  (V-10), and no **Only Where Each Pair First Diverges** option: a games job
+  has no pairs.
+- [ ] **Game Pairs** "tester divergences": `static-equity` vs `static-score`, 5
+  pairs per task, 50 Pairs To Play, **Position Recorder** and then **Only
+  Where Each Pair First Diverges** ticked (it appears only once recording is).
+  **Expect** its settings to say "Position Recorder: yes (first divergences)", and
+  on its page each saved position to be a pair's two games at one turn, the
+  same board and rack, each player to move in one, their ranked moves
+  differing at the top; **Random position** never shows a lone game.
 - [ ] **Games**: **expect** the batch field to step by 2, and the browser to
   refuse an odd number.
-- [ ] **Opening rack analysis** with `static-equity` (recorder best, 10 plays
+- [ ] **Opening Rack Analysis** with `static-equity` (recorder best, 10 plays
   kept). **Expect** a warning that only one play per rack would be stored, and
-  creation refused; with `static-equity-all` it is accepted.
+  creation refused; with `tester-static-all` (A-4) it is accepted.
+  **Expect** under **Analyses Per Rack** "One: tester-static-all is static, …"
+  and no number boxes; on its admin page, a Consensus card saying its player
+  is static, with no consensus to change.
+- [ ] **Opening Rack Analysis** "tester consensus" on english_ab with the
+  seeded simmer `ab-sim-2ply-rack`: **Minimum Analyses Per Rack** 2,
+  **Maximum Analyses Per Rack** 3, **Consensus %** 100. **Expect** the note
+  under them to say each rack is analysed at least 2 times until 100% agree,
+  or 3 times. **Do** set the maximum to 1 first. **Expect** the Consensus %
+  box disabled and "One analysis per rack." Created and activated, **expect**
+  its Job settings to say Minimum Analyses Per Rack 2, Maximum Analyses Per
+  Rack 3 and Consensus % 100%, Racks analyzed / Racks settled / Settled
+  without a consensus figures, and, once it finishes, every one of its 8
+  racks settled. **Do** look up one of its racks. **Expect** "MOVE is the best
+  move in k of n analyses (…%)" and an Analysis column numbering each
+  analysis's ranked moves, each with its Win % and P1-S…P2-BP.
+- [ ] **Do** change "tester consensus" once it has completed, on its
+  **Manage** page's **Consensus** card: the same three boxes, filled with its
+  settings, **Save** disabled until one changes. Set the minimum above the
+  maximum. **Expect** "The most analyses must be at least the fewest, and at
+  most 100." Set Minimum 3 and Maximum 4. **Expect** "Saved: N racks
+  unsettled, so the job reopened." -- active again at its allocation, any
+  final export of it now a snapshot, and its Job settings saying 3 and 4 -- or,
+  with the other active jobs leaving no room for its allocation, "…so the job
+  reopened, inactive — the other active jobs allocate …%: free some and
+  activate it." The audit log has `job.consensus_changed` ("min 2 -> 3, max 3
+  -> 4; N racks unsettled") and `job.activated` (or `job.deactivated`). Once
+  it has completed again, set Consensus % to 60. **Expect** "Saved: the job is
+  completed, with 0 racks unsettled." Lowering the settings on an active job
+  until no rack is unsettled completes it.
+- [ ] **Do** leave the letter distribution on "Choose…" and submit. **Expect**
+  the browser to hold the form on that field.
 - [ ] **Do** clear a number box and submit. **Expect** "Fill in every setting: …
   is empty."
-- [ ] **Do** set Elo high below Elo low. **Expect** "must be a finite number
-  greater than elo_low".
+- [ ] **Do** tick **Significance Test** and set Confidence % to 100. **Expect** the
+  browser to hold the form (99.99 is the most it takes); sent anyway, the
+  server refuses it: "must be above 50 and below 100".
 
 ### A-8 Activate, share out and deactivate
 
-The six seeded jobs hold 96% between them.
+The seeded games and pairs jobs hold 50% between them once the two english_ab
+jobs have finished (100% while those run).
 
-- [ ] **Do** activate "tester cap" at 10%. **Expect** "the other active jobs
-  already allocate 96% — 4% is the most this job can take".
-- [ ] **Do** deactivate "dev leave generation" (its **Manage** page →
-  **Deactivate**). **Expect** "Job deactivated." and status **inactive**; its
-  public page no longer says "live".
-- [ ] **Do** activate "tester cap" at 16%. **Expect** "Job activated.", "Now:
-  16%", and the workers taking its tasks.
+- [ ] **Do** activate "tester cap" at 60%. **Expect** "the other active jobs
+  already allocate 50% — 50% is the most this job can take".
+- [ ] **Do** deactivate "dev games (positions saved)" (its **Manage** page → **Deactivate**).
+  **Expect** "Job deactivated." and **inactive** in the Status card with
+  "Paused: no worker is offered its tasks …", the same cards as the public
+  page's; its public page no longer says "live".
+- [ ] **Do** activate "tester cap" at 25%. **Expect** "Job activated.", "Now:
+  25%", and the workers taking its tasks.
 - [ ] **Do** type 150, then 2.5, and **Activate**. **Expect** "Enter a
   whole-number allocation from 0 to 100."
 - [ ] **Do** change an active job's share and **Activate** again. **Expect** the
   new share taken.
-- [ ] **Do** deactivate every job but one, at 16%. **Expect** that job to get
+- [ ] **Do** deactivate every job but one, at 25%. **Expect** that job to get
   all the work: shares weigh only against the other active jobs.
-- [ ] **Do** create a game-pairs job with **Min MAGPIE version** `9.9.9`, and
+- [ ] **Do** open **Allocation** (admin tabs). **Expect** every active and
+  inactive job, none completed, each with its status, its share now and a box
+  set to it (0 for an inactive job), the total "N% of 100% allocated", and
+  **No changes** disabled. **Do** set the seeded games job to 0 and "tester
+  cap" to its share plus the games job's. **Expect** the total unchanged, the
+  two rows in bold and **Save 2 changes**. **Do** raise one to push the total
+  over 100. **Expect** the total red, "lower some jobs before saving", and the
+  save disabled. Put it back and **Save**. **Expect** "Saved: 2 jobs changed.",
+  the games job inactive and "tester cap" at its new share, and in the audit
+  log `job.deactivated` and `job.allocation_changed` ("25% -> 75%").
+- [ ] **Do** **Share equally**. **Expect** 100% split among the jobs above 0%.
+- [ ] **Do** create a game-pairs job with **Oldest MAGPIE** `9.9.9`, and
   make it the only active one. **Expect** every worker told its MAGPIE is too
   old and stopping. Deactivate it and restart the workers.
 
@@ -524,15 +753,21 @@ The six seeded jobs hold 96% between them.
   **Expect** that tab on the jobs list, without the job, and the other saying
   "This job no longer exists." with every action disabled.
 
-### A-10 Export a finished job
+### A-10 Export a job
 
 - [ ] **Do** **Export results** on "tester cap". **Expect** "Building…", then
-  "N rows · N MB · download · SHA-256 of the .gz …", with links valid for an
-  hour.
+  "Final results · N rows · N MB · download · SHA-256 of the .gz …", with links
+  valid for an hour.
 - [ ] **Do** download. **Expect** a gzipped file of one JSON object per line.
-- [ ] **Do** export "tester positions" once it has completed. **Expect** a
-  second download, of its positions.
-- [ ] **Expect** no export card on an active or inactive job.
+- [ ] **Do** **Export a snapshot** on an active job. **Expect** "Snapshot as of
+  <time> — job still running" in amber, with a download. **Do** it again a
+  minute later. **Expect** a later time and more rows.
+- [ ] **Do** export "tester positions" while it runs, then again once it has
+  completed. **Expect** the first a snapshot with its positions as a second
+  download, and the button on the completed job to read **Build the final
+  export** until the final one is built, then "Final results".
+- [ ] **Do** **Export a snapshot** on an active leave-generation job. **Expect**
+  the note that rack totals are as of the last merge.
 
 ### A-11 Data gaps
 
@@ -550,14 +785,22 @@ The six seeded jobs hold 96% between them.
 On the two-letter data imported in A-3: eight possible racks, so a generation
 closes in seconds rather than never.
 
-- [ ] **Do** **New job**: Leave generation, "tester leaves", letter distribution
-  `english_ab`, board `standard15`, lexicon `CSW21_ab`, games per task 1,000,
-  generations 3, occurrences per rack 100, racks per task 50. **Expect**
-  Redundancy greyed out: leave generation runs at redundancy 1.
-- [ ] **Do** make room (A-8) and activate it at 16%. **Expect** its wordmap built
+- [ ] **Do** **Player configs** → **New**: `tester-ab`, **Move Recorder (-r)**
+  best, the `CSW21_ab` lexicon and leaves, **Sorted By (-s)** equity, static,
+  and **Rack Info Table (-rit)** unticked under **Show advanced options**.
+- [ ] **Do** **New job**: Leave Generation, "tester leaves", letter distribution
+  `english_ab`, board `standard15`, player config `ab-sim-2ply-rack`.
+  **Expect** a red "ab-sim-2ply-rack simulates 2 plies and asks for a rack info table; leave
+  generation plays statically on equity, without a rack info table or endgame
+  solving." (Submitted anyway, the server refuses it the same way.) **Do** pick `tester-ab`, games per task 1,000, racks per task 50,
+  occurrences per rack per generation "100, 200, 300". **Expect** "3
+  generations: 100 → 200 → 300." under the targets. (**Do** type "100, 0" there first. **Expect** a red
+  "Every target must be between 1 and 1,000,000, not 0.")
+- [ ] **Do** make room (A-8) and activate it at 25%. **Expect** its wordmap built
   on **Derived data** within about fifteen seconds (A-6).
 - [ ] **Expect**, on its public page, the generations closing one after another
-  — "Generation 2 of 3", racks at target "8 / 8" — and the job completed
+  — "Generation 2 of 3 — target 200 occurrences per rack", "Targets by
+  generation: 100, 200, 300.", racks at target "8 / 8" — and the job completed
   within about a minute: "its last generation was built".
 - [ ] **Do** **Merge progress now** on its **Manage** page. **Expect** "Merged N
   staged results into M racks." (N may be 0 once it has finished.)
@@ -566,20 +809,33 @@ closes in seconds rather than never.
 - [ ] **Do** **Force rebuild** and confirm. **Expect** every generation
   rewritten. (On an active job it is refused: "deactivate the job before
   forcing a rebuild …".)
-- [ ] **Do** export it (A-10). **Expect** a download.
+- [ ] **Do** export it ([A-10](#a-10-export-a-job)). **Expect** a download.
 
 ### A-13 Rating pools
 
+- [ ] **Do** **New rating pool**. **Expect** the letter distribution and board
+  layout on "Choose…", not filled in.
 - [ ] **Do** **New rating pool**: "tester pool", classic, the `english`
   distribution and `standard15` the seeded jobs use, anchor `static-equity` at
-  1500, with `static-score` and `sim-1ply` ticked. **Expect** the pool's page,
-  fitted, all three rated from the three seeded pairs jobs.
+  1500, with `static-score` ticked. **Expect** the pool's page, fitted, both
+  rated from the seeded pairs job.
 - [ ] **Do** a second pool with nothing ticked. **Expect** "Never computed."
   until a member is added.
-- [ ] **Do** **Remove** `sim-1ply`. **Expect** it gone and the others refitted.
-  **Add** it back. **Expect** every rating to move: its games are evidence for
-  everyone. **Expect** no Remove on the anchor.
+- [ ] **Do** **Remove** `static-score`. **Expect** it gone and the anchor left
+  alone, with nothing to be rated against. **Add** it back. **Expect** it rated
+  again. **Expect** no Remove on the anchor.
 - [ ] **Do** **Recompute**. **Expect** "Last fit … (manual)".
+- [ ] **Do** under **Anchor**, pick `static-score` and 1600, **Save**. **Expect**
+  "anchored at 1600", "Last fit … (anchor)", `static-score` marked anchor at
+  1600.0 and every other rating moved by the same amount. **Expect**
+  `static-equity` now has a **Remove** button.
+- [ ] **Do** pick a config that is not a member as the anchor (from "Other
+  player configs") and **Save**. **Expect** it listed as a member and the
+  anchor.
+- [ ] **Do** **Delete pool** on the second pool, and confirm. **Expect** the
+  ratings list, without it.
+- [ ] **Expect** no Anchor card or Delete button when signed out or as a
+  non-admin.
 
 ### A-14 Delete a user
 
@@ -610,8 +866,9 @@ closes in seconds rather than never.
   recorded." in red: nothing backs up a local stack.
 - [ ] **Do** **Audit log**. **Expect** everything done above, newest first:
   `job.created`, `job.activated`, `job.deactivated`, `job.completed`,
-  `job.purged`, `job.deleted`, `job.export_started`,
+  `job.consensus_changed`, `job.purged`, `job.deleted`, `job.export_started`,
   `input_data.import_staged`, `input_data.import_confirmed`,
+  `input_data.import_nothing_new`,
   `rating_pool.created`, `rating_pool.member_added`, `user.deleted`,
   `worker.banned`, `worker.unbanned` and more.
 - [ ] **Do** filter by action `job.activated`, then by target type `job`.
@@ -677,7 +934,7 @@ curl -s "$SITE/api/worker/client-version"
 ```bash
 curl -s -o /dev/null -w '%{http_code}\n' "$SITE/api/me"                     # 401: not signed in
 curl -s -o /dev/null -w '%{http_code}\n' "$SITE/api/admin/player-configs"   # 401
-curl -s -o /dev/null -w '%{http_code}\n' "$SITE/api/jobs/$JOB/positions"    # 401: signed-in users only
+curl -s -o /dev/null -w '%{http_code}\n' "$SITE/api/jobs/$JOB/positions/random"  # 401: signed-in users only
 ```
 
 ### A signed-in user
@@ -712,13 +969,17 @@ curl -s -b "$JAR" -H "X-CSRF-Token: $CSRF" -H 'Content-Type: application/json' \
 curl -s -b "$JAR" "$SITE/api/me/api-keys"
 ```
 
-**Search a job's saved positions** (the seeded "(positions saved)" job). Up to
-20 a page, newest first; `next_cursor`, when present, fetches the next page
-(`&cursor=…`), and `&rack=` keeps one rack.
+**A job's saved positions** (the seeded "(positions saved)" job): one at
+random, or those with one rack, up to 20 a page, newest first;
+`next_cursor`, when present, fetches the next page (`&cursor=…`). The board
+they are drawn on is public.
 
 ```bash
-curl -s -b "$JAR" "$SITE/api/jobs/$JOB/positions?per_page=5" \
+curl -s -b "$JAR" "$SITE/api/jobs/$JOB/positions/random" \
+  | jq '{game_index, turn_number, rack, position, previous_move, best: .moves[0].move}'
+curl -s -b "$JAR" "$SITE/api/jobs/$JOB/positions?rack=aeinrst&per_page=5" \
   | jq '.items[] | {game_index, turn_number, rack, best: .moves[0].move}'
+curl -s "$SITE/api/jobs/$JOB/board" | jq '{start, first_row: .squares[0], letters: .letters[:3]}'
 ```
 
 **An admin route, as a user**, is `403`:
@@ -750,19 +1011,34 @@ curl -s -b "$JAR" -H "X-CSRF-Token: $CSRF" -H 'Content-Type: application/json' \
 
 **Create a job, activate it, deactivate it.** Created inactive (`201`);
 activation sets the share (`200`), and a share that would take the active
-jobs past 100% is `409` — with the seed's six jobs active, 4% is the most
-left.
+jobs past 100% is `409` — with the seed's games and pairs jobs active, 50% is
+the most left. This one runs no significance test and plays its 20 pairs;
+`"test_enabled": true` turns the test on, with `min_pairs` then required (at
+least 1, at most `max_pairs`) and `confidence_pct` optional (95 by default,
+strictly between 50 and 100), and `min_pairs` or `confidence_pct` sent without
+it is a `400` naming each.
 
 ```bash
 curl -s -b "$JAR" -H "X-CSRF-Token: $CSRF" -H 'Content-Type: application/json' \
   -d '{"name":"cli test","job_type":"game_pairs","variant":"classic",
        "letterdist_id":"<letterdist id>","layout_id":"<layout id>",
        "player1_config_id":"<config id>","player2_config_id":"<config id>",
-       "pairs_per_batch":10,"min_pairs":20,"max_pairs":20}' \
+       "pairs_per_batch":10,"max_pairs":20}' \
   "$SITE/api/admin/jobs" | jq '.job.id'
 curl -s -b "$JAR" -H "X-CSRF-Token: $CSRF" -H 'Content-Type: application/json' \
   -d '{"allocation":4}' "$SITE/api/admin/jobs/$JOB/activate"
 curl -s -b "$JAR" -H "X-CSRF-Token: $CSRF" -X POST "$SITE/api/admin/jobs/$JOB/deactivate"
+```
+
+**Change an opening-rack job's consensus.** Only the fields sent change; the
+answer is the job, its settings, how many racks they leave unsettled, and
+whether a completed job reopened (and, reopened inactive, why). A job of
+another type, or settings creation would refuse, is a `400`.
+
+```bash
+curl -s -b "$JAR" -H "X-CSRF-Token: $CSRF" -H 'Content-Type: application/json' \
+  -X PATCH -d '{"min_results_per_rack":2,"max_results_per_rack":3,"consensus_pct":80}' \
+  "$SITE/api/admin/jobs/<opening-rack job id>/consensus" | jq '{unsettled_racks, reopened, reopened_inactive_reason, status: .job.status}'
 ```
 
 **Operational health**: the fleet, the derived-file queue, the backups, and
@@ -805,8 +1081,8 @@ These differ on the real site, and are checked there (README, "Deploying"):
 - Pages are HTTPS only: a page asked for over plain HTTP redirects, and the API
   over plain HTTP answers `426` rather than redirecting.
 - `/api/dev/login` does not exist: `404`.
-- Wordmaps and rack info tables are built by a scheduled task every five
-  minutes, not within seconds.
+- Wordmaps, rack info tables and word info tables are built by a scheduled
+  task every five minutes, not within seconds.
 - Backups run nightly and **Backups** shows them; alarms mail on failure.
 - Contributors connect from other machines.
 

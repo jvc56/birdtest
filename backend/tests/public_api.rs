@@ -130,11 +130,13 @@ async fn game_result_at(
     task
 }
 
+/// An anonymous worker with `tasks_completed` tasks finished, each held a
+/// second.
 async fn anon_worker(db: &TestDb, tasks_completed: i64) -> Uuid {
     let uuid = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO anonymous_workers (uuid, tasks_completed, last_completed_at)
-         VALUES ($1, $2, CASE WHEN $2 > 0 THEN now() END)",
+        "INSERT INTO anonymous_workers (uuid, tasks_completed, compute_ms, last_completed_at)
+         VALUES ($1, $2, $2 * 1000, CASE WHEN $2 > 0 THEN now() END)",
     )
     .bind(uuid)
     .bind(tasks_completed)
@@ -147,7 +149,7 @@ async fn anon_worker(db: &TestDb, tasks_completed: i64) -> Uuid {
 async fn opening_rack_job(db: &TestDb, racks_per_batch: i32) -> Uuid {
     let admin = db.user(&format!("admin{}", Uuid::new_v4().simple()), true).await;
     let player = db.static_player("solver", admin).await;
-    let job = db.bare_job("opening_rack", 1, admin).await;
+    let job = db.bare_job("opening_rack", admin).await;
     sqlx::query(
         "INSERT INTO job_opening_rack_config
              (job_id, player_config_id, racks_per_batch, rack_size, total_racks)
@@ -174,7 +176,7 @@ async fn opening_rack_job(db: &TestDb, racks_per_batch: i32) -> Uuid {
 async fn a_jobs_full_configuration_is_public() {
     let db = TestDb::new().await;
     let app = birdtest::app(db.state().await);
-    let job = db.games_job(1, 10).await;
+    let job = db.games_job(10).await;
 
     let (status, config) = send(&app, get_request(&format!("/api/jobs/{job}/config"), &[])).await;
     assert_eq!(status, StatusCode::OK, "{config}");
@@ -184,6 +186,8 @@ async fn a_jobs_full_configuration_is_public() {
     assert_eq!(config["games"]["unit"], "game");
     assert_eq!(config["games"]["max_units"], 1_000_000);
     assert_eq!(config["games"]["per_batch"], 10);
+    assert_eq!(config["games"]["test_enabled"], true, "{config}");
+    assert_eq!(config["games"]["confidence_pct"], 95.0, "{config}");
     let players = config["players"].as_array().unwrap();
     assert_eq!(players.len(), 2, "{config}");
     assert_eq!(players[0]["role"], "player 1");
@@ -214,7 +218,7 @@ async fn a_jobs_full_configuration_is_public() {
 async fn player_configs_are_public() {
     let db = TestDb::new().await;
     let app = birdtest::app(db.state().await);
-    let job = db.games_job(1, 10).await;
+    let job = db.games_job(10).await;
     let (p1, p2): (Uuid, Uuid) = sqlx::query_as(
         "SELECT player1_config_id, player2_config_id FROM job_game_config WHERE job_id = $1",
     )
@@ -244,7 +248,7 @@ async fn player_configs_are_public() {
     assert!(config["lexicon"].as_str().unwrap().starts_with("NWL"), "{config}");
     assert!(config["created_at"].is_string(), "{config}");
     // Every setting a job's config shows is here, and nothing about who made it.
-    for key in ["use_wordmap", "use_rit", "movegen_margin", "num_plays", "sort_strategy", "leaves"] {
+    for key in ["use_wordmap", "use_rit", "use_wit", "movegen_margin", "num_plays", "sort_strategy", "leaves"] {
         assert!(config.get(key).is_some(), "{key} missing: {config}");
     }
     assert!(config.get("created_by").is_none() && config.get("role").is_none(), "{config}");
@@ -262,8 +266,8 @@ async fn the_job_list_filters_by_status() {
     let db = TestDb::new().await;
     let app = birdtest::app(db.state().await);
     let admin = db.user("root", true).await;
-    let active = db.bare_job("games", 1, admin).await;
-    let inactive = db.bare_job("games", 1, admin).await;
+    let active = db.bare_job("games", admin).await;
+    let inactive = db.bare_job("games", admin).await;
     sqlx::query("UPDATE jobs SET status = 'inactive' WHERE id = $1")
         .bind(inactive)
         .execute(&db.pool)
@@ -284,7 +288,7 @@ async fn the_job_list_filters_by_status() {
 #[tokio::test]
 async fn the_job_list_flags_a_stalled_job() {
     let db = TestDb::new().await;
-    db.games_job(1, 2).await;
+    db.games_job(2).await;
     let app = birdtest::app(db.state().await);
     let stalled = |body: &serde_json::Value| body["items"][0]["stalled"].clone();
 
@@ -333,7 +337,7 @@ async fn the_job_list_paginates_and_clamps_its_page_size() {
     let admin = db.user("root", true).await;
     let mut jobs = Vec::new();
     for day in 1..=5 {
-        let job = db.bare_job("games", 1, admin).await;
+        let job = db.bare_job("games", admin).await;
         sqlx::query("UPDATE jobs SET created_at = $2::timestamptz WHERE id = $1")
             .bind(job)
             .bind(format!("2026-01-0{day}T00:00:00Z"))
@@ -369,7 +373,7 @@ async fn the_job_list_paginates_and_clamps_its_page_size() {
 }
 
 /// A-PUBLIC-2: each job type's detail carries its own stats block and no
-/// other -- games and pairs the SPRT block in their own unit, an opening-rack
+/// other -- games and pairs the match-test block in their own unit, an opening-rack
 /// job its rack progress, a leave job its generation -- and an unknown job is
 /// a 404, for the detail and the stream alike.
 #[tokio::test]
@@ -378,8 +382,8 @@ async fn job_detail_carries_the_stats_block_of_its_type() {
     let app = birdtest::app(db.state().await);
     let admin = db.user("root", true).await;
 
-    let games = db.games_job(1, 2).await;
-    let pairs = db.bare_job("game_pairs", 1, admin).await;
+    let games = db.games_job(2).await;
+    let pairs = db.bare_job("game_pairs", admin).await;
     let p1 = db.static_player("p1", admin).await;
     let p2 = db.static_player("p2", admin).await;
     sqlx::query(
@@ -394,15 +398,16 @@ async fn job_detail_carries_the_stats_block_of_its_type() {
     .await
     .unwrap();
     let racks = opening_rack_job(&db, 6).await;
-    let leave = db.bare_job("leave_generation", 1, admin).await;
+    let leave = db.bare_job("leave_generation", admin).await;
     let kwg = db.input_data("kwg", "CSW24").await;
+    let leave_player = db.leave_player(kwg, true, admin).await;
     sqlx::query(
         "INSERT INTO job_leave_config
-             (job_id, kwg_id, num_iterations, generation_count, target_rack_count, racks_per_task)
-         VALUES ($1, $2, 100, 3, 1000, 50)",
+             (job_id, player_config_id, num_iterations, target_rack_counts, racks_per_task)
+         VALUES ($1, $2, 100, ARRAY[100, 500, 1000], 50)",
     )
     .bind(leave)
-    .bind(kwg)
+    .bind(leave_player)
     .execute(&db.pool)
     .await
     .unwrap();
@@ -431,11 +436,31 @@ async fn job_detail_carries_the_stats_block_of_its_type() {
     assert_eq!(pairs["games"]["pentanomial"], json!([0, 0, 0, 0, 0]));
     assert_eq!(pairs["games"]["min_units"], 10);
     assert_eq!(pairs["games"]["max_units"], 20);
+    // A config row that says nothing of the test runs none, and reports none:
+    // `games_job` asks for one, this pairs job does not.
+    assert_eq!(games["games"]["test"]["status"], "running", "{games}");
+    assert_eq!(pairs["games"]["test"], json!(null), "{pairs}");
     let (_, racks) = send(&app, get_request(&format!("/api/jobs/{racks}"), &[])).await;
-    assert_eq!(racks["opening_racks"], json!({ "racks_analyzed": 0, "racks_total": 100 }));
+    assert_eq!(
+        racks["opening_racks"],
+        json!({ "racks_analyzed": 0, "racks_settled": 0, "racks_without_consensus": 0, "racks_total": 100 })
+    );
+    let (_, settings) = send(&app, get_request(&format!("/api/jobs/{leave}/config"), &[])).await;
+    assert_eq!(settings["leave_generation"]["target_rack_counts"], json!([100, 500, 1000]));
+    // The lexicon and wordmap setting are the player's, shown with it.
+    let players = settings["players"].as_array().unwrap();
+    assert_eq!(players.len(), 1, "{settings}");
+    assert_eq!(players[0]["role"], "player");
+    assert_eq!(players[0]["id"], json!(leave_player));
+    assert_eq!(players[0]["lexicon"], "CSW24");
+    assert_eq!(players[0]["use_wordmap"], true);
+    assert!(settings["leave_generation"].get("lexicon").is_none(), "{settings}");
+    assert!(settings["leave_generation"].get("use_wordmap").is_none(), "{settings}");
     let (_, leave) = send(&app, get_request(&format!("/api/jobs/{leave}"), &[])).await;
     assert_eq!(leave["leave_generation"]["current_generation"], 1);
     assert_eq!(leave["leave_generation"]["generation_count"], 3);
+    assert_eq!(leave["leave_generation"]["target_rack_count"], 100, "generation 1's target");
+    assert_eq!(leave["leave_generation"]["target_rack_counts"], json!([100, 500, 1000]));
     assert_eq!(leave["job"]["lexicon"], "CSW24");
 
     let unknown = Uuid::new_v4();
@@ -455,7 +480,7 @@ async fn job_detail_carries_the_stats_block_of_its_type() {
 async fn the_results_feed_paginates_and_filters_without_counting() {
     let db = TestDb::new().await;
     let app = birdtest::app(db.state().await);
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     let alice = db.user("alice", false).await;
     let worker = anon_worker(&db, 2).await;
     let mut newest_first = Vec::new();
@@ -675,8 +700,10 @@ async fn rack_lookup_finds_an_analysed_rack() {
     assert_eq!(
         body["items"],
         json!([
-            { "rank": 1, "move": "8G WUZ", "score": 30, "equity": 32.5 },
-            { "rank": 2, "move": "8H ZA", "score": 22, "equity": 21.0 },
+            { "analysis": 1, "rank": 1, "move": "8G WUZ", "score": 30, "equity": 32.5,
+              "iterations": null, "win_percentage": null, "plies": [] },
+            { "analysis": 1, "rank": 2, "move": "8H ZA", "score": 22, "equity": 21.0,
+              "iterations": null, "win_percentage": null, "plies": [] },
         ]),
         "{typed} -> {}",
         racks[1]
@@ -700,9 +727,170 @@ async fn rack_lookup_finds_an_analysed_rack() {
     assert_eq!(body["message"], "no such job");
 }
 
-/// A-PUBLIC-4b: a games job's captured positions are searchable by a signed-in
-/// user -- newest first, a page at a time, each with its ranked moves, and by
-/// rack however it is typed -- and by nobody signed out. A job type that
+/// A games job with `capture_positions` on.
+async fn capturing_games_job(db: &TestDb) -> Uuid {
+    let job = db.games_job(2).await;
+    sqlx::query("UPDATE job_game_config SET capture_positions = true WHERE job_id = $1")
+        .bind(job)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    job
+}
+
+/// A-PUBLIC-4g: a simulated position's moves show their win percentage and
+/// their first two plies' statistics, however many more the job recorded, and
+/// the position what its player inferred of the opponent's leave first. A
+/// position that claims an inference it cannot have -- on a static analysis,
+/// on a game's first turn, with eleven leaves, or leaves out of order -- is
+/// refused.
+#[tokio::test]
+async fn a_simulated_position_shows_its_plies_and_its_inference() {
+    let db = TestDb::new().await;
+    let state = db.state().await;
+    let cfg = state.cfg.clone();
+    let app = birdtest::app(state);
+    let job = capturing_games_job(&db).await;
+    // Recording four plies, so the read is what keeps it to two.
+    sqlx::query(
+        "UPDATE player_configs SET num_plies_recorded = 4
+         WHERE id = (SELECT player1_config_id FROM job_game_config WHERE job_id = $1)",
+    )
+    .bind(job)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let plies = json!([
+        { "ply": 0, "bingo_percentage": 12.5, "average_score": 31.25 },
+        { "ply": 1, "bingo_percentage": 7.5, "average_score": 28.5 },
+        { "ply": 2, "bingo_percentage": 5.0, "average_score": 30.5 },
+    ]);
+    let leaves = |n: usize| -> Vec<serde_json::Value> {
+        (0..n).map(|i| json!({ "leave": "EIR", "draws": 100 - i as i64, "equity": 18.25 })).collect()
+    };
+    let inference = json!({
+        "num_leaves": 40, "total_draws": 900, "average_equity": 12.5,
+        "leaves": [
+            { "leave": "EIR", "draws": 120, "equity": 18.25 },
+            { "leave": "AET", "draws": 80, "equity": 15.0 },
+        ],
+    });
+    let position = |turn: i64, analysis: &str, inference: Option<serde_json::Value>| {
+        let simmed = analysis == "sim";
+        let mut position = json!({
+            "game_index": 0, "turn_number": turn, "rack": "AABCDE?",
+            "position": format!("cgp-{turn}"), "played_move": "8D BACCAE",
+            "played_move_score": 74, "num_moves": 40, "analysis": analysis,
+            "moves": [{
+                "move": "8D BACCAE", "score": 74, "equity": 81.2,
+                "iterations": if simmed { 340 } else { 0 },
+                "win_percentage": if simmed { json!(61.5) } else { json!(null) },
+                "plies": if simmed { plies.clone() } else { json!([]) },
+            }],
+        });
+        if turn > 0 {
+            position["previous_move"] = json!("8G DAB");
+            position["previous_move_score"] = json!(12);
+        }
+        if let Some(inference) = inference {
+            position["inference"] = inference;
+        }
+        position
+    };
+    // Every submission also carries game 1's first turn, which a capturing
+    // job requires, so a refusal is the inference's.
+    let other_game = {
+        let mut other = position(0, "sim", None);
+        other["game_index"] = json!(1);
+        other["rack"] = json!("ABBCDEE");
+        other
+    };
+    let submit_positions = |positions: serde_json::Value| {
+        let app = app.clone();
+        let other_game = other_game.clone();
+        async move {
+            let (assignment, uuid) = first_claim(&app).await;
+            let mut result = games_result(2, 1);
+            let mut positions = positions.as_array().unwrap().clone();
+            positions.push(other_game);
+            result["positions"] = json!(positions);
+            send(
+                &app,
+                post_json(
+                    "/api/worker/result",
+                    &[("x-worker-uuid", uuid.as_str())],
+                    json!({ "claim_token": assignment["claim_token"], "result": result }),
+                ),
+            )
+            .await
+        }
+    };
+
+    let mut too_many = inference.clone();
+    too_many["leaves"] = json!(leaves(11));
+    too_many["num_leaves"] = json!(400);
+    let mut out_of_order = inference.clone();
+    out_of_order["leaves"] = json!([
+        { "leave": "AET", "draws": 80, "equity": 15.0 },
+        { "leave": "EIR", "draws": 120, "equity": 18.25 },
+    ]);
+    for (bad, why) in [
+        (position(3, "static", Some(inference.clone())), "a static analysis"),
+        (position(0, "sim", Some(inference.clone())), "a first turn"),
+        (position(3, "sim", Some(too_many)), "eleven leaves"),
+        (position(3, "sim", Some(out_of_order)), "leaves out of order"),
+    ] {
+        let (status, body) = submit_positions(json!([bad])).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{why}: {body}");
+    }
+
+    let (status, body) = submit_positions(json!([
+        position(0, "sim", None),
+        position(3, "sim", Some(inference.clone())),
+    ]))
+    .await;
+    assert_eq!((status, &body), (StatusCode::OK, &json!({ "accepted": true })));
+
+    let user = db.user(&format!("reader{}", Uuid::new_v4().simple()), false).await;
+    let headers = admin_headers(&cfg, user);
+    let (status, page) = send(
+        &app,
+        get_request(&format!("/api/jobs/{job}/positions?rack=AABCDE%3F"), &headers),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let items = page["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2, "{page}");
+    let at = |turn: i64| items.iter().find(|p| p["turn_number"] == turn).unwrap();
+    // Stored to the four plies recorded, shown to two.
+    let shown = json!([
+        { "ply": 0, "bingo_percentage": 12.5, "average_score": 31.25 },
+        { "ply": 1, "bingo_percentage": 7.5, "average_score": 28.5 },
+    ]);
+    for turn in [0, 3] {
+        assert_eq!(at(turn)["moves"][0]["plies"], shown, "{page}");
+        assert_eq!(at(turn)["moves"][0]["win_percentage"], json!(61.5), "{page}");
+        assert_eq!(at(turn)["moves"][0]["iterations"], json!(340), "{page}");
+    }
+    assert_eq!(at(0)["inference"], json!(null), "{page}");
+    assert_eq!(at(3)["inference"], inference, "{page}");
+    let stored: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM position_analysis_plies p
+         JOIN position_analysis_moves m ON m.id = p.move_id
+         JOIN position_analysis_records r ON r.id = m.record_id WHERE r.job_id = $1",
+    )
+    .bind(job)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(stored, 9, "three plies a move, three positions (game 1's too)");
+}
+
+/// A-PUBLIC-4b: a games job's captured positions are searchable by rack by a
+/// signed-in user -- newest first, a page at a time, each with its ranked
+/// moves -- the rack however it is typed, spelt as MAGPIE spells one (blank
+/// last), and by nobody signed out. A search names a rack; a job type that
 /// captures nothing is refused.
 #[tokio::test]
 async fn captured_positions_are_searchable_when_signed_in() {
@@ -710,77 +898,201 @@ async fn captured_positions_are_searchable_when_signed_in() {
     let state = db.state().await;
     let cfg = state.cfg.clone();
     let app = birdtest::app(state);
-    let job = db.games_job(1, 2).await;
-    sqlx::query("UPDATE job_game_config SET capture_positions = true WHERE job_id = $1")
-        .bind(job)
-        .execute(&db.pool)
-        .await
-        .unwrap();
+    let job = capturing_games_job(&db).await;
+    // The racks as MAGPIE writes them (`rack_get_string`): machine-letter
+    // order, the blank last. The job's distribution is `testdist.csv`.
     for batch in 0..2 {
         let mut result = games_result(2, 1);
         result["positions"] = json!([
-            { "game_index": 0, "turn_number": 0, "rack": "AEINRST", "position": format!("cgp-{batch}-0"),
+            { "game_index": 0, "turn_number": 0, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "AABCDE?", "position": format!("cgp-{batch}-0"),
               "num_moves": 40, "moves": [
-                  { "move": "8D RETAINS", "score": 74, "equity": 81.2 },
-                  { "move": "8D STAINER", "score": 72, "equity": 79.0 } ] },
-            { "game_index": 1, "turn_number": 3, "rack": "AEINRSU", "position": format!("cgp-{batch}-1"),
-              "previous_move": "8D DOG", "previous_move_score": 10,
-              "num_moves": 30, "moves": [{ "move": "8D URINATES", "score": 70, "equity": 77.0 }] },
+                  { "move": "8D BACCAE", "score": 74, "equity": 81.2 },
+                  { "move": "8D ABACE", "score": 72, "equity": 79.0 } ] },
+            { "game_index": 1, "turn_number": 3, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "ABBCDEE", "position": format!("cgp-{batch}-1"),
+              "previous_move": "8D DAB", "previous_move_score": 10,
+              "num_moves": 30, "moves": [{ "move": "8D BEDE", "score": 70, "equity": 77.0 }] },
         ]);
         let (assignment, uuid) = first_claim(&app).await;
         submit(&app, &assignment, &uuid, result).await;
     }
 
     let path = format!("/api/jobs/{job}/positions");
-    let (status, _) = send(&app, get_request(&path, &[])).await;
+    let (status, _) = send(&app, get_request(&format!("{path}?rack=AABCDE?"), &[])).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "signed out");
 
     let user = db.user(&format!("reader{}", Uuid::new_v4().simple()), false).await;
     let headers = admin_headers(&cfg, user);
 
-    // Every position, newest first, two to a page.
-    let (status, first) = send(&app, get_request(&format!("{path}?per_page=2"), &headers)).await;
+    let (status, body) = send(&app, get_request(&path, &headers)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "no rack: {body}");
+
+    // One rack, typed in lower case, out of order and with the blank first
+    // (URL-encoded), one to a page, newest first.
+    let (status, first) =
+        send(&app, get_request(&format!("{path}?rack=%3Fedcbaa&per_page=1"), &headers)).await;
     assert_eq!(status, StatusCode::OK, "{first}");
-    let positions: Vec<&str> =
-        first["items"].as_array().unwrap().iter().map(|p| p["position"].as_str().unwrap()).collect();
-    assert_eq!(positions, ["cgp-1-1", "cgp-1-0"], "{first}");
-    let cursor = first["next_cursor"].as_str().expect("a full page has a next");
-    let (_, second) =
-        send(&app, get_request(&format!("{path}?per_page=2&cursor={cursor}"), &headers)).await;
-    let positions: Vec<&str> =
-        second["items"].as_array().unwrap().iter().map(|p| p["position"].as_str().unwrap()).collect();
-    assert_eq!(positions, ["cgp-0-1", "cgp-0-0"], "{second}");
-
-    let later = &first["items"][0];
-    assert_eq!(later["game_index"], 1);
-    assert_eq!(later["turn_number"], 3);
-    assert_eq!(later["previous_move"], "8D DOG");
-    assert_eq!(later["previous_move_score"], 10);
-    assert_eq!(later["num_moves"], 30);
-
-    // One rack, typed in lower case and out of order.
-    let (status, found) = send(&app, get_request(&format!("{path}?rack=tsrniea"), &headers)).await;
-    assert_eq!(status, StatusCode::OK, "{found}");
-    let items = found["items"].as_array().unwrap();
-    assert_eq!(items.len(), 2, "{found}");
-    assert!(items.iter().all(|p| p["rack"] == "AEINRST"), "{found}");
+    assert_eq!(first["items"].as_array().unwrap().len(), 1, "{first}");
+    assert_eq!(first["items"][0]["position"], "cgp-1-0", "{first}");
+    assert_eq!(first["items"][0]["rack"], "AABCDE?");
+    assert_eq!(first["items"][0]["analysis"], "static");
     assert_eq!(
-        items[0]["moves"],
+        first["items"][0]["moves"],
         json!([
-            { "rank": 1, "move": "8D RETAINS", "score": 74, "equity": 81.2, "win_percentage": null },
-            { "rank": 2, "move": "8D STAINER", "score": 72, "equity": 79.0, "win_percentage": null },
+            { "rank": 1, "move": "8D BACCAE", "score": 74, "equity": 81.2, "iterations": null,
+              "win_percentage": null, "mean_spread": null, "fidelity_plies": null, "plies": [] },
+            { "rank": 2, "move": "8D ABACE", "score": 72, "equity": 79.0, "iterations": null,
+              "win_percentage": null, "mean_spread": null, "fidelity_plies": null, "plies": [] },
         ])
     );
-    assert!(found["next_cursor"].is_null(), "{found}");
-    let (_, none) = send(&app, get_request(&format!("{path}?rack=QQQQQQQ"), &headers)).await;
-    assert_eq!(none["items"], json!([]));
+    // A static position infers nothing.
+    assert_eq!(first["items"][0]["inference"], json!(null));
+    let cursor = first["next_cursor"].as_str().expect("a full page has a next");
+    let (_, second) = send(
+        &app,
+        get_request(&format!("{path}?rack=%3Fedcbaa&per_page=1&cursor={cursor}"), &headers),
+    )
+    .await;
+    assert_eq!(second["items"][0]["position"], "cgp-0-0", "{second}");
+    // The rack's last position: no "Next" to a page with nothing on it.
+    assert!(second["next_cursor"].is_null(), "{second}");
+
+    let (_, later) = send(&app, get_request(&format!("{path}?rack=eedcbba"), &headers)).await;
+    let items = later["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2, "{later}");
+    assert!(later["next_cursor"].is_null(), "{later}");
+    assert_eq!(items[0]["game_index"], 1);
+    assert_eq!(items[0]["turn_number"], 3);
+    assert_eq!(items[0]["previous_move"], "8D DAB");
+    assert_eq!(items[0]["previous_move_score"], 10);
+    // And the move played from it, which the board draws where it goes.
+    assert_eq!(items[0]["played_move"], "8D PLAYED");
+    assert_eq!(items[0]["played_move_score"], 10);
+    assert_eq!(items[0]["num_moves"], 30);
+
+    // A rack no tile of the distribution spells finds nothing, rather than
+    // failing.
+    let (status, none) = send(&app, get_request(&format!("{path}?rack=QQQQQQQ"), &headers)).await;
+    assert_eq!((status, &none["items"]), (StatusCode::OK, &json!([])));
 
     let racks = opening_rack_job(&db, 3).await;
     let (status, body) =
-        send(&app, get_request(&format!("/api/jobs/{racks}/positions"), &headers)).await;
+        send(&app, get_request(&format!("/api/jobs/{racks}/positions?rack=A"), &headers)).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, _) = send(
+        &app,
+        get_request(&format!("/api/jobs/{}/positions?rack=A", Uuid::new_v4()), &headers),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// A-PUBLIC-4c: a random position is drawn from the tasks that have one,
+/// passing over those still being played, and a job that has captured
+/// nothing -- no task yet, or none returned -- answers `null`. Signed in only;
+/// games and pairs jobs only.
+#[tokio::test]
+async fn a_random_position_is_drawn_from_the_tasks_that_have_one() {
+    let db = TestDb::new().await;
+    let state = db.state().await;
+    let cfg = state.cfg.clone();
+    let app = birdtest::app(state);
+    let job = capturing_games_job(&db).await;
+    let path = format!("/api/jobs/{job}/positions/random");
+    let (status, _) = send(&app, get_request(&path, &[])).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "signed out");
+    let user = db.user(&format!("reader{}", Uuid::new_v4().simple()), false).await;
+    let headers = admin_headers(&cfg, user);
+
+    let (status, body) = send(&app, get_request(&path, &headers)).await;
+    assert_eq!((status, &body), (StatusCode::OK, &json!(null)), "no task yet");
+
+    // Five tasks claimed, none returned: every draw lands on a task with no
+    // positions, and so does the fallback.
+    let mut claims = Vec::new();
+    for _ in 0..5 {
+        claims.push(first_claim(&app).await);
+    }
+    let seeds: Vec<i64> = sqlx::query_scalar("SELECT seed FROM tasks WHERE job_id = $1 ORDER BY seed")
+        .bind(job)
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(seeds.len(), 5, "one task a claim");
+    let (status, body) = send(&app, get_request(&path, &headers)).await;
+    assert_eq!((status, &body), (StatusCode::OK, &json!(null)), "none returned yet");
+
+    // The middle task returns two positions. Every draw is one of them; the
+    // first captured is never the fallback (the newest), so its appearing is
+    // a draw that found its task past the four that have none.
+    let (assignment, uuid) = &claims[2];
+    let mut result = games_result(2, 1);
+    result["positions"] = json!([
+        { "game_index": 0, "turn_number": 0, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "AABCDE?", "position": "first",
+          "num_moves": 3, "moves": [{ "move": "8D BACCAE", "score": 74, "equity": 81.2 }] },
+        { "game_index": 1, "turn_number": 4, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "ABBCDEE", "position": "second",
+          "previous_move": "8D DAB", "previous_move_score": 10,
+          "num_moves": 3, "moves": [{ "move": "8D BEDE", "score": 70, "equity": 77.0 }] },
+    ]);
+    submit(&app, assignment, uuid, result).await;
+    let task: Uuid = sqlx::query_scalar("SELECT task_id FROM task_claims WHERE claim_token = $1")
+        .bind(Uuid::parse_str(assignment["claim_token"].as_str().unwrap()).unwrap())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..40 {
+        let (status, body) = send(&app, get_request(&path, &headers)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["task_id"], json!(task), "{body}");
+        assert!(!body["moves"].as_array().unwrap().is_empty(), "with its ranked moves: {body}");
+        seen.insert(body["position"].as_str().unwrap().to_string());
+    }
+    assert_eq!(seen.len(), 2, "both positions drawn: {seen:?}");
+
+    let racks = opening_rack_job(&db, 3).await;
+    let (status, body) =
+        send(&app, get_request(&format!("/api/jobs/{racks}/positions/random"), &headers)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, _) = send(
+        &app,
+        get_request(&format!("/api/jobs/{}/positions/random", Uuid::new_v4()), &headers),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// A-PUBLIC-4d: a job's board is public: its layout square by square, the
+/// start square, and every letter of its distribution with its blank's
+/// spelling and its score.
+#[tokio::test]
+async fn a_jobs_board_is_its_layout_and_letter_scores() {
+    let db = TestDb::new().await;
+    let app = birdtest::app(db.state().await);
+    let job = db.games_job(2).await;
+    let (status, board) = send(&app, get_request(&format!("/api/jobs/{job}/board"), &[])).await;
+    assert_eq!(status, StatusCode::OK, "{board}");
+    assert_eq!(board["start"], json!([7, 7]));
+    let squares = board["squares"].as_array().unwrap();
+    assert_eq!(squares.len(), 15);
+    assert!(squares.iter().all(|row| row.as_array().unwrap().len() == 15));
+    assert_eq!(squares[0][0], "triple_word");
+    assert_eq!(squares[0][3], "double_letter");
+    assert_eq!(squares[1][1], "double_word");
+    assert_eq!(squares[1][5], "triple_letter");
+    assert_eq!(squares[0][1], "normal");
+    assert_eq!(
+        board["letters"],
+        json!([
+            { "letter": "?", "blank": "?", "score": 0 },
+            { "letter": "A", "blank": "a", "score": 1 },
+            { "letter": "B", "blank": "b", "score": 3 },
+            { "letter": "C", "blank": "c", "score": 3 },
+            { "letter": "D", "blank": "d", "score": 2 },
+            { "letter": "E", "blank": "e", "score": 1 },
+        ])
+    );
     let (status, _) =
-        send(&app, get_request(&format!("/api/jobs/{}/positions", Uuid::new_v4()), &headers)).await;
+        send(&app, get_request(&format!("/api/jobs/{}/board", Uuid::new_v4()), &[])).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
@@ -795,7 +1107,7 @@ async fn captured_positions_are_searchable_when_signed_in() {
 #[tokio::test]
 async fn the_stream_sends_what_a_reload_would_fetch_after_each_result() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     let app = birdtest::app(db.state().await);
     let detail = format!("/api/jobs/{job}");
 
@@ -836,7 +1148,7 @@ async fn the_stream_sends_what_a_reload_would_fetch_after_each_result() {
 #[tokio::test]
 async fn the_stream_unsubscribes_when_the_client_disconnects() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     let state = db.state().await;
     let app = birdtest::app(state.clone());
     assert!(!state.sse.has_subscribers(job));
@@ -882,7 +1194,7 @@ async fn contributor_lists_paginate_and_leak_no_credentials() {
         let id = db.user(name, false).await;
         users.push(id);
         sqlx::query(
-            "UPDATE users SET tasks_completed = $2, last_completed_at = now(),
+            "UPDATE users SET tasks_completed = $2, compute_ms = $2 * 1000, last_completed_at = now(),
                               password_hash = '$argon2id$v=19$secret-' || username
              WHERE id = $1",
         )
@@ -971,6 +1283,69 @@ async fn contributor_lists_paginate_and_leak_no_credentials() {
         "both kinds of contributor in one ranking, the idle worker left out"
     );
 
+    // Ranked by compute time unless asked otherwise: each order its own, and
+    // the same contributors in each. Games and racks run against tasks here,
+    // so each order is visibly its own.
+    for (name, games, racks) in
+        [("alice", 10, 600), ("bob", 20, 500), ("carol", 100, 400), ("deleted-dave", 30, 300)]
+    {
+        sqlx::query("UPDATE users SET games_played = $2, racks_analyzed = $3 WHERE username = $1")
+            .bind(name)
+            .bind(games as i64)
+            .bind(racks as i64)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+    }
+    for (uuid, games, racks) in [(busy, 40, 200), (light, 50, 100), (idle, 0, 0)] {
+        sqlx::query("UPDATE anonymous_workers SET games_played = $2, racks_analyzed = $3 WHERE uuid = $1")
+            .bind(uuid)
+            .bind(games as i64)
+            .bind(racks as i64)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+    }
+    let ranked = |sort: &'static str| {
+        let app = app.clone();
+        async move {
+            let (status, body) = send(&app, get_request(&format!("/api/workers{sort}"), &[])).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["total"], 6, "{sort}");
+            body["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["username"].as_str().or(item["anon_id"].as_str()).unwrap().to_string())
+                .collect::<Vec<_>>()
+        }
+    };
+    let (busy_id, light_id) =
+        (birdtest::auth::public_anon_id(busy), birdtest::auth::public_anon_id(light));
+    let by_tasks = ["deleted-dave", "alice", &busy_id, "bob", &light_id, "carol"];
+    assert_eq!(ranked("").await, by_tasks, "compute time, by default");
+    assert_eq!(ranked("?sort=compute").await, by_tasks);
+    assert_eq!(ranked("?sort=tasks").await, by_tasks);
+    assert_eq!(
+        ranked("?sort=games").await,
+        ["carol", &light_id, &busy_id, "deleted-dave", "bob", "alice"]
+    );
+    assert_eq!(
+        ranked("?sort=racks").await,
+        ["alice", "bob", "carol", "deleted-dave", &busy_id, &light_id]
+    );
+    let (_, body) = send(&app, get_request("/api/workers?per_page=1", &[])).await;
+    assert_eq!(
+        body["items"][0],
+        json!({
+            "user_id": users[3], "anon_id": null, "username": "deleted-dave",
+            "compute_seconds": 9.0, "games_played": 30, "racks_analyzed": 300,
+            "tasks_completed": 9, "last_seen_at": body["items"][0]["last_seen_at"],
+        })
+    );
+    let (status, body) = send(&app, get_request("/api/workers?sort=username", &[])).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "only a counter ranks: {body}");
+
     for path in ["/api/users", "/api/workers"] {
         let (_, body) = send(&app, get_request(&format!("{path}?per_page=100000"), &[])).await;
         assert_eq!(body["per_page"], 500, "{path}");
@@ -989,7 +1364,7 @@ async fn tied_contributors_are_each_listed_exactly_once() {
     let mut expected = Vec::new();
     for i in 0..9 {
         let id = db.user(&format!("user{i}"), false).await;
-        sqlx::query("UPDATE users SET tasks_completed = 1 WHERE id = $1")
+        sqlx::query("UPDATE users SET tasks_completed = 1, compute_ms = 1000 WHERE id = $1")
             .bind(id)
             .execute(&db.pool)
             .await
@@ -999,10 +1374,12 @@ async fn tied_contributors_are_each_listed_exactly_once() {
     }
     expected.sort();
 
-    for per_page in [2, 3, 4, 5, 7] {
+    // Every order ties here -- one task each, a second each, no games or racks.
+    for (per_page, sort) in [(2, ""), (3, "compute"), (4, "games"), (5, "racks"), (7, "tasks")] {
         let mut seen = Vec::new();
         for page in 0..=(18 / per_page) {
-            let path = format!("/api/workers?page={page}&per_page={per_page}");
+            let sort = if sort.is_empty() { String::new() } else { format!("&sort={sort}") };
+            let path = format!("/api/workers?page={page}&per_page={per_page}{sort}");
             let (status, body) = send(&app, get_request(&path, &[])).await;
             assert_eq!(status, StatusCode::OK, "{body}");
             assert_eq!(body["total"], 18);
@@ -1012,7 +1389,7 @@ async fn tied_contributors_are_each_listed_exactly_once() {
             }
         }
         seen.sort();
-        assert_eq!(seen, expected, "per_page={per_page}");
+        assert_eq!(seen, expected, "per_page={per_page} sort={sort}");
     }
 
     // Far past the end: an empty page with the true total, not a scan.
@@ -1033,7 +1410,7 @@ async fn tied_jobs_and_users_are_each_listed_exactly_once() {
     let admin = db.user("root", true).await;
     let mut jobs = Vec::new();
     for _ in 0..9 {
-        jobs.push(db.bare_job("games", 1, admin).await.to_string());
+        jobs.push(db.bare_job("games", admin).await.to_string());
     }
     for i in 0..9 {
         db.user(&format!("tied{i}"), false).await;
@@ -1083,7 +1460,7 @@ async fn tied_jobs_and_users_are_each_listed_exactly_once() {
 #[tokio::test]
 async fn live_pushes_are_spaced_by_the_stats_interval_but_admin_changes_are_not() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     let admin = db.user("root", true).await;
     let mut cfg = db.config();
     cfg.stats_cache = std::time::Duration::from_secs(10);
@@ -1144,7 +1521,7 @@ async fn live_pushes_are_spaced_by_the_stats_interval_but_admin_changes_are_not(
 #[tokio::test]
 async fn submissions_during_a_cool_down_are_pushed_when_it_ends() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     let mut cfg = db.config();
     cfg.stats_cache = std::time::Duration::from_secs(2);
     let app = birdtest::app(db.state_with(cfg).await);
@@ -1184,4 +1561,182 @@ async fn submissions_during_a_cool_down_are_pushed_when_it_ends() {
     .await
     .expect("the submissions made during the cool-down are pushed when it ends");
     assert_eq!(everything["games"]["units_completed"], 6);
+}
+
+/// A game-pairs job capturing positions, keeping first divergences or not.
+async fn capturing_pairs_job(db: &TestDb, first_divergence: bool) -> Uuid {
+    let admin = db.user(&format!("admin{}", Uuid::new_v4().simple()), true).await;
+    let p1 = db.static_player(&format!("p1{}", Uuid::new_v4().simple()), admin).await;
+    let p2 = db.static_player(&format!("p2{}", Uuid::new_v4().simple()), admin).await;
+    let job = db.bare_job("game_pairs", admin).await;
+    sqlx::query(
+        "INSERT INTO job_game_pair_config
+             (job_id, player1_config_id, player2_config_id, pairs_per_batch, min_pairs,
+              max_pairs, capture_positions, capture_first_divergence)
+         VALUES ($1, $2, $3, 2, 1000000, 1000000, TRUE, $4)",
+    )
+    .bind(job)
+    .bind(p1)
+    .bind(p2)
+    .bind(first_divergence)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    job
+}
+
+/// Two pairs, the second diverging: as a pairs result reports them.
+fn pairs_result(positions: serde_json::Value) -> serde_json::Value {
+    let mut result = games_result(4, 2);
+    result["pentanomial"] = json!([0, 0, 2, 0, 0]);
+    result["divergent_games"] = games_result(2, 1)["all_games"].clone();
+    result["positions"] = positions;
+    result
+}
+
+fn divergence(game: i32, turn: i32, scores: &str, best: &str) -> serde_json::Value {
+    json!({ "game_index": game, "turn_number": turn, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "ABBCDEE",
+            "position": format!("15/15/15/15/15/15/15/7DAB5/15/15/15/15/15/15/15 {scores} 0"),
+            "previous_move": "8H DAB", "previous_move_score": 10,
+            "num_moves": 30, "moves": [{ "move": best, "score": 70, "equity": 77.0 }] })
+}
+
+/// A-PUBLIC-4f: a game-pairs job that keeps first divergences takes from each
+/// diverging pair both games' positions at that one turn and nothing else --
+/// a pair's lone position, or two at different turns, is a `400` -- and every
+/// saved position of a pairs job comes with its partner, the same turn of the
+/// pair's other game, at random and by rack, where the rack finds the pair
+/// once.
+#[tokio::test]
+async fn a_pairs_job_keeps_first_divergences_and_shows_each_with_its_partner() {
+    let db = TestDb::new().await;
+    let state = db.state().await;
+    let cfg = state.cfg.clone();
+    let app = birdtest::app(state);
+    let job = capturing_pairs_job(&db, true).await;
+
+    let (assignment, uuid) = first_claim(&app).await;
+    let request = &assignment["task_request"];
+    assert_eq!(request["job_type"], "game_pairs");
+    assert_eq!(request["capture_positions"], json!(true));
+    assert_eq!(request["capture_first_divergence"], json!(true));
+
+    for (positions, why) in [
+        (json!([divergence(2, 5, "ABBCDEE/ 20/10", "8D BEDE")]), "keeps both games' or neither"),
+        (
+            json!([divergence(2, 5, "a 20/10", "8D BEDE"), divergence(3, 6, "b 10/20", "8D BED")]),
+            "turns 5 and 6",
+        ),
+        (json!([]), "divergent_games says 1 diverged"),
+    ] {
+        let (status, body) = send(
+            &app,
+            post_json(
+                "/api/worker/result",
+                &[("x-worker-uuid", uuid.as_str())],
+                json!({ "claim_token": assignment["claim_token"], "result": pairs_result(positions) }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{why}: {body}");
+        assert!(body.to_string().contains(why), "{why}: {body}");
+    }
+    // Pair 1 diverged at turn 5: player 1 played BEDE in game 2 and player 2
+    // BED in game 3, from the same board and tiles.
+    submit(
+        &app,
+        &assignment,
+        &uuid,
+        pairs_result(json!([
+            divergence(3, 5, "ABBCDEE/XYZ 10/20", "8D BED"),
+            divergence(2, 5, "XYZ/ABBCDEE 20/10", "8D BEDE"),
+        ])),
+    )
+    .await;
+
+    let user = db.user(&format!("reader{}", Uuid::new_v4().simple()), false).await;
+    let headers = admin_headers(&cfg, user);
+    let (status, config) = send(&app, get_request(&format!("/api/jobs/{job}/config"), &[])).await;
+    assert_eq!(status, StatusCode::OK, "{config}");
+    assert_eq!(config["games"]["capture_first_divergence"], json!(true), "{config}");
+
+    let (status, random) =
+        send(&app, get_request(&format!("/api/jobs/{job}/positions/random"), &headers)).await;
+    assert_eq!(status, StatusCode::OK, "{random}");
+    let partner = &random["partner"];
+    assert_eq!(random["turn_number"], 5, "{random}");
+    assert_eq!(partner["turn_number"], 5, "{random}");
+    let mut games = [random["game_index"].as_i64().unwrap(), partner["game_index"].as_i64().unwrap()];
+    games.sort();
+    assert_eq!(games, [2, 3], "{random}");
+    assert!(partner.get("partner").is_none(), "a partner carries no partner of its own: {random}");
+    let played = |item: &serde_json::Value| item["moves"][0]["move"].as_str().unwrap().to_string();
+    let mut plays = [played(&random), played(partner)];
+    plays.sort();
+    assert_eq!(plays, ["8D BED", "8D BEDE"], "{random}");
+
+    // Both games hold the rack; the pair is one result, led by its first game.
+    let (status, page) = send(
+        &app,
+        get_request(&format!("/api/jobs/{job}/positions?rack=ABBCDEE"), &headers),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let items = page["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "{page}");
+    assert_eq!(items[0]["game_index"], 2, "{page}");
+    assert_eq!(items[0]["partner"]["game_index"], 3, "{page}");
+}
+
+/// A-PUBLIC-4f, continued: a pairs job capturing every position shows each with its
+/// partner where the other game has that turn, and `null` where it does not;
+/// a games job's positions carry no partner field at all.
+#[tokio::test]
+async fn a_pairs_position_without_a_partner_turn_says_so() {
+    let db = TestDb::new().await;
+    let state = db.state().await;
+    let cfg = state.cfg.clone();
+    let app = birdtest::app(state);
+    let job = capturing_pairs_job(&db, false).await;
+    let (assignment, uuid) = first_claim(&app).await;
+    assert_eq!(assignment["task_request"]["capture_first_divergence"], json!(false));
+    // Every game has positions; game 1 has a turn 9 game 0 never reached.
+    let mut positions: Vec<serde_json::Value> =
+        (0..4).map(|game| divergence(game, 0, "a 0/0", "8D BED")).collect();
+    positions.push(divergence(1, 9, "b 0/0", "8D BEDE"));
+    submit(&app, &assignment, &uuid, pairs_result(json!(positions))).await;
+
+    let user = db.user(&format!("reader{}", Uuid::new_v4().simple()), false).await;
+    let headers = admin_headers(&cfg, user);
+    let (_, page) = send(
+        &app,
+        get_request(&format!("/api/jobs/{job}/positions?rack=ABBCDEE&per_page=20"), &headers),
+    )
+    .await;
+    let items = page["items"].as_array().unwrap();
+    // Turn 0 of each pair once, with its partner; game 1's turn 9 alone.
+    assert_eq!(items.len(), 3, "{page}");
+    let lone = items.iter().find(|i| i["turn_number"] == 9).expect("turn 9");
+    assert!(lone["partner"].is_null(), "{lone}");
+    for item in items.iter().filter(|i| i["turn_number"] == 0) {
+        assert_eq!(item["game_index"].as_i64().unwrap() % 2, 0, "{item}");
+        assert_eq!(item["partner"]["game_index"], item["game_index"].as_i64().unwrap() + 1);
+    }
+
+    // Out of the way, so the next claim is the games job's.
+    sqlx::query("UPDATE jobs SET status = 'inactive' WHERE id = $1")
+        .bind(job)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let games = capturing_games_job(&db).await;
+    let mut result = games_result(2, 1);
+    result["positions"] = json!([divergence(0, 0, "a 0/0", "8D BED"), divergence(1, 0, "a 0/0", "8D BED")]);
+    let (games_assignment, games_uuid) = first_claim(&app).await;
+    assert_eq!(games_assignment["job_id"], games.to_string());
+    assert_eq!(games_assignment["task_request"]["capture_first_divergence"], json!(false));
+    submit(&app, &games_assignment, &games_uuid, result).await;
+    let (_, random) =
+        send(&app, get_request(&format!("/api/jobs/{games}/positions/random"), &headers)).await;
+    assert!(random.get("partner").is_none(), "{random}");
 }

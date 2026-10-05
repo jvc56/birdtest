@@ -57,20 +57,22 @@ Tasks move through an explicit state machine:
 ```
 available → claimed → completed
                ↑          
-         (heartbeat timeout on a claim: one slot reopens; task returns to available if it had been at capacity)
+         (heartbeat timeout or decline: the claim ends; the task returns to available)
 ```
 
-State is determined by denormalized counters (`accepted_count`, `active_claim_count`) relative to the job's `redundancy` value X:
+A task has **one slot**: one worker holds it at a time, and its one accepted result completes it. State follows from denormalized counters (`accepted_count`, `active_claim_count`), each 0 or 1:
 
-- **available**: `accepted_count + active_claim_count < redundancy` — open capacity remains; workers can claim a new slot.
-- **claimed**: `accepted_count + active_claim_count = redundancy` but `accepted_count < redundancy` — all slots are filled with in-flight claims; waiting on results.
-- **completed**: `accepted_count = redundancy` — all X results have been submitted and accepted.
+- **available**: no live claim and no accepted result — made, then given back (its claim lapsed or was declined); the next worker gets it before anything new is generated.
+- **claimed**: a live claim; waiting on its result.
+- **completed**: its result has been submitted and accepted.
 
-Individual claims are rows in `task_claims`. When a claim's heartbeat times out, that claim row is flipped to `abandoned`, `active_claim_count` is decremented, and if the task was at capacity it returns to **available**. Reclamation is lazy — it runs at the moment the next task is requested and the job is a candidate, not via a background process — **and a process reclaims nothing until it has been up for the heartbeat timeout itself** (`scheduler::reclaim_lapsed`). A heartbeat can only arrive at a server that is there to receive it: after an outage longer than the timeout, every open claim in the fleet looks that old however alive its worker, and the first claim request after the restart abandoned all of them — every task in flight handed out again, every result being computed answered `accepted: false`. A live worker's heartbeat arrives within thirty seconds of the server's return, so a claim still silent a full timeout after startup is reclaimed as before; what it costs is that a worker which really did die during the outage is noticed up to one timeout later. A job nobody asks for work from — one that is inactive, completed, or parked at 0% — therefore keeps a lapsed claim on its books until something reclaims it: activation above 0% makes it a candidate again, and starting an [export](#exports) reclaims the job's lapsed claims first, since a completed job is never claimed from again.
+A job used to state a `redundancy` X, and each task waited for X independent results. Nothing compared them (reconciliation was deferred), every aggregate had to read one result per task, and it cost X times the compute for the same answer; it was removed in October 2026. Opening-rack jobs instead re-analyse a rack until its analyses agree ([consensus](#opening-rack-consensus)), each analysis a task of its own.
+
+Individual claims are rows in `task_claims`. When a claim's heartbeat times out, that claim row is flipped to `abandoned`, `active_claim_count` is decremented, and the task returns to **available**. Reclamation is lazy — it runs at the moment the next task is requested and the job is a candidate, not via a background process — **and a process reclaims nothing until it has been up for the heartbeat timeout itself** (`scheduler::reclaim_lapsed`). A heartbeat can only arrive at a server that is there to receive it: after an outage longer than the timeout, every open claim in the fleet looks that old however alive its worker, and the first claim request after the restart abandoned all of them — every task in flight handed out again, every result being computed answered `accepted: false`. A live worker's heartbeat arrives within thirty seconds of the server's return, so a claim still silent a full timeout after startup is reclaimed as before; what it costs is that a worker which really did die during the outage is noticed up to one timeout later. A job nobody asks for work from — one that is inactive, completed, or parked at 0% — therefore keeps a lapsed claim on its books until something reclaims it: activation above 0% makes it a candidate again, and starting an [export](#exports) reclaims the job's lapsed claims first, since a completed job is never claimed from again.
 
 #### Task Generation
 
-Every job type generates its tasks **on demand**: the next task request is generated, inserted and claimed in one transaction at claim time. A task with capacity left — its claim lapsed, or its redundancy is not yet filled — returns to `available` and is re-dispatched before anything new is generated. There is no pre-populated strategy (see [Creation Strategies](#creation-strategies)).
+Every job type generates its tasks **on demand**: the next task request is generated, inserted and claimed in one transaction at claim time. A task whose claim lapsed or was declined returns to `available` and is re-dispatched before anything new is generated. There is no pre-populated strategy (see [Creation Strategies](#creation-strategies)).
 
 ---
 
@@ -80,11 +82,11 @@ Every job type generates its tasks **on demand**: the next task request is gener
 2. The system selects the active job **most behind its configured allocation share** — specifically, among active jobs with an allocation above 0%, the one with the lowest ratio of `(claims_issued - claims_baseline) / allocation`, where `jobs.claims_issued` counts every claim ever issued for that job, **including abandoned and declined ones** — a claim consumed real dispatch capacity at the moment it was issued regardless of what happened to it afterward, so the count only ever goes up (a purge, which deletes the claims it counts, resets it). It is a counter rather than a `COUNT(*)` over `task_claims` because selection runs on every claim request, and a count grows with each job's whole history. Excluding abandoned claims would let a job with flaky or slow workers accumulate a disproportionate share by having its timeouts discounted, and would make the count non-monotonic — the opposite of what the deficit-based scheduler needs. Ties are broken by job creation order (oldest first). This is a deterministic deficit-based selection; no randomness is involved.
 
    **A job's share is measured from when it joined, not from when it was created.** `jobs.claims_baseline` is reset — on activation, which is also how an allocation is changed, and on a purge — so that the job's ratio equals the **lowest ratio among the other jobs being served** (`scheduler::join_at_parity`), and it takes its share from then on. *Being served* means a claim issued within the heartbeat timeout of the most recent claim of any other job on offer — `jobs.last_claimed_at`, which rides the `UPDATE jobs` every claim already makes — measured from the latest claim rather than from now, so after a quiet spell (a deployment gap, a quiet night) the jobs that were being served when the fleet stopped still set the pace; with no other job ever claimed, the highest ratio on offer, or zero. Joining is then **settled**: for an hour after it joined (`scheduler::JOIN_SETTLE`, from `jobs.activated_at`, which every join sets), each claim of the job lifts it level with the lowest of the claiming worker's other candidates — the ones it just passed over included — less one claim of that job and one of this one, the slack the turn check allows (`scheduler::issue_claim`, `pace_for`). A worker that declines the job because it cannot run it at all (`missing_data`, `magpie_version`, `unknown_job_type`, `derived_mismatch`) undoes the settling its claim gave (`scheduler::unsettle`): the server cannot filter a data gap, so every worker without the job's data is issued one claim of it, and that claim had settled a job only a minority could run at the majority's pace — past the minority's own lagging job, where the minority never reached it (none of 400 claims). Two more rules keep a job with nothing to hand out from banking debt: **a job passed over for want of a task is lifted to where the job the worker claims stood before its claim** (`scheduler::lift_passed_over`, after the claim commits, skipping a row somebody holds) — a games job whose every game is in flight, a generation being built, a dispatch hold (a seeding, a purge) — and **a job not served for a heartbeat timeout rejoins at parity on its first claim back, which starts its settling** (`scheduler::issue_claim`) — one whose MAGPIE floor was above the fleet's, whose data was not out. Every one of these only ever raises a job's ratio. The reason for the two steps is that a fleet split by capability — a release rolling out, data some workers lack — has no single pace: each class of workers runs its jobs at its own rate, and a job only some can run lags the rest for as long as the split lasts. That lag is the scheduler working (the minority's job gets all of the minority), but it means no one join point is right. What each single point did (the thirty-second audit, passes 19 and 20): level with the lowest of *every* job on offer, a newcomer was level with a job nobody could run and took twelve of the next twelve claims; level with the *leader*, a newcomer only the lagging class could run starved behind that class's job — none of the next 1,000 claims; bounding every job's lag behind the job just claimed to make up for that scrambled the jobs that lagged together (two at 45% split 978 : 22) and made a concurrent burst to a small job permanent (64 to 87 claims where 30 is fair); and level with the lowest *served*, a newcomer everyone could run was level with a job only a minority could run and took the majority's claims until it had caught theirs — the majority job's first claim came 331st, and an allocation changed from 20% to 19% did the same. Settled against the next candidate only, a job that paused for one claim let a newcomer be settled past it; and settling forgave the payback of a concurrent burst (307 to 324 claims where 30 is fair) until claims were checked for their turn. Joined at the lowest served, a job is below no class's pace, so it is never starved; settled, the first claim from each class that runs faster puts it level with that class's jobs, so it takes nothing over; and a structural lag is never lifted, because within the class that runs it a lagging job keeps pace. The limits of the hour and of the lift are KL-89. This is start-time fair queuing's rule — a flow that (re)joins starts at the current virtual time, of the workers that will serve it, and a flow with nothing to send earns no credit — and it is what makes "no starvation" true. Measured over a job's whole life, as it was, every change to the set of jobs was a takeover: a job activated beside one that had issued two million claims had a ratio of zero, so it was first in every candidate list until it had issued two million of its own, and the older job — at the same 50% — got *nothing* for as long as that took. A purge (which zeroes `claims_issued`), a reactivation after a week switched off, and an allocation raised from 10% to 50% (which cuts the ratio to a fifth) all did the same. With the baseline, the shares an admin sets are the shares the fleet sees from that moment, selection is still one deterministic statement, and the long-run ratios still converge on the allocations, because every job's numerator counts from the same point in the fleet's history. The baseline can be negative (a job with no claims joining a busy fleet is credited the claims that put it level).
-3. Expired claims for the candidate jobs are lazily reclaimed, in one statement: each timed-out `task_claims` row is flipped to `abandoned`, `active_claim_count` is decremented, and tasks that were at capacity return to `available`. A claim somebody holds locked — a submission, a decline, a purge — is skipped rather than waited on (`FOR UPDATE SKIP LOCKED`): it is not lapsed in any sense that matters, and the next claim request reclaims it if it still needs to be.
+3. Expired claims for the candidate jobs are lazily reclaimed, in one statement: each timed-out `task_claims` row is flipped to `abandoned`, `active_claim_count` is decremented, and their tasks return to `available`. A claim somebody holds locked — a submission, a decline, a purge — is skipped rather than waited on (`FOR UPDATE SKIP LOCKED`): it is not lapsed in any sense that matters, and the next claim request reclaims it if it still needs to be.
 4. The system acquires the next task (one being re-dispatched, or else one generated on demand), inserts a `task_claims` row, increments `active_claim_count`, and issues a claim token (UUID) to the worker.
 5. The server responds with the **task request** for that job type.
 6. The worker performs the task and submits a **task response** along with the claim token.
-7. If the claim token matches a `task_claims` row that is not abandoned and was issued to the identity presenting it (a token presented by any other identity is treated as unknown, so bans and audit rows mean what they say), the task response is accepted, a **task record** is stored keyed to the `task_claim_id`, `accepted_count` is incremented, and `active_claim_count` is decremented. When `accepted_count = redundancy` the task is marked **completed**. If the token is stale (the claim was abandoned due to timeout, or this result was already accepted), the submission is answered `{"accepted": false}` and changes nothing. The claim row is locked from lookup to commit, so a timeout reclaiming it concurrently cannot count it as well.
+7. If the claim token matches a `task_claims` row that is not abandoned and was issued to the identity presenting it (a token presented by any other identity is treated as unknown, so bans and audit rows mean what they say), the task response is accepted, a **task record** is stored keyed to the `task_claim_id`, `accepted_count` is incremented, `active_claim_count` is decremented, and the task is marked **completed**. If the token is stale (the claim was abandoned due to timeout, or this result was already accepted), the submission is answered `{"accepted": false}` and changes nothing. The claim row is locked from lookup to commit, so a timeout reclaiming it concurrently cannot count it as well.
 
 ---
 
@@ -99,8 +101,7 @@ Workers are the clients that perform tasks and submit results. Two types are sup
 
 - **Plausibility checks at submission time** — every submission is checked against what is *possible*, not against what is usual: a negative standard deviation, a play scoring negative points, a rack with eight tiles (counted as tiles: a multi-character letter such as Catalan's `[L·L]` is written bracketed and is one), a negative count of moves generated, a per-ply bingo percentage outside [0, 100] or plies out of order, a pentanomial whose pairs need more draws than the games report, a batch reporting a different number of games than the task dispatched. Implemented in [`backend/src/jobs/plausibility.rs`](backend/src/jobs/plausibility.rs). This is the only active integrity mechanism at submission time, and the rest of this section explains why it is the only one that can be.
 - **Worker ban list** — a persistent table of banned worker identities; banned workers cannot claim or submit tasks. Meaningful for authenticated workers; for anonymous workers, banning targets the UUID. Applied by an admin; nothing bans automatically. A ban binds an identity, not a person: a client that sends none mints a new one on every claim, so it cannot be banned, and a banned account's owner can go on contributing without a key (KL-56). **One row per identity**, enforced by a partial unique index: enforcement is an `EXISTS`, so a second row's reason is never read, while unban deletes by row id — so a duplicate would leave an identity banned after an admin had lifted the ban, with nothing to say why. Banning again with a different reason is unban-then-ban, which the audit log records as both halves.
-- **Redundant task execution** — each job specifies a redundancy value X; X independent workers must each complete the task. All X results are stored independently. No consensus or agreement check is performed at submission time — reconciliation is a downstream analysis question deferred past v1. Every aggregate that treats results as observations — SPRT, progress counts, the job list, rating evidence and a leave generation's occurrence totals — reads **one result per task**, the first accepted: games are seeded and deterministic (a leave-generation task carries its seed too), so the other copies replay the same games, and counting them would multiply the evidence by the redundancy. "First" is the task's `accepted_count` read as zero under the task's row lock, which every submission takes before storing anything. A later result for a leave task is credited to its worker (`leave_records`) and not folded into `leave_rack_progress` — a guard rather than a path, since a
-leave-generation job is created at redundancy 1 only.
+- **No redundant task execution** — a task has one slot and one result. Jobs used to state a redundancy X, with X workers completing each task, but no consensus or agreement check was ever built, so the copies cost X times the compute for nothing an aggregate could use; it was removed in October 2026. The cross-check below is what would make replication worth its cost.
 
 #### Why impossibility, and not per-worker anomaly detection
 
@@ -114,8 +115,8 @@ clients at the same depth on the same position return the same evaluation, so
 disagreement is proof. birdtest has no ground truth to compare against. Workers
 are handed *different* seeds — that is how the seed space tiles without gaps or
 overlaps — so no two workers ever play the same games. The only cross-worker
-statistic available is the win rate, and that is precisely what SPRT is
-measuring. A test on it cannot separate "this worker is broken" from "these
+statistic available is the win rate, and that is precisely what the match
+test is measuring. A test on it cannot separate "this worker is broken" from "these
 seeds favoured player 2", so it would flag honest contributors at its own alpha
 rate while an attacker biasing results by a percent passed straight through.
 Two further problems compound it: opening-rack analysis by a simming player is
@@ -159,9 +160,9 @@ the no-false-positives bar:
   seeds producing the same aggregate is ordinary for a small batch — a one-game
   batch has three possible results.
 
-The natural next step, when a job first runs at redundancy > 1, is **cross-checking
-replicated tasks**: at that point N workers do run the same seed with the same
-configs, `game_results` already stores each claim's row separately, and games are
+The natural next step, if replication is ever brought back (as sampled audit
+tasks, say), is **cross-checking replicated tasks**: N workers running the same
+seed with the same configs, each claim's row stored separately, and games
 deterministic, so disagreement becomes proof rather than evidence. That is where
 detection with real teeth lives, and it needs no population statistics at all.
 It applies to jobs whose players are all static: a simulation samples, and its
@@ -214,19 +215,44 @@ position on every turn regardless; this decides whether those are recorded
 rather than discarded, turning a job run to settle an Elo question into a corpus
 of analysed positions as well.
 
+A `game_pairs` job can keep less: with `capture_first_divergence` as well, only
+each pair's **first divergence**. A pair's two games share their tiles and swap
+who moves first, so until the players choose different moves they are one game
+played from both seats; the turn they first disagree is the one position both
+players faced, with each player's ranking of it. From each pair that diverges
+the worker keeps both games' positions at that turn -- one board, one rack to
+play from, each player to move in one game -- and from a pair played
+identically, nothing. MAGPIE's positions recorder holds each turn's positions
+until the pair's play says whether that turn is the divergence
+(`divergentpositions`, `autoplay_results_commit_positions`), so nothing else
+reaches the result. The server checks the shape strictly: every pair with
+positions has exactly two, at one turn, on one board with one rack, and there
+are as many such pairs as `divergent_games` says diverged. The job's page shows
+every saved position of a pairs job beside its partner -- the same turn of the
+pair's other game -- which for a first divergence is the two players' answers
+side by side.
+
 They share `position_analysis_records` with opening racks -- the request differs
 by job type, but what comes back is a position analysis either way. In-game rows
 carry the CGP, the game index and the turn number, which are NULL for an opening
 rack.
 
+A simulated in-game position can also carry its **inference**: what the
+player inferred of the opponent's leave from their previous move, before it
+simulated. MAGPIE infers once per turn, for a player that uses inference, past
+a game's first turn, when the previous move was not a pass; an opening rack
+never infers (there is no previous move). It is a position's, not a move's,
+so it is stored once per position (`position_analysis_inference`): how many
+distinct leaves the inference found, how many it drew, their mean equity, and
+up to ten of the leaves the opponent most likely kept, most drawn first. The
+job page shows it under the position's moves.
+
 Two things this design turns on, both consequences of games being deterministic:
 
-- **Redundant claims replay identical games**, so in-game positions are keyed on
-  `(task_id, game_index, turn_number)` rather than on the claim, with
-  `ON CONFLICT DO NOTHING`. The first accepted claim records them and the rest
-  are no-ops, so redundancy still verifies the *result* without multiplying the
-  corpus. Opening racks keep their per-claim key, so redundant analyses of the
-  same rack can still be compared.
+- **In-game positions are keyed on `(task_id, game_index, turn_number)`**, with
+  `ON CONFLICT DO NOTHING`: a task has one slot, so a conflict could only be a
+  duplicate. Opening racks keep their per-claim key, so the several analyses
+  of a rack a consensus job asks for can be compared.
 - **There is no sampling and no per-task cap.** Every position of every game is
   captured, which makes `games_per_batch` the control on submission size: a
   batch of 20 games is a few hundred KB, a batch of 1,000 is on the order of
@@ -306,29 +332,30 @@ move's score: MAGPIE sets it so under a score sort.
 
 ### Statistical Result Evaluation
 
-For game and game-pair jobs, results are evaluated using the Sequential Probability Ratio Test (SPRT). A job has two finish conditions:
+For game and game-pair jobs, results can be evaluated with the **match test**, which answers one question: is one player better than the other, at a stated confidence? The test is **optional and off by default** (`test_enabled`): a job without it plays `max_games` (or `max_pairs`) and completes, with no verdict stored — its `job.completed` audit row says `reached_target` — and its result is the match score (wins, losses and draws, score and win rate, the players' average scores and spread). A job that only wants the games played should not be stopped early by a test nobody asked for, nor show an interval nobody acts on. Its `min_*` and `confidence_pct` are stored at their defaults (a floor of 0, 95%) and read by nothing, and the API refuses either sent without `test_enabled: true` rather than dropping it: the job would otherwise play to its cap with no test, and nothing would say so until it finished. A job with the test has two finish conditions:
 
-1. **SPRT significance**: SPRT is evaluated as results are submitted (debounced, below), and acted on once `min_games` (or `min_pairs`) have been completed. The job auto-completes when a check finds the LLR past the significance boundary.
-2. **Hard cap**: the job auto-completes when `max_games` (or `max_pairs`) is reached, regardless of SPRT outcome. **No task is generated past the cap**: once every game (or pair) up to it has been handed out, a claim finds nothing new to generate, tasks whose claims lapse are still re-dispatched, and the job completes as their results land. Generating beyond the cap handed out work that could not change the verdict — as many batches as workers asked before the debounced check next ran.
+1. **A decision**: the test is evaluated as results are submitted (debounced, below), and acted on once `min_games` (or `min_pairs`) have been completed. The job auto-completes when a check finds player 1's score interval wholly above an even score (`player1_better`) or wholly below it (`player2_better`).
+2. **Hard cap**: the job auto-completes when `max_games` (or `max_pairs`) is reached, regardless of the test, which is then `inconclusive`. **No task is generated past the cap**: once every game (or pair) up to it has been handed out, a claim finds nothing new to generate, tasks whose claims lapse are still re-dispatched, and the job completes as their results land. Generating beyond the cap handed out work that could not change the verdict — as many batches as workers asked before the debounced check next ran.
 
-SPRT is evaluated inline on the submission path (no background sweep), and
-**debounced**: every eighth submission for a job, plus unconditionally whenever
-that job has nothing left in flight. A submission checks only while its job is
-active, so one more trigger covers the results that land with nobody to check
-them — the last results of a job deactivated while they were out, or a last
-check that failed: a claim that finds a games, pairs or opening-rack job with
-nothing to hand out and no claim in flight checks it, off the claim request, at
-most every ten seconds per job and at once after an activation. Without it such
-a job, reactivated, stayed active at its allocation for good (thirty-second
-audit). The server flips the job to `completed`
-automatically when either condition is met, and **stores the verdict it completed
-on** — status, LLR and units (`jobs.sprt_decided_*`) — with the completion. The
-claims in flight at that moment are still played and accepted, and the live
-figures are recomputed from every accepted result, so the LLR can go on moving
-afterwards, even back inside the bounds; without the stored verdict a job that
-passed could show "running" on its own page with no record of the decision that
-stopped it. The page shows the stored verdict as the result and the live LLR
-beside it. A purge clears it.
+The test is evaluated inline on the submission path (no background sweep), and
+**debounced**: every eighth submission for a job (`TEST_CHECK_EVERY`), plus
+unconditionally whenever that job has nothing left in flight. A submission
+checks only while its job is active, so one more trigger covers the results
+that land with nobody to check them — the last results of a job deactivated
+while they were out, or a last check that failed: a claim that finds a games,
+pairs or opening-rack job with nothing to hand out and no claim in flight
+checks it, off the claim request, at most every ten seconds per job and at
+once after an activation. Without it such a job, reactivated, stayed active at
+its allocation for good (thirty-second audit). The server flips the job to
+`completed` automatically when either condition is met, and **stores the
+verdict it completed on** — status, player 1's interval at that moment (lower
+and upper) and units (`jobs.test_decided_*`) — with the completion. The claims
+in flight at that moment are still played and accepted, and the live figures
+are recomputed from every accepted result, so the interval can go on moving
+afterwards, even back around an even score; without the stored verdict a job
+that decided could show "running" on its own page with no record of the
+decision that stopped it. The page shows the stored verdict as the result and
+the live interval beside it. A purge clears it.
 
 The debounce trades *when* a job notices it is finished for the cost of
 noticing, and nothing else — the check still reads `game_results`, so a
@@ -336,11 +363,12 @@ debounced check is late, never wrong. That is what separates it from replacing
 the read with a counter, which would make a drifted counter able to stop a job
 early (see [What these reads cost](#what-these-reads-cost-measured)). The cost
 is bounded at seven extra tasks, and the first several of those are free: when
-the LLR crosses, the job flips to `completed`, but every task already claimed
+the test decides, the job flips to `completed`, but every task already claimed
 across the fleet is still played and still accepted, because the submit path
 validates the claim rather than the job's status. A bound at or below the number
 of tasks typically in flight therefore wastes nothing that was not already going
-to be wasted.
+to be wasted. Checking this often is safe only because the interval stays valid
+however often it is checked (below).
 
 The unconditional check when nothing is in flight is a correctness cover rather
 than an optimisation. The check is triggered *by* submissions, so a job whose
@@ -348,33 +376,39 @@ contributors all stop between checks would not be evaluated again until work
 resumed — which, for a job that has already reached its stopping point, means
 never: it would sit `active` holding its allocation.
 
-#### How the LLR is computed
+#### Why a match test, and not an SPRT
+
+Until October 2026 the test was an SPRT between two Elo hypotheses, H0 at
+`elo_low` and H1 at `elo_high` (−10 and +10 by default), with error rates α
+and β. Those error rates held only *at* the two hypothesised values, and its
+verdict said which of the two the data favoured, not whether player 1 was
+better. Two problems followed:
+
+- **Equal players got a winner about half the time.** By symmetry, two equal
+  players "passed" about as often as they "failed", and the badge said
+  "passed (H1 accepted)".
+- **It asked for settings the question doesn't have.** An admin had to pick an
+  Elo margin, α and β, none of which appear in "is A better, at 95%
+  confidence?". Its normal-approximation LLR also overstated |LLR| when nearly
+  every pair split (KL-87), which is common for pairs that play identically.
+
+The match test answers the question directly: it keeps a confidence interval
+for player 1's score that stays valid however often it is checked, and stops
+as soon as the interval excludes an even score. Its only settings are the
+confidence and the floor and cap the SPRT already had.
+
+#### How the interval is computed
 
 **A games job's batch is even.** MAGPIE gives player 1 the first move in a run's
 first game and alternates from there, and every task is a run of its own. At a
 batch of 1 — the default until the thirty-second audit's pass 18 — player 1
-moved first in every game of the job, and SPRT passed two identical players on
-the first move alone (+42 Elo measured, an H1 of +10 accepted after 358
-games); any odd batch leans the same way, by less. An even batch gives each
-player the first move in half of every task's games. Game pairs are balanced
-already: each pair gives each side the first move once. (The schema's column
-default is still 1; the API always sets it. A `games` job made before then
-with an odd batch is biased, KL-87.)
-
-The hypotheses are stated in Elo: H0 says the difference is `elo_low`, H1 says
-it is `elo_high`, each within ±1000. The test uses a normal approximation of
-the kind fishtest has used — treat
-the sample as draws from a distribution with unknown mean and compare the
-likelihood of the observed mean under the two hypothesised means:
-
-```
-expected_score(elo) = 1 / (1 + 10^(-elo/400))
-
-llr = n · (µ₁ - µ₀) · (mean - (µ₀ + µ₁)/2) / variance
-```
-
-where `µ₀ = expected_score(elo_low)` and `µ₁ = expected_score(elo_high)`. The
-acceptance bounds are `ln(β / (1-α))` and `ln((1-β) / α)`.
+moved first in every game of the job, and the SPRT then in use passed two
+identical players on the first move alone (+42 Elo measured, an H1 of +10
+accepted after 358 games); any odd batch leans the same way, by less. An even
+batch gives each player the first move in half of every task's games. Game
+pairs are balanced already: each pair gives each side the first move once.
+(The schema's column default is still 1; the API always sets it. A `games` job
+made before then with an odd batch is biased, KL-87.)
 
 What differs between the two job types is **what one observation is**, and that
 choice is the whole statistical content of the test:
@@ -384,8 +418,79 @@ choice is the whole statistical content of the test:
 | `games` | one game | 1 / 0.5 / 0 | games played |
 | `game_pairs` | one **pair** | `i / 4` for pentanomial bucket `i` | pairs played |
 
-For a plain `games` job the sample is per-game, with
-`mean = (wins + 0.5·draws)/n` and `second_moment = (wins + 0.25·draws)/n`.
+From the counts the server already stores (`stats/outcomes.rs`: the per-game
+`Tally` and the `Pentanomial`) it takes n, the mean score μ̂ and the sample
+variance σ̂² of the unit scores. For a plain `games` job the sample is
+per-game, with `mean = (wins + 0.5·draws)/n` and `second_moment = (wins +
+0.25·draws)/n`.
+
+The interval is an **asymptotic confidence sequence** (Waudby-Smith, Arbour,
+Sinha, Kennedy & Ramdas, *Time-uniform central limit theory and asymptotic
+confidence sequences*, 2021): the Robbins normal-mixture boundary with the
+sample's own variance (`stats/match_test.rs`). With α = 1 − confidence/100:
+
+```
+half_width(n) = sqrt( 2·(n·σ̂²·ρ² + 1) / (n²·ρ²) · ln( sqrt(n·σ̂²·ρ² + 1) / α ) )
+ρ²            = (−2·ln α + ln(−2·ln α + 1)) / (n*·v)
+n*            = sqrt(min_units · max_units)
+v             = 1/4 for a game, 1/16 for a pair
+interval      = [ μ̂ − half_width, μ̂ + half_width ], clipped to [0, 1]
+```
+
+Why this method, and the choices in it:
+
+- **It holds under repeated looks.** The interval contains the true score at
+  every n at once, with probability about the confidence, so checking it every
+  eighth submission and stopping the moment it decides is valid. Stopping the
+  first time an ordinary fixed-n 95% interval excluded ½ would name a winner
+  between equal players far more often than one time in twenty; with this one
+  the chance of ever naming a winner between them is at most about α, split
+  between the two sides. Simulated, checked after every batch of 50 pairs from
+  500 to 10,000, equal players got a winner in at most α + 2% of runs, and a
+  player scoring 53.5% per game (about +24 Elo) was found better in at least
+  90% of them (TESTING.md, `U-STATS-3b`).
+- **It needs only stored sums.** n, μ̂ and σ̂² come from the stored counts at
+  any moment, in any order, so it is recomputed on every read, as the SPRT
+  was, with no column per result and no per-unit history. An exact,
+  nonasymptotic (betting) confidence sequence would need each unit's outcome
+  in order, which batches do not keep.
+- **Asymptotic means a floor.** It assumes enough units for the mean to be
+  close to normal, so `min_units` is required with the test, at least 1 and at
+  most the cap, and nothing is acted on before it.
+- **Tuned at n\*, for a planning variance v.** n\* = √(min_units · max_units),
+  the geometric mean of the earliest point the test acts and its cap, is where
+  the boundary is tightest; v is ¼ for a game (the most a score in [0, 1] can
+  vary) and 1/16 for a pair (about what a paired match's pair scores do). The
+  paper's ρ is tuned for a variance of 1: used as it is on scores of variance
+  near 1/20, it put the tightest point twenty times past n\*, and early in a
+  job 90 wins in 100 games decided nothing. The boundary is flat around its
+  tightest point — at 95%, within a tenth of the narrowest any tuning gives,
+  from a fifth of n\* to twenty times it — so neither guess needs to be close.
+  Both are fixed before any game is played, as the guarantee requires; the
+  variance *inside* the boundary is the sample's own.
+- **No observed variance is still an interval.** If every pair splits, σ̂² is
+  0 and the half-width is `sqrt(2·ln(1/α) / (n²·ρ²))`, which shrinks with n
+  but never reaches zero, so a run of identical pairs cannot decide anything
+  on its own. The SPRT's overstatement there (KL-87) is gone with it.
+- **The confidence is strictly between 50% and 100%.** At 100% ln α is
+  infinite and the interval never closes; at half or less it is no test.
+
+**The decision**, made only once n ≥ `min_units`: a lower bound above ½ is
+`player1_better`; an upper bound below ½ is `player2_better`; n ≥ `max_units`
+with neither is `inconclusive`, and the interval then says how large a
+difference the games rule out. Below `min_units` the interval is computed and
+reported but never acted on — except that the hard cap still applies, so a job
+whose `max_units` is below its `min_units` ends inconclusive rather than
+running for ever. Before anything is played the mean is ½ and the interval
+every score. The status is one of `running`, `player1_better`,
+`player2_better`, `inconclusive`.
+
+**Elo is for display.** `elo(s) = −400·log10(1/s − 1)` is applied to μ̂ and to
+both bounds, clamped at ±1000 where a bound reaches 0 or 1. A pair's `i/4` is
+player 1's per-game score, so the Elo is per game for both job types. The job
+page's Significance Test card says it in one sentence ("static-equity scores 53.1% per
+game (95% interval 51.2% to 55.0%).") over a bar of the interval around 50%;
+the Elo figures are in the API, and the card shows none.
 
 #### The pentanomial, and why pairs are the unit
 
@@ -397,8 +502,8 @@ both, lost one and drew one, split, won one and drew one, or won both. MAGPIE
 reports those five counts directly (see [MAGPIE reports the
 pentanomial](#magpie-reports-the-pentanomial)), indexed by player 1's half-point
 score across the pair, and the sample's mean and variance are taken over pair
-scores of `i/4`. That puts the mean on the same per-game scale
-`expected_score(elo)` expects while `n` honestly counts pairs.
+scores of `i/4`. That puts the mean on the same per-game scale as a game's
+score while `n` honestly counts pairs.
 
 **Every completed pair is in the sample, including the pairs whose two games
 played identically.** Those are guaranteed 1-1 ties: they score exactly 0.5,
@@ -417,38 +522,27 @@ of which only 100 diverged and one player took 99 of them:
 | Every pair (10,000 of them) | 0.4975 | about **-1.7 Elo** |
 | The 50 divergent pairs alone | 0.01 | about **-800 Elo** |
 
-Same games. A test fed the second number crosses any boundary it is given,
-almost immediately, on a hundredth of the evidence — so an SPRT configured to
-resolve ±10 Elo stops being able to resolve anything at all, and reports every
-difference as decisive. The divergent counts are still collected and still
-shown, as a **diagnostic** of how often two configs differ at all. Nothing is
-tested on them.
-
-**The LLR is 0 for a degenerate sample** — no observations yet, or zero observed
-variance, which is what a run in which every pair split produces. The test has
-not begun to discriminate, and reporting 0 rather than dividing by zero is what
-keeps the dashboard honest about that.
+Same games. A test fed the second number decides almost immediately, on a
+hundredth of the evidence, whatever confidence it is asked for, and reports
+every difference as decisive. The divergent counts are still collected and
+still shown, as a **diagnostic** of how often two configs differ at all.
+Nothing is tested on them.
 
 **The sample size and the progress count are the same number.** `min_pairs` and
 `max_pairs` gate on pairs played, and the pentanomial's sample is pairs played,
-so the two cannot drift apart. (They could, and did, when the LLR ran over a
-filtered subset of games while the gates counted pairs — a job would then either
-end early or never end.)
-
-The status is one of `running`, `passed`, `failed`, `terminated_at_max`. Below
-`min_units` the LLR is computed and reported but never acted on — except that
-the hard cap still applies, so a job whose `max_units` is below its `min_units`
-terminates rather than running forever.
+so the two cannot drift apart. (They could, and did, when the SPRT's LLR ran
+over a filtered subset of games while the gates counted pairs — a job would
+then either end early or never end.)
 
 ### Ratings
 
 Ratings are **siloed from job control flow entirely**. Nothing in the rating
 system is read while dispatching, claiming, validating or completing a task, and
 no job decision reads a rating. The coupling runs one way: a fit reads finished
-`game_results` and writes a snapshot. SPRT stays where it belongs, on the job
-config tables — it is a per-job **stopping rule**, not a measurement, and
-`elo_low`/`elo_high` are hypotheses about one comparison rather than anyone's
-rating.
+`game_results` and writes a snapshot. The match test stays where it belongs,
+on the job config tables — it is a per-job **stopping rule**, not a
+measurement, and the Elo it shows is one comparison's score rather than
+anyone's rating.
 
 Everything below lives in four `rating_*` tables and one module. See
 [Rating pools](#rating-pools) for the schema and the fit.
@@ -456,18 +550,19 @@ Everything below lives in four `rating_*` tables and one module. See
 #### In one place: when a rating is computed, and where it is shown
 
 A rating is never updated by a result landing. It is recomputed for a whole
-pool, from scratch, by `ratings::fit_and_store`, on exactly three triggers:
+pool, from scratch, by `ratings::fit_and_store`, on exactly four triggers:
 
 | Trigger | When | Who | What is written |
 |---|---|---|---|
 | **evidence** | Every two minutes, from a sweep started by `main.rs` (`ratings::recompute_stale`), for each pool whose eligible jobs' `games_completed` sum, or whose members, differ from its last run's (`evidence_games`) | The server, unattended | A new `rating_runs` row with a `player_config_ratings` row per member and a `rating_run_residuals` row per head-to-head — or nothing, if the evidence has not moved |
 | **membership** | Immediately, inside the request, when an admin adds or removes a member (`POST`/`DELETE /api/admin/rating-pools/:id/members`) | An admin | The same, unconditionally |
 | **manual** | Immediately, on `POST /api/admin/rating-pools/:id/recompute` | An admin | The same, unconditionally |
+| **anchor** | Immediately, in the same transaction as the change, when an admin moves the anchor or its rating (`PATCH /api/admin/rating-pools/:id`). The sweep would never notice: neither the evidence nor the members moved | An admin | The same, unconditionally |
 
 So a result submitted now is in a rating within two minutes, and a job that
 finishes at 03:00 is rated by 03:02 without anyone doing anything. Nothing on
 the claim or submit path reads or writes a rating, and no job decision depends
-on one; SPRT is a separate, per-job stopping rule.
+on one; the match test is a separate, per-job stopping rule.
 
 Ratings are **displayed on the ratings pages and nowhere else**:
 
@@ -478,7 +573,8 @@ Ratings are **displayed on the ratings pages and nowhere else**:
   run's provenance (trigger, iterations, convergence, evidence consumed), and
   the residual table showing where the fit disagrees with the games. A config
   with no path of games to the anchor is listed as unrated rather than drawn.
-  Admin membership controls appear inline here for admins.
+  Admin membership controls appear inline here for admins, with the anchor
+  (config and rating) and a Delete button.
 - **No history chart.** The page once drew each config's rating across the
   stored runs; it was removed as more noise than signal on a page read for the
   latest fit. `GET /api/rating-pools/:id/history` still serves those series to
@@ -487,7 +583,7 @@ Ratings are **displayed on the ratings pages and nowhere else**:
   middle, and labels still alike widened where they differ -- so no two read
   the same (the full name is each one's title).
 
-A job's own pages (`/jobs/[id]`) show its SPRT verdict, win rate and
+A job's own pages (`/jobs/[id]`) show its match test's verdict, win rate and
 pentanomial, and **no rating**: a rating belongs to a pool, not to a job, and a
 `games` job (unpaired) feeds no pool at all. Runs are kept in full for a month
 and then thinned to one a day (see below), so the history is bounded while the
@@ -589,7 +685,20 @@ membership row goes, the results stay in `game_results`, so re-adding costs
 nothing but a recompute.
 
 The anchor cannot be removed while it is the anchor; the pool would lose its
-scale.
+scale. It can be moved: `PATCH /api/admin/rating-pools/:id` sets another config
+(added as a member if it is not one) or another rating, and refits in the same
+transaction, so the page never shows the new anchor beside ratings on the old
+scale. Earlier runs keep the scale they were fitted on, so the history steps at
+the change — which is what happened. The change, a removal's anchor check and a
+pool's delete all take the pool's fit lock, so none of them interleaves with a
+fit or with each other: a removal that passed its check cannot land after an
+anchor change made its config the anchor.
+
+A pool can be deleted (`DELETE /api/admin/rating-pools/:id`): its members, runs,
+ratings and residuals cascade, and its census (`name`, `members`, `runs`) is
+logged first. The games stay with their jobs — a pool is only a view over them
+— and its configs and input data are free to be deleted after it. A sweep that
+listed the pool before the delete skips it without logging a failure.
 
 #### Two things the fit has to handle honestly
 
@@ -657,7 +766,7 @@ good enough for the distinction the page needs to draw, 1700 ± 15 against
 On membership change and on demand, immediately; on new evidence, from a periodic
 sweep (two minutes) rather than a hook on result submission. A fit is global to a
 pool, an active job submits results far faster than any rating needs to move, and
-— unlike SPRT — nothing blocks on the answer. The sweep first compares the sum
+— unlike the match test — nothing blocks on the answer. The sweep first compares the sum
 of the pool's eligible jobs' `games_completed` (each job's first-result-per-task
 running total, kept by the submission that stores the result) against the last
 run's `evidence_games`, and its current members against the configs that run
@@ -743,6 +852,12 @@ API keys are stored as hashes (never raw values) in the database. The raw key is
      keyboard walk it calls strong is refused; a long passphrase it calls good
      is taken); the server's refusal says only that the password is too weak,
      not why.
+
+   The form checks the length and address rules itself first, as the server
+   words them (`frontend/src/lib/accountRules.ts`), and is `novalidate`: the
+   browser's own checks showed a popup where the server's errors are red text
+   under the field, and took `a@b`, which the server refuses. The server still
+   checks everything. The sign-in and password-reset forms do the same.
 
    A **taken username** returns `409` naming it. The user has to choose another
    one to get anywhere, and `GET /api/users` publishes the whole list anyway, so
@@ -841,30 +956,28 @@ Shows all jobs with: job type, status, allocation, and a completion counter (tas
 
 - Job metadata: type, status, config summary, created by, created at.
 - Completion progress.
-- **Per-worker contribution table**: worker identity (username, or an anonymous worker's pseudonym — never its UUID, which is its credential), tasks completed for this job. Sorted by tasks completed descending.
+- **Per-worker contribution table**: worker identity (username, or an anonymous worker's pseudonym — never its UUID, which is its credential), tasks completed for this job and the compute time those claims were held (on a wide screen). Sorted by tasks completed descending.
 
 #### Job Detail Page — By Job Type
 
 **Games / Game pairs**
 
-- SPRT status text: one of `running`, `passed (H1 accepted)`, `failed (H0 accepted)`, or `stopped at its cap`.
-- The pentanomial (game pairs only): the five pair outcomes the LLR is computed from. Ratings are not here — they are pool-scoped and live on the [ratings page](#the-ratings-page).
-- Running result counts and percentages: wins / losses / draws for player 1.
-- **Saved positions**, for a job with `capture_positions` set: the latest captured positions, ten at a time, each with its board (CGP), the rack of the player to move, the move before it and the ranked moves; and a search for the positions played from one rack. Signed-in users only (`GET /api/jobs/:id/positions`); a signed-out visitor is told to sign in. The public has the results feed, and a job that captures holds millions of positions.
+- A **Significance Test** card, for a job that runs the test (one without has none, and `games.test` is `null`): a status badge (`running`, `player 1 better`, `player 2 better`, `inconclusive`, or paused or undecided from the job's own status), one sentence — "static-equity scores 53.1% per game (95% interval 51.2% to 55.0%)." (nothing in Elo) and, once decided, which player is better at that confidence — a bar of the interval on a scale of player 1's score with 50% marked, and a folded explanation with the job's own confidence.
+- The pentanomial (game pairs only), in the Significance Test card: the five pair outcomes the test is computed from. Ratings are not here — they are pool-scoped and live on the [ratings page](#the-ratings-page).
+- A **match score** card, after the settings and before the Significance Test card: player 1's wins–losses–draws, its score (W + ½D) out of the games played and the win % that is, each player's average score per game and player 1's average spread, and the win/loss/draw chart and percentages. It counts games for a pairs job too. For a job without a test it is the job's result. The averages are the batches' `p1_score_mean` / `p2_score_mean` weighted by their games, over the first accepted result of each task (`jobstats::SCORE_MEANS`).
+- **Saved positions**, for a job with `capture_positions` set: one captured position at a time, drawn on the job's own board (`Board.svelte`) — its premium squares from the layout, the tiles with their letters and scores (a blank in lower case, scoring nothing), both racks and scores with the player to move marked, and the tiles the move before it placed outlined — beside its ranked moves — each with its win percentage, how often the simulation played it out (**Iters**), and its first two plies' average score and bingo percentage (P1-S, P1-BP, P2-S, P2-BP, P1 the reply) when it was simulated, and a solved move's depth as **Solved Plies** — and its CGP as text. A simulated position past turn 0 whose player inferred the opponent's leave first (its previous move not a pass) shows that inference under the moves: "Inferred from MOVE: N possible leaves, average equity E", and up to ten of the leaves the opponent most likely kept, with their draws and equity. **Random position** draws another (`GET /api/jobs/:id/positions/random`); a rack search shows that rack's positions newest first, one at a time with **Next** and **Previous** (`GET /api/jobs/:id/positions?rack=`). On a game-pairs job each position comes with its `partner`, the same turn of the pair's other game, and the two are drawn side by side ("Game 1 of the pair", "Game 2 of the pair", each naming the player to move); a rack both games hold finds the pair once. A job keeping only first divergences (`capture_first_divergence`) shows exactly the turn each pair's players first chose differently. There is no list of the newest positions: a job that captures holds millions, and one at a time on a board is what the section is for. The CGP and the move notation are read by `lib/cgp.ts` as MAGPIE writes them (`game_get_cgp_string`, `move_get_string`: `8G HUH` across, `E9 (E)RUVIM` down, letters played through in parentheses, `[L·L]` for a multi-letter tile); a position it cannot read is shown as text. The board scales to its box, so a phone shows it whole. On an `xl` screen the pane is a grid of `27rem minmax(0,1fr)`: the board has a fixed column, so it is the same size whatever position it shows, and the moves start right beside it, every cell on one line with tight padding (as in the opening-rack lookup's table); narrower, the moves go under the board. Signed-in users only; a signed-out visitor is told to sign in. The public has the results feed. Clicking a ranked move to preview it on the board is a follow-up.
 
 **Opening rack analysis**
 
-- Progress: racks analyzed against the size of the rack space, and nothing else.
-- Search input: enter a rack string to look up its analysis. Returns the full ranked move list (all N plays that were evaluated) for that rack, sourced from `position_analysis_moves`.
+- Progress: racks settled against the size of the rack space, racks analyzed, and for a job seeking a consensus the racks settled and those settled without one.
+- Search input: enter a rack string to look up its analysis. Returns the full ranked move list (all N plays that were evaluated) for that rack, every analysis of it numbered, sourced from `position_analysis_moves`, each move with its win percentage, how often the simulation played it out (**Iters**, `position_analysis_moves.iterations`, which MAGPIE reports per move) and its first two plies' statistics when the player simulated (`GET /api/jobs/:id/results?rack=`).
 - Below it, up to ten racks the job has analysed -- the newest, from the first page of the results feed -- each a button that looks it up, so a visitor has something to try.
 
   The panel used to carry the average best equity and a breakdown of what the
   best opening play was — placement, exchange or pass — and both are gone.
   They aggregated over every stored move row of the job, which made them the
   most expensive read in the payload and one that grew without bound; and they
-  counted per *claim* where `racks_analyzed` counts per task, so at
-  `redundancy > 1` the move-type total was twice the rack count displayed beside
-  it. Nothing is lost from storage: every ranked move is still there,
+  counted per *claim* where `racks_analyzed` counted per task. Nothing is lost from storage: every ranked move is still there,
   `GET /api/jobs/:id/results` still returns the best move, score and equity per
   rack, `?rack=` still returns a rack's full ranked list, and an
   [admin export](#exports) is the path for analysing the corpus properly.
@@ -873,7 +986,7 @@ Shows all jobs with: job type, status, allocation, and a completion counter (tas
 
 **Leave generation**
 
-- Current generation number and the configured per-generation minimum rack target (e.g., "Generation 3 — target: 500 occurrences per rack").
+- Current generation number and that generation's own occurrence target (e.g., "Generation 3 of 6 — target 500 occurrences per rack"), and every generation's target when they differ.
 - **Live**, pushed as results land: tasks completed and games played in the in-progress generation.
 - **As of the last merge**, and labelled with its time: racks at target out of the generation's total, and the rack with the fewest occurrences with its count. Accepted results are staged and merged into the per-rack totals in batches — every half hour, and about once a minute as a generation nears its end — so these lag by that much; see [What a merge costs](#what-a-merge-costs). Neither comes from a worker's heartbeat.
 
@@ -886,19 +999,27 @@ push use it, so a live update is byte-for-byte what a page reload would produce.
 
 ```
 JobStats {
-  job:               { id, job_type, status, allocation, redundancy,
+  job:               { id, job_type, status, allocation,
                        min_magpie_version, created_at, created_by, lexicon, variant }
   tasks_total, tasks_completed, tasks_available, tasks_claimed, results_accepted
   games?:            { unit: "game" | "pair", wins, losses, draws,
-                       units_completed, pentanomial?, divergent_pairs?, min_units, max_units,
+                       units_completed, pentanomial?, divergent_pairs?,
+                       divergent?: { wins, losses, draws, p1_score_mean, p2_score_mean,
+                                     spread_mean },   // pairs: the games that diverged
+                       min_units, max_units,
+                       p1_score_mean, p2_score_mean, spread_mean,   // null before any game
                        win_pct, loss_pct, draw_pct,
-                       sprt: { llr, lower_bound, upper_bound, status } }
-  opening_racks?:    { racks_analyzed, racks_total }
-  leave_generation?: { current_generation, generation_count, target_rack_count,
+                       test: { mean, lower, upper, elo, elo_lower, elo_upper,
+                               confidence_pct, status } | null,
+                       decided?: { status, lower, upper, units } }
+  opening_racks?:    { racks_analyzed, racks_settled, racks_without_consensus, racks_total }
+  leave_generation?: { current_generation, generation_count,
+                       target_rack_count,     // the current generation's
+                       target_rack_counts,    // every generation's, in order
                        tasks_completed, games_played,            // live
                        racks_at_target, racks_total, min_rack, min_rack_count,
                        progress_as_of }                          // as of the last merge
-  workers:           [ { user_id, anon_id, username, tasks_completed } ]
+  workers:           [ { user_id, anon_id, username, tasks_completed, compute_seconds } ]
   other_workers:     number
   eta_seconds?:      number
 }
@@ -913,9 +1034,7 @@ jobs, and are read from the ratings page.
 the job list's `units_completed` read `jobs.games_completed`,
 `opening_racks.racks_analyzed` reads `jobs.racks_analyzed`, and the job list's
 task counts read `jobs.tasks_total` / `jobs.tasks_completed`. The first two are
-maintained in the submit transaction once per task, on its first accepted result
-— the same row the aggregates they replace selected, since redundant claims
-replay the same deterministic work. `tasks_total` rides on the claim's existing
+maintained in the submit transaction, once per accepted result (a task has one). `tasks_total` rides on the claim's existing
 `UPDATE jobs`, and `tasks_completed` on the moment a task actually *reaches*
 completed, which the submit path's own update already computes.
 
@@ -923,7 +1042,7 @@ They exist because the reads did not scale: the job list re-derived per-task
 game totals for every job on every page view (2.2 s at the test volume) and
 counted each job's tasks twice more besides, and counting distinct analysed
 racks cost seconds at a million racks on every detail view and every live push.
-Nothing that *decides* anything reads them: SPRT still reads `game_results`, so
+Nothing that *decides* anything reads them: the match test still reads `game_results`, so
 a drifted counter is a wrong number on a page and cannot stop a job early. A
 purge zeroes them and a partial restore recomputes them (RUNBOOK §2.3).
 
@@ -941,6 +1060,21 @@ by that — finding the new maximum is the scan the counter exists to avoid, and
 it is a display figure that only ever moves forward. Account deletion subtracts
 nothing: it anonymizes in place and keeps the claims, so no donated compute is
 lost.
+
+Beside `tasks_completed` each identity carries **`compute_ms`, `games_played`
+and `racks_analyzed`**, and `/api/workers` ranks by compute time unless asked
+otherwise (`?sort=compute|games|racks|tasks`). MAGPIE reports no CPU time or
+thread count, so compute is the time each accepted claim was held, claim to
+submission, in whole milliseconds (`CLAIM_COMPUTE_MS`, one expression for the
+submission that adds it, the purge that gives it back and RUNBOOK §2.3b's
+recount). Each claim records its own games and racks
+(`task_claims.games_played`, `racks_analyzed`: a games or pairs batch's games,
+an opening-rack batch's racks, a leave task's `num_iterations` games and the
+distinct racks it reported), which is what lets a purge give back exactly what
+the submissions added by summing the claims it is about to delete, without
+reading the results. Each order is its own pair of partial indexes, one per kind
+of identity, so every order is two index scans merged, as the list always was;
+the cost is three more index entries on the identity's row per submission.
 
 With the two opening-rack aggregates removed, `opening_racks` is now those two
 counters and nothing else: two single-row reads, constant time at any job size.
@@ -966,12 +1100,11 @@ constant bound on the scan, so the completed-claims index serves it; the
 activation is a second condition. It is `null` for
 an inactive job and `null` when nothing completed in that window — there is
 nothing to extrapolate from, and a fabricated number is worse than a blank. For
-SPRT jobs the remaining work is measured in units against `max_units`, at the
-rate units have been finishing (claims × games or pairs per batch ÷ redundancy —
-from the observed units per completed task, as it first was, it counted every
-redundant claim and read half the time left at redundancy 2). For an opening-rack
-job it is the racks left of its rack space, at the rate racks have been finishing
-(claims × batch ÷ redundancy). A leave job has no ETA: its generations' size
+games and pairs jobs the remaining work is measured in units against `max_units`, at the
+rate units have been finishing (claims × games or pairs per batch). For an
+opening-rack job it is the analyses left -- the racks not yet settled, times
+the analyses each still needs -- at the rate racks have been analysed (claims ×
+batch). A leave job has no ETA: its generations' size
 depends on the draws. A job already past its cap reports 0. Tasks are made on
 demand, so "remaining tasks" was only what was in flight — a 3.2-million-rack
 job 1% done read three minutes left — and the job list's progress bar likewise
@@ -1025,13 +1158,15 @@ The **job list** carries a `stalled` flag per job — workers are declining it a
 none is completing it. A job pinned to data nobody has does not announce itself:
 the workers go on contributing elsewhere and this one simply gets nothing done,
 so the symptom is an absence and has to be stated rather than noticed. For
-on-demand SPRT jobs the list also reports `units_completed` against `max_units`,
+games and pairs jobs the list also reports `units_completed` against `max_units`,
 because a task count that grows as work is handed out is not a meaningful
 denominator.
 
 #### Exports
 
-A completed job's whole corpus is read **once**, not once per caller.
+A job's whole corpus is read **once**, not once per caller — at any point in the
+job's life, as a snapshot while it runs and as its final corpus once it has
+completed.
 
 The results stream scans from a cursor and holds a pool connection for as long
 as its caller keeps reading. That is fine for a spot check and wrong for a
@@ -1107,7 +1242,10 @@ unit stays one line per record and `row_count` counts records; each record's
 moves come through `(record_id, rank)`, so the cost is an index probe per
 record — about 70 seconds per million records at five moves each on the
 development machine, on a background task. The admin stream runs the same
-queries, so the two are the same corpus.
+queries, so the two are the same corpus. A captured position's record carries
+its `inference` beside its moves (null when it has none), and an opening-rack
+record its rack's consensus standing when the job's maximum is above one
+analysis per rack.
 
 **A games or game-pairs job that captured positions exports two objects.** Its
 result rows, as ever, and beside them `…/<export>.positions.ndjson.gz`: every
@@ -1123,18 +1261,53 @@ corpus capture exists to build had no way out of the database at all. Both
 objects are written before the row says `ready`, a purge deletes both, and both
 live under `exports/` and expire with it.
 
-**Only completed jobs can be exported**, and that restriction is what makes the
-artifact worth having: a completed job's results are immutable, so an export is
-built once and reused by every later download, where an export of an active job
-would be stale as it was written. It is also why the stream can safely redirect
-to one.
+**Any job can be exported, and the export says what it is.** A job still taking
+results — active, or inactive between runs — exports a **snapshot**: the corpus
+as of the moment its snapshot was taken, consistent in itself, downloadable,
+and labelled on the admin page "Snapshot as of <time> — job still running". A
+completed job exports its **final** corpus, which is what makes that artifact
+worth keeping: a completed job's results are immutable, so it is built once and
+reused by every later download, and the results stream redirects to it. Only a
+final export is ever served in the completed job's place — `newest_ready`, the
+redirect, reads `is_final` exports only — so a completed job whose only exports
+are snapshots streams from the database, and the page offers to build its final
+export. (Before exports could be taken mid-run the rule was "completed only",
+and the redirect served the newest ready export whatever it was built from:
+an export taken mid-run would have become the completed job's corpus.) The one
+way a completed job takes results again is a consensus edit that unsettles an
+opening-rack job's racks; that reopens it and demotes its final exports to
+snapshots (`exports::unfinalize`), since it will have a new final corpus once
+it completes again; an export still building then is marked final only if the
+job is still completed when it finishes.
 
-**And only once its results have settled.** A job is marked completed the
-moment its stopping rule is met or an admin forces it, but the claims already
-out are still played and still accepted, so its results keep arriving for up to
-the heartbeat timeout. An export started in that window missed them, and every
-later download was redirected to it. So an export is refused (`409`) while any
-claim of the job is still open; no claim can be issued against a completed job,
+**Final is decided inside the snapshot.** An export reads its results and its
+captured positions in **one** `REPEATABLE READ`, read-only transaction on one
+connection — read on two, as they were, the positions file of a running job
+could name results the results file did not hold. The transaction's first
+statement takes the snapshot and asks of the state it sees whether this is the
+final corpus: the job completed, no claim still open, and (a leave job) nothing
+staged. Not what `start` saw: a job exported while active can complete before
+its build begins its read, with its last claims still landing, and one marked
+final on a status read before its rows were would be the short corpus the
+marker exists to rule out. The transaction holds one connection and one
+snapshot for both scans, as the two scans each held one before; the two-builds
+cap, the six-hour limit and the closed-not-drained connection bound it the same
+way.
+
+**A running leave-generation job's export reflects its last merge.** Its corpus
+is `leave_rack_progress`, which a merge updates at most every half hour; the
+export does not force one (only a completed job's is merged first, below), and
+the admin page says so beside a snapshot of a leave job.
+
+**A completed job's export waits until its results have settled.** A job is
+marked completed the moment its stopping rule is met or an admin forces it, but
+the claims already out are still played and still accepted, so its results keep
+arriving for up to the heartbeat timeout. An export started in that window
+missed them, and every later download was redirected to it (it would now be a
+snapshot, never redirected to, but it is still not what an admin exporting a
+completed job asked for). So a completed job's export is refused (`409`) while
+any claim of the job is still open — a running job's is not, since an active
+job always has claims out; no claim can be issued against a completed job,
 so once none is open the results are fixed. The job's lapsed claims are
 reclaimed first, through the same statement dispatch uses: reclamation is
 otherwise lazy, running only when a worker asks for work and the job is a
@@ -1202,7 +1375,7 @@ leave-generation job's 3,199,724 progress rows. Warm times, best of two:
 
 What the numbers settled:
 
-- **The SPRT path still reads the rows, but not on every submission.** About
+- **The match test still reads the rows, but not on every submission.** About
   50 ms at 400,000 units in large batches, but 340–620 ms at 400,000 result rows
   (batches of one), and linear in the job's history from there. The
   stopping rule keeps reading `game_results` rather than a counter — it cannot
@@ -1374,7 +1547,7 @@ What the numbers settled:
 | Frontend hosting | ECS (same service as backend), S3 + CloudFront later |
 | Styling | Tailwind CSS |
 | Component library | shadcn-svelte (dark mode only; Tailwind `darkMode: 'class'` with `dark` always applied to root) |
-| Charts | LayerCake |
+| Charts | Plain SVG and markup (no chart library) |
 | Live updates | Server-Sent Events (SSE) via Axum |
 | Auth | Roll your own (Axum + Argon2 + Paseto) |
 | Email | AWS SES |
@@ -1424,6 +1597,7 @@ start. The process has no SSM code path of its own.
 | `JOB_STATS_CACHE_SECONDS` | `10` | How old a job's stats payload (`GET /api/jobs/:id`, the stream's first event) may be, and the least spacing of its live pushes. The payload reads the job's whole history; rebuilt on every view and every second a busy job was watched, it cost about a second of database time per second on a large job. Built one at a time per job; dropped by every admin action on the job, by its completion and by a leave generation closing, so the admin page reloading after an action reads the change. `0` builds it on every request (the tests). |
 | `S3_BUCKET` | `birdtest-artifacts` | |
 | `S3_ENDPOINT` | unset | Set to MinIO's address locally; the AWS SDK works against it unmodified. |
+| `S3_PUBLIC_ENDPOINT` | unset | The object store as a browser reaches it, when that differs from `S3_ENDPOINT`: export download links are signed for it. The compose stack sets `http://localhost:${MINIO_PORT}`, since its backend reaches MinIO as `minio:9000`; production leaves it unset. |
 | `MIN_MAGPIE_VERSION` | `0.1.1` | The enforced global floor, and the default floor for a new job. Also a floor the server's own pinned MAGPIE must clear: startup fails if `MAGPIE_BIN` reports less, since the server would be publishing hashes built by a MAGPIE its workers may not run. |
 | `MAGPIE_BIN` | `/usr/local/bin/magpie` | The pinned MAGPIE the server runs for every derived file and every leave-generation KLV. The backend image builds one in; locally, a checkout's `bin/magpie`. Startup fails without a working one. |
 | `MAGPIE_THREADS` | `1` | Threads given to a conversion. The web task keeps 1; the derived-file builder task sets its vCPU count. |
@@ -1467,11 +1641,11 @@ what the workers are checked against.
 | Seed gap of batch size | Keeps task seeds unique and ordered, `next_seed = MAX(seed) + batch_size`; a batch's games are drawn from a stream seeded with its task's seed, so no two tasks share them |
 | Ratings pooled across jobs, scoped by (variant, letterdist, layout) | A rating is only comparable under fixed conditions, but it is not a property of one job; pooling is what lets a config's whole record produce one number |
 | Only paired jobs feed ratings | `-gp` swaps seats on every seed, so a pair is side-balanced; unpaired games would need an explicit side-advantage term to avoid biasing every rating |
-| Two finish conditions for SPRT jobs | `min_games`/`min_pairs` prevents early false-positive termination; `max_games`/`max_pairs` bounds compute cost |
+| Two finish conditions for a job with a match test | `min_games`/`min_pairs` keeps an asymptotic interval from being acted on too early; `max_games`/`max_pairs` bounds compute cost |
 | Jobs created inactive | Allocation is set at activation time, not creation, so the admin reviews the full active job set and assigns percentages as a single deliberate act |
 | API keys active/inactive toggle | Lets contributors rotate or temporarily suspend a key without losing it; only active keys accepted for auth |
 | Account deletion is app-layer, not CASCADE | The account is anonymized in place, its contributions kept, and its keys, codes and tokens deleted; a cascade would delete what the account did, and the census row it writes first must outlive it |
-| SPRT evaluated inline on the submission path, debounced | No background sweep needed; a debounced check is late, never wrong (see Statistical Result Evaluation) |
+| Match test evaluated inline on the submission path, debounced | No background sweep needed; a debounced check is late, never wrong (see Statistical Result Evaluation) |
 | Two containers per ECS task | Axum backend + Nginx for SvelteKit static files; cleaner than co-mingling in one process |
 
 ---
@@ -1520,9 +1694,9 @@ alongside everyone else's. Blast radius, worst first:
   with, so bad data propagates into every later generation. It is folded into
   running per-rack totals (`occurrence_count +=`, at the next merge), so there
   is no per-claim detail to subtract back out afterwards.
-- **`games` / `game_pairs`** — SPRT is a decision procedure over an aggregate. A
-  minority of workers on a different lexicon biases the win rate and SPRT
-  reaches a confident, wrong conclusion. Nothing about the output looks anomalous.
+- **`games` / `game_pairs`** — the match test is a decision procedure over an
+  aggregate. A minority of workers on a different lexicon biases the win rate
+  and the test reaches a confident, wrong conclusion. Nothing about the output looks anomalous.
 - **`opening_rack`** — most recoverable (per-rack rows can be deleted and
   recomputed), but easiest to corrupt: a different `.kwg` changes which plays
   exist at all.
@@ -1754,7 +1928,12 @@ is the first thing that breaks.
 5. Compare each `(path, sha256)` against `input_data`. Stage the result, keeping
    the bytes of every `letterdist` and `layout` entry, and the object key of
    every `kwg` and `klv` entry, so confirmation does not have to download again.
-6. Mark the row `staged`, or `failed` with the reason in `error`.
+6. Mark the row `staged`, or `failed` with the reason in `error` — or, when
+   every file is already known, `nothing_new`, audited as
+   `input_data.import_nothing_new`: there is nothing to confirm, and left
+   `staged` it offered an Insert of 0 rows and waited a day to be expired. The
+   page says "No new data to insert." Its lexica and leaves were still
+   uploaded in step 4, so an import is still how a missing object comes back.
 
 **Phase 2 — confirm.** The admin sees three groups: **new** rows, **known** rows
 (the majority, and the reason the diff exists), and **path collisions** — a path
@@ -1862,9 +2041,10 @@ knowing its type first. Putting the letter distribution here rather than on the
 player is not arbitrary: MAGPIE takes one `-ld` for the whole game, and two
 players cannot draw from different bags. The same is true of the board.
 
-**The per-type tables** keep only what is genuinely per-type.
-`job_leave_config` is the one place a lexicon still sits on a job, because leave
-generation has one bot and no `player_configs` row to hold it.
+**The per-type tables** keep only what is genuinely per-type. No lexicon sits on
+a job: leave generation's bot plays as a player config too
+(`job_leave_config.player_config_id`), in both seats, and takes its lexicon and
+wordmap setting from it.
 
 #### Validation at job creation
 
@@ -2242,7 +2422,7 @@ The core of birdtest is the task claim endpoint — the sequence that runs every
 3. **Lazy reclamation**: Before acquiring a task, any claimed tasks whose `last_heartbeat_at` (or `claimed_at`, if no heartbeat has been received yet) exceeds the heartbeat timeout are returned to `available`. One statement covers every candidate job rather than one per job: no index on `task_claims` leads with the job, so the planner reaches expired claims through the partial index on open claims — one entry per claim in flight across the fleet — and filters by job afterwards. Per job, a claim request paid that scan once per candidate for a set of rows that does not depend on the job at all. Skipped entirely while the process is younger than the heartbeat timeout — see [Task States](#task-states) for why a restarted server has to hear from the fleet before it judges it.
 
 4. **Task acquisition** — strategy-dependent:
-   - **Re-dispatch first**, under the job's dispatch lock like everything else here: `SELECT ... FOR UPDATE SKIP LOCKED` on the job's `available` tasks — a lapsed claim's task, or one with redundancy left to fill — **excluding any task this worker already holds a slot on**. Redundancy means independent workers; without the exclusion, a worker holding a slot on the oldest open task is offered it again on every attempt, refused by the per-identity unique index each time, and gets no work at all.
+   - **Re-dispatch first**, under the job's dispatch lock like everything else here: `SELECT ... FOR UPDATE SKIP LOCKED` on the job's `available` tasks — a lapsed or declined claim's task — **excluding any task this worker already holds a slot on**: without the exclusion, such a task is offered again on every attempt, refused by the per-identity unique index each time, and the worker gets no work at all.
    - **Otherwise generate**: produce the next task request for the job type and insert + claim it atomically in a single transaction.
 
 5. **Response**: The server serializes the job-type-specific task request and returns it to the worker along with the claim token.
@@ -2330,10 +2510,16 @@ letter distribution (parsed), its players' configs flattened into the shape a
 request carries, its `expected_data`, and for opening racks the rack-space
 table a range is unranked with — is a *template* (`jobs::dispatch::JobTemplate`)
 read once per job per process and kept in memory (`AppState.templates`), the
-way a dispatchable job's derived-file hashes are. It cannot go stale: a job's
-config rows have no update path, player configs are immutable, and an
-`input_data` row cannot be deleted while a job or a config pins it. A purge
-changes none of it; deleting the job forgets it. Before the template, a games
+way a dispatchable job's derived-file hashes are. It cannot go stale in what
+it is used for: player configs are immutable, an `input_data` row cannot be
+deleted while a job or a config pins it, and a job's config rows have one
+update path, an opening-rack job's consensus settings
+([Editing the consensus](#opening-rack-consensus)). The template keeps those
+as the job was created, and nothing reads them from it: a claim reads them
+under the job's dispatch lock, and a submission after taking its claim
+(`ConsensusSettings::load`), and the edit holds the dispatch lock and every
+open claim, so neither reads them mid-edit. A purge changes none of it;
+deleting the job forgets it. Before the template, a games
 claim made five reads of those rows inside the lock — the config, the
 distribution, a three-way join per player and the six-table `expected_data`
 union — and a re-dispatched task's request made six; now the reads under the
@@ -2438,15 +2624,15 @@ The mirror of the claim, and the only place results enter the system.
    task rows stayed locked for the whole decode (KL-20, closed).
 3. Normalize it into the record shape and insert it.
 4. Mark the claim `completed`, increment `accepted_count`, decrement
-   `active_claim_count`, and recompute the task's state against the job's
-   `redundancy`, stamping `completed_at` when it reaches it.
+   `active_claim_count`, and complete the task (it has one slot), stamping
+   `completed_at`.
 5. Commit. No audit row is written: the completed claim and the stored result
    already record the submission. Ratings are deliberately **not** touched
    here: a fit is global to a rating pool and nothing in this path depends on
    it, so it runs on a periodic sweep instead.
 6. **After** the commit: evaluate the finish conditions on only the aggregates
-   they need — the SPRT statistics, or an opening-rack job's task counts.
-   Inline, because SPRT decides whether the job keeps dispatching. The job row
+   they need — the match test's statistics, or an opening-rack job's task
+   counts. Inline, because the test decides whether the job keeps dispatching. The job row
    the submission's transaction read (step 1, before anything was stored) is
    the one the check uses, rather than a second read of it on the path the
    worker waits on. The
@@ -2646,7 +2832,7 @@ Some request types are shared across job types:
 
 ### Task Response Types
 
-A task response is what the worker submits after completing a task. It is validated on receipt and then transformed into a task record for storage. Response types may differ from their corresponding request types (e.g., a single seed request may yield a batch of game results). Response and record types are shared across job types where the stored shape is identical regardless of how the task was generated — games and game pairs both submit the aggregate MAGPIE's autoplay reports for a batch (`{games, wins, losses, ties, score means and standard deviations}`), with game pairs adding the pentanomial over every completed pair and a second aggregate over the divergent ones. Autoplay does not emit individual games, and nothing downstream needs them: SPRT and the dashboard both work off counts.
+A task response is what the worker submits after completing a task. It is validated on receipt and then transformed into a task record for storage. Response types may differ from their corresponding request types (e.g., a single seed request may yield a batch of game results). Response and record types are shared across job types where the stored shape is identical regardless of how the task was generated — games and game pairs both submit the aggregate MAGPIE's autoplay reports for a batch (`{games, wins, losses, ties, score means and standard deviations}`), with game pairs adding the pentanomial over every completed pair and a second aggregate over the divergent ones. Autoplay does not emit individual games, and nothing downstream needs them: the match test and the dashboard both work off counts.
 
 | Type | Used by |
 |---|---|
@@ -2702,6 +2888,100 @@ At claim time (all in one transaction):
 4. `INSERT INTO opening_rack_requests (task_id, variant, letter_distribution, board_layout, rack_start, rack_count, player_config_id)` — the range, not the racks. There is no lexicon column: the player config carries it.
 5. Return the expanded racks, the seed, and a claim token.
 
+#### Opening-rack consensus
+
+A job can ask for a rack to be analysed until its analyses agree on its best
+move. A simulation samples, so two analyses of the same rack -- on two
+workers, or from two seeds -- can rank it differently; one analysis says
+nothing about how settled its answer is. Three settings on
+`job_opening_rack_config`:
+
+- `min_results_per_rack` (default 1): the fewest analyses a rack gets;
+- `consensus_pct` (default 100, above 50): the share of a rack's analyses
+  whose rank-1 move must be its most common rank-1 move;
+- `max_results_per_rack` (default 1, at most 100): the most analyses a rack
+  gets.
+
+They are the only settings of a job that change after it is created (see
+**Editing the consensus**, below). Claims and submissions read them fresh
+(`ConsensusSettings::load`) rather than from the job's cached template.
+
+A rack is **settled** once it has at least the fewest analyses and they agree
+in that share, or once it has the most -- then *without a consensus*, on its
+most common best move (the alphabetically first of a tie). A settled rack is
+not analysed again, unless an edit of the settings unsettles it. One and one is one analysis per rack, the job as it was;
+a static player may ask for nothing else, since its analyses are deterministic
+and always agree (job creation refuses it). The share is above half so that
+only one move can hold it.
+
+This replaced `redundancy` for opening racks (removed October 2026): that ran
+every *task* N times and compared nothing, where this re-analyses only the
+racks whose answer is in doubt, and stops as soon as it is not.
+
+**Dispatch.** The first pass is unchanged: ranges tiling the space. Once the
+cursor reaches `total_racks` it keeps stepping by `racks_per_batch`, and a task
+there **reissues** up to a batch of unsettled racks, listed explicitly
+(`opening_rack_requests.racks`), its seed the cursor -- so rack `i` of it is
+analysed from `seed + i`, a seed no earlier analysis of it used, and the worker
+contract is unchanged (a request has always carried its racks). Under the
+job's dispatch lock `opening_rack::next_reissue` picks the unsettled racks with
+the fewest analyses, excluding any rack another reissue holds, and preferring
+racks the claiming identity has not analysed: when too few are left that it
+has not (a small fleet, the last racks) it fills the batch with ones it has,
+since each analysis has its own seed and a rack wanting more analyses than the
+fleet has workers would otherwise never settle. A lapsed reissue goes back to
+`available` with its list and goes out again before anything new.
+
+**State.** `opening_rack_progress (job_id, rack)` holds each rack's analyses,
+its top move and how many ranked it first, `settled` and `without_consensus`,
+written in the transaction that stores an analysis: `record_consensus` reads
+the rack's rank-1 moves through the `(job_id, rack)` index -- at most
+`max_results_per_rack` records a rack -- and upserts the row. **Every
+opening-rack job keeps the rows**, one wanting one analysis per rack too: each
+of its racks settles at its first, and its row is what an edit raising the
+maximum later reissues from. (They were kept only above one analysis per rack
+until the consensus became editable: an edit across one would then have had
+no rows to reissue from, or, the other way, counted reissues in flight as new
+racks.) Only reissuing depends on a maximum above one (`reissues()`). The
+cost is one row per analysed rack, and the index on unsettled racks stays
+small for a one-analysis job, every row of which is settled. The job's
+`racks_analyzed` (racks with an analysis), `racks_settled` and
+`racks_without_consensus` are running totals bumped with the rest of the
+job's row, and the job completes once `racks_settled` reaches `total_racks`
+with nothing in flight. The page's progress bar is racks settled; its rack
+lookup numbers each analysis of a rack and says what they agree on; an export
+line carries its rack's standing (for a job whose maximum is above one).
+
+**Editing the consensus.** `PATCH /api/admin/jobs/:id/consensus` takes any of
+the three settings; only those sent change, and none that differs is a `200`
+that writes nothing. It refuses what creation refuses (the same
+`consensus_problems`, and a maximum above one for a static player), and any
+job but an opening-rack one. Under the locks a purge takes, in its order --
+the job's dispatch lock, its open claims, its row -- and the config row `FOR
+UPDATE`, it updates the settings and **restates every rack**
+(`opening_rack::restate_racks`) by `standing()`'s rule: agreed is at least the
+fewest analyses with the top move's share at least the consensus; settled is
+agreed or at the most. `racks_settled` and `racks_without_consensus` are reset
+from the rows. Raising the settings unsettles racks; lowering them settles
+racks. Then the job follows:
+
+- **Completed, with racks now unsettled: it reopens.** Under the activation
+  lock, it goes back to `active` at its allocation (joining at parity, its
+  derived data requested, `job.activated`) if the other active jobs leave room
+  for it, and to `inactive` otherwise, or with no allocation (`job.deactivated`,
+  and the response says why). Either way its final exports become snapshots
+  ([Exports](#exports)).
+- **Active, with every rack now settled:** it completes at once if nothing is
+  in flight, or with its last in-flight claim's submission.
+- **Inactive:** its status stays; it completes when next activated if nothing
+  is left.
+
+The audit row is `job.consensus_changed`, its reason the changes and what they
+leave ("min 1 -> 2, max 1 -> 3; 4 racks unsettled"), with the status change
+beside it when there is one. The response is the job, its settings, the racks
+left unsettled, whether it reopened, and why it reopened inactive. The admin
+job page's **Consensus** card makes the same edit.
+
 #### Games — On-demand
 
 Each task represents one batch of games (`games_per_batch` from the job config) played starting at a given seed. MAGPIE seeds a random stream with S and draws each of the batch's N game seeds from it, so a task's games are fixed by S alone. Consecutive task seeds are spaced `games_per_batch` apart, which keeps them unique and ordered.
@@ -2715,7 +2995,7 @@ At claim time (all in one transaction):
 4. `INSERT INTO task_claims (task_id, claim_token, state, claimed_by_...)`.
 5. Return the request + claim token to the worker.
 
-SPRT and finish-condition checks run during result submission, not at claim time.
+Match-test and finish-condition checks run during result submission, not at claim time.
 
 ---
 
@@ -2723,13 +3003,13 @@ SPRT and finish-condition checks run during result submission, not at claim time
 
 Same as games, except the batch size is `pairs_per_batch` from the job config. Each task seed is spaced `pairs_per_batch` apart: `SELECT COALESCE(MAX(seed) + $pairs_per_batch, 1) FROM tasks WHERE job_id = $job_id`. The job type sets MAGPIE's `-gp` flag, so both orderings of each seed are played in a single invocation.
 
-Results are a `GameResultsResponse` — the same type games use — carrying the aggregate over every game played, the **pentanomial** over every completed pair, and the divergent subset. SPRT runs on the pentanomial: the pair is the independent unit (the two games share a seed), and it is also the unit `min_pairs` and `max_pairs` bound, so the sample size and the progress count are the same number. The divergent aggregate is stored and displayed as a diagnostic of how often the two configs differ, and nothing is tested on it — see [The pentanomial, and why pairs are the unit](#the-pentanomial-and-why-pairs-are-the-unit).
+Results are a `GameResultsResponse` — the same type games use — carrying the aggregate over every game played, the **pentanomial** over every completed pair, and the divergent subset. The match test runs on the pentanomial: the pair is the independent unit (the two games share a seed), and it is also the unit `min_pairs` and `max_pairs` bound, so the sample size and the progress count are the same number. The divergent aggregate is stored and displayed as a diagnostic of how often the two configs differ, and nothing is tested on it — see [The pentanomial, and why pairs are the unit](#the-pentanomial-and-why-pairs-are-the-unit).
 
 ---
 
 #### Leave Generation — On-demand, partitioned generations
 
-Leave generation has sequential phases: generation N must complete before generation N+1 begins. Within a generation, work is **partitioned across many parallel workers**: each task forces a different subset of the racks that still need occurrences for the current generation and plays a bounded batch of games. A generation is not "one worker, one task" — it's many small tasks that collectively drive every rack up to the configured per-generation occurrence target.
+Leave generation has sequential phases: generation N must complete before generation N+1 begins. Within a generation, work is **partitioned across many parallel workers**: each task forces a different subset of the racks that still need occurrences for the current generation and plays a bounded batch of games. A generation is not "one worker, one task" — it's many small tasks that collectively drive every rack up to the generation's occurrence target. The job states one target per generation — `target_rack_counts`, MAGPIE's own `leavegen 100,200,500,…` shape — and the list's length is how many generations it runs; a later generation, playing better leaves, can be sampled harder.
 
 **State**: Per-rack occurrence progress *within* the current generation is tracked directly in Postgres, in `leave_rack_progress (job_id, generation, rack, occurrence_count, equity_sum)`. An accepted result is **staged** (`leave_rack_staging`, one row per task) and folded into those totals by a **merge** (`leave_gen::merge_staged`) — periodically, when a claim finds the generation nearly done, and always before a generation closes — rather than by the submission itself; see "On result acceptance" and [What a merge costs](#what-a-merge-costs). The generation's live counters (`leave_generation_progress`) move with every accepted result. None of it needs anything from MAGPIE beyond what already exists. The output of a *completed* generation (a combined KLV, built server-side once every rack has reached target — see Aggregation below) is stored in S3 and referenced by `leave_generation_artifacts.artifact_key`; the next generation's tasks receive that artifact key as input.
 
@@ -2753,8 +3033,8 @@ one still uploading does not — see "A request fails on a stall" under
 unaffected either way, since they send keep-alives every 15 seconds.
 
 At claim time:
-1. Determine the current generation: the lowest generation number that hasn't been marked complete. If none exists and `configured_generation_count` generations are already done, return "no work."
-2. Check that the generation's rack universe exists — every generation's, the first included, is written by a task the first claim to find it missing starts. That check is one indexed `EXISTS`. A claim that finds the universe missing rolls back, starts the seeding on its own task, and treats the job as having no work yet: the seeding takes the job's lock without waiting and holds it while it writes, so no claim reads a half-written universe, and a seeding a client or a deploy interrupts rolls back whole and is started again by the next claim. (It used to run inside the claim itself, where MAGPIE's 120-second request timeout could cancel it — on a database slower than that at writing 3.2 million rows, every claim restarted it and none finished.) Then select up to `racks_per_task` racks below `target_rack_count`, in one of two ways (`leave_gen::next_step`), chosen from the generation's summary row — how many racks were below target as of the last merge, the same age as the counts both selections read.
+1. Determine the current generation: the lowest generation number that hasn't been marked complete. If none exists and as many generations as `target_rack_counts` lists are already done, return "no work."
+2. Check that the generation's rack universe exists — every generation's, the first included, is written by a task the first claim to find it missing starts. That check is one indexed `EXISTS`. A claim that finds the universe missing rolls back, starts the seeding on its own task, and treats the job as having no work yet: the seeding takes the job's lock without waiting and holds it while it writes, so no claim reads a half-written universe, and a seeding a client or a deploy interrupts rolls back whole and is started again by the next claim. (It used to run inside the claim itself, where MAGPIE's 120-second request timeout could cancel it — on a database slower than that at writing 3.2 million rows, every claim restarted it and none finished.) Then select up to `racks_per_task` racks below the generation's own target (`target_rack_counts[generation]`), in one of two ways (`leave_gen::next_step`), chosen from the generation's summary row — how many racks were below target as of the last merge, the same age as the counts both selections read.
 
    **While many racks are below target — more than a hundred tasks' worth (`SWEEP_WHILE_TASKS_REMAIN`) — a sweep.** The generation's racks are handed out in primary-key order from a cursor remembered between claims (`leave_selection_cursors`, one row per generation, read and written only under the job's lock), one *lap* over the universe at a time, skipping racks already at target. A lap **starts only with no claim of the generation in flight and nothing staged**. From there every rack that is out — forced by an open claim, or by a result not yet merged — was handed out during this lap and so lies behind the cursor, and nothing ahead of it is out: a claim needs no list of what is out, and selection costs the same with one result staged as with ten thousand. (A task whose claim lapsed is reissued as it stands, before anything new is selected, so its racks stay behind the cursor with it.) Each selection reads one rack more than a task holds, so the task that takes a lap's last racks knows it and deletes the cursor in its own transaction; after that the job hands out nothing until the lap's last results are in and merged, and the next lap selects on exact counts. That pause is one task's duration and one merge per lap — some 6,400 tasks for English — and it is the wait that already precedes closing a generation, which is simply a lap that starts and finds nothing below target. (One task's duration when every worker holding one of the lap's last tasks is alive. When one is not, it is the heartbeat timeout for that claim to lapse plus a whole task for whoever is reissued it, with the job handing out nothing meanwhile; it is left that way on purpose for now — see [Known Limits and Open Questions](#known-limits-and-open-questions), KL-15.) A cursor lost to a purge or a partial restore is a lap not started: the same rule applies and nothing is handed out twice. A claim that hands out nothing commits rather than rolls back, so a lap found finished stays found.
 
@@ -2768,7 +3048,7 @@ At claim time:
 
    **Reopened tasks are reissued here, not before.** For every other job type a task whose claim timed out is re-dispatched before anything new is generated. For leave generation that happens only after the lock is taken and the current generation determined, and only for a task whose `leave_requests.generation` is that generation *and* only while no transition for that generation is running; step 2 runs when there is none. The transition check is separate from the generation check and both are needed: a generation does not read as *closed* until its transition commits the artifact row, so throughout the tens of seconds a transition takes, the current generation is still the closing one and a reopened task of it would otherwise be handed straight back out — its occurrences folded into the very rows the transition is streaming, leaving the uploaded KLV irreproducible from the database. A transition past the takeover timeout does not count, or a job whose transition process died would stall forever instead of being taken over. Reissued before the lock, a claim would be invisible to the in-flight check exactly as a new one was. Reissued for any generation, a task from a generation that has since closed would be handed out again, played with an outdated KLV, and its result discarded. A task left over from a closed generation stays `available` and is never dispatched again, so the job list's task counts for a leave job can show a few such tasks as never completed.
 3. Draw the task's seed and `INSERT INTO tasks (job_id, seed, state) VALUES ($job_id, $seed, 'available') RETURNING id`, claimed in the same transaction.
-4. `INSERT INTO leave_requests (task_id, lexicon, variant, letter_distribution, board_layout, generation, seed, forced_racks, num_games, previous_artifact_key, use_wordmap)` — `seed` is drawn fresh for the task, and stored so a reissued task replays it; `forced_racks` is the chosen rack subset (see Schema); `previous_artifact_key` is the prior generation's combined KLV, which for generation 1 is the server-built zeroed KLV stored at generation 0, so it is never NULL.
+4. `INSERT INTO leave_requests (task_id, variant, letter_distribution, board_layout, generation, seed, forced_racks, num_games, previous_artifact_key, player_config_id)` — the request's `player` (and the top-level `lexicon`, the player's) come from the job's template, as every job type's players do; `seed` is drawn fresh for the task, and stored so a reissued task replays it; `forced_racks` is the chosen rack subset (see Schema); `previous_artifact_key` is the prior generation's combined KLV, which for generation 1 is the server-built zeroed KLV stored at generation 0, so it is never NULL.
 5. `INSERT INTO task_claims (...)`.
 6. Return the request and claim token.
 
@@ -2835,8 +3115,7 @@ What is left unsolved is that a merge still rewrites most of a 432 MB relation a
 ### Position Capture From Games
 
 **Status: implemented.** Verified end to end: MAGPIE captured 98 positions across
-4 real games, with the CGP evolving turn by turn, and the redundancy
-deduplication held under `redundancy = 2`.
+4 real games, with the CGP evolving turn by turn.
 
 A worker playing a game already analyzes a position on every turn: it generates
 candidate moves, ranks them, and picks one. Those analyses used to be discarded.
@@ -2906,22 +3185,16 @@ one.
 
 There is deliberately no sample rate, no turn limit and no per-task cap. Capture is
 all-or-nothing per job, which removes the need for sampling to be deterministic and
-removes the failure mode where redundant claims sample different positions and
-defeat the deduplication below.
+removes any question of which positions a task sampled.
 
-#### Redundancy would multiply the corpus, and the fix is cheap
+#### Keyed on the task
 
-Games are seeded and deterministic, so with `redundancy > 1` every worker on a task
-plays *identical* games and captures *identical* positions — X copies of the same
-analysis.
-
-Keying captured positions on `(task_id, game_index, turn_number)` rather than on
-the claim, with `ON CONFLICT DO NOTHING`, makes the first accepted claim the one
-that lands and the rest no-ops. Redundancy keeps doing its job for the *result* —
-each claim's aggregate is still stored separately, so agreement between workers
-can be checked later — without multiplying the corpus.
-Opening racks keep their per-claim key, so redundant analyses of the same rack can
-still be compared.
+Captured positions are keyed on `(task_id, game_index, turn_number)` rather than
+on the claim, with `ON CONFLICT DO NOTHING`. When jobs could run a task more than
+once (redundancy, removed in October 2026), this made the first accepted copy
+land and the rest no-ops; a task now has one slot, and the key is also how a
+random position is drawn. Opening racks keep their per-claim key, so the several
+analyses of a rack an opening-rack consensus asks for can be compared.
 
 #### Schema
 
@@ -2947,7 +3220,11 @@ pairs with `num_plays`, which is how many the player simulates; note that with
 capture on, MAGPIE raises each simming player's `num_plays` to at least that cap,
 so job creation refuses a capture job whose simmers would be raised: each must
 already consider at least that many. Per-ply statistics pair the same way:
-`num_plies_recorded` against `plies`.
+`num_plies_recorded` against `plies`. The saved-positions read returns at most
+the first two plies of each move (P1, the reply, and P2), whatever was
+recorded, since the page never shows more. A position's inference is a row of
+`position_analysis_inference`, keyed on the record, inserted beside its plies
+and carried by exports and partial restores as they are.
 
 #### MAGPIE changes
 
@@ -3044,7 +3321,8 @@ so the client reads results out of the structs instead of parsing formatted outp
 `config_contribute_games` serializes the array into the `positions` field of its
 submission, and sets the recorder option when the task request asks for it, so
 `capture_positions` on the birdtest job becomes `autoplay games,positions` on the
-MAGPIE invocation.
+MAGPIE invocation, and with `capture_first_divergence` on a pairs job,
+`autoplay games,divergentpositions`.
 
 #### Wire format
 
@@ -3061,6 +3339,7 @@ carries:
       "rack": "AEINRST",
       "position": "15/15/... AEINRST/ 0/0 0",
       "previous_move": "8D DOG", "previous_move_score": 10,
+      "played_move": "8D RETAINS", "played_move_score": 74,
       "num_moves": 412,
       "moves": [ { "move": "8D RETAINS", "score": 74, "equity": 81.2,
                    "win_percentage": 62.1, "blended_utility": 0.64 } ] }
@@ -3069,10 +3348,40 @@ carries:
 ```
 
 `previous_move` / `previous_move_score` are absent on turn 0 of a game, where
-nothing preceded it. `blended_utility` — the win%+spread blend, sometimes used to
+nothing preceded it. `played_move` / `played_move_score` are always present: the
+move chosen from this position, written against this position's board (so a
+tile it plays through is in parentheses). It need not be the top of `moves` --
+a simmer can pick a play lower by equity, and a solver's pick is its own --
+and with first-divergence capture no later row holds it as its previous move,
+so it is stated rather than derived (October 2026). The job page draws it on
+the board where it goes, beside the previous move's outline, and marks it in
+the ranked list. `blended_utility` — the win%+spread blend, sometimes used to
 rank moves instead of equity or raw win percentage — has the same nullability as
 `win_percentage`: present only for a simming player. The whole array is absent when
 capture is off, which keeps every existing client valid.
+
+A simulated position whose player inferred first also carries `inference`
+(absent otherwise; October 2026):
+
+```json
+"inference": { "num_leaves": 143, "total_draws": 52011, "average_equity": 12.41,
+               "leaves": [ { "leave": "AEINST", "draws": 812, "equity": 30.2 } ] }
+```
+
+`leaves` is at most ten, most drawn first, each the tiles the opponent kept,
+written in the job's letter distribution. MAGPIE keeps a list of them only
+when asked to, so autoplay raises each seat's inference `leave_list_capacity`
+to ten (`AUTOPLAY_CAPTURED_INFERENCE_LEAVES`) when it captures positions, and
+leaves it at none otherwise. The server refuses (`plausibility::check_inference`)
+an inference on a position that cannot have one -- not simulated, turn 0, or
+no previous move -- and one that is not internally possible: more than ten
+leaves, fewer distinct leaves found than listed, a leave drawn more often than
+all the draws, leaves out of draw order, an equity that is not finite or past
+MAGPIE's bounds, or a leave that is not one (malformed, or as many tiles as a
+full rack). `contract-fixtures/result-games-inference.json` is
+its fixture, written by hand; MAGPIE's
+`test_inferring_players_report_their_inference` checks its own output carries
+every key the fixture does.
 
 **Server-side validation rejects positions outside the task's own games** — a
 `game_index` beyond the batch, or a `turn_number` beyond any plausible game — since
@@ -3633,6 +3942,7 @@ MAGPIE's per-player settings, where `N` is 1 or 2:
 | `use_wordmap` | `-wN` | applied directly against `players_data`, not `-wN`'s own arg parsing, and **before** the task's lexicon loads, which is when MAGPIE decides whether to load a wordmap |
 | `use_rit` | — | applied against `players_data` the same way, and **before** the lexicon loads |
 | `rit_name` | — | The name to load the table under, `<lexicon>.<leaves>`. A table stores precomputed leave values, so it belongs to the pair rather than the lexicon; the server pins a hash for this exact name (see [Wordmap and rack info table provenance](#wordmap-and-rack-info-table-provenance)) |
+| `use_wit` | `-witN` | applied against `players_data` the same way, and **before** the lexicon loads. The table is named for the lexicon and built from the `.kwg` alone; the server pins a hash for it as a `wit` entry |
 | `min_play_iterations` | `-miN` | |
 | `threshold` | `-thN` | `'none'` \| `'gk16'` |
 | `sampling_rule` | `-saN` | `'round_robin'` \| `'top_two_ids'` |
@@ -3687,7 +3997,7 @@ a new MAGPIE setting has a table it visibly is not in.
 | Letter distribution (`-ld`), board layout (`-bdn`), variant (`-var`) | Yes | Required on every request; the two files are pinned by digest |
 | Win% model (`-winpct`) | For simmers | From whichever player states one; pinned by digest |
 | Wordmap (`-w1`/`-w2`), rack info table (`-rit*`) | They must not — but a stale or mismatched file does | Flags stated per player and set *before* the lexical load; the file's bytes must match the hash the server built, or the task is declined. A table is loaded by its pair's name, never the lexicon's |
-| Word info table (`-wit*`) | A stale one prunes legal plays | Switched off for both players before every load; birdtest offers no setting for it |
+| Word info table (`-wit*`) | It must not — but a stale one prunes legal plays | Stated per player (`use_wit`, on unless a config opts out) and set *before* the lexical load; the file's bytes must match the hash the server built (role `wit`), or the task is declined |
 | Recorder (`-r*`), sort (`-s*`) | Yes | Required per player |
 | Plies, candidate plays, iterations, minimum play iterations, stopping condition, time limit, threshold, sampling rule, inference and its margin, utility weights (`-pl*`, `-np*`, `-i*`, `-mi*`, `-sc*`, `-tl*`, `-th*`, `-sa*`, `-si*`, `-im*`, `-uwin*`, `-uspread*`, `-uspreadscale*`) | Yes | `num_plies` and `num_plays` required of every player, the rest of every simmer; all reset to MAGPIE's defaults first. An opening-rack task copies the player's into the run-wide settings `impl_move_gen` and `impl_sim` read, and forces inference off (there is no previous play, and `game_history` is whatever the contributor last loaded). A time limit must be 0 |
 | Bingo bonus (`-bb`), simulation cutoff (`-cutoff`) | Yes | Required at the top of every request (the cutoff where the job can simulate) |
@@ -3793,7 +4103,7 @@ rather than ending the process with `log_fatal`.
 No per-game autoplay recorder is needed, but a paired run does need one thing
 autoplay did not report:
 
-- **`games` jobs.** SPRT consumes wins, losses and draws, which is exactly what
+- **`games` jobs.** The match test consumes wins, losses and draws, which is exactly what
   autoplay already reports. Nothing downstream ever needed individual games.
 - **`game_pairs` jobs.** The pair is the unit, so the counts have to be per
   pair. MAGPIE's `-gp` mode gains a **pentanomial**: five counts indexed by
@@ -3837,15 +4147,21 @@ The last row is correct rather than a bug: move *record* type governs what is
 recorded, not which move is played, and static play forces `MOVE_RECORD_BEST`.
 
 birdtest matches this: `game_records` is gone, replaced by `game_results` storing
-the two aggregates plus the pentanomial, with pairs SPRT computed from the
+the two aggregates plus the pentanomial, with a pairs job's test computed from the
 pentanomial and the divergent counts kept only as a diagnostic.
 
 ### Wordmap and rack info table provenance
 
+The word info table (`use_wit`, role `wit`) goes through everything below the
+way a wordmap does -- named for its lexicon, built from the `.kwg` alone, its
+hash pinned by the server -- except that it has no sidecar fallback: a claim that pins no hash for it is declined, as for a
+rack info table.
+
 Whether either file is used is the **job's** decision, not the client's: both
 are player settings like any other, sent as `use_wordmap` and `use_rit` on each
-player object (and, for `leave_generation`, which has one bot rather than a
-player pair, `use_wordmap` on the request itself). The config decides; a
+player object (for `leave_generation`, the one `player` the bot plays both seats
+as; it never loads a rack info table, since each generation plays a new KLV and
+a table caches one). The config decides; a
 config created without saying gets a wordmap and a rack info table (see
 "Creating a player config"). Games run dramatically faster with a wordmap, so most jobs will
 ask for it — but the client neither assumes it nor builds one it was not asked
@@ -3968,13 +4284,20 @@ clear error and `contribute` stops — there is no fallback location. A job that
 asked for neither file never reaches this path.
 
 MAGPIE can open a third file by lexicon name as it loads: a **word info table**
-(`.wit`), a per-substring letter mask move generation prunes with. birdtest
-offers no setting for it and pins no hash, so contribute switches it off for
-both players before every load. It is opt-in on the CLI (`-wit`), and left
-alone a contributor's `settings.txt` — or an earlier command in the same
-process — would have carried it into every task: built from the lexicon on disk
-it prunes nothing legal, built from an older one it prunes plays that exist,
-and nothing in a task would have checked which.
+(`.wit`), a per-substring letter mask move generation prunes with. It is
+opt-in on the CLI (`-wit`), but on by default here: a player config states
+`use_wit`, which the API defaults to true (it speeds move generation and costs
+a few seconds' build and ~122 MB for CSW24), and every request states the flag for each player, so a
+contributor's `settings.txt` — or an earlier command in the same process —
+cannot carry one into a task. Built from the lexicon on disk a table prunes
+nothing legal; built from an older one, or by an older builder, it prunes plays
+that exist. So it is handled like the other two: the server builds one from the
+`.kwg` alone (`convert kwg2wit`, builder `wit-1`, about three seconds and
+122 MB for CSW24), pins its hash as a `wit` entry in `expected_data.derived`,
+and the worker builds its own and uses it only if the bytes agree. Unlike a
+rack info table it holds nothing a leave generation changes, so a leave job's
+player may use one. Until 2026-10 birdtest offered no setting for it, and
+contribute switched it off for both players before every load.
 
 #### Leave generation keeps tables off
 
@@ -4162,9 +4485,9 @@ the worker applies both rather than whatever its own settings last loaded.
   "forced_racks": ["AABCELT", "AABCELU"],
   "previous_artifact_key": "leaves/<job>/generation-1.klv2",
   "previous_artifact_sha256": "<the sha256 recorded when the server built it>",
-  "use_wordmap": true,
   "bingo_bonus": 50,
-  "num_games": 10000 }
+  "num_games": 10000,
+  "player": { } }
 ```
 
 The player above is a **static** one, and it is the whole shape: the settings
@@ -4283,7 +4606,9 @@ Server-side validation, so the client must satisfy it:
   config's `num_plays_recorded`; `num_moves` says how many were ranked and must
   not be below the number reported. It is optional, for builds that predate it.
 - `positions` is present only when the job set `capture_positions`, and each entry
-  must fall inside the task's own games — see
+  must fall inside the task's own games; a pairs job keeping first divergences
+  sends exactly two per diverging pair, at one turn of one position, and as
+  many pairs as `divergent_games` says diverged — see
   [Position Capture From Games](#position-capture-from-games).
 - A leave result names full 7-tile racks only, each once, each with a `count` of
   at least 1 and a finite `mean`; and the counts together may not exceed
@@ -4811,14 +5136,15 @@ insert).
 |---|---|
 | `user.registered` | Registration |
 | `task.declined` | A worker declining, with the reason in `reason` |
-| `job.created` / `job.activated` / `job.deactivated` / `job.completed` | Admin job lifecycle; `job.completed` also for a job the server completes (its stopping rule, SPRT, its last generation), with no actor and the verdict in `reason` |
+| `job.created` / `job.activated` / `job.deactivated` / `job.completed` | Admin job lifecycle; `job.completed` also for a job the server completes (its stopping rule: the match test, its last generation), with no actor and the verdict in `reason` (`player1_better`, `player2_better`, `inconclusive`) — or `reached_target` for a games or pairs job without a test |
+| `job.consensus_changed` | An opening-rack job's consensus settings changed, the changes and the racks left unsettled in `reason` ("min 1 -> 2, max 1 -> 3; 4 racks unsettled"); beside it `job.activated` or `job.deactivated` when the change reopened a completed job |
 | `job.purged` / `job.purged.census` | Purge |
 | `job.deleted` / `job.deleted.census` | Delete |
 | `user.deleted` / `user.deleted.census` | Account deletion |
 | `job.artifacts_rebuild_started` | An artifact rebuild, before it rewrites anything, with `force` |
 | `job.artifacts_rebuilt` | Artifact rebuild, with counts, when it ends |
 | `job.export_started` | An admin starting a results export |
-| `input_data.import_staged` / `input_data.import_confirmed` | Tarball import |
+| `input_data.import_staged` / `input_data.import_confirmed` / `input_data.import_nothing_new` | Tarball import; the last when every file was already known, so there was nothing to confirm (actor: the admin who started it) |
 | `worker.banned` | Ban, with the free-text reason |
 | `worker.unbanned` | Lifting a ban, naming the identity rather than the ban row, which is gone |
 | `user.signed_out_everywhere` | "Sign out everywhere" on the account page |
@@ -4890,9 +5216,11 @@ All Admin API endpoints require the requesting user to have `is_admin = TRUE`. A
 | `POST` | `/api/admin/player-configs` | Create a new player configuration. Refuses what MAGPIE would refuse or cut short: more than 25 plies (`MAX_PLIES`), more than 10 recorded plies (what a captured position keeps), more than 200,000 plays generated (MAGPIE allocates every one up front, and a static player ranking every opening play needs up to some 64,000) or 32,767 recorded (a stored rank is a `SMALLINT`), a margin that is negative, not finite or past MAGPIE's largest equity (2,147,483.645), as well as non-positive counts. |
 | `GET` | `/api/admin/player-configs/:id` | Get a single player configuration. |
 | `DELETE` | `/api/admin/player-configs/:id` | Delete a player configuration. Rejected if any job, rating pool, rating history or clone references it. |
-| `POST` | `/api/admin/jobs` | Create a new job, with an optional `name` (at most 100 characters, one line; the form asks for it) shown first wherever jobs are listed and as the job page's title. Created in the `inactive` state — see `.../activate` to set its allocation and start dispatching work. Refuses a board layout that is not 15×15 (every MAGPIE build the fleet runs has `BOARD_DIM` 15, so every worker would fail every task) and an SPRT `alpha` below 0.000001 (an infinite upper bound; `beta` has the same floor for symmetry). |
+| `POST` | `/api/admin/jobs` | Create a new job, with an optional `name` (at most 100 characters, one line; the form asks for it) shown first wherever jobs are listed and as the job page's title. Created in the `inactive` state — see `.../activate` to set its allocation and start dispatching work. Refuses a board layout that is not 15×15 (every MAGPIE build the fleet runs has `BOARD_DIM` 15, so every worker would fail every task) and a match-test confidence outside (50, 100) (at 100% the interval never closes). |
 | `POST` | `/api/admin/jobs/:id/deactivate` | Set a job to inactive. Workers will no longer be assigned tasks from it. Refused (`409`) for a completed job. |
 | `POST` | `/api/admin/jobs/:id/activate` | Activate an inactive job. Body: `{ "allocation": int }`. Sets allocation and transitions status to active. |
+| `PUT` | `/api/admin/jobs/allocations` | Set several jobs' allocations at once. Body: `{ "allocations": [{ "job_id": uuid, "allocation": int }] }`. Checked as a whole -- the active jobs must sum to at most 100% as the request leaves them -- under the activation lock, every named row locked in id order first. Above 0% a job is active (activated if it was not); 0% leaves it inactive (deactivated if it was active, its last allocation kept). A completed job, a job named twice or an allocation outside 0–100 refuses the whole request. Audited per job: `job.allocation_changed` (from what to what), and `job.activated` / `job.deactivated` for a status change. The `/admin/allocation` page sends it. |
+| `PATCH` | `/api/admin/jobs/:id/consensus` | Change an opening-rack job's consensus settings. Body: any of `{ "min_results_per_rack", "max_results_per_rack", "consensus_pct" }`; only those sent change. Refuses (`400`) what creation refuses, and any other job type. Restates every rack, then reopens a completed job left with unsettled racks (active if its allocation fits, inactive otherwise) and completes an active one left with none. Answers `{ job, config, unsettled_racks, reopened, reopened_inactive_reason }`. Audited as `job.consensus_changed`. See [Editing the consensus](#opening-rack-consensus). |
 | `POST` | `/api/admin/jobs/:id/complete` | Force-complete a job immediately, regardless of task progress. Refused (`409`) for a job that is already completed. |
 | `POST` | `/api/admin/jobs/:id/purge` | Delete every claim, result, leave-gen progress and staged-result row, selection cursor, artifact row and task for a job, reset its dispatch counter and rejoin it at parity with the other jobs (`claims_baseline`), then re-seed its initial state. Ratings are untouched: they belong to rating pools, and the sweep refits a pool whose evidence changed. Returns `{ tasks_reset }`. Writes a census of what it destroyed to the audit log first. `409` while a purge or delete of the job is already running: each runs to completion on a task of its own, so a second click stacked a second behind the first's locks. |
 | `DELETE` | `/api/admin/jobs/:id` | Delete a job and all its tasks. `409` while a purge or delete of it is running, as above. |
@@ -4904,12 +5232,12 @@ All Admin API endpoints require the requesting user to have `is_admin = TRUE`. A
 | `GET` | `/api/admin/input-data` | List known input data rows — path, role, name, digest, tarball date. |
 | `DELETE` | `/api/admin/input-data/:id` | Delete an input data row. A row referenced by a job, player config or rating pool cannot be deleted; the foreign key is the safety mechanism and the error reads "this file is pinned by N jobs, player configs or rating pools". |
 | `POST` | `/api/admin/input-data/imports` | Start a tarball import. Returns `202` and an import id immediately; the fetch and diff run as a background task. |
-| `GET` | `/api/admin/input-data/imports/:id` | Poll an import: progress while running, the staged diff once staged, or the failure reason. |
+| `GET` | `/api/admin/input-data/imports/:id` | Poll an import: progress while running, the staged diff once staged (or `nothing_new`, every file already known), or the failure reason. |
 | `POST` | `/api/admin/input-data/imports/:id/confirm` | Insert the staged new and changed (collision) rows, in one transaction. |
 | `GET` | `/api/admin/jobs/:id/data-gaps` | What workers reported they were missing for this job, from `worker_data_gaps`. |
 | `GET` | `/api/admin/jobs/:id/results/stream` | Newline-delimited JSON (`application/x-ndjson`) of every record for the job, streamed straight from a database cursor so a download never buffers a whole job in memory. The source table follows the job type: position analyses (each with its ranked moves and plies nested), game results, or leave-rack progress — the export's own queries. `?positions=true` (games and game-pairs jobs) streams the positions the job captured instead of its result rows. At most two run at once (a third gets `429`); a completed job with a ready export gets a `303` to it instead. A stream is complete exactly when it ends cleanly: what can fail before the first row (a connection, a leave job's settle) is a status, and a query that fails part-way cuts the body off with an error rather than ending it, which a client over HTTP/1.1 or later reports as a failed transfer (HTTP/1.0 has no chunks, and a cut reads as an end there). |
-| `POST` | `/api/admin/jobs/:id/export` | Build a **completed** job's results into one gzipped NDJSON object in the artifact store. `202` with an id; the work runs on a background task. `409` for a job that is not completed, or whose last claims are still in flight. |
-| `GET` | `/api/admin/jobs/:id/export` | The newest export for the job, with a presigned `download_url` once it is ready — and, for a games or game-pairs job that captured positions, a `positions_download_url` for the second object holding them. |
+| `POST` | `/api/admin/jobs/:id/export` | Build a job's results into one gzipped NDJSON object in the artifact store: a completed job's final corpus, or a snapshot of one still running. `202` with an id; the work runs on a background task. `409` while an export of the job is running, or for a completed job whose last claims are still in flight. |
+| `GET` | `/api/admin/jobs/:id/export` | The newest export for the job — `is_final`, or a snapshot as of `snapshot_at` — with a presigned `download_url` once it is ready, and, for a games or game-pairs job that captured positions, a `positions_download_url` for the second object holding them. |
 | `GET` | `/api/admin/workers` | The contributor list with anonymous workers' real UUIDs, which banning one needs; the public list carries pseudonyms only. |
 | `GET` | `/api/admin/derived-data` | Every wordmap and rack info table the server has been asked to build: state, builder, hash, attempts and the last error. A job whose files are not `built` is not dispatched, and this is where that wait — or the failure behind it — is visible. |
 | `POST` | `/api/admin/derived-data/retry` | Put one `failed` build back in the queue: `{ role, name, builder, kwg_id, klv_id, letterdist_id }`, as `GET /api/admin/derived-data` lists them (`klv_id` null for a wordmap); without the builder, `kwg_id` or `letterdist_id` it is a `400`, since rows can share a role and name, and a row that matches no failed build of this version's builders — a rack info table sent without its `klv_id` among them — is a `404`. Explicit rather than automatic: a failed attempt is tried again after 5 and then 15 minutes, which a passing outage survives, so a build that has failed three times failed for a reason a fourth attempt does not change — a missing or damaged input, a broken binary. |
@@ -4917,7 +5245,9 @@ All Admin API endpoints require the requesting user to have `is_admin = TRUE`. A
 | `GET` | `/api/admin/backups` | Recent backup runs and how stale the newest successful one is. Read-only: backups are performed by a scheduled task, never by the server — see [Backups and Restore](#backups-and-restore). |
 | `POST` | `/api/admin/rating-pools` | Create a rating pool: name, scope, and the anchor config that fixes the scale. The anchor joins as a member automatically. |
 | `POST` | `/api/admin/rating-pools/:id/members` | Add a player config to the pool and refit it. Returns the new run id. |
-| `DELETE` | `/api/admin/rating-pools/:id/members/:config_id` | Remove a config and refit. Refused for the pool's anchor, which every other rating is measured against; `404` for a config not in the pool, which is neither logged nor refitted. |
+| `DELETE` | `/api/admin/rating-pools/:id/members/:config_id` | Remove a config and refit. Refused for the pool's anchor, which every other rating is measured against (move the anchor first); `404` for a config not in the pool, which is neither logged nor refitted. |
+| `PATCH` | `/api/admin/rating-pools/:id` | Move the anchor (`anchor_player_config_id`, added as a member if it is not one) and/or its `anchor_rating`, and refit in the same transaction (trigger `anchor`). Logged as `rating_pool.anchor_changed` with old → new in the reason. `run_id` is `null` when nothing changed. |
+| `DELETE` | `/api/admin/rating-pools/:id` | Delete a pool with its members, runs, ratings and residuals, after logging its census. The games stay with their jobs. `204`; `404` for a pool that does not exist. |
 | `POST` | `/api/admin/rating-pools/:id/recompute` | Force a refit without changing membership. |
 | `POST` | `/api/admin/jobs/:id/merge-progress` | Leave-generation jobs only. Fold the job's staged results into its per-rack totals now rather than at the next half-hourly merge, waiting for a merge already running. Returns `{ folds_merged, racks_updated }`. Nothing needs it — claims ask for a merge near a generation's end and a transition drains before it reads — so it is for an admin who wants the page's rack figures current, and for the end-to-end suite. |
 | `POST` | `/api/admin/jobs/:id/rebuild-artifacts` | Leave-generation jobs only. Recompute each generation's KLV from `leave_rack_progress` and report whether the stored object is still present and still matches its recorded hash. Rewrites only missing objects unless `?force=true`. |
@@ -4976,16 +5306,16 @@ the body omits them:
 
 | Field | Default |
 |---|---|
-| `redundancy` | 1 |
 | `min_magpie_version` | the server-wide floor |
-| `games_per_batch` | 2 — and it must be even (see "How the LLR is computed") |
+| `games_per_batch` | 2 — and it must be even (see "How the interval is computed") |
 | `pairs_per_batch` | 1 |
 | `racks_per_batch` | 500 |
 | `rack_size` | 7 |
-| `sprt_alpha` / `sprt_beta` | 0.05 |
-| `elo_low` / `elo_high` | −10 / +10 |
-| `generation_count` | 1 |
-| `use_wordmap` (leave generation) | **true** — it is the most game-heavy job type there is and a wordmap is a large speedup; workers build one on demand |
+| `test_enabled` | **false** — the job plays its `max_games` / `max_pairs` and stops; `min_*` and `confidence_pct` are refused without it |
+| `min_games` / `min_pairs` | none: required when `test_enabled` is true |
+| `confidence_pct` | 95 |
+| `min_results_per_rack` / `max_results_per_rack` / `consensus_pct` | 1 / 1 / 100 |
+| `target_rack_counts` (leave generation) | none: required, one occurrence target per generation, 1 to 100 of them, each 1 to 1,000,000 |
 | `capture_positions` | false |
 
 A job's run-wide MAGPIE settings are not fields of the body: `bingo_bonus` (50)
@@ -4993,19 +5323,22 @@ and `sim_cutoff` (0.005) are written onto the job from MAGPIE's defaults at
 creation and stated on every request, for the reason player configs state
 theirs.
 
-Beyond role matching, creation enforces seven rules the schema cannot express:
+Beyond role matching, creation enforces eight rules the schema cannot express:
 
-- **Settings a worker can run and a test can evaluate.** `redundancy` at least 1;
-  `variant` is `classic` or `wordsmog`; batch sizes at least 1 (`racks_per_batch`
+- **Settings a worker can run and a test can evaluate.** `variant` is `classic` or `wordsmog`; batch sizes at least 1 (`racks_per_batch`
   at most 10,000; `games_per_batch` at most 10,000 games, 1,000 when the job
-  captures positions, and `pairs_per_batch` half of that); `rack_size` 1–7; `max_*` at least 1 and
-  `min_*` at least 0; `sprt_alpha` and `sprt_beta` at least 0.000001 and below 1
-  with a sum below 1 (a subnormal alpha made the upper bound infinite; beta
-  has the same floor for symmetry); `elo_low` below `elo_high`; `min_magpie_version`, when given, a
+  captures positions, and `pairs_per_batch` half of that); `rack_size` 1–7; `max_*` at least 1;
+  with `test_enabled`, `min_*` given, at least 1 and at most `max_*`, and
+  `confidence_pct` strictly between 50 and 100 (at 100 the interval's
+  logarithm of 1 − confidence is infinite and it never closes), and without it
+  neither `min_*` nor `confidence_pct`; an opening-rack job's consensus as
+  `consensus_problems` checks it, for creation and an edit alike (a share
+  above 50 and at most 100, a fewest of 1–100, a most from the fewest to 100,
+  and, by the player check, a most above 1 only for a simmer); `min_magpie_version`, when given, a
   version (`major.minor[.patch]`, digits only — read loosely, a typo was 0.0.0,
   the most permissive floor). Every violation is reported at once as
   a field error. A zero batch would make every claim regenerate the seed the last
-  one took and retry forever; inverted hypotheses flip the LLR's sign.
+  one took and retry forever.
 
 - **A board MAGPIE loads.** The layout is checked as MAGPIE's loader checks it,
   never accepting one it refuses (and stricter only on its parser's quirks):
@@ -5034,9 +5367,18 @@ Beyond role matching, creation enforces seven rules the schema cannot express:
   `capture_positions` on, MAGPIE raises each simming player's `num_plays` to
   player 1's `num_plays_recorded`, so a smaller `num_plays` would make turning
   capture on change the games. Refused, naming the player.
-- **Leave generation runs at redundancy 1.** Its redundant copies replay the
-  same seed only when MAGPIE is single-threaded; multi-threaded, they are
-  different samples, and there is no integrity use for them today.
+- **A leave job's player plays statically on equity, with no rack info table.**
+  A generation's leave values are the mean equity of the racks the bot drew, as
+  MAGPIE's `leavegen` computes them: a simmer ranks on something else and plays
+  orders of magnitude slower, a score sort ignores the very leaves each
+  generation feeds back, and a rack info table caches the values of one KLV
+  where every generation plays a new one. `num_plies > 0`, a `sort_strategy`
+  other than `equity` and `use_rit` are each refused, naming the player. Its
+  lexicon must be a `kwg` the job's distribution can spell; its leaves are not
+  checked, because they are never loaded — every generation plays the server's
+  KLV — and they, with any win% model, are left out of the job's
+  `expected_data`, so a worker is not turned away for lacking files no task
+  reads.
 
 The response is `{ job }`. Creation writes no rows up front for any job type: no
 tasks, and no leave-generation rack universe, which the first claim seeds as it
@@ -5073,8 +5415,7 @@ is incremented so every session ends, and `deleted_at` is set. Login, password
 reset and `CurrentUser` all refuse a deleted account, and `/api/users` omits it.
 Contributions stay: the account's claims and results are kept under the
 tombstone and **no counter is rolled back**, so no donated compute is lost —
-including captured in-game positions other redundant claims deduplicated
-against, and leave-generation occurrences that could not have been subtracted
+including leave-generation occurrences that could not have been subtracted
 anyway. Open claims are left to time out; nothing can submit for them once the
 keys are gone. `jobs.created_by`, `player_configs.created_by` and
 `worker_bans.banned_by` keep pointing at the tombstone, and `audit_log` records
@@ -5104,16 +5445,18 @@ do not exist.
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/api/jobs` | List jobs with status and summary stats. Paginated; `?status=active` (or `inactive`, `completed`) lists only those, with a matching total. |
-| `GET` | `/api/jobs/:id/config` | Everything the job runs with, public: the job's settings (variant, letter distribution and board by name, bingo bonus, sim cutoff, redundancy, oldest MAGPIE), its type's (a games or pairs job's batch, minimum, cap and SPRT parameters; an opening-rack or leave-generation job's own), and every setting of each player config, with its files by name and its id. No creator, no user ids. |
+| `GET` | `/api/jobs/:id/config` | Everything the job runs with, public: the job's settings (variant, letter distribution and board by name, bingo bonus, sim cutoff, oldest MAGPIE), its type's (a games or pairs job's batch, whether it runs a match test, its minimum, cap and confidence; an opening-rack or leave-generation job's own), and every setting of each player config, with its files by name and its id. No creator, no user ids. |
 | `GET` | `/api/player-configs` | Every player config, newest first, public: every setting with files by name, the config it was cloned from and when it was made. No creator. |
 | `GET` | `/api/player-configs/:id` | One player config, in the same shape. |
-| `GET` | `/api/jobs/:id` | Job detail, configuration, and aggregate statistics; for a completed job, how it was completed (`completion`: when, whether an admin forced it, and the server's reason — the SPRT verdict, `last generation built`, or none when an opening-rack job's racks ran out). |
-| `GET` | `/api/jobs/:id/results` | Task records for a job, paginated by cursor (`?cursor=`; see [Pagination](#pagination)). `?worker=` filters to one contributor by username or anonymous pseudonym (`anon_id`), resolved to an identity before the job is read; a name that is nobody's is an empty page. `?rack=` is opening-rack jobs only and switches to a single-rack lookup, returned whole. |
-| `GET` | `/api/jobs/:id/positions` | **Signed in.** A games or game-pairs job's captured positions, newest first, at most 20 a page by cursor, each with its CGP, game, turn, rack, previous move and ranked moves. `?rack=` keeps those whose player to move held that rack, however it is typed. Another job type is a `400`. |
+| `GET` | `/api/jobs/:id` | Job detail, configuration, and aggregate statistics; for a completed job, how it was completed (`completion`: when, whether an admin forced it, and the server's reason — the match test's verdict (`player1_better`, `player2_better`, `inconclusive`), `reached_target` for a games or pairs job without a test, `last generation built`, or none when an opening-rack job's racks ran out). |
+| `GET` | `/api/jobs/:id/results` | Task records for a job, paginated by cursor (`?cursor=`; see [Pagination](#pagination)). `?worker=` filters to one contributor by username or anonymous pseudonym (`anon_id`), resolved to an identity before the job is read; a name that is nobody's is an empty page. `?rack=` is opening-rack jobs only and switches to a single-rack lookup, returned whole: every analysis of the rack numbered, each ranked move with its win percentage (`null` for a static analysis) and its first two plies' statistics (`plies`, `[]` for a static one). |
+| `GET` | `/api/jobs/:id/positions` | **Signed in.** A games or game-pairs job's captured positions where the player to move held `?rack=` (required), newest first, at most 20 a page by cursor, each with its CGP, game, turn, rack, previous move and ranked moves (each with its win percentage and at most its first two plies' statistics), and its `inference` (`null` when it has none). The rack may be typed in any case and order, a multi-letter tile bracketed or not; it is spelt as MAGPIE spells one (the job's machine-letter order, blanks last) before the lookup, so a rack with a tile the job's distribution lacks finds nothing. No rack, or another job type, is a `400`. |
+| `GET` | `/api/jobs/:id/positions/random` | **Signed in.** One of a games or game-pairs job's captured positions at random, in the same shape, or `null` before it has any. Drawn through two index probes — a random seed's next task (`tasks_seed_unique_idx`), then a random turn of that task (`position_analysis_records_in_game_idx`) — never `ORDER BY random()` over millions of rows; a task with no positions yet is passed over, and after eight such draws the job's newest position is taken. Another job type is a `400`. |
+| `GET` | `/api/jobs/:id/board` | What a position is drawn on, public: the job's layout parsed (`start` as `[row, column]`, `squares` row by row — `normal`, `double_letter` … `quadruple_word`, `brick`) and every letter of its distribution in machine-letter order with its blank's spelling and its score. Read from the bytes the job pins, by the same parsers job creation checks them with. |
 | `GET` | `/api/jobs/:id/stream` | SSE stream of live stat updates for a job. Pushes an event after accepted results, coalesced to at most one per `JOB_STATS_CACHE_SECONDS` (an admin's change, a completion or a generation closing at once). |
 
 | `GET` | `/api/users` | List all registered user accounts with contribution stats. Paginated. |
-| `GET` | `/api/workers` | Contributor stats for all workers (anonymous and authenticated), paginated. |
+| `GET` | `/api/workers` | Contributor stats for all workers (anonymous and authenticated) — compute time, games, racks, tasks and the last result — paginated, ranked by compute time or by `?sort=compute\|games\|racks\|tasks`. |
 | `GET` | `/api/rating-pools` | Rating pools with their conditions, member counts and last fit time. |
 | `GET` | `/api/rating-pools/:id` | Latest fit for one pool: run provenance, every member's rating with uncertainty, and the residuals. |
 | `GET` | `/api/rating-pools/:id/history` | Stored runs' ratings, oldest first, thinned to at most 500 runs evenly spaced over the pool's history, for the six current members rated highest in the newest run. No page draws it now. |
@@ -5123,10 +5466,10 @@ trimmed, letters sorted. A rack is a multiset of tiles, so `AEINRST` and
 `TSRNIEA` are the same rack and a user typing either should find it. It matches
 only opening-rack records (`game_index IS NULL`), so an incidentally-captured
 in-game position with the same rack does not surface as an opening-rack analysis.
-The full ranked move list is returned in one page rather than paginated. Under
-redundancy above 1 a rack has one record per accepted claim, and the lists come
-back one record after another, each in rank order, rather than interleaved by
-rank.
+The full ranked move list is returned in one page rather than paginated. A rack
+an opening-rack job analysed more than once, to reach a consensus, has one
+record per analysis, and the lists come back one record after another, each in
+rank order, rather than interleaved by rank.
 
 ---
 
@@ -5140,12 +5483,12 @@ SvelteKit uses file-based routing under `frontend/src/routes/`. Each directory w
 |---|---|
 | `/` | Landing page — brief description of birdtest, links to the job list and the worker setup guide. |
 | `/jobs` | Job list — all jobs with type, status, allocation, and completion counter. Loaded on visit rather than live: there is no job-list stream, only a per-job one. |
-| `/jobs/[id]` | Job detail — job-type-specific stats and per-worker contribution table. Live-updated via SSE. Beside the lexicon and variant, how each player searches ("4-ply sim, 1,000 iterations vs static, by equity"); a Settings card repeats that per player and holds every setting behind "All settings" — the job's, its type's, and the players' side by side with those they differ in marked — and a JSON download (`GET /api/jobs/:id/config`). |
+| `/jobs/[id]` | Job detail — four headline cards (status, allocation, tasks completed, estimated time left; the admin page has the same), job-type-specific stats and per-worker contribution table. Live-updated via SSE. The status card says nothing beside an active job's badge; an inactive job's says "Paused: …" (and where its significance test stands), a completed job's "Finished …: …" and why. Beside the lexicon and variant, how each player searches ("4-ply sim, 1,000 iterations vs static, by equity"); a Job settings card — the job's settings and its type's, every row, with no toggle, the significance test one row ("no" or "yes (95%)") — then a Player settings card, the players side by side (`PlayerSettingsTable`: one column per player, those they differ in bold, each name linking to its config), showing their key rows (Lexicon, Leaves, Sorted By, Move Recorder, Moves Generated, Plies, Uses Inference, Uses Preendgame, Uses Endgame, for every player) with an "All settings" toggle for the rest, and a JSON download (`GET /api/jobs/:id/config`). Which player rows are key is `jobSettings.ts`'s (`PLAYER_ROWS`, `keySettings`). The admin job page has the same cards. |
 | `/users` | Registered user list — all user accounts with contribution stats. |
-| `/workers` | Contributor leaderboard — all workers (anonymous and authenticated) ranked by tasks completed. |
+| `/workers` | Contributor leaderboard — all workers (anonymous and authenticated) ranked by compute time, or by games, racks or tasks at a click on the column; on a phone only the ranked column is shown beside the name, and a "Rank by" row above the list chooses it. |
 | `/ratings` | Rating pool list — each pool's conditions, member count and last fit. |
 | `/player-configs` | Every player config, newest first: its name, how it searches, its lexicon and leaves. Public, like the job pages that already show players' settings. |
-| `/player-configs/[id]` | One config: its key settings (search, files, plays considered, what is kept, wordmap and rack info table), every setting behind "All settings", a JSON download, and the config it was cloned from. The job page's Settings card links each player here. |
+| `/player-configs/[id]` | One config: a table of its key settings (its files, how moves are sorted, recorded and generated, plies, and whether it infers and solves the pre-endgame and endgame) that "All settings" grows to every setting — the job page's `PlayerSettingsTable` with one column — a JSON download, and the config it was cloned from. The job page's Settings card links each player here. |
 | `/ratings/[id]` | [The ratings page](#the-ratings-page) — ratings with uncertainty, history, and residuals. Admin controls for membership appear inline for admins. |
 
 ### Auth Routes
@@ -5174,17 +5517,18 @@ Protected by a layout guard (`/admin/+layout.svelte`) that requires `is_admin = 
 | Route | Page |
 |---|---|
 | `/admin` | Admin overview — redirects to `/jobs`, the job list; a job's page links ("Manage") to its admin page, `/admin/jobs/:id`. There is no `/admin/jobs` list; `/admin/jobs/new` creates a job. |
-| `/admin/jobs/new` | Create job form — job type selector, then type-specific config fields; a games or pairs job can be set to save the positions it plays (`capture_positions`), which caps its batch at 1,000 games or 500 pairs. |
-| `/admin/jobs/[id]` | Admin job view — the job's progress, ETA, status, contributors and data gaps (what workers declined it for; the public page has the rest: pentanomial, W/L/D, SPRT bounds) plus controls: activate, deactivate, force-complete, purge, delete (the last three ask first: none can be taken back), an artifact check and "merge progress now" for leave generation, and for a completed job the export panel — start, poll, download. |
+| `/admin/allocation` | Every active and inactive job with its allocation, set together and saved in one request (`PUT /api/admin/jobs/allocations`): a running total that turns red above 100% and holds the save, "Share equally", and only the jobs changed are sent. |
+| `/admin/jobs/new` | Create job form — job type selector, then type-specific config fields; a games or pairs job can be set to save the positions it plays (`capture_positions`), which caps its batch at 1,000 games or 500 pairs, and a pairs job saving them to keep only where each pair first diverges (`capture_first_divergence`). The letter distribution and board layout start empty ("Choose…") and must be picked, here and on the rating-pool form: the first of each imported is no default worth having. A games or pairs job's **Significance Test** checkbox, ticked, shows its **Confidence %** (95) and minimum; an opening-rack job's consensus is three fields, Minimum and Maximum Analyses Per Rack and Consensus %. Every field is named as the settings tables name it, in Title Case. |
+| `/admin/jobs/[id]` | Admin job view — the public page's four headline cards (status, allocation, tasks completed, ETA), the job's progress, its settings, match score and Significance Test cards as the public page has them, for an opening-rack job a Consensus card that changes its consensus settings (`PATCH .../consensus`), contributors and data gaps (what workers declined it for) plus controls: activate, deactivate, force-complete, purge, delete (the last three ask first: none can be taken back), an artifact check and "merge progress now" for leave generation, and for a completed job the export panel — start, poll, download. |
 | `/admin/player-configs` | Player config list — name, recorder type, sort strategy, sim parameters. |
-| `/admin/player-configs/new` | Create player config form. |
+| `/admin/player-configs/new` | Create player config form, each field named as the settings tables name it with its MAGPIE argument beside it ("Move Recorder (-r)", "Sorted By (-s)"). No number box on either form has spinner arrows. |
 | `/admin/rating-pools/new` | Create rating pool form — name, variant, letter distribution, board layout, anchor config and rating, and optionally the other members to add once it exists. Linked from `/ratings` for an admin; membership is managed on the pool's page after that. |
 | `/admin/users` | User account list — delete accounts. (Contribution stats are shown publicly at `/users`.) |
 | `/admin/workers` | Worker ban management — ban / unban workers by user ID or anonymous UUID. |
 | `/admin/audit-log` | Audit log viewer — filterable by action and target type; paginated. (Not by actor: the page has no actor filter.) |
 | `/admin/input-data` | Input data browser and import wizard — pick a tarball date, watch the import, review the staged diff, confirm. |
 | `/admin/fleet` | What MAGPIE versions have claimed work recently, from `task_claims.magpie_version`. |
-| `/admin/derived-data` | The wordmap and rack info table build queue: what is built, pending or failed, and a retry for the failures. |
+| `/admin/derived-data` | The wordmap and rack info table build queue: what is built, pending or failed, and a retry for the failures. It reads the queue again for as long as it is open — every 3 s while anything is pending or building, every 10 s otherwise, not while the tab is hidden (`lib/poller.ts`) — so a build queued later shows up by itself; the admin job page's list of the files a job waits on does the same. Polled rather than pushed: the builder is a separate process on a five-minute schedule, and a push would need Postgres `LISTEN`/`NOTIFY` for little gain. |
 | `/admin/backups` | Recent backup runs and the staleness of the newest successful one. |
 
 ---
@@ -5304,7 +5648,8 @@ birdtest/
 │       ├── ratings.rs              # rating pools: evidence, fits, snapshots
 │       ├── stats/
 │       │   ├── mod.rs
-│       │   ├── sprt.rs             # SPRT LLR and boundaries
+│       │   ├── match_test.rs       # the match test: player 1's score interval and its verdict
+│       │   ├── outcomes.rs         # Tally, Pentanomial and Sample, which the test and the ratings read
 │       │   └── bradley_terry.rs    # batch anchored rating fit (Newton)
 │       ├── jobs/                   # job type system
 │       │   ├── mod.rs              # shared request/record helpers
@@ -5351,11 +5696,9 @@ birdtest/
 │       │       ├── WorkerTable.svelte
 │       │       ├── Pagination.svelte
 │       │       ├── ProgressBar.svelte
-│       │       ├── OutcomeChart.svelte   # LayerCake: win/loss/draw over time
 │       │       ├── RatingDotPlot.svelte  # ratings with error bars (not a bar chart: Elo has no zero)
 │       │       ├── ResidualMatrix.svelte # actual vs predicted per head-to-head
-│       │       ├── Bars.svelte           # LayerCake mark layer
-│       │       └── AxisY.svelte          # LayerCake axis layer
+│       │       └── PlayerCompareTable.svelte # two players side by side, higher green
 │       └── routes/
 │           ├── +layout.svelte      # global layout (nav bar, footer)
 │           ├── +page.svelte                        # /
@@ -5479,6 +5822,20 @@ CREATE TABLE users (
     -- counter exists to avoid; it only ever moves forward, and is a display
     -- figure.
     tasks_completed      BIGINT NOT NULL DEFAULT 0 CHECK (tasks_completed >= 0),
+    -- The rest of the contribution, kept the same way and given back the same
+    -- way: the time each accepted claim was held, claim to submission, in
+    -- milliseconds (MAGPIE reports no CPU or thread counts, so this is the
+    -- measure of compute there is, and what the contributor list ranks by);
+    -- the games those claims played; and the racks they analysed -- an
+    -- opening-rack batch's racks, the distinct racks a leave task drew. Summed
+    -- from each claim's own figures (`task_claims.games_played`,
+    -- `racks_analyzed`), every claim counted: unlike a job's progress, which
+    -- counts one result per task, a contributor did the work of each claim.
+    -- Integer milliseconds rather than fractional seconds so that what a purge
+    -- takes back is exactly what the submissions added.
+    compute_ms           BIGINT NOT NULL DEFAULT 0 CHECK (compute_ms >= 0),
+    games_played         BIGINT NOT NULL DEFAULT 0 CHECK (games_played >= 0),
+    racks_analyzed       BIGINT NOT NULL DEFAULT 0 CHECK (racks_analyzed >= 0),
     last_completed_at    TIMESTAMPTZ,
     created_at           TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -5488,10 +5845,18 @@ CREATE TABLE users (
 CREATE INDEX users_contribution_idx ON users (tasks_completed DESC, created_at ASC)
     WHERE deleted_at IS NULL;
 
--- Serves the account half of /api/workers, in that list's order (see
--- anonymous_workers_contribution_idx). A deleted account keeps its place there:
--- its work was done, and it is listed under its anonymized name.
+-- Serve the account half of /api/workers, one per order that list offers --
+-- compute time (its default), games, racks and tasks -- with the list's own
+-- predicate, so whichever it is sorted by it is the same contributors (see
+-- anonymous_workers_contribution_idx). A deleted account keeps its place
+-- there: its work was done, and it is listed under its anonymized name.
 CREATE INDEX users_worker_rank_idx ON users (tasks_completed DESC, id)
+    WHERE tasks_completed > 0;
+CREATE INDEX users_worker_compute_idx ON users (compute_ms DESC, id)
+    WHERE tasks_completed > 0;
+CREATE INDEX users_worker_games_idx ON users (games_played DESC, id)
+    WHERE tasks_completed > 0;
+CREATE INDEX users_worker_racks_idx ON users (racks_analyzed DESC, id)
     WHERE tasks_completed > 0;
 
 CREATE TABLE email_confirmations (
@@ -5549,20 +5914,31 @@ CREATE TABLE anonymous_workers (
     -- Any request from this identity touches this, at most once a minute: it
     -- answers "is this worker still around".
     last_seen_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    -- The contribution counters, mirroring users.tasks_completed /
-    -- last_completed_at; see there for why they are counters and who
-    -- decrements them. `last_completed_at` is distinct from `last_seen_at`
-    -- above: one is the last task finished, the other is the last request of
-    -- any kind, and the contributor list shows the first.
+    -- The contribution counters, mirroring users.tasks_completed, compute_ms,
+    -- games_played, racks_analyzed and last_completed_at; see there for what
+    -- each counts, why they are counters and who decrements them.
+    -- `last_completed_at` is distinct from `last_seen_at` above: one is the
+    -- last task finished, the other is the last request of any kind, and the
+    -- contributor list shows the first.
     tasks_completed   BIGINT NOT NULL DEFAULT 0 CHECK (tasks_completed >= 0),
+    compute_ms        BIGINT NOT NULL DEFAULT 0 CHECK (compute_ms >= 0),
+    games_played      BIGINT NOT NULL DEFAULT 0 CHECK (games_played >= 0),
+    racks_analyzed    BIGINT NOT NULL DEFAULT 0 CHECK (racks_analyzed >= 0),
     last_completed_at TIMESTAMPTZ
 );
 
--- Serves the anonymous half of /api/workers, which merges both kinds of
--- identity in one ranking. Partial: an identity that has completed nothing is
--- not a contributor and is not listed.
+-- Serve the anonymous half of /api/workers, which merges both kinds of
+-- identity in one ranking, one per order it offers (users_worker_*_idx is the
+-- other half). Partial: an identity that has completed nothing is not a
+-- contributor and is not listed, whatever the list is sorted by.
 CREATE INDEX anonymous_workers_contribution_idx
     ON anonymous_workers (tasks_completed DESC, uuid) WHERE tasks_completed > 0;
+CREATE INDEX anonymous_workers_compute_idx
+    ON anonymous_workers (compute_ms DESC, uuid) WHERE tasks_completed > 0;
+CREATE INDEX anonymous_workers_games_idx
+    ON anonymous_workers (games_played DESC, uuid) WHERE tasks_completed > 0;
+CREATE INDEX anonymous_workers_racks_idx
+    ON anonymous_workers (racks_analyzed DESC, uuid) WHERE tasks_completed > 0;
 
 CREATE TABLE worker_bans (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -5662,8 +6038,11 @@ CREATE TABLE input_data_imports (
     -- NULL until the download completes: the row exists from the moment the
     -- background task is spawned.
     tarball_sha256 TEXT,
+    -- 'nothing_new': staged, every file already known, so there is nothing
+    -- to confirm; it goes there straight from 'running' rather than waiting
+    -- a day in 'staged' to be expired.
     state          TEXT NOT NULL DEFAULT 'running'
-                   CHECK (state IN ('running', 'staged', 'confirmed',
+                   CHECK (state IN ('running', 'staged', 'nothing_new', 'confirmed',
                                     'cancelled', 'failed')),
     -- What the poller renders while state = 'running'.
     progress_bytes   BIGINT NOT NULL DEFAULT 0,
@@ -5718,15 +6097,16 @@ CREATE TABLE input_data_import_rows (
 -- change cannot pass without bumping them, and the server asks the binary it
 -- runs (`magpie builders`) rather than being told in configuration.
 CREATE TABLE derived_data (
-    role          TEXT NOT NULL CHECK (role IN ('wmp','rit')),
-    -- What the worker loads the file as. A wordmap's is its lexicon's name; a
-    -- rack info table's is '<lexicon>.<leaves>', because a table belongs to a
-    -- (.kwg, .klv2) pair and two jobs on CSW24 with different leaves must not
-    -- share one.
+    role          TEXT NOT NULL CHECK (role IN ('wmp','rit','wit')),
+    -- What the worker loads the file as. A wordmap's and a word info table's
+    -- is its lexicon's name; a rack info table's is '<lexicon>.<leaves>',
+    -- because a table belongs to a (.kwg, .klv2) pair and two jobs on CSW24
+    -- with different leaves must not share one.
     name          TEXT NOT NULL,
-    builder       TEXT NOT NULL,          -- 'wmp-1', 'rit-1'
+    builder       TEXT NOT NULL,          -- 'wmp-1', 'rit-1', 'wit-1'
     kwg_id        UUID NOT NULL REFERENCES input_data(id),
-    -- NULL for a wordmap, which is built from the lexicon alone. The partial
+    -- NULL for a wordmap and a word info table, which are built from the
+    -- lexicon alone. The partial
     -- unique indexes below are what make (role, name, builder, kwg, NULL) a key
     -- rather than a duplicate waiting to happen: in a UNIQUE constraint two
     -- NULLs are distinct, so a plain UNIQUE would let a wordmap be queued
@@ -5758,16 +6138,17 @@ CREATE TABLE derived_data (
     CONSTRAINT derived_data_built_has_hash CHECK (
         (state = 'built') = (sha256 IS NOT NULL AND bytes IS NOT NULL)
     ),
-    -- A wordmap is built from the lexicon and the distribution; a rack info
-    -- table additionally from the leaves. A wmp row carrying a klv_id would be
-    -- claiming a dependency it does not have.
+    -- A wordmap and a word info table are built from the lexicon and the
+    -- distribution; a rack info table additionally from the leaves. A wmp or
+    -- wit row carrying a klv_id would be claiming a dependency it does not
+    -- have.
     CONSTRAINT derived_data_inputs_match_role CHECK (
         (role = 'rit') = (klv_id IS NOT NULL)
     )
 );
 
--- The identity of a derived file, in the two shapes it comes in. Partial
--- indexes because a wordmap's klv_id is NULL and NULLs are distinct in a
+-- The identity of a derived file, one index per role. Partial indexes because
+-- a wordmap's and a word info table's klv_id is NULL and NULLs are distinct in a
 -- UNIQUE constraint, which would silently permit duplicate wordmap rows.
 CREATE UNIQUE INDEX derived_data_wmp_idx
     ON derived_data (name, builder, kwg_id, letterdist_id)
@@ -5775,6 +6156,9 @@ CREATE UNIQUE INDEX derived_data_wmp_idx
 CREATE UNIQUE INDEX derived_data_rit_idx
     ON derived_data (name, builder, kwg_id, klv_id, letterdist_id)
     WHERE role = 'rit';
+CREATE UNIQUE INDEX derived_data_wit_idx
+    ON derived_data (name, builder, kwg_id, letterdist_id)
+    WHERE role = 'wit';
 
 -- The builder task's queue: oldest request first, so a job that has been
 -- waiting is not starved by one created since.
@@ -5804,8 +6188,7 @@ CREATE TABLE jobs (
     name       TEXT NOT NULL DEFAULT '' CHECK (char_length(name) <= 100),
     job_type   job_type NOT NULL,
     -- NULL until the job is first activated; set by the admin at activation
-    -- time. Every active job's share of the *claims* (not of worker time, KL-88):
-    -- the scheduler hands each
+    -- time. Every active job's share of the fleet: the scheduler hands each
     -- claim to the active job furthest behind
     -- `(claims_issued - claims_baseline) / allocation`, and the active jobs
     -- may allocate at most 100% between them. There is
@@ -5813,8 +6196,6 @@ CREATE TABLE jobs (
     -- is exactly what `inactive` means, and a job that should get everything
     -- is the only one above 0%.
     allocation INT CHECK (allocation BETWEEN 0 AND 100),
-    -- Number of independent workers that must complete each task. Default 1 = single-claim behavior.
-    redundancy INT NOT NULL DEFAULT 1 CHECK (redundancy >= 1),
     -- Jobs start inactive; admin activates with an allocation percentage.
     status     job_status NOT NULL DEFAULT 'inactive',
     -- SET NULL if the creating admin's account is deleted.
@@ -5861,13 +6242,7 @@ CREATE TABLE jobs (
     -- reset -- on activation, on an allocation change, on a purge -- so that
     -- the job's ratio equals the lowest ratio among the other jobs being
     -- served (see `last_claimed_at` below): it joins at parity and takes its
-    -- share from then on; for an hour after joining (`activated_at`), each
-    -- claim of it lifts it level with the lowest of the claiming worker's
-    -- other candidates.
-    -- A job a claim passes over for want of a task is lifted level with the
-    -- job claimed, and a job unserved for a heartbeat timeout rejoins at
-    -- parity on its next claim, so a job with nothing to hand out banks no
-    -- debt (`scheduler::lift_passed_over`, `issue_claim`).
+    -- share from then on.
     --
     -- Without it the deficit was measured over a job's whole life, so a job
     -- activated today beside one that had issued two million claims took
@@ -5885,39 +6260,48 @@ CREATE TABLE jobs (
     -- climb, and a newcomer put level with *it* then took every claim from the
     -- jobs that were actually running until it had caught up with them.
     last_claimed_at TIMESTAMPTZ,
-    -- The SPRT verdict a games or game-pairs job was completed on, as the
-    -- finish check saw it: NULL for every other job, and for one completed any
-    -- other way (by an admin, or at its cap in the claim path). The live
-    -- figures are recomputed from every accepted result, and the claims in
-    -- flight when a job completes are still played and accepted -- so without
-    -- this the page of a job that passed could drift back to "running" with no
-    -- record anywhere of the decision that stopped it. A purge clears it.
-    sprt_decided_status TEXT CHECK (sprt_decided_status IN ('passed', 'failed', 'terminated_at_max')),
-    sprt_decided_llr    DOUBLE PRECISION,
-    sprt_decided_units  BIGINT,
-    CONSTRAINT jobs_sprt_decided_together CHECK (
-        (sprt_decided_status IS NULL) = (sprt_decided_llr IS NULL)
-        AND (sprt_decided_status IS NULL) = (sprt_decided_units IS NULL)
+    -- The match test's verdict a games or game-pairs job was completed on, as
+    -- the finish check saw it, with player 1's score interval and the units it
+    -- had then: NULL for every other job, for one completed any other way (by
+    -- an admin, or at its cap in the claim path), and for one that runs no
+    -- test -- there is no verdict to keep, and its `job.completed` audit row
+    -- says `reached_target` instead. The live figures are recomputed from
+    -- every accepted result, and the claims in flight when a job completes are
+    -- still played and accepted -- so without this the page of a job that
+    -- decided could drift back to "running" with no record anywhere of the
+    -- decision that stopped it. A purge clears it.
+    test_decided_status TEXT CHECK (test_decided_status IN
+                            ('player1_better', 'player2_better', 'inconclusive')),
+    test_decided_lower  DOUBLE PRECISION,
+    test_decided_upper  DOUBLE PRECISION,
+    test_decided_units  BIGINT,
+    CONSTRAINT jobs_test_decided_together CHECK (
+        (test_decided_status IS NULL) = (test_decided_lower IS NULL)
+        AND (test_decided_status IS NULL) = (test_decided_upper IS NULL)
+        AND (test_decided_status IS NULL) = (test_decided_units IS NULL)
     ),
     -- Progress totals the dashboard reads, maintained in the submit transaction
-    -- rather than counted on read (PLAN.md, "What these reads cost"). Both are
-    -- incremented
-    -- once per task, on its FIRST accepted result, because that is the row the
-    -- reads they replace selected: with redundancy > 1 the later claims of a
-    -- task replay the same deterministic work, and summing all of them would
-    -- multiply every total by the redundancy.
+    -- rather than counted on read (PLAN.md, "What these reads cost"), once per
+    -- accepted result: a task has one slot, so one result.
     --
     -- games_completed counts GAMES for both games and game_pairs; a pairs job's
     -- unit count is half of it, exactly as the read derived it. racks_analyzed
     -- counts distinct opening racks with an accepted analysis, which is a plain
     -- sum because each task covers its own disjoint slice of the rack space.
     --
-    -- Neither is authoritative for anything that decides: SPRT still reads
+    -- Neither is authoritative for anything that decides: the match test still reads
     -- game_results, so a drifted counter shows a wrong number on a page and
     -- cannot stop a job early. A purge zeroes them; a partial restore
     -- recomputes them (RUNBOOK 2.3).
     games_completed BIGINT NOT NULL DEFAULT 0 CHECK (games_completed >= 0),
     racks_analyzed  BIGINT NOT NULL DEFAULT 0 CHECK (racks_analyzed >= 0),
+    -- An opening-rack job's racks that need no more analysis (see
+    -- job_opening_rack_config's consensus), and those of them settled by
+    -- reaching their most analyses without a consensus. Racks settle at their
+    -- first analysis when the job wants one, so for such a job the first is
+    -- racks_analyzed. The job is done once every rack is settled.
+    racks_settled            BIGINT NOT NULL DEFAULT 0 CHECK (racks_settled >= 0),
+    racks_without_consensus  BIGINT NOT NULL DEFAULT 0 CHECK (racks_without_consensus >= 0),
     -- Tasks created, and tasks that reached `completed`. The job list shows
     -- both for every job on the page, and counting them meant two COUNT(*)s
     -- over `tasks` per job per page view -- linear in each job's whole history,
@@ -6006,6 +6390,7 @@ CREATE TABLE player_configs (
     -- own defaults, so a setting missing here is a task no worker will run.
     use_wordmap          BOOLEAN NOT NULL,   -- -w1 / -w2
     use_rit               BOOLEAN NOT NULL,  -- rack info table            (-rit1 / -rit2)
+    use_wit               BOOLEAN NOT NULL,  -- word info table (-wit1 / -wit2)
     -- More simulation parameters: NULL for a static player, set for a simmer.
     min_play_iterations   INT,               -- -mi1 / -mi2
     threshold             TEXT,              -- 'none' | 'gk16'            (-th1 / -th2)
@@ -6018,7 +6403,32 @@ CREATE TABLE player_configs (
     -- than per-player. Stored here anyway (duplicated on both players'
     -- rows in a job, validated equal at job-creation time) so this table
     -- stays the single, exhaustive source of what a job asked MAGPIE for.
+    -- The same holds of num_plays_recorded and num_plies_recorded above in a
+    -- games or game-pairs job that captures positions: MAGPIE reads player
+    -- 1's for both seats, so job creation requires the two to agree.
     movegen_margin         DOUBLE PRECISION NOT NULL, -- move-gen equity margin for 'equity' recording (-mmargin)
+    -- Endgame and pre-endgame (PEG) solving, read only by games and game-pairs
+    -- jobs: an opening rack never reaches a small bag, and a leave job's games
+    -- end before one (job creation refuses a leave player that solves).
+    --
+    -- endgame_plies is the switch for both: 0 solves nothing, because PEG
+    -- scores its emptier scenarios with endgame solves. Above 0 the player
+    -- solves the endgame to that depth once the bag is empty, and runs PEG
+    -- while the bag holds 1..peg_max_bag tiles (0 = no PEG). Neither has a time
+    -- limit: the depth and the schedule bound the work, so a player is as
+    -- strong on a slow machine as on a fast one. Like a simulation, a solve is
+    -- multithreaded and so not reproducible run to run.
+    endgame_plies          INT NOT NULL DEFAULT 0,    -- -eplies1 / -eplies2
+    peg_max_bag            INT NOT NULL DEFAULT 0,    -- -pegbag1 / -pegbag2
+    -- The PEG schedule: NULL when peg_max_bag is 0, all set when it is not.
+    peg_stage_top_k        INT[],                     -- survivors per halving stage (-pegtopk1 / -pegtopk2)
+    peg_scenario_stride    INT,                       -- 1 = full enumeration (-pegstride1 / -pegstride2)
+    peg_opp_model          TEXT,                      -- 'rational' | 'pessimistic' (-pegpess1 / -pegpess2)
+    peg_nested             BOOLEAN,                   -- nested lookahead (-pegnested1 / -pegnested2)
+    -- The nested lookahead's knobs: set exactly when peg_nested is.
+    peg_nested_cand_caps   INT[],                     -- per-level candidate caps (-pegncaps)
+    peg_nested_max_depth   INT,                       -- nested pegs before a rollout (-pegndepth)
+    peg_nested_strides     INT[],                     -- stride per inner bag size 1..4 (-pegnstrides)
     -- SET NULL, like jobs.created_by: a config outlives the admin who made it.
     created_by       UUID REFERENCES users(id) ON DELETE SET NULL,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -6042,6 +6452,27 @@ CREATE TABLE player_configs (
             AND threshold IS NULL AND sampling_rule IS NULL
             AND inference_margin IS NULL AND utility_w_winpct IS NULL
             AND utility_w_spread IS NULL AND utility_spread_scale IS NULL)
+    ),
+    -- The solver settings nest: PEG needs the endgame, the PEG schedule is
+    -- stated exactly when PEG runs, and the nested knobs exactly when nested
+    -- lookahead is on. MAGPIE refuses a request that breaks any of these.
+    CONSTRAINT player_configs_solver_settings CHECK (
+        endgame_plies BETWEEN 0 AND 25
+        AND peg_max_bag BETWEEN 0 AND 4
+        AND (endgame_plies > 0 OR peg_max_bag = 0)
+        AND (
+            (peg_max_bag = 0
+                AND peg_stage_top_k IS NULL AND peg_scenario_stride IS NULL
+                AND peg_opp_model IS NULL AND peg_nested IS NULL)
+            OR
+            (peg_max_bag > 0
+                AND peg_stage_top_k IS NOT NULL AND peg_scenario_stride IS NOT NULL
+                AND peg_opp_model IN ('rational', 'pessimistic')
+                AND peg_nested IS NOT NULL)
+        )
+        AND (peg_nested IS TRUE) = (peg_nested_cand_caps IS NOT NULL)
+        AND (peg_nested IS TRUE) = (peg_nested_max_depth IS NOT NULL)
+        AND (peg_nested IS TRUE) = (peg_nested_strides IS NOT NULL)
     )
 );
 
@@ -6060,7 +6491,23 @@ CREATE TABLE job_opening_rack_config (
     rack_size         INT NOT NULL DEFAULT 7 CHECK (rack_size BETWEEN 1 AND 7),
     -- Size of the rack space, computed at job creation. Tasks address ranges of
     -- it, so this is what tells the scheduler when the job is exhausted.
-    total_racks       BIGINT NOT NULL CHECK (total_racks >= 0)
+    total_racks       BIGINT NOT NULL CHECK (total_racks >= 0),
+    -- Consensus: a rack is analysed until enough of its analyses agree on its
+    -- best move, each analysis a task of its own. Its consensus is the share
+    -- of its analyses whose rank-1 move is the most common rank-1 move. It is
+    -- settled once it has at least `min_results_per_rack` analyses and its
+    -- consensus is at least `consensus_pct`, or once it has
+    -- `max_results_per_rack` analyses (settled without consensus), and not
+    -- analysed again unless an admin changes these three (the only settings a
+    -- job's config may change after creation), which restates every rack.
+    -- One and one is one analysis per rack, which is what a static player
+    -- gets: its analyses are deterministic and always agree.
+    consensus_pct          DOUBLE PRECISION NOT NULL DEFAULT 100
+                           CHECK (consensus_pct > 50 AND consensus_pct <= 100),
+    min_results_per_rack   INT NOT NULL DEFAULT 1 CHECK (min_results_per_rack >= 1),
+    max_results_per_rack   INT NOT NULL DEFAULT 1
+                           CHECK (max_results_per_rack >= min_results_per_rack
+                                  AND max_results_per_rack <= 100)
 );
 
 CREATE TABLE job_game_config (
@@ -6070,14 +6517,20 @@ CREATE TABLE job_game_config (
     player1_config_id   UUID NOT NULL REFERENCES player_configs(id),
     player2_config_id   UUID NOT NULL REFERENCES player_configs(id),
     games_per_batch     INT NOT NULL DEFAULT 1,
-    -- Two finish conditions: SPRT significance (evaluated after min_games) OR reaching max_games.
-    min_games           INT NOT NULL,   -- SPRT is not evaluated until this many games are complete
-    max_games           INT NOT NULL,   -- job auto-completes at this count regardless of SPRT
-    -- SPRT parameters (H0: elo_diff = elo_low, H1: elo_diff = elo_high)
-    sprt_alpha          DOUBLE PRECISION NOT NULL DEFAULT 0.05,
-    sprt_beta           DOUBLE PRECISION NOT NULL DEFAULT 0.05,
-    elo_low             DOUBLE PRECISION NOT NULL DEFAULT -10.0,
-    elo_high            DOUBLE PRECISION NOT NULL DEFAULT 10.0,
+    -- Whether the job runs the match test (stats/match_test.rs): a confidence
+    -- interval for player 1's score that stays valid however often it is
+    -- checked, the job stopping once it excludes an even score. Off, it plays
+    -- max_games and stops, and min_games and confidence_pct are stored at
+    -- their defaults and read by nothing. Off by default: a job that only
+    -- wants the games played should not be stopped early by a test it did not
+    -- ask for.
+    test_enabled        BOOLEAN NOT NULL DEFAULT FALSE,
+    -- Two finish conditions: a decision (looked for from min_games on) OR reaching max_games.
+    min_games           INT NOT NULL,   -- the test is not acted on before this many games are complete
+    max_games           INT NOT NULL,   -- job auto-completes at this count regardless of the test
+    -- How confident a decision is: the interval's coverage, in percent.
+    confidence_pct      DOUBLE PRECISION NOT NULL DEFAULT 95
+                        CHECK (confidence_pct > 50 AND confidence_pct < 100),
     -- Keep the position analyses the worker produces while playing. A worker
     -- analyses a position every turn regardless; this decides whether those are
     -- recorded. Off by default: at ~22.5 turns a game it roughly doubles the
@@ -6092,49 +6545,66 @@ CREATE TABLE job_game_pair_config (
     player1_config_id   UUID NOT NULL REFERENCES player_configs(id),
     player2_config_id   UUID NOT NULL REFERENCES player_configs(id),
     pairs_per_batch     INT NOT NULL DEFAULT 1,
+    -- As on job_game_config: off, the job plays max_pairs and stops.
+    test_enabled        BOOLEAN NOT NULL DEFAULT FALSE,
     min_pairs           INT NOT NULL,
     max_pairs           INT NOT NULL,
-    sprt_alpha          DOUBLE PRECISION NOT NULL DEFAULT 0.05,
-    sprt_beta           DOUBLE PRECISION NOT NULL DEFAULT 0.05,
-    elo_low             DOUBLE PRECISION NOT NULL DEFAULT -10.0,
-    elo_high            DOUBLE PRECISION NOT NULL DEFAULT 10.0,
+    confidence_pct      DOUBLE PRECISION NOT NULL DEFAULT 95
+                        CHECK (confidence_pct > 50 AND confidence_pct < 100),
     -- Keep the position analyses the worker produces while playing. A worker
     -- analyses a position every turn regardless; this decides whether those are
     -- recorded. Off by default: at ~22.5 turns a game it roughly doubles the
     -- rows a job produces.
-    capture_positions   BOOLEAN NOT NULL DEFAULT FALSE
+    capture_positions   BOOLEAN NOT NULL DEFAULT FALSE,
+    -- With capture on, keep only each pair's first divergence: both games'
+    -- positions at the first turn the two games play different moves, and
+    -- nothing from a pair played identically. Before that turn the two games
+    -- are the same game; after it they are two different ones, and the turn
+    -- itself is where the players disagree.
+    capture_first_divergence BOOLEAN NOT NULL DEFAULT FALSE,
+    CONSTRAINT job_game_pair_config_divergence_needs_capture
+        CHECK (capture_positions OR NOT capture_first_divergence)
 );
 
 CREATE TABLE job_leave_config (
     job_id         UUID PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
-    -- The one place a lexicon still sits on a job: leave generation has a
-    -- single bot and no player_configs row to hold it. It needs no klv_id
-    -- (every generation's leaves come from the server-built KLV artifact, and
-    -- generation 1's is a zeroed one) and no winpct_id (the bot plays
-    -- statically). Its complete data requirement is this plus the job's
-    -- letterdist_id and layout_id.
-    kwg_id         UUID NOT NULL REFERENCES input_data(id),
+    -- The player the leave-generating bot plays as, in both seats: its lexicon
+    -- and wordmap setting are the job's. Its leaves are never loaded -- every
+    -- generation's come from the server-built KLV artifact, and generation 1's
+    -- is a zeroed one -- and nor is its win% model, since the bot plays
+    -- statically. So the job's complete data requirement is this player's kwg
+    -- plus the job's letterdist_id and layout_id. Job creation refuses a player
+    -- that simulates, sorts on anything but equity, or asks for a rack info
+    -- table: leave values are measured from static equity play.
+    player_config_id UUID NOT NULL REFERENCES player_configs(id),
     -- Games each leave-gen task plays over its forced-rack subset.
     num_iterations INT NOT NULL,
-    -- How many sequential generations this job runs before it is complete.
-    generation_count  INT NOT NULL DEFAULT 1 CHECK (generation_count >= 1),
-    -- Per-generation occurrence target every rack must reach before the generation closes.
-    target_rack_count INT NOT NULL CHECK (target_rack_count >= 1),
+    -- The occurrence target every rack must reach before a generation closes,
+    -- one per generation: element g (1-based, as generations are numbered) is
+    -- generation g's, and the array's length is how many generations the job
+    -- runs before it is complete. MAGPIE's `leavegen 100,200,500,…` shape.
+    -- `<= ALL` over an array holding a NULL is NULL, which a CHECK passes, so
+    -- the NULL test is separate; and it is indexed by generation, so flat and
+    -- starting at 1.
+    target_rack_counts INT[] NOT NULL CHECK (
+        array_ndims(target_rack_counts) = 1
+        AND array_lower(target_rack_counts, 1) = 1
+        AND cardinality(target_rack_counts) >= 1
+        AND 1 <= ALL (target_rack_counts)
+        AND array_position(target_rack_counts, NULL) IS NULL
+    ),
     -- Size of the forced-rack subset handed to a single task.
-    racks_per_task    INT NOT NULL CHECK (racks_per_task >= 1),
-    -- Whether the leave-generating bot plays with a wordmap. Sent to the worker,
-    -- which builds one from its .kwg if it does not already have it. A player
-    -- setting like any other -- workers assume nothing about wordmaps.
-    use_wordmap       BOOLEAN NOT NULL DEFAULT TRUE
+    racks_per_task    INT NOT NULL CHECK (racks_per_task >= 1)
 );
 
 -- Exports
 --
--- A completed job's results, as one gzipped NDJSON object in the artifact
--- store. Only completed jobs can be exported, and that is what makes the
--- artifact worth having: a completed job's results are immutable, so an export
--- is built once and reused, where an export of an active job would be stale as
--- it was written.
+-- A job's results, as one gzipped NDJSON object in the artifact store. Any job
+-- can be exported; is_final says whether this is the completed job's corpus,
+-- which is immutable and so built once and reused (the results stream
+-- redirects to it), or a snapshot of a job still taking results, which is
+-- offered as a download labelled with its time and never served in the
+-- finished job's place.
 --
 -- Shaped like input_data_imports, and for the same reason: a long operation an
 -- admin starts, polls, and then acts on. birdtest runs as a single instance, so
@@ -6162,13 +6632,23 @@ CREATE TABLE job_exports (
     positions_bytes        BIGINT,
     positions_sha256       TEXT,
     positions_row_count    BIGINT,
+    -- TRUE when the snapshot the export was read in saw the job completed,
+    -- with no claim still open and nothing staged: its final corpus. Decided
+    -- inside that snapshot (exports::read_snapshot), not when the export was
+    -- requested -- a job exported mid-run can complete before its rows are
+    -- read, with its last results still landing. FALSE until built, so an
+    -- unfinished or unmarked row is never taken for the final one.
+    is_final      BOOLEAN NOT NULL DEFAULT FALSE,
+    -- When that snapshot was taken, for the page's "Snapshot as of …".
+    snapshot_at   TIMESTAMPTZ,
     error         TEXT,
     requested_by  UUID REFERENCES users(id) ON DELETE SET NULL,
     requested_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     completed_at  TIMESTAMPTZ
 );
 
--- The newest ready export for a job, which is what a download resolves to.
+-- The newest ready export for a job, which is what a download resolves to
+-- (the newest final one, for the results stream).
 CREATE INDEX job_exports_job_idx ON job_exports (job_id, requested_at DESC);
 
 -- One export of a job at a time. Only the page's disabled button stopped a
@@ -6184,9 +6664,7 @@ CREATE TABLE tasks (
     job_id               UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
     -- The seed the task's games are played from. Every job type plays games,
     -- so every task has one, stated on its request: games and game pairs seed
-    -- their batch from it (MAGPIE draws each game's seed from a stream seeded
-    -- with it; the applied migration's copy of this comment still says "step
-    -- by one per game", left so its checksum holds); an opening-rack task's is
+    -- their batch from it and step by one per game; an opening-rack task's is
     -- the index of its first rack in the job's rack space, and rack i of the
     -- batch is analysed from seed + i; a leave-generation task's is drawn
     -- when the task is created. Stored as signed int64; interpreted as uint64
@@ -6195,7 +6673,9 @@ CREATE TABLE tasks (
     -- below serves.
     seed                 BIGINT NOT NULL,
     state                task_state NOT NULL DEFAULT 'available',
-    -- Denormalized counters used by SKIP LOCKED selection; avoids per-candidate join/aggregate.
+    -- Denormalized counters used by SKIP LOCKED selection; avoids per-candidate
+    -- join/aggregate. A task has one slot: it is claimed by one worker at a
+    -- time and completed by its one accepted result, so each is 0 or 1.
     accepted_count       INT NOT NULL DEFAULT 0,
     active_claim_count   INT NOT NULL DEFAULT 0,
     created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -6214,12 +6694,11 @@ CREATE UNIQUE INDEX tasks_seed_unique_idx ON tasks (job_id, seed);
 -- The queue index carries `created_at` rather than `state`, which the partial
 -- predicate already fixes: claim-time selection takes the *oldest* available
 -- task of a job (`registry::next_available`), so with `state` in the key the
--- planner had to read every available task of the job and sort it. A job with
--- redundancy above 1 leaves tasks available until their slots fill, so that is
--- not a short list.
+-- planner had to read every available task of the job and sort it.
 CREATE INDEX tasks_queue_idx   ON tasks (job_id, created_at) WHERE state = 'available';
 
--- Individual claims (one row per worker claim; up to redundancy concurrent/cumulative rows per task)
+-- Individual claims (one row per worker claim: a task's lapsed and declined
+-- claims, then the one that completed it)
 --
 -- claimed_by_user_id carries no ON DELETE clause because a user row is never
 -- deleted: account deletion anonymizes it in place (users.deleted_at, and a
@@ -6251,6 +6730,16 @@ CREATE TABLE task_claims (
     claimed_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_heartbeat_at    TIMESTAMPTZ,
     completed_at         TIMESTAMPTZ,
+    -- What this claim's accepted result played and analysed, written when it
+    -- completes (zero until then, and for a claim that never does): the games
+    -- of a games or pairs batch or of a leave task, the racks of an
+    -- opening-rack batch or the distinct racks a leave task drew. Its
+    -- contributor's running totals add these, so a purge can give back
+    -- exactly what they added by summing the claims it is about to delete,
+    -- without reading the results. Every claim's own, not the task's first
+    -- result's.
+    games_played         INT NOT NULL DEFAULT 0,
+    racks_analyzed       INT NOT NULL DEFAULT 0,
     -- As reported at claim time. What the fleet is actually running, which is
     -- the evidence for raising a job's floor.
     magpie_version       TEXT,
@@ -6325,9 +6814,17 @@ CREATE TABLE opening_rack_requests (
     -- pins, not on whatever board its own settings last loaded.
     board_layout      TEXT NOT NULL,
     -- Index of the first rack in this batch, and how many it covers. The final
-    -- batch of a job may be short.
+    -- batch of a job may be short. A task reissuing racks a consensus still
+    -- wants (`racks` below) has its seed here instead: the cursor past the end
+    -- of the rack space, so rack i of it is analysed from a seed no earlier
+    -- analysis used.
     rack_start        BIGINT NOT NULL CHECK (rack_start >= 0),
     rack_count        INT NOT NULL CHECK (rack_count >= 1),
+    -- The racks themselves, for a task reissuing racks a consensus still
+    -- wants: they are scattered over the space rather than a range of it.
+    -- NULL for a task covering a range, which is every task of a job wanting
+    -- one analysis per rack.
+    racks             TEXT[] CHECK (racks IS NULL OR cardinality(racks) = rack_count),
     previous_play     TEXT,                  -- GCG-encoded previous move; required when inference is enabled; NULL for opening racks
     player_config_id  UUID NOT NULL REFERENCES player_configs(id)
 );
@@ -6341,6 +6838,9 @@ CREATE TABLE game_requests (
     -- Denormalized from the job config, like everything else here, so the
     -- request a re-dispatched task replays is exactly the one it was given.
     capture_positions BOOLEAN NOT NULL DEFAULT FALSE,
+    -- Game pairs only: of the captured positions, keep only each pair's first
+    -- divergence (job_game_pair_config.capture_first_divergence).
+    capture_first_divergence BOOLEAN NOT NULL DEFAULT FALSE,
     -- seed is also stored on the tasks row; duplicated here for convenience when reading the full request.
     seed              BIGINT NOT NULL,
     num_games         INT NOT NULL DEFAULT 1,
@@ -6350,7 +6850,7 @@ CREATE TABLE game_requests (
 
 CREATE TABLE leave_requests (
     task_id             UUID PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
-    lexicon             TEXT NOT NULL,
+    -- No lexicon or wordmap column: the player config carries both.
     variant             TEXT NOT NULL,
     letter_distribution TEXT NOT NULL,
     board_layout        TEXT NOT NULL,
@@ -6366,8 +6866,31 @@ CREATE TABLE leave_requests (
     -- the server-built zeroed KLV at generation-0, so every generation fetches
     -- its leaves the same way and the client has no first-generation branch.
     previous_artifact_key TEXT NOT NULL,
-    use_wordmap         BOOLEAN NOT NULL   -- denormalized from job_leave_config.use_wordmap
+    player_config_id    UUID NOT NULL REFERENCES player_configs(id)
 );
+
+-- An opening-rack job's racks: how many analyses each has, its most common
+-- rank-1 move and how many analyses ranked it first, and whether it is
+-- settled (see job_opening_rack_config). Every opening-rack job keeps them,
+-- even one wanting one analysis per rack, which settles each rack at its
+-- first: an admin may change its consensus settings later, and its reissues
+-- then start from these rows. A rack has a row from its first analysis; the
+-- racks still to be reissued are its unsettled rows, fewest analyses first.
+CREATE TABLE opening_rack_progress (
+    job_id     UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    rack       TEXT NOT NULL,
+    results    INT NOT NULL CHECK (results >= 1),
+    top_move   TEXT NOT NULL,
+    top_count  INT NOT NULL CHECK (top_count BETWEEN 1 AND results),
+    settled    BOOLEAN NOT NULL,
+    -- Settled by reaching the job's most analyses, its analyses still split.
+    without_consensus BOOLEAN NOT NULL CHECK (settled OR NOT without_consensus),
+    PRIMARY KEY (job_id, rack)
+);
+
+-- What a reissue picks from: a job's unsettled racks, fewest analyses first.
+CREATE INDEX opening_rack_progress_unsettled_idx
+    ON opening_rack_progress (job_id, results, rack) WHERE NOT settled;
 
 -- Per-rack occurrence progress for each generation of a leave-gen job, one row per
 -- full 7-tile rack the distribution can draw (3,199,724 for English), seeded at zero when
@@ -6475,7 +6998,7 @@ CREATE TABLE leave_selection_cursors (
     PRIMARY KEY (job_id, generation)
 );
 
--- Task records (one per accepted claim; keyed by task_claim_id since redundancy > 1 yields multiple results per task)
+-- Task records (one per accepted claim, keyed by task_claim_id)
 -- task_id is denormalized here for efficient job-results queries without joining through task_claims.
 
 -- One analysed position per row, whatever produced it.
@@ -6518,6 +7041,19 @@ CREATE TABLE position_analysis_records (
     -- NULL for turn 0 of a game (nothing preceded it) and for opening racks.
     previous_move       TEXT,
     previous_move_score INT,
+    -- The move played from this position, and its score: the one chosen this
+    -- turn, which need not be the top-ranked move below (a simmer's pick, or
+    -- a solver's), and which no later row holds when only a pair's first
+    -- divergence is kept. Every in-game position has it; an opening rack,
+    -- from which nothing is played, never does.
+    played_move         TEXT,
+    played_move_score   INT,
+    -- How the move played from this position was chosen: by static equity, a
+    -- simulation, a pre-endgame solve or an endgame solve. Decides which of
+    -- its moves' statistics are set: win_percentage and per-ply rows for a
+    -- simulation, mean_spread and fidelity_plies for a solve. An opening rack
+    -- is 'static' or 'sim'.
+    analysis            TEXT NOT NULL CHECK (analysis IN ('static', 'sim', 'peg', 'endgame')),
     -- How many moves the worker ranked, which is generally far more than the
     -- stored moves. The one thing about the analysis those cannot tell you,
     -- since they are truncated.
@@ -6530,20 +7066,24 @@ CREATE TABLE position_analysis_records (
     CONSTRAINT position_analysis_in_game_together CHECK (
         (game_index IS NULL AND turn_number IS NULL)
         OR (game_index IS NOT NULL AND turn_number IS NOT NULL)
+    ),
+    CONSTRAINT position_analysis_played_in_game CHECK (
+        (played_move IS NULL) = (game_index IS NULL)
+        AND (played_move_score IS NULL) = (played_move IS NULL)
     )
 );
 
--- Games are seeded and deterministic, so redundant claims replay identical
--- games and would capture identical positions. Keying on the task rather than
--- the claim makes the first accepted claim the one that lands and the rest
--- no-ops, so redundancy still verifies the *result* without multiplying the
--- corpus.
+-- One position per turn of a task's game. It is also how a random saved
+-- position is drawn
+-- (`/api/jobs/:id/positions/random`): a random turn of one task's games, a
+-- few hundred entries at most, where `ORDER BY random()` read the whole job.
 CREATE UNIQUE INDEX position_analysis_records_in_game_idx
     ON position_analysis_records (task_id, game_index, turn_number)
     WHERE game_index IS NOT NULL;
 
--- Opening racks keep their natural key: one analysis per rack per claim, so
--- redundant claims each record their own and can be compared.
+-- Opening racks keep their natural key: one analysis per rack per claim. A
+-- rack an opening-rack job analyses more than once, to reach a consensus,
+-- is in several tasks, each with its own claim.
 CREATE UNIQUE INDEX position_analysis_records_rack_idx
     ON position_analysis_records (task_claim_id, rack)
     WHERE game_index IS NULL;
@@ -6601,14 +7141,20 @@ CREATE TABLE position_analysis_moves (
     move            TEXT NOT NULL,
     score           INT NOT NULL,
     equity          DOUBLE PRECISION NOT NULL,
-    -- The simulated win percentage. NULL for a static player, which ranks on
-    -- equity alone and simulates nothing.
+    -- The win percentage: a simulation's, or a pre-endgame solve's over every
+    -- way the bag can be drawn. NULL for a static or endgame analysis.
     win_percentage  DOUBLE PRECISION,
     -- Mean win%+spread blend in [0, 1] (see the player config's
     -- utility_w_winpct/utility_w_spread/utility_spread_scale), sometimes used
     -- to rank moves instead of equity or raw win percentage. NULL for a
     -- static player, same as win_percentage.
-    blended_utility DOUBLE PRECISION
+    blended_utility DOUBLE PRECISION,
+    -- A pre-endgame or endgame solve's projected final spread for the mover,
+    -- in points, and the endgame depth the move was ranked at (a PEG move's
+    -- deepest tier; 0 is PEG's greedy seed). NULL for a static or simulated
+    -- analysis.
+    mean_spread     DOUBLE PRECISION,
+    fidelity_plies  SMALLINT
 );
 -- Every read of a best move goes through its record: the results listing joins
 -- `record_id` and filters `rank = 1`, and a rack lookup reads a record's whole
@@ -6636,18 +7182,28 @@ CREATE TABLE position_analysis_plies (
     PRIMARY KEY (move_id, ply)
 );
 
+-- What a simming player inferred of the opponent's leave before it simmed a
+-- captured position: how many distinct leaves the inference found, how many it
+-- drew in all, their mean equity, and the most drawn of them -- at most ten
+-- `{leave, draws, equity}` objects, most drawn first. Only a simulated in-game
+-- position past a game's first turn, whose opponent did not pass, has one; an
+-- opening rack never does (there is no opponent move to infer from).
+CREATE TABLE position_analysis_inference (
+    record_id      BIGINT PRIMARY KEY
+                   REFERENCES position_analysis_records(id) ON DELETE CASCADE,
+    num_leaves     BIGINT NOT NULL CHECK (num_leaves >= 0),
+    total_draws    BIGINT NOT NULL CHECK (total_draws >= 0),
+    average_equity DOUBLE PRECISION NOT NULL,
+    leaves         JSONB NOT NULL CHECK (jsonb_typeof(leaves) = 'array'
+                                         AND jsonb_array_length(leaves) <= 10)
+);
+
 -- Shared by games and game pairs: one row per accepted claim, holding the
 -- aggregate MAGPIE's autoplay reports. Autoplay does not emit individual games
 -- -- it reports counts and score moments for a batch, and in `-gp` mode also
 -- the pentanomial: how many completed pairs ended in each of the five possible
--- pair outcomes. The pentanomial is what SPRT and the rating fits read; the
+-- pair outcomes. The pentanomial is what the match test and the rating fits read; the
 -- divergent summary alongside it is a diagnostic only.
---
--- With redundancy > 1 a task has several rows here, one per accepted claim,
--- and because games are seeded and deterministic they describe the *same*
--- games. Every aggregate that treats rows as observations (SPRT, progress,
--- ratings) therefore reads one row per task -- the first accepted -- or it
--- would count each game `redundancy` times.
 CREATE TABLE game_results (
     task_claim_id     UUID PRIMARY KEY REFERENCES task_claims(id) ON DELETE CASCADE,
     task_id           UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -6670,7 +7226,7 @@ CREATE TABLE game_results (
     -- pent_0 is "player 1 lost both games" and pent_4 is "won both". NULL for
     -- `games` jobs, which do not play pairs.
     --
-    -- This -- not the divergent subset below -- is what SPRT and the ratings
+    -- This -- not the divergent subset below -- is what the match test and the ratings
     -- read. The pair is the independent unit of a paired run, and *every* pair
     -- belongs in the sample: a pair whose two games played identically is a
     -- guaranteed 1-1 tie, lands in pent_2, and is exactly the observation that
@@ -6702,17 +7258,23 @@ CREATE TABLE game_results (
 
     -- The divergent subset: pairs whose two games did not play identically.
     -- Kept as a *diagnostic* -- it says how often two configs actually differ,
-    -- which is worth showing -- and deliberately not used as a statistical
-    -- sample. NULL for `games` jobs.
+    -- and how they fare where they do, which the job page shows as a match
+    -- score of its own -- and deliberately not used as a statistical sample.
+    -- Each player's mean score over the subset's games, as MAGPIE reports it
+    -- (0 when no pair diverged). NULL for `games` jobs.
     divergent_games   INT CHECK (divergent_games >= 0),
     divergent_wins    INT CHECK (divergent_wins >= 0),
     divergent_losses  INT CHECK (divergent_losses >= 0),
     divergent_ties    INT CHECK (divergent_ties >= 0),
+    divergent_p1_score_mean DOUBLE PRECISION,
+    divergent_p2_score_mean DOUBLE PRECISION,
     CONSTRAINT game_results_divergent_all_or_nothing CHECK (
         (divergent_games IS NULL AND divergent_wins IS NULL
-             AND divergent_losses IS NULL AND divergent_ties IS NULL)
+             AND divergent_losses IS NULL AND divergent_ties IS NULL
+             AND divergent_p1_score_mean IS NULL AND divergent_p2_score_mean IS NULL)
         OR (divergent_games IS NOT NULL AND divergent_wins IS NOT NULL
              AND divergent_losses IS NOT NULL AND divergent_ties IS NOT NULL
+             AND divergent_p1_score_mean IS NOT NULL AND divergent_p2_score_mean IS NOT NULL
              AND divergent_wins + divergent_losses + divergent_ties = divergent_games
              AND divergent_games <= games)
     ),
@@ -6804,7 +7366,7 @@ CREATE TABLE leave_generation_transitions (
 -- while dispatching, claiming, validating or completing a task, and nothing
 -- above (jobs, the two game config tables, game_results) mentions a rating.
 -- The coupling runs one way -- the fit reads finished game_results -- so a
--- rating can never affect whether a job stops. SPRT stays on the job config
+-- rating can never affect whether a job stops. The match test stays on the job config
 -- tables where it belongs: it is a per-job stopping rule, not a measurement.
 
 -- A rating pool is a set of player configs whose ratings are comparable, plus
@@ -6864,7 +7426,8 @@ CREATE TABLE rating_runs (
     pool_id       UUID NOT NULL REFERENCES rating_pools(id) ON DELETE CASCADE,
     computed_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     -- Why this run happened: 'membership' (an admin added or removed a config),
-    -- 'evidence' (new results arrived), or 'manual'.
+    -- 'evidence' (new results arrived), 'manual', or 'anchor' (an admin moved
+    -- the anchor or its rating).
     trigger       TEXT NOT NULL,
     method        TEXT NOT NULL DEFAULT 'bradley_terry_newton',
     -- Fit provenance. A run that did not converge is still stored and still
@@ -7100,12 +7663,12 @@ says so in its implemented option, rather than being removed.
   - leave it.
 - **Option implemented:** Left alone deliberately.
 - **Justification:** A late result for a finished job is real work. It is
-  harmless to SPRT, which has already decided, and to ratings, which refit on
+  harmless to the match test, which has already decided, and to ratings, which refit on
   it, and `tasks_claimed` is a display figure. Refusing late submissions throws
   away real results. A periodic sweep is the background process the lazy
   design exists to avoid.
 
-**KL-2. A poison task blocks an SPRT job at its cap.**
+**KL-2. A poison task blocks a games or pairs job at its cap.**
 - **Context:** No task is generated past `max_games`/`max_pairs`, so a job at its
   cap completes only when every task handed out has a result. Opening racks
   have always had this property.
@@ -7154,7 +7717,7 @@ says so in its implemented option, rather than being removed.
   declines needs a policy (how many, from how many workers, and whether a
   broken release rather than the job is to blame). Revisit if one ever is.
 
-**KL-3. Re-dispatch at redundancy above 1 walks every task the claimant has already filled.**
+**KL-3. Re-dispatch at redundancy above 1 walks every task the claimant has already filled.** *Closed: redundancy was removed (October 2026); a task has one slot.*
 - **Context:** `registry::next_available` takes the oldest `available` task the
   identity holds no slot on. Generation never waits for redundancy to catch up.
 - **Problem:** With workers of unequal speed, the fast one's completed-once tasks
@@ -7285,7 +7848,7 @@ says so in its implemented option, rather than being removed.
   every live stats build is the same read.
 - **Options considered:** move it off the worker's wait (eleventh audit);
   per-job win/loss/tie and pentanomial running totals kept in the submit
-  transaction beside `jobs.games_completed`, for SPRT and the page, with the
+  transaction beside `jobs.games_completed`, for the match test and the page, with the
   full read as a periodic cross-check; a finish-check stride that grows with
   the job; a leaner form of the first-result-per-task read (about 200–280 ms).
 - **Option implemented:** Kept inline, and unchanged.
@@ -7357,7 +7920,7 @@ says so in its implemented option, rather than being removed.
   run, both depend on the worker's thread count.
 - **Problem:** The same task can give different results on different workers.
   That is why simming jobs are excluded from any equality cross-check, and why
-  leave generation runs at redundancy 1.
+  an opening-rack job's consensus is only worth seeking for a simming player.
 - **Options considered:**
   - pin threads per task from the server;
   - leave them to the contributor's `contribute.txt`.
@@ -7397,7 +7960,7 @@ says so in its implemented option, rather than being removed.
   but large results waits on it. Revisit if capture or simming opening-rack
   jobs run at scale, or the slow-link claim is ever seen.
 
-**KL-55. Redundancy above 1 has two untested edges.**
+**KL-55. Redundancy above 1 has two untested edges.** *Closed: redundancy was removed (October 2026); a task has one slot.*
 - **Context:** No job runs above redundancy 1 today (see KL-3).
 - **Problem:**
   - Two concurrent reclaims holding lapsed claims on the same two tasks update
@@ -7522,7 +8085,8 @@ says so in its implemented option, rather than being removed.
 - **Options considered:** a spawned task with a status row, like exports.
 - **Option implemented:** None.
 - **Justification:** Each upload is idempotent, so running it again repairs a
-  partial run. Build the task if a job ever has that many generations.
+  partial run. Build the task if a job ever has that many generations. (A job
+  may list up to 100 generations' targets, so one that long can exist.)
 
 **KL-20. A submission's validation ran while its claim and task rows were locked.** *(Closed.)*
 - **Context:** It ran inside the same locks before, on an async worker, and then on the blocking pool.
@@ -7801,16 +8365,20 @@ says so in its implemented option, rather than being removed.
 - **Justification:** A character-set rule has to allow for international names,
   which is a product decision.
 
-**KL-41. A rating pool cannot be edited or deleted once created.**
-- **Context:** A pool's anchor and scope are fixed. Creation validates them: a
+**KL-41. A rating pool could not be edited or deleted once created.** Closed in the September 2026 feature batch.
+- **Context:** A pool's anchor and scope were fixed. Creation validates them: a
   variant a job can have, input-data rows of the right roles, and an anchor
   rating whose scale does not overflow.
-- **Problem:** A pool made by mistake stays, and keeps its anchor config from
-  being deleted.
+- **Problem:** A pool made by mistake stayed, and kept its anchor config from
+  being deleted; an anchor could not be moved at all.
 - **Options considered:** an update route and a delete route.
-- **Option implemented:** Validation at creation only.
-- **Justification:** It is admin-only and cosmetic. Add the routes if it ever
-  matters.
+- **Option implemented:** Both. `PATCH /api/admin/rating-pools/:id` moves the
+  anchor and its rating and refits; `DELETE` removes the pool and what cascades
+  from it, freeing its configs and input data. The scope (variant,
+  distribution, layout) stays fixed: a pool over other conditions is another
+  pool.
+- **Justification:** Mistakes are cheap to undo, and a pool's scale can follow
+  the configs an admin wants it anchored on.
 
 **KL-42. A worker's identity was resolved before its rate limit was checked. Closed in the twenty-first and twenty-second audits.**
 - **Context:** The worker extractor looked a presented key or UUID up in the
@@ -7920,9 +8488,9 @@ says so in its implemented option, rather than being removed.
     expired delete markers; `failed` and expired `job_exports` rows are never
     pruned; a build ended by its time limit or a restart leaves its multipart
     upload to the seven-day rule.
-  - At redundancy above 1, a games export has one row per accepted claim and an
-    opening-rack export one record per claim per rack, while the job's
-    statistics use the first result per task; nothing in the export marks it.
+  - An opening-rack export of a consensus job has one record per analysis of
+    a rack; the job's progress table (`opening_rack_progress`) says which
+    move each rack settled on.
   - After a point-in-time restore (§1), a `ready` row whose objects a later
     purge deleted redirects to a 404.
   - The admin page shows only the newest export row, so a failed or running
@@ -7933,8 +8501,7 @@ says so in its implemented option, rather than being removed.
   lifecycle rule for delete markers and a prune of old rows; mark the first
   result in the export; list every unexpired export on the page.
 - **Option implemented:** None.
-- **Justification:** Storage and wording, with no wrong data served; no job
-  runs above redundancy 1.
+- **Justification:** Storage and wording, with no wrong data served.
 
 **KL-73. The contributor-instruction test catches one phrasing.**
 - **Context:** `F-DOCS-1` (`contributeDocs.test.ts`) reads the pages' source.
@@ -8084,11 +8651,10 @@ says so in its implemented option, rather than being removed.
 - **Context:** The job pages, the purge path, the worker list (thirty-second
   audit, pass 1).
 - **Problem:**
-  - A games job force-completed by an admin has no stored verdict, so its SPRT
-    panel shows the live status — "running … not acted on until N pairs are
-    complete", "the minimum of N pairs is reached; SPRT is checked as pairs
-    arrive", or with a minimum of 0 "SPRT is checked as pairs arrive" — on a
-    completed job.
+  - A games job force-completed by an admin has no stored verdict, so its
+    test panel showed the live status — "running … not acted on until N pairs
+    are complete" — on a completed job. (Since fixed: the Significance Test card
+    says "not decided: the job was completed before the test was".)
   - Two purge races were reasoned about and not reproduced: a leave universe
     seeding spawned in the microseconds before a purge commits could seed a
     generation of the purged job; and a leave transition running when its job
@@ -8111,14 +8677,15 @@ says so in its implemented option, rather than being removed.
     rating-pool membership rows do not name the pool; activating a completed
     job queues its derived builds before it answers `409`. The job pages show
     an inactive or completed job's old allocation beside its status.
-  - SPRT on a run with no variance — every pair the same outcome — computes an
-    LLR of 0 whatever the mean, so a thousand straight wins runs to
-    `max_units` and is stored as stopped at its cap, where 999 wins and a draw
-    pass at once. Fishtest regularizes with pseudo-counts; not built.
+  - The SPRT, on a run with no variance — every pair the same outcome —
+    computed an LLR of 0 whatever the mean, so a thousand straight wins ran to
+    `max_units`. (Closed with the SPRT: the match test's interval keeps a
+    width when no variance is observed, `sqrt(2·ln(1/α) / (n²·ρ²))`, so a
+    thousand straight wins decide.)
   - One hostile leave result can hold a rack's count up to `num_games` × 1,000
     occurrences at a mean of ±5,000 — the plausibility ceilings — which fixes
     that rack's mean and puts it at target for good, shifting its sub-leaves.
-    Leave generation runs at redundancy 1 (KL-14), so nothing cross-checks it;
+    A task has one result (KL-14), so nothing cross-checks it;
     outside the broken-client threat model the checks are built for (not
     reproduced).
   - An admin's "merge now", or an export settling a leave job, waits for a
@@ -8134,7 +8701,7 @@ says so in its implemented option, rather than being removed.
     push builds one of its own (so a watched and visited job can cost two
     builds an interval; not measured); and when a job's stream ends for good (a `404` after a delete) its
     page goes on showing the last stats with nothing to say the job is gone.
-- **Options considered:** label a force-completed job's SPRT panel as such;
+- **Options considered:** label a force-completed job's test panel as such;
   publish the cached payload when a push is overtaken; an `onGone` callback
   that tells the page;
   drop the per-task request tables' foreign keys to player configs (the job's
@@ -8423,9 +8990,9 @@ says so in its implemented option, rather than being removed.
 - **Justification:** Admin-only, each visible and recoverable by a reload or
   a second action.
 
-**KL-87. What the SPRT still gets wrong at the edges.**
-- **Context:** `stats/sprt.rs`, `routes/admin.rs::validate_job_body`
-  (thirty-second audit, pass 18).
+**KL-87. What the SPRT got wrong at the edges, and the odd games batch.** *The SPRT's two halves are closed: the match test replaced it (October 2026). The odd-batch half remains.*
+- **Context:** `stats/sprt.rs` (since replaced by `stats/match_test.rs`),
+  `routes/admin.rs::validate_job_body` (thirty-second audit, pass 18).
 - **Problem:**
   - A `games` job created before pass 18 with an odd `games_per_batch` gave
     player 1 the first move in more than half its games — every one at a
@@ -8433,23 +9000,27 @@ says so in its implemented option, rather than being removed.
     of 1, +14 at 3, +8 at 5). Nothing marks such a job; and the
     schema's column default is still 1 (the migration is fixed), so a direct
     `INSERT` that leaves the column out — a script, a test fixture — makes one.
-  - The normal approximation overstates |LLR| when almost every pair is a
-    split: `[0,0,10000,1,0]` at ±10 reads 1151 where the exact GSPRT gives
-    about 1.1, so one decisive pair among a few dozen splits can decide a job
-    with no minimum. Simulated type I error stayed near α at the hypotheses,
-    so this misleads the displayed LLR more than the verdict.
-  - With `min_units = 0` and wide Elo bounds the type I error roughly doubles
-    (about 10–12% against α = 5% at [0, 200]); a minimum of 50 brings it
-    back to 1–2.5%.
+  - *(Closed.)* The SPRT's normal approximation overstated |LLR| when almost
+    every pair was a split: `[0,0,10000,1,0]` at ±10 read 1151 where the exact
+    GSPRT gives about 1.1, so one decisive pair among a few dozen splits could
+    decide a job with no minimum. The match test's interval keeps a width
+    when no variance is observed, so a run of splits decides nothing on its
+    own.
+  - *(Closed.)* With `min_units = 0` and wide Elo bounds the SPRT's type I
+    error roughly doubled (about 10–12% against α = 5% at [0, 200]). The match
+    test has no Elo bounds, needs a floor of at least 1, and keeps its error
+    rate however often it is checked: simulated, equal players got a winner in
+    at most α + 2% of runs (TESTING.md, `U-STATS-3b`).
 - **Options considered:** refusing to activate a games job with an odd batch;
   fishtest-style pseudo-count regularization, or the exact MLE GSPRT; a floor
-  on `min_units`.
-- **Option implemented:** None of these (pass 18 made new games jobs' batch
-  even and bounded the Elo hypotheses to ±1000).
-- **Justification:** Such jobs are found with `SELECT job_id FROM
+  on `min_units`; replacing the test.
+- **Option implemented:** Pass 18 made new games jobs' batch even. October
+  2026 replaced the SPRT with the match test
+  ([Why a match test](#why-a-match-test-and-not-an-sprt)), which closes the
+  second and third problems.
+- **Justification:** Odd-batch jobs are found with `SELECT job_id FROM
   job_game_config WHERE games_per_batch % 2 = 1`; their verdicts should be
-  read as biased and the jobs re-run. The approximation keeps α at the
-  hypotheses, and the minimum is the admin's to set.
+  read as biased and the jobs re-run.
 
 **KL-88. Allocation is a share of claims, not of worker time.**
 - **Context:** `scheduler.rs` (the deficit counts claims), the admin job page
@@ -8641,11 +9212,12 @@ says so in its implemented option, rather than being removed.
     refuses.
     Creating a config writes no audit row, where creating a job or a pool does.
   - The job and player-config forms show a server refusal as one line at the
-    foot of the form, by API field name (`layout_id`, `sprt_alpha`), not at the
+    foot of the form, by API field name (`layout_id`, `confidence_pct`), not at the
     input under its label; and job creation checks the layout only once the
     other settings pass, so an admin can fix one error and meet a second.
-  - The job form's α and β take any value the server does (`step="any"`), so
-    their arrow keys step by one and are of no use; they are typed.
+  - The job form's α and β took any value the server did (`step="any"`), so
+    their spinners stepped by one and were of no use. (Gone with the SPRT: the
+    form has no α or β, and no number box has spinner arrows.)
   - A leave job whose generation-0 KLV fails to build after the job row
     commits is answered `500`, but exists; the form stays, and a second click
     makes a second job.
@@ -9014,11 +9586,13 @@ says so in its implemented option, rather than being removed.
   dead tuples is several merges' worth before autovacuum starts. A per-table
   `autovacuum_vacuum_scale_factor` near 0.02 is a tuning choice left for when
   a production table's bloat is measured. *(Fifteenth audit.)*
-- **`users` carries two contribution indexes** (`users_contribution_idx` for
+- **`users` carries two tasks-completed indexes** (`users_contribution_idx` for
   `/api/users`, tie-broken by `created_at`, and `users_worker_rank_idx` for
   `/api/workers`, by `id`), each written on every registered submission. One
   would do if `/api/users` broke ties by id — a visible ordering change, left
-  for a decision. *(Fifteenth audit.)*
+  for a decision. *(Fifteenth audit.)* (The worker list's other three orders,
+  compute, games and racks, have an index each too, on both kinds of
+  identity: every submission writes them.)
 - **The job list's `stalled` flag reads `jobs.last_completed_at`** — done
   (nineteenth audit). Answered from the claims, "no result in a day" joined
   every task of the job to the day's completions (hundreds of milliseconds at a
@@ -9067,11 +9641,11 @@ what makes selective restore worth building rather than only whole-database
 rollback:
 
 - **Irreplaceable.** `game_results`, `position_analysis_records` / `_moves` /
-  `_plies`, `leave_rack_progress` together with `leave_rack_staging` (the
+  `_plies` / `_inference`, `leave_rack_progress` together with `leave_rack_staging` (the
   accepted leave results not yet merged into it), `leave_records`, `rating_pools`,
   `rating_pool_members`, `task_claims`, `audit_log`. This is donated compute. A
   contributor is not going to run the same 40,000 game pairs again because we
-  lost them, and the SPRT state derived from them cannot be recomputed from
+  lost them, and the match test's verdict derived from them cannot be recomputed from
   anything else. Rating *runs* are the exception in the other direction: they are
   a pure function of pool membership and `game_results`, so a lost snapshot is
   one recompute away — which is exactly the property batch fitting buys.
@@ -9451,11 +10025,10 @@ there as dumped, so a partial run resumes and a conflicting row stops it
 (`scripts/restore-job.sh`, RUNBOOK §2.2), then repair
 the denormalized counters — which is the part a naive row copy gets wrong.
 `tasks.accepted_count` and `active_claim_count` must be recomputed from the restored
-`task_claims`, and `tasks.state` / `completed_at` recomputed against the job's
-redundancy. `purge_job` deletes tasks precisely so they regenerate cleanly; a
+`task_claims`, and `tasks.state` / `completed_at` recomputed from them. `purge_job` deletes tasks precisely so they regenerate cleanly; a
 restore that puts claims back without their counters leaves the scheduler
 dispatching work that is already done. Finally, recompute what is not a simple copy:
-the job's SPRT verdict, and the rating pools (a refit, from data that is already
+the job's match-test verdict, and the rating pools (a refit, from data that is already
 there).
 
 Two ways to package that: a documented runbook plus SQL snippets (no code, no

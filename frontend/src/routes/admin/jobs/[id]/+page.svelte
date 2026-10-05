@@ -11,11 +11,17 @@
     type JobStats
   } from '$lib/api';
   import { subscribeToJob } from '$lib/sse';
-  import { jobTitle, jobTypeLabel, sprtLabel, sprtState, duration } from '$lib/format';
-  import JobStatusBadge from '$lib/components/JobStatusBadge.svelte';
-  import CompletionNote from '$lib/components/CompletionNote.svelte';
+  import { exportSummary, jobTitle, jobTypeLabel } from '$lib/format';
+  import type { JobConfig } from '$lib/jobSettings';
+  import JobStatusCard from '$lib/components/JobStatusCard.svelte';
+  import JobStatsRow from '$lib/components/JobStatsRow.svelte';
+  import TaskCounts from '$lib/components/TaskCounts.svelte';
   import DerivedDataStatus from '$lib/components/DerivedDataStatus.svelte';
+  import JobSettings from '$lib/components/JobSettings.svelte';
+  import ConsensusEditor from '$lib/components/ConsensusEditor.svelte';
+  import MatchScore from '$lib/components/MatchScore.svelte';
   import ProgressBar from '$lib/components/ProgressBar.svelte';
+  import MatchTestCard from '$lib/components/MatchTestCard.svelte';
   import WorkerTable from '$lib/components/WorkerTable.svelte';
 
   // The [id] route only matches when the param is present.
@@ -38,6 +44,10 @@
   //   one shows as that and not as an empty answer, and failed reads are
   //   tried again on the next live payload and every five seconds.
   let stats: JobStats | null = null;
+  // Read until one read succeeds; the page shows without it, as the public
+  // page does. Fixed once the job exists but for an opening-rack job's
+  // consensus, which the Consensus card changes and then reads again.
+  let config: JobConfig | null = null;
   // null until read: shown as "could not load", never as "none".
   let gaps: DataGap[] | null = null;
   let allocation: number | null = null;
@@ -106,6 +116,12 @@
     const payloadsAtStart = streamPayloads;
     reloading = true;
     window.clearTimeout(retry);
+    if (config === null) {
+      api
+        .jobConfig(jobId)
+        .then((value) => (config = value))
+        .catch(() => {});
+    }
     const [job, gapsRead, exportRead] = await Promise.allSettled([
       api.job(jobId),
       api.jobDataGaps(jobId),
@@ -195,6 +211,10 @@
       busy = false;
     }
   }
+
+  $: exportView = stats
+    ? exportSummary(jobExport, stats.job)
+    : { label: null, note: null, button: 'Export results' };
 
   function megabytes(bytes: number | null): string {
     return bytes === null ? '—' : `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
@@ -384,10 +404,10 @@
       {#if stats.job.name}
         <span class="text-sm text-muted-foreground">{jobTypeLabel(stats.job.job_type)}</span>
       {/if}
-      <JobStatusBadge status={stats.job.status} />
       <a href="/jobs/{jobId}" class="text-sm">public view</a>
     </header>
-    <CompletionNote {stats} />
+    <JobStatusCard {stats} />
+    <JobStatsRow {stats} />
     <DerivedDataStatus {jobId} />
 
     <div class="card space-y-4">
@@ -466,7 +486,8 @@
       <p class="text-xs text-muted-foreground">
         The active jobs may allocate at most 100% between them; activation is rejected if this
         job's share would push the total over. A share of 0% is the same as inactive: the job
-        is offered to nobody until it is raised.
+        is offered to nobody until it is raised. To move shares between jobs in one step, use
+        <a href="/admin/allocation">Allocation</a>.
       </p>
 
       {#if rebuild}
@@ -528,59 +549,64 @@
       {/if}
     </div>
 
-    {#if stats.job.status === 'completed'}
-      <div class="card space-y-3">
-        <h2 class="text-lg font-medium">Export</h2>
-        <p class="text-xs text-muted-foreground">
-          A completed job's whole corpus as one gzipped NDJSON file, built once on a background
-          task and downloaded straight from the artifact store. An opening-rack line is a rack
-          with its ranked moves; a games job that captured positions gets those as a second
-          file. Refused while the job's last claims are still in flight.
-        </p>
-        <div class="flex flex-wrap items-center gap-3">
-          <button
-            class="btn-secondary"
-            on:click={startExport}
-            disabled={busy || gone || exportStarted || jobExport?.state === 'running'}
-          >
-            {jobExport ? 'Export again' : 'Export results'}
-          </button>
-          {#if jobExport}
-            <span class="text-sm">
-              {#if jobExport.state === 'running'}
-                Building…
-              {:else if jobExport.state === 'ready'}
-                {(jobExport.row_count ?? 0).toLocaleString()} rows ·
-                {megabytes(jobExport.bytes)}
-                {#if jobExport.download_url}
-                  · <a href={jobExport.download_url}>download</a>
-                {/if}
-                {#if jobExport.sha256}
-                  · <span class="whitespace-nowrap">SHA-256 of the .gz</span>
-                  <code class="break-all text-xs">{jobExport.sha256}</code>
-                {/if}
-                {#if jobExport.positions_row_count !== null}
-                  · {jobExport.positions_row_count.toLocaleString()} captured positions ·
-                  {megabytes(jobExport.positions_bytes)}
-                  {#if jobExport.positions_download_url}
-                    · <a href={jobExport.positions_download_url}>download positions</a>
-                  {/if}
-                  {#if jobExport.positions_sha256}
-                    · <span class="whitespace-nowrap">SHA-256 of the .gz</span>
-                    <code class="break-all text-xs">{jobExport.positions_sha256}</code>
-                  {/if}
-                {/if}
-                {#if jobExport.download_url}(links valid for an hour){/if}
-              {:else if jobExport.state === 'expired'}
-                Expired: the store keeps an export for thirty days. Export again to rebuild it.
-              {:else}
-                <span class="text-destructive">Failed: {jobExport.error ?? 'unknown error'}</span>
+    <div class="card space-y-3">
+      <h2 class="text-lg font-medium">Export</h2>
+      <p class="text-xs text-muted-foreground">
+        The job's whole corpus as one gzipped NDJSON file, built on a background task and
+        downloaded straight from the artifact store. An opening-rack line is a rack with its
+        ranked moves; a games job that captured positions gets those as a second file. A job
+        still taking results exports a snapshot as of when it was read; a completed job's final
+        export is refused while its last claims are still in flight.
+      </p>
+      <div class="flex flex-wrap items-center gap-3">
+        <button
+          class="btn-secondary"
+          on:click={startExport}
+          disabled={busy || gone || exportStarted || jobExport?.state === 'running'}
+        >
+          {exportView.button}
+        </button>
+        {#if jobExport}
+          <span class="text-sm">
+            {#if jobExport.state === 'running'}
+              Building…
+            {:else if jobExport.state === 'ready'}
+              {#if exportView.label}
+                <span class:text-warning={!jobExport.is_final}>{exportView.label}</span> ·
               {/if}
-            </span>
-          {/if}
-        </div>
+              {(jobExport.row_count ?? 0).toLocaleString()} rows ·
+              {megabytes(jobExport.bytes)}
+              {#if jobExport.download_url}
+                · <a href={jobExport.download_url}>download</a>
+              {/if}
+              {#if jobExport.sha256}
+                · <span class="whitespace-nowrap">SHA-256 of the .gz</span>
+                <code class="break-all text-xs">{jobExport.sha256}</code>
+              {/if}
+              {#if jobExport.positions_row_count !== null}
+                · {jobExport.positions_row_count.toLocaleString()} captured positions ·
+                {megabytes(jobExport.positions_bytes)}
+                {#if jobExport.positions_download_url}
+                  · <a href={jobExport.positions_download_url}>download positions</a>
+                {/if}
+                {#if jobExport.positions_sha256}
+                  · <span class="whitespace-nowrap">SHA-256 of the .gz</span>
+                  <code class="break-all text-xs">{jobExport.positions_sha256}</code>
+                {/if}
+              {/if}
+              {#if jobExport.download_url}(links valid for an hour){/if}
+            {:else if jobExport.state === 'expired'}
+              Expired: the store keeps an export for thirty days. Export again to rebuild it.
+            {:else}
+              <span class="text-destructive">Failed: {jobExport.error ?? 'unknown error'}</span>
+            {/if}
+          </span>
+        {/if}
       </div>
-    {/if}
+      {#if exportView.note}
+        <p class="text-xs text-muted-foreground">{exportView.note}</p>
+      {/if}
+    </div>
 
     <div class="card space-y-3">
       <h2 class="text-lg font-medium">Progress</h2>
@@ -590,19 +616,11 @@
           max={stats.games.max_units}
           label="{stats.games.unit}s completed"
         />
-        <p class="text-sm text-muted-foreground">
-          {#if stats.games.decided}
-            SPRT {sprtLabel(stats.games.decided.status)}, LLR
-            {stats.games.decided.llr.toFixed(3)} (now {stats.games.sprt.llr.toFixed(3)})
-          {:else}
-            SPRT {sprtLabel(sprtState(stats.job.status, stats.games))} — LLR {stats.games.sprt.llr.toFixed(3)}
-          {/if}
-        </p>
       {:else if stats.opening_racks}
         <ProgressBar
-          value={stats.opening_racks.racks_analyzed}
+          value={stats.opening_racks.racks_settled}
           max={stats.opening_racks.racks_total}
-          label="racks analysed"
+          label="racks settled"
         />
       {:else if stats.leave_generation}
         <ProgressBar
@@ -613,12 +631,32 @@
       {:else}
         <ProgressBar value={stats.tasks_completed} max={stats.tasks_total} label="tasks completed" />
       {/if}
-      <p class="text-sm text-muted-foreground">
-        {stats.tasks_available.toLocaleString()} available ·
-        {stats.tasks_claimed.toLocaleString()} claimed ·
-        ETA {duration(stats.eta_seconds)}
-      </p>
+      <TaskCounts {stats} />
     </div>
+
+    {#if config?.opening_racks}
+      <ConsensusEditor
+        {jobId}
+        {config}
+        disabled={busy || gone}
+        on:saved={() => {
+          // The settings changed: read them again with the job. In place, so
+          // the card -- and the notice it shows -- stays up meanwhile.
+          api
+            .jobConfig(jobId)
+            .then((value) => (config = value))
+            .catch(() => {});
+          reload();
+        }}
+      />
+    {/if}
+    {#if config}
+      <JobSettings {config} />
+    {/if}
+    {#if stats.games}
+      <MatchScore games={stats.games} players={config?.players.map((p) => p.name) ?? []} />
+    {/if}
+    <MatchTestCard {stats} players={config?.players.map((p) => p.name) ?? []} />
 
     <div class="card">
       <h2 class="mb-1 text-lg font-medium">Data gaps</h2>

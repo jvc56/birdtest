@@ -132,7 +132,7 @@ async fn main() -> Result<()> {
     // Rating fits run on a periodic sweep rather than on result submission: a
     // fit is global to a pool, an active job submits results far faster than
     // any rating needs to move, and nothing in the submission path waits on the
-    // answer. SPRT, which *does* gate job completion, stays inline.
+    // answer. The match test, which *does* gate job completion, stays inline.
     {
         let db = state.pool.clone();
         tokio::spawn(async move {

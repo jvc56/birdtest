@@ -389,7 +389,7 @@ jobs:
           make magpie
           magpie="$PWD/bin/magpie"
           # MAGPIE exits 0 on an error, so the output is what says it worked.
-          "$magpie" builders | tee /dev/stderr | grep -q '"klv_builder_version"'
+          "$magpie" builders | tee /dev/stderr | grep -q '"wit_builder_version"'
           # Each command as the server runs it (backend/src/magpie.rs): in a
           # scratch root whose ./data holds the inputs, on MAGPIE's two-letter
           # test lexicon. A help text that still names a conversion says nothing
@@ -417,9 +417,10 @@ jobs:
           }
           run convert dawg2wordmap CSW21_ab english_ab -threads 1
           run convert klvwmp2rit CSW21_ab english_ab CSW21_ab CSW21_ab -threads 1
+          run convert kwg2wit CSW21_ab english_ab -threads 1
           run createdata klv zero english_ab
           run convert rackequity2klv racks english_ab -threads 1
-          for f in CSW21_ab.wmp CSW21_ab.rit zero.klv2 racks.klv2; do
+          for f in CSW21_ab.wmp CSW21_ab.rit CSW21_ab.wit zero.klv2 racks.klv2; do
             test -s "data/lexica/$f" || { echo "magpie wrote no data/lexica/$f" >&2; exit 1; }
           done
           if ls data/lexica | grep -q '\.tmp$'; then

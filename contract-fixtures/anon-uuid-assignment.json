@@ -1,19 +1,20 @@
 {
-  "claim_token": "df5b4e78-d5b5-4fbc-9be5-8317a685bb18",
-  "job_id": "f4ebe207-4bac-46d0-b72f-18508401a92b",
+  "claim_token": "af764aba-95c4-497f-b65f-d52bea985a4f",
+  "job_id": "68fed27e-0dcb-41d7-862c-6bfa1002dda3",
   "task_request": {
     "job_type": "games",
     "variant": "classic",
     "letter_distribution": "english",
     "board_layout": "standard15",
     "seed": "1",
-    "num_games": 1,
+    "num_games": 2,
     "game_pairs": false,
     "capture_positions": true,
+    "capture_first_divergence": false,
     "bingo_bonus": 50,
     "sim_cutoff": 0.005,
     "player1": {
-      "name": "e2e-static-equity",
+      "name": "e2e-solving",
       "recorder_type": "best",
       "sort_strategy": "equity",
       "lexicon": "NWL23",
@@ -29,6 +30,7 @@
       "use_wordmap": false,
       "use_rit": false,
       "rit_name": null,
+      "use_wit": false,
       "min_play_iterations": null,
       "threshold": null,
       "sampling_rule": null,
@@ -37,12 +39,23 @@
       "utility_w_spread": null,
       "utility_spread_scale": null,
       "win_pct_model": null,
-      "movegen_margin": 5.0
+      "movegen_margin": 5.0,
+      "endgame_plies": 2,
+      "peg_max_bag": 2,
+      "peg_stage_top_k": [
+        2
+      ],
+      "peg_scenario_stride": 1,
+      "peg_opp_model": "rational",
+      "peg_nested": false,
+      "peg_nested_cand_caps": null,
+      "peg_nested_max_depth": null,
+      "peg_nested_strides": null
     },
     "player2": {
-      "name": "e2e-static-score",
+      "name": "e2e-solving",
       "recorder_type": "best",
-      "sort_strategy": "score",
+      "sort_strategy": "equity",
       "lexicon": "NWL23",
       "leaves": "NWL23",
       "max_iterations": null,
@@ -56,6 +69,7 @@
       "use_wordmap": false,
       "use_rit": false,
       "rit_name": null,
+      "use_wit": false,
       "min_play_iterations": null,
       "threshold": null,
       "sampling_rule": null,
@@ -64,7 +78,18 @@
       "utility_w_spread": null,
       "utility_spread_scale": null,
       "win_pct_model": null,
-      "movegen_margin": 5.0
+      "movegen_margin": 5.0,
+      "endgame_plies": 2,
+      "peg_max_bag": 2,
+      "peg_stage_top_k": [
+        2
+      ],
+      "peg_scenario_stride": 1,
+      "peg_opp_model": "rational",
+      "peg_nested": false,
+      "peg_nested_cand_caps": null,
+      "peg_nested_max_depth": null,
+      "peg_nested_strides": null
     }
   },
   "min_magpie_version": "0.1.1",
@@ -106,5 +131,5 @@
     ],
     "derived": []
   },
-  "worker_uuid": "b438f0fd-912d-4edf-9342-3b859895776d"
+  "worker_uuid": "9ae76351-608c-406c-b256-e79988e0dadb"
 }

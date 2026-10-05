@@ -37,9 +37,9 @@ async fn scope(db: &TestDb) -> Scope {
 /// A `jobs` row of `job_type` in `variant` and `scope`, and nothing else.
 async fn job_in(db: &TestDb, job_type: &str, variant: &str, scope: Scope) -> Uuid {
     sqlx::query_scalar(
-        "INSERT INTO jobs (job_type, allocation, redundancy, status, variant,
+        "INSERT INTO jobs (job_type, allocation, status, variant,
                            letterdist_id, layout_id, bingo_bonus, sim_cutoff)
-         VALUES ($1::job_type, 50, 1, 'active', $2, $3, $4, 50, 0.005)
+         VALUES ($1::job_type, 50, 'active', $2, $3, $4, 50, 0.005)
          RETURNING id",
     )
     .bind(job_type)
@@ -408,103 +408,6 @@ async fn a_head_to_head_counts_pairs_and_scores_half_points_over_four() {
     assert_eq!((row, col), (anchor, rival));
     assert_eq!(pairs, 4.0, "four pairs, not eight games");
     assert_eq!(actual, 0.5625, "nine half-points over four, per pair");
-}
-
-/// A further accepted copy of `task`'s result, from another claim, with its
-/// own pentanomial, stamped `seconds_ago`.
-async fn redundant_copy(db: &TestDb, job: Uuid, task: Uuid, pent: [i32; 5], seconds_ago: i32) {
-    let [p0, p1, p2, p3, p4] = pent;
-    let (wins, ties, losses) = (p2 + p3 + 2 * p4, p1 + p3, 2 * p0 + p1 + p2);
-    let worker = Uuid::new_v4();
-    sqlx::query("INSERT INTO anonymous_workers (uuid) VALUES ($1)")
-        .bind(worker)
-        .execute(&db.pool)
-        .await
-        .unwrap();
-    let claim: Uuid = sqlx::query_scalar(
-        "INSERT INTO task_claims (task_id, job_id, claim_token, state, claimed_by_anon_uuid, completed_at)
-         VALUES ($1, (SELECT job_id FROM tasks WHERE id = $1), gen_random_uuid(), 'completed', $2, now()) RETURNING id",
-    )
-    .bind(task)
-    .bind(worker)
-    .fetch_one(&db.pool)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO game_results
-             (task_claim_id, task_id, job_id, games, wins, losses, ties,
-              p1_score_mean, p1_score_sd, p2_score_mean, p2_score_sd,
-              pent_0, pent_1, pent_2, pent_3, pent_4, submitted_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, 420, 60, 410, 58,
-                 $8[1], $8[2], $8[3], $8[4], $8[5], now() - make_interval(secs => $9))",
-    )
-    .bind(claim)
-    .bind(task)
-    .bind(job)
-    .bind(wins + losses + ties)
-    .bind(wins)
-    .bind(losses)
-    .bind(ties)
-    .bind(pent.to_vec())
-    .bind(seconds_ago)
-    .execute(&db.pool)
-    .await
-    .unwrap();
-}
-
-/// I-RATE-3 (redundancy): under redundancy 2 one task has two accepted
-/// results. They replay the same seeded pairs, so the fit counts the task
-/// once -- four pairs, not eight -- and reads the **first accepted** copy.
-/// The copies here disagree completely ([0,0,0,0,4] and [4,0,0,0,0]) so which
-/// one was read is visible in the head-to-head's score, and the test is run
-/// with the order both ways round so it cannot pass by accident of which
-/// claim id sorts first.
-#[tokio::test]
-async fn a_redundant_task_is_evidence_once_through_its_first_accepted_copy() {
-    for (first, second, anchor_score) in
-        [([0, 0, 0, 0, 4], [4, 0, 0, 0, 0], 1.0), ([4, 0, 0, 0, 0], [0, 0, 0, 0, 4], 0.0)]
-    {
-        let db = TestDb::new().await;
-        let admin = db.user("root", true).await;
-        let scope = scope(&db).await;
-        let anchor = db.static_player("a-anchor", admin).await;
-        let rival = db.static_player("b-rival", admin).await;
-        let job = pairs_job(&db, "classic", scope, anchor, rival).await;
-        sqlx::query("UPDATE jobs SET redundancy = 2 WHERE id = $1")
-            .bind(job)
-            .execute(&db.pool)
-            .await
-            .unwrap();
-        let task: Uuid = sqlx::query_scalar(
-            "INSERT INTO tasks (job_id, seed, state, accepted_count, completed_at)
-             VALUES ($1, 1, 'completed', 2, now()) RETURNING id",
-        )
-        .bind(job)
-        .fetch_one(&db.pool)
-        .await
-        .unwrap();
-        redundant_copy(&db, job, task, first, 120).await;
-        redundant_copy(&db, job, task, second, 60).await;
-        let pool = pool(&db, "pool", "classic", scope, anchor, &[rival], 2000.0).await;
-
-        let run = ratings::recompute(&db.pool, pool, Trigger::Manual).await.unwrap();
-        assert_eq!(evidence(&db, run).await, (4, 1), "one task's four pairs, once");
-        let stored = stored_ratings(&db, run).await;
-        assert_eq!((stored[&anchor].pairs_played, stored[&rival].pairs_played), (4, 4));
-        let residuals = residuals(&db, run).await;
-        assert_eq!(residuals.len(), 1, "{residuals:?}");
-        let (row, col, pairs, actual, _) = residuals[0];
-        assert_eq!((row, col, pairs), (anchor, rival, 4.0));
-        assert_eq!(actual, anchor_score, "the first accepted copy, {first:?}, not {second:?}");
-        // And the fit moved the right way: the rival loses to the anchor when
-        // the first copy says so, and beats it when it says the reverse.
-        let rival_rating = stored[&rival].rating;
-        if anchor_score == 1.0 {
-            assert!(rival_rating < 2000.0, "{rival_rating}");
-        } else {
-            assert!(rival_rating > 2000.0, "{rival_rating}");
-        }
-    }
 }
 
 /// I-RATE-4: a fit stores one run and one rating per member, the anchor
@@ -1174,7 +1077,7 @@ async fn removing_a_config_that_is_not_a_member_is_a_404() {
 }
 
 /// A-RATE-5: removing the anchor is refused, with a message that says what to
-/// do instead, and changes nothing.
+/// do instead -- move the anchor (A-RATE-8) -- and changes nothing.
 #[tokio::test]
 async fn removing_the_anchor_is_refused_with_the_fix_named() {
     let db = TestDb::new().await;
@@ -1195,7 +1098,7 @@ async fn removing_the_anchor_is_refused_with_the_fix_named() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     let message = body["message"].as_str().unwrap();
     assert!(message.contains("cannot remove the pool's anchor"), "{message}");
-    assert!(message.contains("create a pool anchored on it"), "{message}");
+    assert!(message.contains("Make another member the anchor first"), "{message}");
 
     let still: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM rating_pool_members
@@ -1400,4 +1303,301 @@ async fn a_self_play_job_is_not_counted_as_evidence() {
 
     let run = ratings::recompute(&db.pool, pool, Trigger::Manual).await.unwrap();
     assert_eq!(evidence(&db, run).await, (9, 1), "the real job's nine pairs, and it alone");
+}
+
+// ---------------------------------------------------------------------------
+// A-RATE: editing the anchor, and deleting a pool
+// ---------------------------------------------------------------------------
+
+async fn pool_row(db: &TestDb, pool: Uuid) -> (Uuid, f64) {
+    sqlx::query_as("SELECT anchor_player_config_id, anchor_rating FROM rating_pools WHERE id = $1")
+        .bind(pool)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+}
+
+async fn is_member(db: &TestDb, pool: Uuid, config: Uuid) -> bool {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM rating_pool_members
+                        WHERE pool_id = $1 AND player_config_id = $2)",
+    )
+    .bind(pool)
+    .bind(config)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap()
+}
+
+/// A-RATE-8: moving the anchor to a config that is not yet a member adds it,
+/// pins it at the new rating, and refits in the same request as an `anchor`
+/// run; the old anchor is then an ordinary member that can be removed (the fix
+/// A-RATE-5 names). Moving only the rating rescales everyone by the same
+/// amount, and sending what is already there changes nothing.
+#[tokio::test]
+async fn an_anchor_change_refits_sets_the_anchor_and_adds_it_as_a_member() {
+    let db = TestDb::new().await;
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+    let f = fixture(&db).await;
+    let headers = admin_headers(&state.cfg, f.admin);
+    let newcomer = db.static_player("c-newcomer", f.admin).await;
+    let job = pairs_job(&db, "classic", f.scope, f.rival, newcomer).await;
+    pair_result(&db, job, [0, 0, 1, 1, 0]).await;
+    let path = format!("/api/admin/rating-pools/{}", f.pool);
+
+    let (status, body) = send(
+        &app,
+        request(
+            "PATCH",
+            &path,
+            &headers,
+            Some(json!({ "anchor_player_config_id": newcomer, "anchor_rating": 1500.0 })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let run: Uuid = body["run_id"].as_str().unwrap().parse().unwrap();
+    assert!(is_member(&db, f.pool, newcomer).await, "the new anchor joined the pool");
+    assert_eq!(pool_row(&db, f.pool).await, (newcomer, 1500.0));
+    let stored = stored_ratings(&db, run).await;
+    assert_eq!(stored.len(), 3, "{stored:?}");
+    assert!(stored[&newcomer].is_anchor && !stored[&f.anchor].is_anchor, "{stored:?}");
+    assert_eq!(stored[&newcomer].rating, 1500.0);
+    assert_eq!(evidence(&db, run).await, (4, 2), "the newcomer's games came in with it");
+    let trigger: String = sqlx::query_scalar("SELECT trigger FROM rating_runs WHERE id = $1")
+        .bind(run)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(trigger, "anchor");
+    let logged: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT action, reason FROM audit_log WHERE action LIKE 'rating_pool.%' ORDER BY id",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        logged,
+        [
+            ("rating_pool.member_added".to_string(), None),
+            (
+                "rating_pool.anchor_changed".to_string(),
+                Some(format!("anchor={}@2000 -> {newcomer}@1500", f.anchor)),
+            ),
+        ]
+    );
+
+    // The rating alone: every rating moves by the same 100.
+    let (status, body) =
+        send(&app, request("PATCH", &path, &headers, Some(json!({ "anchor_rating": 1600.0 })))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let shifted = stored_ratings(&db, body["run_id"].as_str().unwrap().parse().unwrap()).await;
+    for (config, before) in &stored {
+        assert!((shifted[config].rating - before.rating - 100.0).abs() < 1e-6, "{config}");
+    }
+
+    // Nothing to change: no run, no log.
+    let runs = run_count(&db, f.pool).await;
+    let (status, body) = send(
+        &app,
+        request("PATCH", &path, &headers, Some(json!({ "anchor_player_config_id": newcomer }))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["run_id"], serde_json::Value::Null);
+    assert_eq!(run_count(&db, f.pool).await, runs);
+
+    // The old anchor is now removable.
+    let (status, body) = send(
+        &app,
+        request("DELETE", &format!("{path}/members/{}", f.anchor), &headers, None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!is_member(&db, f.pool, f.anchor).await);
+}
+
+/// A-RATE-8b: an anchor that does not exist is a 400 on its field, an anchor
+/// rating out of range or an empty body a 400, and an unknown pool a 404.
+/// None of them changes the pool, its members, or its runs.
+#[tokio::test]
+async fn a_bad_anchor_change_is_refused_and_changes_nothing() {
+    let db = TestDb::new().await;
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+    let f = fixture(&db).await;
+    let headers = admin_headers(&state.cfg, f.admin);
+    let path = format!("/api/admin/rating-pools/{}", f.pool);
+    let members: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rating_pool_members")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+
+    let ghost = Uuid::new_v4();
+    for (body, field) in [
+        (json!({ "anchor_player_config_id": ghost }), Some("anchor_player_config_id")),
+        (json!({ "anchor_rating": 1.0e6 }), Some("anchor_rating")),
+        (json!({}), None),
+    ] {
+        let (status, response) = send(&app, request("PATCH", &path, &headers, Some(body.clone()))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {response}");
+        if let Some(field) = field {
+            assert_eq!(response["fields"][0]["field"], field, "{response}");
+        }
+    }
+    let (status, response) = send(
+        &app,
+        request(
+            "PATCH",
+            &format!("/api/admin/rating-pools/{}", Uuid::new_v4()),
+            &headers,
+            Some(json!({ "anchor_rating": 1500.0 })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{response}");
+
+    assert_eq!(pool_row(&db, f.pool).await, (f.anchor, 2000.0));
+    let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rating_pool_members")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(after, members);
+    assert_eq!(run_count(&db, f.pool).await, 0);
+}
+
+/// A-RATE-9: deleting a pool takes its members, runs, ratings and residuals
+/// with it, writes its census first, and is a 404 afterwards -- to read and to
+/// delete again. It frees the configs it anchored and rated, which could not
+/// be deleted while it stood; the games stay with their job.
+#[tokio::test]
+async fn deleting_a_pool_cascades_frees_its_configs_and_is_a_404_after() {
+    let db = TestDb::new().await;
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+    let f = fixture(&db).await;
+    let headers = admin_headers(&state.cfg, f.admin);
+    ratings::recompute(&db.pool, f.pool, Trigger::Manual).await.unwrap();
+    let path = format!("/api/admin/rating-pools/{}", f.pool);
+
+    // A second pool anchored on a config nothing else uses: its delete is
+    // what frees that config.
+    let idle = db.static_player("c-idle", f.admin).await;
+    let idle_pool = pool(&db, "idle", "classic", f.scope, idle, &[], 2000.0).await;
+    let delete_idle = format!("/api/admin/player-configs/{idle}");
+    let (status, body) = send(&app, request("DELETE", &delete_idle, &headers, None)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "the pool pins its anchor: {body}");
+
+    let (status, body) = send(&app, request("DELETE", &path, &headers, None)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    for table in ["rating_runs", "player_config_ratings", "rating_run_residuals"] {
+        let left: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 0, "{table}");
+    }
+    assert!(!is_member(&db, f.pool, f.anchor).await && !is_member(&db, f.pool, f.rival).await);
+    let games: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM game_results")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert!(games > 0, "the games are the job's, not the pool's");
+    let census: String = sqlx::query_scalar(
+        "SELECT reason FROM audit_log WHERE action = 'rating_pool.deleted.census'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(census, "name=pool members=2 runs=1");
+
+    let (status, body) = send(&app, request("GET", &format!("/api/rating-pools/{}", f.pool), &[], None)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let (status, body) = send(&app, request("DELETE", &path, &headers, None)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let (status, body) = send(
+        &app,
+        request("POST", &format!("{path}/members"), &headers, Some(json!({ "player_config_id": f.rival }))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    let (status, body) =
+        send(&app, request("DELETE", &format!("/api/admin/rating-pools/{idle_pool}"), &headers, None)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (status, body) = send(&app, request("DELETE", &delete_idle, &headers, None)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "the anchor is free: {body}");
+}
+
+/// Counts the ERROR events of the future it is attached to.
+struct CountErrors(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CountErrors {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        if *event.metadata().level() == tracing::Level::ERROR {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+/// I-RATE-12: a pool deleted after the sweep listed the pools -- here while
+/// the sweep waits on its fit lock, which the delete holds -- is skipped
+/// without an error logged, and the sweep goes on to the next pool.
+#[tokio::test]
+async fn the_sweep_skips_a_pool_deleted_mid_sweep_quietly() {
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let db = TestDb::new().await;
+    let admin = db.user("root", true).await;
+    let anchor = db.static_player("a-anchor", admin).await;
+    let rival = db.static_player("b-rival", admin).await;
+    let scope = scope(&db).await;
+    let job = pairs_job(&db, "classic", scope, anchor, rival).await;
+    pair_result(&db, job, [0, 1, 1, 0, 0]).await;
+    let doomed = pool(&db, "doomed", "classic", scope, anchor, &[rival], 2000.0).await;
+    let kept = pool(&db, "kept", "classic", scope, anchor, &[rival], 2000.0).await;
+
+    // The delete's own first step: the doomed pool's fit lock.
+    let mut deleting = db.pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(2, hashtext($1::text))")
+        .bind(doomed)
+        .execute(&mut *deleting)
+        .await
+        .unwrap();
+    let errors = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let subscriber = tracing_subscriber::registry().with(CountErrors(errors.clone()));
+    let sweeping = db.pool.clone();
+    let sweep = tokio::spawn(
+        async move { ratings::recompute_stale(&sweeping).await }.with_subscriber(subscriber),
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_stat_activity
+             WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        if waiting > 0 || sweep.is_finished() {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "the sweep never reached the doomed pool");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    sqlx::query("DELETE FROM rating_pools WHERE id = $1")
+        .bind(doomed)
+        .execute(&mut *deleting)
+        .await
+        .unwrap();
+    deleting.commit().await.unwrap();
+
+    let fitted = sweep.await.unwrap().unwrap();
+    assert_eq!(errors.load(std::sync::atomic::Ordering::SeqCst), 0, "nothing logged as a failure");
+    assert_eq!(run_count(&db, kept).await, 1, "the other pool was still fitted");
+    // The kept pool may have been fitted before the doomed one or after it,
+    // but the doomed one never was.
+    assert_eq!(fitted, 1);
 }

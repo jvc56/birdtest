@@ -53,6 +53,37 @@ async fn two_jobs_and_two_generations_never_share_a_key() {
     assert_eq!(bucket.keys().await.len(), 3);
 }
 
+/// I-ART-4: with `S3_PUBLIC_ENDPOINT` set, a download link is signed for that
+/// host and works there. The compose backend reaches MinIO as `minio:9000`,
+/// which no browser resolves, and a link signed for it cannot be rewritten
+/// afterwards: the signature covers the host. The same MinIO under a second
+/// name stands in for the browser's.
+#[tokio::test]
+async fn a_download_link_is_signed_for_the_public_endpoint() {
+    let db = TestDb::new().await;
+    let (state, _bucket) = db.state_with_object_store().await;
+    let internal = state.cfg.s3_endpoint.clone().unwrap();
+    let public = if internal.contains("localhost") {
+        internal.replacen("localhost", "127.0.0.1", 1)
+    } else {
+        internal.replacen("127.0.0.1", "localhost", 1)
+    };
+    assert_ne!(public, internal, "TEST_S3_ENDPOINT names neither localhost nor 127.0.0.1");
+    let mut cfg = (*state.cfg).clone();
+    cfg.s3_public_endpoint = Some(public.clone());
+    let store = birdtest::artifacts::ArtifactStore::new(std::sync::Arc::new(cfg)).await;
+
+    store.put("exports/x.ndjson.gz", b"public".to_vec()).await.unwrap();
+    let url = store
+        .presigned_get("exports/x.ndjson.gz", std::time::Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert!(url.starts_with(&public), "{url} is not signed for {public}");
+    let response = reqwest::get(&url).await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK, "{url}");
+    assert_eq!(response.bytes().await.unwrap().as_ref(), b"public");
+}
+
 /// The bucket really is removed with its test: nothing a test writes outlives
 /// it.
 #[tokio::test]
