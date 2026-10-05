@@ -31,7 +31,7 @@ other then fails a test rather than a contributor's run.
 | `result-opening-rack.json` | client → server | A simulating player's rack analyses, with win%, blended utility and per-ply statistics |
 | `result-leave-generation.json` | client → server | Every rack a leave-generation task saw, on MAGPIE's two-letter test distribution |
 
-The digests here are the real ones from `data-20251004.tgz`, so a fixture that
+The digests here are the real ones from `data-20260925.tgz`, so a fixture that
 stops matching what an import produces is itself a signal.
 
 ## Capturing

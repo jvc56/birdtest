@@ -1410,8 +1410,8 @@ def main() -> int:
     seed.import_input_data(client, seed_args)
     ctx = Context(args, client, seed_args)
     ctx.data = seed.input_data_ids(client, seed_args)
-    ctx.winpct = next((r["id"] for r in ctx.get("/api/admin/input-data", "input data")
-                       if r["role"] == "winpct"), None)
+    ctx.winpct = seed.winpct_for(ctx.get("/api/admin/input-data", "input data"),
+                                 seed_args.letterdist)
     expect(ctx.winpct is not None, "the imported data has no win% model")
 
     timings = []

@@ -628,7 +628,7 @@ path, nothing recognisable, and a bomb by compression ratio.)
 - `U-ARCHIVE-5` A symlink that aliases a file inside the archive is pinned with
   its target's bytes — what `download_data.sh` leaves a worker reading through
   it — and one that leaves the archive, dangles, loops, or names a file of
-  another kind is refused. The current `data-20251004.tgz` carries such aliases,
+  another kind is refused. The current `data-20260925.tgz` carries such aliases (23 of them),
   and refusing them refused the whole release. *(Covered:
   `inputdata::tests::a_symlink_alias_is_pinned_with_its_targets_bytes`,
   `inputdata::tests::a_symlink_that_is_not_an_alias_inside_the_archive_is_refused`.)*
