@@ -309,6 +309,9 @@ jobs:
       - run: terraform fmt -check -recursive -diff
       - run: terraform init -backend=false -input=false
       - run: terraform validate
+      # Plans against mock providers (infra/tests): every variable validation
+      # refuses a wrong value and lets the right one through. No credentials.
+      - run: terraform test
 
   # Scripts checked without Docker or AWS.
   scripts:
@@ -320,6 +323,11 @@ jobs:
         run: ./scripts/dev-restore-check.sh
       - name: every bash block in RUNBOOK.md and README.md parses
         run: ./scripts/runbook-check.sh RUNBOOK.md README.md
+      # The server's tests pin what the fake worker sends through these; a
+      # change to the fake that left them behind tested a shape it no longer
+      # sends.
+      - name: the fake-worker fixtures are what the fake worker emits
+        run: ./scripts/fake-worker-fixtures.sh --check
 
   # MAGPIE's half of the contract. Each repository
   # tests against its own copy of the fixtures, so a fixture changed here and

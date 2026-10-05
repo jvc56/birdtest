@@ -594,7 +594,7 @@
                   <code class="break-all text-xs">{jobExport.positions_sha256}</code>
                 {/if}
               {/if}
-              {#if jobExport.download_url}(links valid for an hour){/if}
+              {#if jobExport.download_url}(links valid for up to an hour){/if}
             {:else if jobExport.state === 'expired'}
               Expired: the store keeps an export for thirty days. Export again to rebuild it.
             {:else}

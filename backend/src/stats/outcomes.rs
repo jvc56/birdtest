@@ -175,7 +175,7 @@ mod tests {
         assert!(all_pairs.mean > 0.49);
     }
 
-    /// I-STATS-1 (maths): W21 L7 D2 per game: mean 11/15, second moment
+    /// U-STATS-1: W21 L7 D2 per game: mean 11/15, second moment
     /// 43/60, variance 161/900.
     #[test]
     fn a_games_tally_has_the_documented_mean_and_variance() {
@@ -185,7 +185,7 @@ mod tests {
         approx(sample.variance, 161.0 / 900.0, 1e-15);
     }
 
-    /// I-STATS-2 (maths): the pentanomial [1, 3, 7, 3, 2] is 16 pairs scored
+    /// U-STATS-2: the pentanomial [1, 3, 7, 3, 2] is 16 pairs scored
     /// i/4: mean 17/32, variance 71/1024.
     #[test]
     fn a_pentanomial_has_the_documented_mean_and_variance() {

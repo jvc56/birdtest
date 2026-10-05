@@ -125,7 +125,7 @@ impl JobHandler for GameHandler {
         template: &JobTemplate,
         task_id: Uuid,
     ) -> AppResult<Self::Request> {
-        super::load_game_request(conn, template, task_id, false).await
+        super::load_game_request(conn, template, task_id).await
     }
 
     fn process_response(response: Self::Response) -> AppResult<Self::Record> {
@@ -197,7 +197,6 @@ pub async fn next_request(
             board_layout: job_data.layout_name.clone(),
             seed: next_seed as u64,
             num_games: config.games_per_batch,
-            game_pairs: false,
             capture_positions: config.capture_positions,
             capture_first_divergence: false,
             bingo_bonus: job_data.bingo_bonus,

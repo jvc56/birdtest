@@ -290,7 +290,7 @@ async fn eventually_completed(db: &TestDb, job: Uuid) -> String {
     job_status(db, job).await
 }
 
-/// I-STATS-9f: an opening-rack job deactivated while its last two tasks are
+/// I-STATS-9i: an opening-rack job deactivated while its last two tasks are
 /// out. Their results land while it is inactive and are accepted, with no
 /// finish check; reactivated, it has nothing to hand out and nothing will
 /// submit again. It used to stay `active` at its allocation for good; the
@@ -355,7 +355,7 @@ async fn a_games_job_whose_cap_landed_while_inactive(test_enabled: bool) -> (Tes
     (db, job)
 }
 
-/// I-STATS-9f (games): the same for a games job at its `max_games` cap.
+/// I-STATS-9i (games): the same for a games job at its `max_games` cap.
 #[tokio::test]
 async fn a_games_job_at_its_cap_whose_results_landed_while_inactive_completes() {
     let (db, job) = a_games_job_whose_cap_landed_while_inactive(true).await;

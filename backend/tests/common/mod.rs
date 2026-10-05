@@ -407,21 +407,44 @@ impl TestDb {
     /// every simulation setting the schema requires of one.
     pub async fn sim_player(&self, name: &str, created_by: Uuid) -> Uuid {
         let player = self.static_player(name, created_by).await;
-        let winpct = self.input_data("winpct", &format!("winpct{name}")).await;
+        self.make_simmer(player, false).await;
+        player
+    }
+
+    /// Makes `player` a 2-ply simmer, inferring or not.
+    async fn make_simmer(&self, player: Uuid, use_inference: bool) {
+        let winpct = self.input_data("winpct", &format!("winpct{player}")).await;
         sqlx::query(
             "UPDATE player_configs
              SET num_plies = 2, winpct_id = $2, max_iterations = 1000, stopping_pct = 99,
-                 use_inference = false, time_limit_secs = 0, min_play_iterations = 100,
+                 use_inference = $3, time_limit_secs = 0, min_play_iterations = 100,
                  threshold = 'none', sampling_rule = 'round_robin', inference_margin = 0,
                  utility_w_winpct = 1, utility_w_spread = 0, utility_spread_scale = 1
              WHERE id = $1",
         )
         .bind(player)
         .bind(winpct)
+        .bind(use_inference)
         .execute(&self.pool)
         .await
         .unwrap();
-        player
+    }
+
+    /// Makes a games or pairs job's player 1 a simmer, for a test that submits
+    /// simulated positions: a task whose players are all static cannot have
+    /// produced one (`U-PLAUS-6`). Before the job's first claim, which reads
+    /// its players into the template cache.
+    pub async fn simulate_player1(&self, job: Uuid, use_inference: bool) {
+        let player: Uuid = sqlx::query_scalar(
+            "SELECT player1_config_id FROM job_game_config WHERE job_id = $1
+             UNION ALL
+             SELECT player1_config_id FROM job_game_pair_config WHERE job_id = $1",
+        )
+        .bind(job)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap();
+        self.make_simmer(player, use_inference).await;
     }
 
     /// A leave job's player on `kwg`: static, sorting on equity, no rack info
@@ -557,8 +580,12 @@ pub fn admin_headers(cfg: &Config, user_id: Uuid) -> Vec<(String, String)> {
     ]
 }
 
+/// A claim from a default build: 15x15, 7-tile racks.
 pub fn claim_body(version: &str, unsupported: &[Uuid]) -> serde_json::Value {
-    serde_json::json!({ "magpie_version": version, "unsupported_jobs": unsupported })
+    serde_json::json!({
+        "magpie_version": version, "board_dim": 15, "rack_size": 7,
+        "unsupported_jobs": unsupported,
+    })
 }
 
 pub fn games_result(games: i32, wins: i32) -> serde_json::Value {

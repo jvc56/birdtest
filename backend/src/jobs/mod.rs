@@ -58,8 +58,8 @@ pub(crate) async fn lock_job_dispatch(conn: &mut PgConnection, job_id: Uuid) -> 
 }
 
 /// Jobs whose dispatch lock this process is holding for a long time: a leave
-/// generation's universe being seeded (tens of seconds), a purge or a delete
-/// (minutes, for a large job).
+/// generation's universe being seeded (tens of seconds), a purge, a delete or
+/// an opening-rack job's consensus edit (minutes, for a large job).
 ///
 /// A claim for such a job skips it without asking the database. The bounded
 /// wait of [`try_lock_job_dispatch`] alone was not enough: each waiter holds a
@@ -71,13 +71,16 @@ pub(crate) async fn lock_job_dispatch(conn: &mut PgConnection, job_id: Uuid) -> 
 /// (`desired_count` is validated to at most one); the advisory lock is still
 /// what makes the hold safe, and this only spares the wait.
 ///
-/// A purge or a delete also holds every open claim of the job
-/// ([`HoldKind::Claims`]), so a submission or decline for one of them is
+/// A purge, a delete or a consensus edit also holds every open claim of the
+/// job ([`HoldKind::Claims`]), so a submission or decline for one of them is
 /// answered at once rather than waiting out its lock timeout on a connection;
 /// and if it ends without committing -- the request dropped at the load
 /// balancer's timeout, a deadlock -- the job's claims are not reclaimed for a
 /// heartbeat timeout afterwards: their heartbeats were skipped while it held
-/// them, not missed.
+/// them, not missed. (An edit's claims outlive it even when it commits, so
+/// its hold never says it committed.) The consensus edit came after the
+/// rest and took the same locks without the hold, stalling the pool as a
+/// purge once did, until the October 2026 audit.
 #[derive(Clone, Default)]
 pub struct DispatchHolds(std::sync::Arc<std::sync::Mutex<HoldsInner>>);
 
@@ -88,9 +91,10 @@ struct HoldsInner {
     /// Jobs whose claims-holding hold ended without committing, and until
     /// when their claims are not reclaimed.
     reclaim_not_before: std::collections::HashMap<Uuid, std::time::Instant>,
-    /// Per job, how many claims holds (purges and deletes) have been taken:
-    /// what an action that waited on the job's row compares, since the hold
-    /// itself can be gone by the time it wakes.
+    /// Per job, how many purges and deletes have taken a claims hold: what
+    /// an action that waited on the job's row compares, since the hold itself
+    /// can be gone by the time it wakes. A consensus edit's hold is not
+    /// counted: it empties nothing.
     claims_holds_taken: std::collections::HashMap<Uuid, u64>,
 }
 
@@ -99,7 +103,8 @@ struct HoldsInner {
 pub enum HoldKind {
     /// Nothing else: a seeding. Submissions go ahead.
     DispatchOnly,
-    /// Every open claim of the job as well: a purge or a delete.
+    /// Every open claim of the job as well: a purge, a delete or a consensus
+    /// edit.
     Claims,
 }
 
@@ -113,21 +118,39 @@ impl DispatchHolds {
         DispatchHold { holds: self.clone(), job_id, kind, grace, committed: false }
     }
 
-    /// A [`HoldKind::Claims`] hold, unless one is already held on the job:
-    /// the check and the hold under one lock, so of two purges or deletes
-    /// arriving together exactly one gets it.
+    /// A [`HoldKind::Claims`] hold for a purge or a delete, unless one is
+    /// already held on the job: the check and the hold under one lock, so of
+    /// two purges or deletes arriving together exactly one gets it. Counted
+    /// in [`Self::claims_holds_taken`].
     pub fn try_hold_claims(&self, job_id: Uuid, grace: std::time::Duration) -> Option<DispatchHold> {
+        self.try_claims(job_id, grace, true)
+    }
+
+    /// The same for a consensus edit, which is not counted: the count is the
+    /// finish check's purge witness, and an edit deletes nothing.
+    pub fn try_hold_claims_uncounted(
+        &self,
+        job_id: Uuid,
+        grace: std::time::Duration,
+    ) -> Option<DispatchHold> {
+        self.try_claims(job_id, grace, false)
+    }
+
+    fn try_claims(&self, job_id: Uuid, grace: std::time::Duration, counted: bool) -> Option<DispatchHold> {
         let mut inner = self.0.lock().expect("dispatch holds poisoned");
         let counts = inner.held.entry(job_id).or_insert([0, 0]);
         if counts[HoldKind::Claims as usize] > 0 {
             return None;
         }
         counts[HoldKind::Claims as usize] += 1;
-        *inner.claims_holds_taken.entry(job_id).or_insert(0) += 1;
+        if counted {
+            *inner.claims_holds_taken.entry(job_id).or_insert(0) += 1;
+        }
         Some(DispatchHold { holds: self.clone(), job_id, kind: HoldKind::Claims, grace, committed: false })
     }
 
-    /// How many purges or deletes of the job have started in this process.
+    /// How many purges or deletes of the job have started in this process
+    /// (consensus edits are not counted).
     pub fn claims_holds_taken(&self, job_id: Uuid) -> u64 {
         self.0
             .lock()
@@ -303,6 +326,14 @@ pub(crate) async fn try_lock_job_dispatch_now(
 /// `finish` is what the check completed the job on. A match-test verdict is
 /// stored with the completion (`jobs.test_decided_*`), and it or
 /// `reached_target` is the audit row's reason.
+///
+/// An opening-rack job is also re-checked here for every rack settled. A
+/// consensus edit is neither a purge nor a status change: it leaves the job
+/// active and moves `racks_settled` down. A check that read the job settled
+/// before the edit committed, and whose update then waited on the edit's row
+/// lock, completed the job with the racks the edit had just unsettled, never
+/// to be reissued. In the update's own predicate, Postgres re-evaluates it
+/// on the row the edit committed.
 pub async fn complete_unless_purged(
     pool: &sqlx::PgPool,
     job_id: Uuid,
@@ -320,7 +351,10 @@ pub async fn complete_unless_purged(
         "UPDATE jobs SET status = 'completed',
                          test_decided_status = $3, test_decided_lower = $4,
                          test_decided_upper = $5, test_decided_units = $6
-         WHERE id = $1 AND status = 'active' AND claims_issued >= $2",
+         WHERE id = $1 AND status = 'active' AND claims_issued >= $2
+           AND (job_type <> 'opening_rack'
+                OR racks_settled >= (SELECT c.total_racks FROM job_opening_rack_config c
+                                     WHERE c.job_id = jobs.id))",
     )
     .bind(job_id)
     .bind(observed_claims_issued)
@@ -481,7 +515,6 @@ pub(crate) async fn load_game_request(
     conn: &mut PgConnection,
     template: &dispatch::JobTemplate,
     task_id: Uuid,
-    game_pairs: bool,
 ) -> AppResult<GameRequest> {
     let (player1, player2) = match &template.kind {
         dispatch::JobKind::Games { player1, player2, .. }
@@ -493,7 +526,6 @@ pub(crate) async fn load_game_request(
         variant: row.get("variant"),
         seed: game::seed_from_row(&row),
         num_games: row.get("num_games"),
-        game_pairs,
         capture_positions: row.get("capture_positions"),
         capture_first_divergence: row.get("capture_first_divergence"),
         bingo_bonus: template.data.bingo_bonus,
@@ -508,9 +540,12 @@ pub(crate) async fn load_game_request(
 /// Writes analysed positions and their top-ranked moves.
 ///
 /// Shared by opening rack jobs (one position per rack) and by games jobs with
-/// capture on (one per turn). `on_conflict_ignore` is set for in-game positions,
-/// which are unique per (task, game, turn): a task has one slot, so a conflict
-/// is a duplicate that can only be a no-op.
+/// capture on (one per turn). Every row lands or the statement fails: a
+/// submission's duplicates are refused before it gets here (two analyses of
+/// one rack, two positions for one turn of a game), and a task has one slot
+/// and one accepted result, so no other claim can have written these rows.
+/// The unique indexes on `position_analysis_records` are what would turn a
+/// breach of either into a failed submission rather than lost rows.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn insert_position_analyses(
     conn: &mut PgConnection,
@@ -520,10 +555,7 @@ pub(crate) async fn insert_position_analyses(
     positions: &[PositionAnalysis],
     top_moves: i32,
     top_plies: i32,
-    on_conflict_ignore: bool,
 ) -> AppResult<()> {
-    use std::collections::HashMap;
-
     if positions.is_empty() {
         return Ok(());
     }
@@ -536,9 +568,8 @@ pub(crate) async fn insert_position_analyses(
     // inside the submit transaction, holding the task's row lock for all of
     // them. The batch sizes keep each statement well under Postgres's
     // 65,535-parameter ceiling.
-    let mut record_ids: Vec<Option<i64>> = vec![None; positions.len()];
-    for (chunk_index, chunk) in positions.chunks(RECORD_ROWS_PER_STATEMENT).enumerate() {
-        let base = chunk_index * RECORD_ROWS_PER_STATEMENT;
+    let mut record_ids: Vec<i64> = Vec::with_capacity(positions.len());
+    for chunk in positions.chunks(RECORD_ROWS_PER_STATEMENT) {
         let mut builder = sqlx::QueryBuilder::new(
             "INSERT INTO position_analysis_records
                  (task_claim_id, task_id, job_id, rack, position, game_index,
@@ -561,39 +592,11 @@ pub(crate) async fn insert_position_analyses(
                 .push_bind(position.analysis.as_str());
         });
 
-        if on_conflict_ignore {
-            // In-game positions: another claim of the same task replayed the
-            // same deterministic games and may already have recorded some of
-            // these, so what comes back is a subset and has to be matched up
-            // rather than zipped. `(game_index, turn_number)` is what the
-            // partial unique index is on, so it identifies the row.
-            builder.push(" ON CONFLICT DO NOTHING RETURNING id, game_index, turn_number");
-            let rows = builder.build().fetch_all(&mut *conn).await?;
-            let mut by_position: HashMap<(i16, i16), usize> = HashMap::new();
-            for (offset, position) in chunk.iter().enumerate() {
-                if let (Some(game), Some(turn)) = (position.game_index, position.turn_number) {
-                    by_position.insert((game, turn), base + offset);
-                }
-            }
-            for row in rows {
-                let (game, turn): (Option<i16>, Option<i16>) =
-                    (row.get("game_index"), row.get("turn_number"));
-                if let (Some(game), Some(turn)) = (game, turn) {
-                    if let Some(&index) = by_position.get(&(game, turn)) {
-                        record_ids[index] = Some(row.get("id"));
-                    }
-                }
-            }
-        } else {
-            // Opening racks: every row lands or the statement fails, and a
-            // multi-row insert returns its rows in the order they were given,
-            // so the ids line up with the chunk.
-            builder.push(" RETURNING id");
-            let ids: Vec<i64> = builder.build_query_scalar().fetch_all(&mut *conn).await?;
-            for (offset, id) in ids.into_iter().enumerate() {
-                record_ids[base + offset] = Some(id);
-            }
-        }
+        // A multi-row insert returns its rows in the order they were given,
+        // so the ids line up with the positions.
+        builder.push(" RETURNING id");
+        let ids: Vec<i64> = builder.build_query_scalar().fetch_all(&mut *conn).await?;
+        record_ids.extend(ids);
     }
 
     // `top_moves` is the config's num_plays_recorded, at least 1 by
@@ -601,11 +604,9 @@ pub(crate) async fn insert_position_analyses(
     // because that is what `rank` is stored as.
     let kept = top_moves.clamp(0, i16::MAX as i32) as usize;
     // Every move to write, across every position, with the record it belongs
-    // to and its rank within that record. A record with no id was already
-    // written by another claim, so its moves are there too and are skipped.
+    // to and its rank within that record.
     let mut pending: Vec<(i64, i16, &MoveEntry)> = Vec::new();
-    for (index, position) in positions.iter().enumerate() {
-        let Some(record_id) = record_ids[index] else { continue };
+    for (&record_id, position) in record_ids.iter().zip(positions) {
         for (rank, entry) in position.moves.iter().take(kept).enumerate() {
             pending.push((record_id, (rank + 1) as i16, entry));
         }
@@ -669,7 +670,8 @@ pub(crate) async fn insert_position_analyses(
                 .push_bind(ply.bingo_percentage)
                 .push_bind(ply.average_score);
         });
-        builder.push(" ON CONFLICT (move_id, ply) DO NOTHING");
+        // No `ON CONFLICT`: every move is new, and a move's plies are refused
+        // unless numbered in strictly ascending order (`check_plies`).
         builder.build().execute(&mut *conn).await?;
     }
 
@@ -678,8 +680,8 @@ pub(crate) async fn insert_position_analyses(
     // (checked in `plausibility::check_inference`), most drawn first.
     let inferences: Vec<(i64, &InferenceSummary)> = positions
         .iter()
-        .enumerate()
-        .filter_map(|(index, position)| Some((record_ids[index]?, position.inference.as_ref()?)))
+        .zip(&record_ids)
+        .filter_map(|(position, &record_id)| Some((record_id, position.inference.as_ref()?)))
         .collect();
     for chunk in inferences.chunks(INFERENCE_ROWS_PER_STATEMENT) {
         let mut builder = sqlx::QueryBuilder::new(
@@ -718,12 +720,12 @@ pub(crate) async fn insert_game_results(
     let divergent = record.divergent_games.as_ref();
     let pentanomial = record.pentanomial.as_ref();
     let bucket = |i: usize| pentanomial.map(|p| p[i] as i32);
-    // `submitted_at` is what every "first accepted result per task" read orders
-    // on, so it is the time of this insert, taken under the task's row lock,
-    // rather than the column's `now()` default: that is when the transaction
-    // *began*, and a submission that began first but reached the lock second
-    // -- accepted second -- would read as the first, so the aggregates would
-    // use one copy while the running totals had counted the other.
+    // `submitted_at` is the time of this insert, taken under the task's row
+    // lock, rather than the column's `now()` default (when the transaction
+    // began). It ordered the per-task "first accepted result" reads while a
+    // task could have more than one; now it is the results feed's order
+    // (`game_results_feed_idx`), close to the claim's completion time, which
+    // a contributor's feed pages by (`routes::public`).
     sqlx::query(
         "INSERT INTO game_results
              (task_claim_id, task_id, job_id, games, wins, losses, ties,
@@ -783,7 +785,6 @@ pub(crate) async fn insert_game_results(
         &record.positions,
         top_moves,
         top_plies,
-        true,
     )
     .await
 }

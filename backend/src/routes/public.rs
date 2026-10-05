@@ -65,7 +65,9 @@ struct JobListItem {
     tasks_total: i64,
     tasks_completed: i64,
     /// For on-demand games and pairs jobs the meaningful denominator is `max_games` /
-    /// `max_pairs`, not a task count that grows as work is handed out.
+    /// `max_pairs`, not a task count that grows as work is handed out; for an
+    /// opening-rack job it is racks settled of `total_racks`, and for leave
+    /// generation generations closed of the count.
     units_completed: Option<i64>,
     max_units: Option<i64>,
     /// Workers are declining this job and none is completing it.
@@ -102,8 +104,11 @@ async fn list_jobs(
                 -- Tasks are made on demand, so for opening racks and leave
                 -- generation a task count is no denominator: it is only what
                 -- has been handed out so far. Their own units instead: racks
-                -- analysed of the rack space, generations closed of the count.
-                j.racks_analyzed, rc.total_racks,
+                -- settled of the rack space, generations closed of the count.
+                -- Settled, as the job's page says, not analysed: a job seeking
+                -- a consensus has every rack analysed long before it is done,
+                -- and read finished here while it re-analysed them.
+                j.racks_settled, rc.total_racks,
                 cardinality(lc.target_rack_counts) AS generation_count,
                 (SELECT COUNT(*) FROM leave_generation_artifacts a
                   WHERE a.job_id = j.id AND a.generation >= 1) AS generations_closed,
@@ -155,7 +160,7 @@ async fn list_jobs(
                 JobType::Games => (Some(game_rows), max_games.map(i64::from)),
                 JobType::GamePairs => (Some(game_rows / 2), max_pairs.map(i64::from)),
                 JobType::OpeningRack => {
-                    (Some(row.get::<i64, _>("racks_analyzed")), row.get::<Option<i64>, _>("total_racks"))
+                    (Some(row.get::<i64, _>("racks_settled")), row.get::<Option<i64>, _>("total_racks"))
                 }
                 JobType::LeaveGeneration => (
                     Some(row.get::<i64, _>("generations_closed")),
@@ -506,7 +511,8 @@ struct ResultsQuery {
     /// Where the previous page left off. Absent for the first page. This route
     /// pages by cursor rather than by offset — see [`super::CursorPage`].
     cursor: Option<String>,
-    /// Filter to one contributor: a username, or an anonymous worker UUID.
+    /// Filter to one contributor: a username, or an anonymous worker's public
+    /// pseudonym (`anon_id`) -- never its UUID, which is its credential.
     worker: Option<String>,
     /// Opening-rack jobs only: look up one rack's full ranked move list.
     rack: Option<String>,
@@ -1033,19 +1039,17 @@ const FIRST_PLIES: &str = "COALESCE((
         FROM position_analysis_plies p WHERE p.move_id = m.id AND p.ply < 2
     ), '[]'::jsonb) AS plies";
 
-/// The full ranked move list for one rack, from `position_analysis_moves`,
-/// each move with its win percentage and its first two plies' statistics when
-/// the rack was simulated.
+/// The ranked move lists for one rack, one per analysis, from
+/// `position_analysis_moves`, each move with its win percentage and its first
+/// two plies' statistics when the rack was simulated.
 async fn rack_lookup(
     state: &AppState,
     job_id: Uuid,
     rack: &str,
 ) -> AppResult<super::CursorPage<serde_json::Value>> {
-    let canonical: String = {
-        let mut chars: Vec<char> = rack.trim().to_uppercase().chars().collect();
-        chars.sort_unstable();
-        chars.into_iter().collect()
-    };
+    // As the job's rack index spelt it when it handed the rack out, which is
+    // how the record stores it.
+    let canonical = crate::jobs::racks::RackIndex::spelling(rack);
 
     // One probe of `(job_id, rack) WHERE game_index IS NULL` rather than a walk
     // of the job's tasks. `game_index IS NULL` is what keeps an incidentally
@@ -1059,16 +1063,35 @@ async fn rack_lookup(
     // every move twice.
     // `analysis` numbers the rack's analyses from 1, so a page can tell them
     // apart and read their consensus.
+    //
+    // Each analysis's list is cut short when there are many: a consensus job
+    // keeps up to 100 analyses of a rack, each of up to 32,767 moves, and
+    // this route is public -- 3.3 million rows, each with its plies, built
+    // and sent for one request. Together they are held to what one analysis
+    // could always fill ([`RACK_LOOKUP_MOVES`]): a rack analysed once is
+    // listed whole as it always was, and of many, each analysis's best moves,
+    // which are what the page reads their consensus from. A probe of the
+    // same index counts them first.
+    let analyses: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM position_analysis_records r
+         WHERE r.job_id = $1 AND r.rack = $2 AND r.game_index IS NULL",
+    )
+    .bind(job_id)
+    .bind(&canonical)
+    .fetch_one(&state.read_pool)
+    .await?;
+    let per_analysis = RACK_LOOKUP_MOVES / analyses.max(1);
     let rows = sqlx::query(&format!(
         "SELECT dense_rank() OVER (ORDER BY r.id)::int AS analysis,
                 m.rank, m.move, m.score, m.equity, m.iterations, m.win_percentage, {FIRST_PLIES}
          FROM position_analysis_records r
-         JOIN position_analysis_moves m ON m.record_id = r.id
+         JOIN position_analysis_moves m ON m.record_id = r.id AND m.rank <= $3
          WHERE r.job_id = $1 AND r.rack = $2 AND r.game_index IS NULL
          ORDER BY r.id ASC, m.rank ASC"
     ))
     .bind(job_id)
     .bind(&canonical)
+    .bind(per_analysis)
     .fetch_all(&state.read_pool)
     .await?;
 
@@ -1088,11 +1111,15 @@ async fn rack_lookup(
         })
         .collect();
 
-    // A rack's whole ranked list comes back in one page, so there is nothing to
-    // page to.
+    // A rack's lists come back in one page, so there is nothing to page to.
     let total = items.len() as i64;
     Ok(super::CursorPage { items, total, per_page: total.max(1), next_cursor: None })
 }
+
+/// The most moves a rack lookup lists across all of a rack's analyses: as
+/// many as one analysis can record (`num_plays_recorded` is at most
+/// `i16::MAX`), shared out evenly between them.
+const RACK_LOOKUP_MOVES: i64 = i16::MAX as i64;
 
 #[derive(Deserialize)]
 struct PositionsQuery {

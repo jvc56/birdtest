@@ -44,7 +44,7 @@ test('E-5: an admin bans a worker and that worker can no longer claim', async ({
   try {
     // A new contributor: its first claim issues its identity, and one
     // finished task puts it on the admin's list of known workers.
-    const assignment = await firstClaim(worker);
+    const assignment = await firstClaim(worker, jobId);
     const uuid = assignment.worker_uuid;
     const submitted = await submit(worker, uuid, assignment);
     expect(submitted.status(), await submitted.text()).toBe(200);

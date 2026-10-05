@@ -83,7 +83,7 @@ test('E-2: a new user registers, confirms, signs in, and makes and deactivates a
   await expect(row.getByRole('button', { name: 'Activate', exact: true })).toBeVisible();
   const claim = await request.post('/api/worker/task', {
     headers: { Authorization: `Bearer ${key}` },
-    data: { magpie_version: '99.0.0', unsupported_jobs: [] }
+    data: { magpie_version: '99.0.0', board_dim: 15, rack_size: 7, unsupported_jobs: [] }
   });
   expect(claim.status()).toBe(401);
   expect((await claim.json()).message).toBe('unknown or inactive API key');

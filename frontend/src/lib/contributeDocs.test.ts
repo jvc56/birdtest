@@ -5,7 +5,7 @@ import { describe, expect, it } from 'vitest';
 // The pages that tell a contributor how to run MAGPIE. `magpie contribute`
 // takes its API key only from an `apikey` line in contribute.txt, never from
 // the command line (MAGPIE's config.c): a key there ends up in shell history
-// and `ps` output. `--api-key` belongs to the test-only Python worker.
+// and `ps` output. `--api-key` is no flag of MAGPIE's.
 function svelteFiles(dir: string): string[] {
   return readdirSync(dir).flatMap((name) => {
     const path = join(dir, name);

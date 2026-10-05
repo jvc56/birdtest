@@ -192,7 +192,6 @@ pub struct OpeningRackRequest {
     /// (the executor used to derive one from the rack's letters).
     #[serde(with = "seed_as_string")]
     pub seed: u64,
-    pub previous_play: Option<String>,
     /// Run-wide settings from the job, stated so no worker supplies its own
     /// build's default: the bingo bonus, and the simulation cutoff.
     pub bingo_bonus: i32,
@@ -231,9 +230,11 @@ pub struct GameRequest {
     /// uint64 at the application layer; stored as a signed BIGINT.
     #[serde(with = "seed_as_string")]
     pub seed: u64,
+    /// Games for a `games` task, pairs for a `game_pairs` one. Which of the
+    /// two a request is, MAGPIE reads from the `job_type` tag alone (a pair
+    /// plays both orderings from the same seed): a flag saying it again could
+    /// only disagree with the tag.
     pub num_games: i32,
-    /// True for `game_pairs`: MAGPIE runs both orderings from the same seed.
-    pub game_pairs: bool,
     /// Whether to keep the position analyses produced while playing. The worker
     /// analyses a position every turn regardless; this decides whether it
     /// reports them. How many ranked moves come back per position is the
@@ -324,7 +325,8 @@ pub struct MoveEntry {
     pub equity: f64,
     /// How many times the simulation played the move out: its own iterations,
     /// which a simulation spends unevenly, most on the leaders. 0 for a move
-    /// nothing simulated; absent from a client that does not send it.
+    /// nothing simulated. MAGPIE sends it on every move; optional only so the
+    /// rest of a move can be read without it (`U-WIRE-3`).
     #[serde(default)]
     pub iterations: Option<i64>,
     /// The simulated win percentage. Absent for a static player, which ranks on
@@ -354,11 +356,8 @@ pub struct RackAnalysis {
     /// config's `num_plays_recorded` -- the same number the server keeps.
     pub moves: Vec<MoveEntry>,
     /// How many moves were ranked before that truncation, which is the one
-    /// thing the stored moves cannot recover. Optional because it was added
-    /// after the first `birdtest-contribute` builds: absent, the reported list
-    /// is all there was, which is what those builds sent.
-    #[serde(default)]
-    pub num_moves: Option<i32>,
+    /// thing the stored moves cannot recover.
+    pub num_moves: i32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -513,8 +512,7 @@ pub struct GameResultsResponse {
     /// look enormous.
     #[serde(default)]
     pub divergent_games: Option<GameAggregate>,
-    /// Empty unless the job asked for capture, which keeps every existing
-    /// client valid.
+    /// Empty unless the job asked for capture.
     #[serde(default)]
     pub positions: Vec<CapturedPosition>,
 }
@@ -569,12 +567,11 @@ impl PositionAnalysis {
     /// An opening rack: no board, no game, no turn, no previous move.
     ///
     /// `num_moves` is what the worker says it ranked, which is generally more
-    /// than it reported. A client that does not send it reported everything it
-    /// ranked, so the list's own length is the honest answer.
+    /// than it reported.
     ///
     /// Its analysis is a simulation's when its moves carry win percentages,
     /// and static otherwise: an opening rack never reaches a solver.
-    pub fn opening_rack(rack: String, moves: Vec<MoveEntry>, num_moves: Option<i32>) -> Self {
+    pub fn opening_rack(rack: String, moves: Vec<MoveEntry>, num_moves: i32) -> Self {
         let analysis = if moves.iter().any(|m| m.win_percentage.is_some()) {
             Analysis::Sim
         } else {
@@ -590,7 +587,7 @@ impl PositionAnalysis {
             previous_move_score: None,
             played_move: None,
             played_move_score: None,
-            num_moves: num_moves.unwrap_or(moves.len() as i32),
+            num_moves,
             moves,
             inference: None,
         }
@@ -708,13 +705,13 @@ mod tests {
 
         for (job_type, wire) in requests {
             let request: TaskRequest = serde_json::from_value(wire.clone()).unwrap();
-            let variant_matches = match (&request, job_type) {
-                (TaskRequest::OpeningRack(_), "opening_rack") => true,
-                (TaskRequest::Games(r), "games") => !r.game_pairs,
-                (TaskRequest::GamePairs(r), "game_pairs") => r.game_pairs,
-                (TaskRequest::LeaveGeneration(_), "leave_generation") => true,
-                _ => false,
-            };
+            let variant_matches = matches!(
+                (&request, job_type),
+                (TaskRequest::OpeningRack(_), "opening_rack")
+                    | (TaskRequest::Games(_), "games")
+                    | (TaskRequest::GamePairs(_), "game_pairs")
+                    | (TaskRequest::LeaveGeneration(_), "leave_generation")
+            );
             assert!(variant_matches, "{job_type} decoded as {request:?}");
             let again = serde_json::to_value(&request).unwrap();
             assert_eq!(again["job_type"], json!(job_type));
@@ -748,9 +745,6 @@ mod tests {
         assert_eq!((entry.win_percentage, entry.blended_utility), (None, None));
         assert!(entry.plies.is_empty());
 
-        let analysis: RackAnalysis =
-            serde_json::from_value(json!({ "rack": "AEINRST", "moves": [bare_move] })).unwrap();
-        assert_eq!(analysis.num_moves, None);
 
         let position: CapturedPosition = serde_json::from_value(json!({
             "game_index": 0, "turn_number": 0, "played_move": "8D PLAYED", "played_move_score": 10, "rack": "AEINRST",

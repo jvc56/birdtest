@@ -399,6 +399,21 @@ impl RackIndex {
         self.counts[0][self.size]
     }
 
+    /// A rack however it was typed -- any case, any order, spaces anywhere --
+    /// spelt as this index spells the racks it enumerates, and so as an
+    /// opening-rack job stores them: upper case, its letters in character
+    /// order (the order [`LetterDistribution::parse`] sorts the tiles in), so
+    /// the blank `?` first. Not [`LetterDistribution::canonical_rack`], which
+    /// spells a rack as MAGPIE's game does for a captured position (machine
+    /// letters in file order, the blank last): for German, whose file lists
+    /// `Ä` after `A`, the two put an `Ä` in different places.
+    pub fn spelling(typed: &str) -> String {
+        let upper = typed.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_uppercase();
+        let mut chars: Vec<char> = upper.chars().collect();
+        chars.sort_unstable();
+        chars.into_iter().collect()
+    }
+
     /// The rack at `index`, or `None` past the end.
     ///
     /// Ordering is by ascending count of each tile in distribution order, and
@@ -518,6 +533,30 @@ mod tests {
             distinct_first_letters.len() > 1,
             "a batch should span the space, got {batch:?}"
         );
+    }
+
+    /// U-RACK-12: a rack typed any way is looked up as the index spells it,
+    /// for a distribution whose file order is not character order (German's
+    /// `A, Ä, B`, the blank first): every rack of the space, typed reversed
+    /// in lower case, comes back as `rack_at` gave it.
+    #[test]
+    fn a_typed_rack_is_spelt_as_the_index_spells_it() {
+        let distribution = LetterDistribution::from_tiles_for_test(vec![
+            Tile { letter: '?', count: 2 },
+            Tile { letter: 'A', count: 2 },
+            Tile { letter: 'Ä', count: 1 },
+            Tile { letter: 'B', count: 1 },
+            Tile { letter: 'O', count: 1 },
+            Tile { letter: 'Ö', count: 1 },
+            Tile { letter: 'Z', count: 1 },
+        ]);
+        let index = RackIndex::new(&distribution, 4).unwrap();
+        for i in 0..index.total() {
+            let rack = index.rack_at(i).unwrap();
+            let typed: String = rack.to_lowercase().chars().rev().collect();
+            assert_eq!(RackIndex::spelling(&format!(" {typed} ")), rack, "typed as {typed:?}");
+        }
+        assert_eq!(RackIndex::spelling("zä? a"), "?AZÄ");
     }
 
     #[test]

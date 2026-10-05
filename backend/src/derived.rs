@@ -383,8 +383,9 @@ pub async fn files_for_job(
 ///   immutable and the job's own config has no update endpoint), so the set of
 ///   `derived_data` rows the query looks up cannot grow or shrink;
 /// - a row only ever moves toward `built` -- the builder task writes `built`,
-///   and an admin retry touches `failed` rows only -- and nothing deletes one
-///   (`input_data` refuses a delete while a derived row references it);
+///   and an admin retry touches `failed` rows only -- and a row is deleted
+///   only with an input file nothing pins (`delete_input_data`), so never one
+///   a dispatchable job's answer names;
 /// - the builder identity the query matches on is a constant of the running
 ///   binary, so a deployment with a different MAGPIE starts with an empty
 ///   cache and asks again.

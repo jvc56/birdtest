@@ -13,7 +13,7 @@ other then fails a test rather than a contributor's run.
 
 | File | Direction | What it pins |
 |---|---|---|
-| `claim-request.json` | client → server | The required claim body: version and unsupported set |
+| `claim-request.json` | client → server | The required claim body: version, the build's board dimension and rack size, and unsupported set |
 | `assignment-games.json` | server → client | A games assignment with `expected_data`, two lexicons, a player 1 with a rack info table and a word info table (all three derived files pinned), and a player 2 that solves its endgame and a nested pre-endgame (every solver key stated) |
 | `assignment-opening-rack.json` | server → client | A rack batch for a simming player: the one job type whose request carries `racks` and a single `player` |
 | `assignment-leave-generation.json` | server → client | Generation 1, reading the server-built zeroed KLV, and the static `player` the bot plays both seats as |
@@ -21,7 +21,8 @@ other then fails a test rather than a contributor's run.
 | `shutdown-data-out-of-date.json` | server → client | Every job unreachable because the data is stale |
 | `shutdown-magpie-too-old.json` | server → client | Every job unreachable because the build is old |
 | `shutdown-both.json` | server → client | Both, leading with the MAGPIE version |
-| `assignment-game-pairs.json` | server → client | A `game_pairs` assignment (`game_pairs: true`) whose players ask for a wordmap, capturing only first divergences (`capture_first_divergence`) |
+| `shutdown-unsupported-build.json` | server → client | A build whose `BOARD_DIM` or `RACK_SIZE` is not the 15 and 7 every job plays with |
+| `assignment-game-pairs.json` | server → client | A `game_pairs` assignment (told apart from games by its `job_type` alone) whose players ask for a wordmap, capturing only first divergences (`capture_first_divergence`) |
 | `anon-uuid-assignment.json` | server → client | The first assignment of a worker with no identity: a games task carrying the minted `worker_uuid`, and a job that pins no derived file (`derived: []`) |
 | `expected-data.json` | server → client | The `expected_data` digest list of an assignment, input files and a derived wordmap |
 | `heartbeat.json` | client → server | A heartbeat |

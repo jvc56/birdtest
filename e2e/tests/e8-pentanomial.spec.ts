@@ -2,9 +2,9 @@ import { test, expect } from '@playwright/test';
 import { seededJob, waitUntilSettled } from '../lib/api';
 
 /**
- * E-8: a game-pairs job's page shows its pentanomial with the five buckets
- * labelled in order, the match test's verdict in words, and player 1's record
- * in the match score box.
+ * E-8: a game-pairs job's page shows its pentanomial's five pair outcomes as
+ * three labelled rows, each read from the player's own side, the match test's
+ * verdict in words, and player 1's record in the match score box.
  *
  * The seeded job, once the fake workers have finished it. They favour player
  * 1, so its test must have ended for player 1 -- finding it better, or at the
@@ -27,7 +27,7 @@ test('E-8: a finished game-pairs job shows its labelled pentanomial and signific
     /^Completed: (decided: player 1 is better|inconclusive: the job reached its cap first), player 1 at \d+\.\d% to \d+\.\d% after [\d,]+ pairs\. The figures above include the pairs that were in flight then\.$/
   );
 
-  // Player 1's score and Elo, with their ranges, in a sentence; the test
+  // Player 1's score, with its range, in a sentence; the test
   // explained with the job's own confidence, folded away.
   await expect(card.getByTestId('significance-test-sentence')).toContainText(
     /^static-equity scores \d+\.\d% per game \(95% interval \d+\.\d% to \d+\.\d%\)/

@@ -620,6 +620,79 @@ async fn a_job_naming_something_that_does_not_exist_is_a_clean_400() {
     assert_eq!(refused["message"], format!("no input data row {missing}"), "{refused}");
 }
 
+/// I-JOB-1f: the schema holds a games or pairs job's counts to what
+/// `validate_job_body` requires, for a row written any other way: a batch of
+/// at least 1, a cap of at least 1, a floor of at least 0, and with the test
+/// on a floor from 1 to the cap. The stopping rule reads the counts unsigned,
+/// so a negative cap was one no job reached. A games row that states no batch
+/// gets 2, the least even one (KL-87).
+#[tokio::test]
+async fn a_games_or_pairs_jobs_counts_are_held_by_the_schema() {
+    let db = TestDb::new().await;
+    let admin = Admin::new(&db, db.state().await).await;
+    let (ld, layout) = board(&db).await;
+    let kwg = db.input_data("kwg", "NWL23").await;
+    let klv = db.input_data("klv", "NWL23").await;
+    let p1 = admin.static_player("p1", kwg, klv, json!({})).await;
+    let p2 = admin.static_player("p2", kwg, klv, json!({})).await;
+
+    for (body, table, unit) in [
+        (games_body(ld, layout, p1, p2), "job_game_config", "games"),
+        (pairs_body(ld, layout, p1, p2), "job_game_pair_config", "pairs"),
+    ] {
+        let (status, created) = admin.create_job(body).await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let job: Uuid = created["job"]["id"].as_str().unwrap().parse().unwrap();
+        let batch = format!("{unit}_per_batch");
+        for set in [
+            format!("{batch} = 0"),
+            format!("max_{unit} = 0"),
+            format!("max_{unit} = -1"),
+            format!("min_{unit} = -1"),
+            // The test on: its floor from 1 to the cap (10).
+            format!("test_enabled = TRUE, min_{unit} = 0"),
+            format!("test_enabled = TRUE, min_{unit} = 11"),
+        ] {
+            let err = sqlx::query(&format!("UPDATE {table} SET {set} WHERE job_id = $1"))
+                .bind(job)
+                .execute(&db.pool)
+                .await
+                .expect_err(&set);
+            let db_err = err.as_database_error().expect("a database error");
+            assert_eq!(db_err.code().as_deref(), Some("23514"), "{set}: {db_err}");
+            assert_eq!(db_err.constraint(), Some(format!("{table}_counts").as_str()), "{set}");
+        }
+        sqlx::query(&format!(
+            "UPDATE {table} SET test_enabled = TRUE, min_{unit} = 10 WHERE job_id = $1"
+        ))
+        .bind(job)
+        .execute(&db.pool)
+        .await
+        .expect("a floor at the cap is a floor");
+
+        if table == "job_game_config" {
+            sqlx::query("DELETE FROM job_game_config WHERE job_id = $1")
+                .bind(job)
+                .execute(&db.pool)
+                .await
+                .unwrap();
+            let batch: i32 = sqlx::query_scalar(
+                "INSERT INTO job_game_config (job_id, player1_config_id, player2_config_id,
+                                              min_games, max_games)
+                 VALUES ($1, $2, $3, 0, 10)
+                 RETURNING games_per_batch",
+            )
+            .bind(job)
+            .bind(p1)
+            .bind(p2)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+            assert_eq!(batch, 2, "the default batch is even");
+        }
+    }
+}
+
 /// A games job between two static players, created through the API.
 async fn api_games_job(db: &TestDb, admin: &Admin) -> Uuid {
     let (ld, layout) = board(db).await;
@@ -757,7 +830,8 @@ async fn an_allocation_outside_0_to_100_is_refused() {
 
 /// Claims and completes one games task, with a captured position whose moves
 /// carry per-ply statistics, so the job has a claim, a result, a record, its
-/// moves and their plies. Returns the claim's worker UUID.
+/// moves and their plies: a simulated one, so the job's player 1 must
+/// simulate ([`TestDb::simulate_player1`]). Returns the claim's worker UUID.
 async fn games_history(app: &Router) -> String {
     let (status, assignment) =
         send(app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
@@ -765,11 +839,11 @@ async fn games_history(app: &Router) -> String {
     let uuid = assignment["worker_uuid"].as_str().unwrap().to_string();
     let mut result = games_result(2, 1);
     result["positions"] = json!([{
-        "game_index": 0, "turn_number": 0, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "AEINRST", "position": "cgp",
+        "game_index": 0, "turn_number": 0, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "sim", "rack": "AEINRST", "position": "cgp",
         "num_moves": 40, "moves": [
-            { "move": "8D RETAINS", "score": 74, "equity": 81.2,
+            { "move": "8D RETAINS", "score": 74, "equity": 81.2, "win_percentage": 55.0,
               "plies": [{ "ply": 1, "bingo_percentage": 10.0, "average_score": 30.0 }] },
-            { "move": "8D STAINER", "score": 70, "equity": 79.0 },
+            { "move": "8D STAINER", "score": 70, "equity": 79.0, "win_percentage": 52.0 },
         ],
     }, {
         // A capturing job's result has positions from every game of its batch.
@@ -947,6 +1021,7 @@ async fn deleting_a_job_leaves_nothing_anywhere_that_points_at_it() {
         .execute(&db.pool)
         .await
         .unwrap();
+    db.simulate_player1(games, false).await;
     games_history(&admin.app).await;
     // A second claim, left open.
     assert_eq!(claim(&admin.app).await, StatusCode::OK);
@@ -1004,6 +1079,7 @@ async fn a_purge_writes_its_census_before_it_destroys_anything() {
         .execute(&db.pool)
         .await
         .unwrap();
+    db.simulate_player1(job, false).await;
     let admin = Admin::new(&db, db.state().await).await;
     games_history(&admin.app).await;
 
@@ -1023,8 +1099,8 @@ async fn a_purge_writes_its_census_before_it_destroys_anything() {
     let census = rows[0].2.as_deref().unwrap();
     assert_eq!(
         census,
-        "tasks=1 claims=1 game_results=1 leave_records=0 positions=2 rack_progress=0 \
-         staged_results=0 artifacts=0",
+        "tasks=1 claims=1 game_results=1 leave_records=0 positions=2 rack_standings=0 \
+         rack_progress=0 staged_results=0 artifacts=0",
         "the census counts what the purge was about to destroy"
     );
     assert_eq!(rows[0].3, Some(job));

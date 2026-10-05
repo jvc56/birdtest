@@ -233,3 +233,25 @@ describe('F-API-6 errorText', () => {
     expect(errorText(new Error('offline'))).toBe('offline');
   });
 });
+
+describe('F-API-7 query strings', () => {
+  it("leaves out a parameter that is undefined, such as a first page's cursor", async () => {
+    respond(200, '{"items":[]}');
+    await api.jobPositions('j', 'AEINRST', { per_page: 1, cursor: undefined });
+    expect(fetchMock.mock.calls.at(-1)![0]).toBe('/api/jobs/j/positions?rack=AEINRST&per_page=1');
+
+    respond(200, '{"items":[]}');
+    await api.jobPositions('j', '?AB', { per_page: 1, cursor: 'c/2' });
+    expect(fetchMock.mock.calls.at(-1)![0]).toBe(
+      '/api/jobs/j/positions?rack=%3FAB&per_page=1&cursor=c%2F2'
+    );
+
+    respond(200, '{"items":[]}');
+    await api.jobResults('j', { per_page: 50, cursor: undefined });
+    expect(fetchMock.mock.calls.at(-1)![0]).toBe('/api/jobs/j/results?per_page=50');
+
+    respond(200, '{"items":[]}');
+    await api.auditLog({ page: 0, action: undefined });
+    expect(fetchMock.mock.calls.at(-1)![0]).toBe('/api/admin/audit-log?page=0');
+  });
+});

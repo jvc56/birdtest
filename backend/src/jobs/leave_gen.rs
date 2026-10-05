@@ -11,7 +11,8 @@ use sqlx::{PgConnection, Row};
 use uuid::Uuid;
 
 /// Tiles on a full rack. Leave generation observes full racks, never leaves,
-/// and MAGPIE's `RACK_SIZE` is the same seven.
+/// and MAGPIE's `RACK_SIZE` is the same seven: a claim states its build's, and
+/// one of another size is sent away (`unsupported_build`, `routes::worker`).
 pub const RACK_SIZE: usize = 7;
 
 /// The name the server hands MAGPIE for a generation's files inside a scratch

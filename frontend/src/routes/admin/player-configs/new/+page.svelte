@@ -54,6 +54,8 @@
   // endgame is the switch for both: the pre-endgame scores its emptier
   // scenarios with endgame solves, so it cannot run without one.
   let solveEndgame = false;
+  // MAGPIE's own `eplies` default. The server has none to fill in: the depth
+  // is the endgame's switch (0 is off), so the form always states it.
   let endgamePlies = 6;
   let runPeg = false;
   // Pre-filled below MAGPIE's own 4: at 4, with the default schedule and

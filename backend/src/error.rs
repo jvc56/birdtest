@@ -365,8 +365,8 @@ mod tests {
         }
     }
 
-    /// The two violations callers treat as ordinary outcomes keep their
-    /// SQLSTATE, and neither says more than that something conflicted.
+    /// U-ERR-7: the two violations callers treat as ordinary outcomes keep
+    /// their SQLSTATE, and neither says more than that something conflicted.
     #[tokio::test]
     async fn constraint_violations_are_conflicts_without_the_constraint_text() {
         let unique: AppError =
@@ -400,6 +400,7 @@ mod tests {
         }
     }
 
+    /// U-ERR-7: a pool timeout is a 503 with `Retry-After`.
     #[test]
     fn a_pool_timeout_is_a_503_with_retry_after() {
         let err: AppError = sqlx::Error::PoolTimedOut.into();

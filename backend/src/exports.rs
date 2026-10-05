@@ -643,13 +643,20 @@ async fn mark_ready(
     // overlaps the two. Without the guard a reaped row would come back
     // `ready`, and an admin would be handed a download of an export nobody
     // was sure had finished.
+    //
+    // The job's status is read `FOR SHARE`, which waits out a transaction
+    // changing it and then reads what that committed. A consensus edit
+    // reopening the job demotes its final exports (`unfinalize`) before it
+    // commits; a plain read here, between that statement and the commit,
+    // still saw `completed`, and stored this export final for a job that
+    // was active again.
     let marked = sqlx::query(
         "UPDATE job_exports
          SET state = 'ready', artifact_key = $2, bytes = $3, sha256 = $4,
              row_count = $5, positions_artifact_key = $6, positions_bytes = $7,
              positions_sha256 = $8, positions_row_count = $9,
              is_final = $10 AND (SELECT j.status = 'completed' FROM jobs j
-                                 WHERE j.id = job_exports.job_id),
+                                 WHERE j.id = job_exports.job_id FOR SHARE),
              snapshot_at = $11, completed_at = now()
          WHERE id = $1 AND state = 'running'",
     )
@@ -768,7 +775,8 @@ pub async fn purge(conn: &mut sqlx::PgConnection, job_id: Uuid) -> AppResult<Vec
 /// will have again once it completes. Left final, `newest_ready` would serve
 /// the old corpus as the completed job's once it completed again. An export
 /// still building when the job reopened is marked final only if the job is
-/// still completed when it finishes (`mark_ready`).
+/// still completed when it finishes (`mark_ready`, which waits for the
+/// reopening to commit).
 pub async fn unfinalize(conn: &mut sqlx::PgConnection, job_id: Uuid) -> AppResult<()> {
     sqlx::query("UPDATE job_exports SET is_final = FALSE WHERE job_id = $1 AND is_final")
         .bind(job_id)

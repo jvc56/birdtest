@@ -97,6 +97,18 @@ const patch = <T>(path: string, body: unknown) => request<T>('PATCH', path, body
 const put = <T>(path: string, body: unknown) => request<T>('PUT', path, body);
 const del = <T>(path: string) => request<T>('DELETE', path);
 
+/**
+ * A query string from parameters, leaving out any that are `undefined`: a
+ * first page has no cursor, and `String(undefined)` sent `cursor=undefined`,
+ * which the server read as "from the start" only because it ignores a cursor
+ * it cannot decode.
+ */
+export function query(params: Record<string, string | number | undefined>): string {
+  return new URLSearchParams(
+    Object.entries(params).flatMap(([k, v]) => (v === undefined ? [] : [[k, String(v)]]))
+  ).toString();
+}
+
 // --- Shared shapes ---------------------------------------------------------
 
 export type JobType = 'opening_rack' | 'games' | 'game_pairs' | 'leave_generation';
@@ -388,7 +400,6 @@ export interface JobStats {
   tasks_completed: number;
   tasks_available: number;
   tasks_claimed: number;
-  results_accepted: number;
   games?: GameStats;
   opening_racks?: {
     racks_analyzed: number;
@@ -729,11 +740,9 @@ export const api = {
     get<Page<JobListItem>>(`/api/jobs?page=${page}${status ? `&status=${status}` : ''}`),
   job: (id: string) => get<JobStats>(`/api/jobs/${id}`),
   /** Cursor-paginated; see {@link CursorPage}. `?rack=` returns one rack's whole list. */
-  jobResults: (id: string, params: Record<string, string | number> = {}) =>
+  jobResults: (id: string, params: Record<string, string | number | undefined> = {}) =>
     get<CursorPage<Record<string, unknown>>>(
-      `/api/jobs/${id}/results?${new URLSearchParams(
-        Object.entries(params).map(([k, v]) => [k, String(v)])
-      )}`
+      `/api/jobs/${id}/results?${query(params)}`
     ),
   /** One rack's ranked moves in an opening-rack job, every analysis of it, in one page. */
   rackLookup: (id: string, rack: string) =>
@@ -741,10 +750,7 @@ export const api = {
   /** Signed-in users only: a games or pairs job's captured positions with one rack, newest first. */
   jobPositions: (id: string, rack: string, params: { per_page?: number; cursor?: string } = {}) =>
     get<CursorPage<SavedPosition>>(
-      `/api/jobs/${id}/positions?${new URLSearchParams({
-        rack,
-        ...Object.fromEntries(Object.entries(params).map(([k, v]) => [k, String(v)]))
-      })}`
+      `/api/jobs/${id}/positions?${query({ rack, ...params })}`
     ),
   /** Signed-in users only: one captured position at random, or `null` before any. */
   randomPosition: (id: string) => get<SavedPosition | null>(`/api/jobs/${id}/positions/random`),
@@ -863,11 +869,9 @@ export const api = {
     post<{ id: string }>('/api/admin/workers/ban', body),
   unbanWorker: (id: string) => del<void>(`/api/admin/workers/ban/${id}`),
   workerBans: () => get<WorkerBan[]>('/api/admin/workers/bans'),
-  auditLog: (params: Record<string, string | number> = {}) =>
+  auditLog: (params: Record<string, string | number | undefined> = {}) =>
     get<Page<Record<string, unknown>>>(
-      `/api/admin/audit-log?${new URLSearchParams(
-        Object.entries(params).map(([k, v]) => [k, String(v)])
-      )}`
+      `/api/admin/audit-log?${query(params)}`
     )
 };
 

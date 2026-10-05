@@ -916,3 +916,62 @@ async fn results_and_positions_are_read_in_one_snapshot() {
     let positions = gunzip(&download(export["positions_download_url"].as_str().unwrap()).await);
     assert!(!positions.contains("\"late\""), "{positions}");
 }
+
+/// I-EXPORT-15: an export that finishes while its completed job is being
+/// reopened -- by a consensus edit whose `unfinalize` has run and whose commit
+/// has not -- waits for the reopening, and is a snapshot. Its final marker
+/// read the job's committed `completed` in between, so it came back final
+/// for a job that was running again, and the stream would have redirected to
+/// it once the job completed anew.
+#[tokio::test]
+async fn an_export_finishing_while_its_job_reopens_is_a_snapshot() {
+    let db = TestDb::new().await;
+    let (state, _bucket) = db.state_with_object_store().await;
+    let app = birdtest::app(state.clone());
+    let admin = db.user("root", true).await;
+    let headers = admin_headers(&state.cfg, admin);
+    let job = completed_capture_job(&db, &app, 1).await;
+    complete(&db, job).await;
+
+    // Held at its results scan, its snapshot taken while the job was completed.
+    let mut reads = db.pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE game_results IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *reads)
+        .await
+        .unwrap();
+    let path = format!("/api/admin/jobs/{job}/export");
+    let (status, body) = send(&app, post_json(&path, &borrowed(&headers), json!({}))).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    wait_for_lock_waiter(&db, "SELECT to_jsonb(r)::text AS row FROM game_results").await;
+
+    // A reopening as the consensus edit makes one: the job's row, the final
+    // exports demoted, the job active again -- not yet committed.
+    let mut reopen = db.pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM jobs WHERE id = $1 FOR UPDATE")
+        .bind(job)
+        .execute(&mut *reopen)
+        .await
+        .unwrap();
+    birdtest::exports::unfinalize(&mut reopen, job).await.unwrap();
+    sqlx::query("UPDATE jobs SET status = 'active' WHERE id = $1")
+        .bind(job)
+        .execute(&mut *reopen)
+        .await
+        .unwrap();
+    reads.commit().await.unwrap();
+    // The export reads the rest and waits to learn what the job is now.
+    wait_for_lock_waiter(&db, "UPDATE job_exports").await;
+    reopen.commit().await.unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let export = loop {
+        let (_, body) = send(&app, get_request(&path, &headers)).await;
+        if body["state"] != "running" {
+            break body;
+        }
+        assert!(Instant::now() < deadline, "the export never finished: {body}");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    assert_eq!(export["state"], "ready", "{export}");
+    assert_eq!(export["is_final"], false, "the job was reopened as it finished: {export}");
+}

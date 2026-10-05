@@ -451,6 +451,14 @@ struct FleetVersion {
 /// What the field is running, over the last week. This is the evidence for
 /// raising a job's floor: the difference between doing it on evidence and doing
 /// it on hope.
+///
+/// The week's completed claims and the claims open now, each through its own
+/// partial index (`task_claims_completed_idx`, `task_claims_open_idx`), so the
+/// read is a week of the fleet's work whatever the table's age. It was every
+/// claim claimed in the week, which no index serves (KL-32): a sequential scan
+/// of every claim ever made, on the main pool with no timeout. A claim that
+/// lapsed or was declined is not counted. On the display pool, for its
+/// statement timeout and to keep the read off the connections claims use.
 async fn fleet(
     State(state): State<AppState>,
     _admin: AdminUser,
@@ -461,12 +469,17 @@ async fn fleet(
                     COUNT(DISTINCT COALESCE(claimed_by_user_id, claimed_by_anon_uuid))
                         AS workers,
                     COUNT(*) AS claims
-             FROM task_claims
-             WHERE claimed_at > now() - interval '7 days'
+             FROM (SELECT magpie_version, claimed_by_user_id, claimed_by_anon_uuid
+                   FROM task_claims
+                   WHERE state = 'completed' AND completed_at > now() - interval '7 days'
+                   UNION ALL
+                   SELECT magpie_version, claimed_by_user_id, claimed_by_anon_uuid
+                   FROM task_claims
+                   WHERE state = 'claimed' AND claimed_at > now() - interval '7 days') c
              GROUP BY magpie_version
              ORDER BY workers DESC",
         )
-        .fetch_all(&state.pool)
+        .fetch_all(&state.read_pool)
         .await?,
     ))
 }
@@ -997,6 +1010,8 @@ fn validate_player_config_body(body: &CreatePlayerConfigBody) -> AppResult<()> {
     let mut err = AppError::bad_request("player config is invalid");
     if body.name.trim().is_empty() {
         err = err.with_field("name", "must not be empty");
+    } else if let Some(problem) = name_problem(body.name.trim()) {
+        err = err.with_field("name", problem);
     }
     let positive = [
         ("max_iterations", body.max_iterations),
@@ -1085,6 +1100,12 @@ fn validate_player_config_body(body: &CreatePlayerConfigBody) -> AppResult<()> {
 
 /// Player configs are immutable, so there is no update endpoint; deletion is
 /// only allowed while nothing references the config.
+///
+/// Left unindexed on purpose: the request tables, `player_config_ratings` and
+/// `rating_run_residuals` have no index leading with the config, so the check
+/// below and the delete's foreign-key probes scan them. A delete is a rare
+/// admin act on an unused config, and an index would cost an entry on every
+/// request row and every fit (thirty-third audit, pass 1).
 async fn delete_player_config(
     State(state): State<AppState>,
     admin: AdminUser,
@@ -1489,16 +1510,23 @@ fn games_batch_field(mut err: AppError, unit: &str, games_per_unit: i32, batch: 
     err
 }
 
-/// Settings the schema cannot express and no worker or test could run with.
-///
-/// Each of these used to be accepted and fail later, far from the admin who
-/// typed it: a `games_per_batch` of 0 makes every claim generate the seed the
-/// previous claim already took, so the job retries a unique-index violation
-/// forever and dispatches nothing; a confidence of 100% puts a logarithm of
-/// zero in the test's interval, which then never closes. Every problem is
-/// reported at once, like registration does.
-/// The longest job name, in characters (the column's check).
-const MAX_JOB_NAME_CHARS: usize = 100;
+/// The longest name a job, player config or rating pool takes, in characters
+/// (each column's check).
+const MAX_NAME_CHARS: usize = 100;
+
+/// What is wrong with a name as stored (trimmed), if anything. Shown in every
+/// list that names it, in job settings and as a page title: a line, not a
+/// document, and nothing that breaks or hides in one. A player config's and a
+/// pool's name took any text until the thirty-third audit (pass 1).
+pub(crate) fn name_problem(name: &str) -> Option<String> {
+    if name.chars().count() > MAX_NAME_CHARS {
+        Some(format!("at most {MAX_NAME_CHARS} characters"))
+    } else if name.chars().any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')) {
+        Some("one line, with no control characters".into())
+    } else {
+        None
+    }
+}
 
 /// The job's name as stored: trimmed, empty when none was given.
 fn job_name(body: &CreateJobBody) -> String {
@@ -1528,15 +1556,18 @@ fn consensus_problems(mut err: AppError, consensus_pct: f64, min: i32, max: i32)
     err
 }
 
+/// Settings the schema cannot express and no worker or test could run with.
+///
+/// Each of these used to be accepted and fail later, far from the admin who
+/// typed it: a `games_per_batch` of 0 makes every claim generate the seed the
+/// previous claim already took, so the job retries a unique-index violation
+/// forever and dispatches nothing; a confidence of 100% puts a logarithm of
+/// zero in the test's interval, which then never closes. Every problem is
+/// reported at once, like registration does.
 fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
     let mut err = AppError::bad_request("job settings are invalid");
-    let name = job_name(body);
-    // Shown in every job list and as the job page's title: a line, not a
-    // document, and nothing that breaks or hides in one.
-    if name.chars().count() > MAX_JOB_NAME_CHARS {
-        err = err.with_field("name", format!("at most {MAX_JOB_NAME_CHARS} characters"));
-    } else if name.chars().any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')) {
-        err = err.with_field("name", "one line, with no control characters");
+    if let Some(problem) = name_problem(&job_name(body)) {
+        err = err.with_field("name", problem);
     }
     if !matches!(body.variant.as_str(), "classic" | "wordsmog") {
         err = err.with_field("variant", "must be 'classic' or 'wordsmog'");
@@ -2551,9 +2582,11 @@ async fn deactivate_job(
     let mut tx = state.pool.begin().await?;
     let before = load_job_for_update(&mut tx, id).await?;
     refuse_if_purged_since(&state, id, purges)?;
-    // Completion is final. Flipping a completed job to inactive would be a
-    // way around that rule: activation only refuses jobs that are *currently*
-    // completed, so deactivate-then-activate would restart it.
+    // Completion is final as far as the lifecycle actions go (only a purge,
+    // or an opening-rack job's consensus edit, takes a job out of it).
+    // Flipping a completed job to inactive would be a way around that rule:
+    // activation only refuses jobs that are *currently* completed, so
+    // deactivate-then-activate would restart it.
     if before.status == JobStatus::Completed {
         return Err(AppError::conflict("a completed job cannot be deactivated"));
     }
@@ -2614,7 +2647,10 @@ async fn complete_job(
     )
     .await?;
     tx.commit().await?;
-    // Completion is final: the job's finish-check counters are never read again.
+    // Nothing checks a completed job, so its finish-check counters go. Not
+    // final for an opening-rack job: a consensus edit that unsettles racks
+    // reopens it (and, force-completed mid-first-pass, it then resumes that
+    // pass; see `update_consensus`), and its counters start afresh.
     state.finish_checks.forget(id);
     super::worker::push_after_change(&state, id);
     Ok(Json(job))
@@ -2665,6 +2701,19 @@ struct ConsensusResult {
 /// starts after reads the new settings once this commits); then the job's
 /// row. Claims and submissions read the settings fresh rather than from the
 /// job's cached template, which keeps them as the job was created.
+///
+/// And under the hold a purge takes (`jobs::DispatchHolds`), on a task of its
+/// own ([`run_to_completion`]), for the same reasons: restating a full
+/// English job rewrites millions of rows, and for that long every claim
+/// considering the job waited out the dispatch lock's bounded wait on a pool
+/// connection, and every submission for one of its claims its five-second
+/// claim lock, which is how a purge used to fill the pool. With the hold,
+/// claims skip the job, those submissions are answered `503` at once, and a
+/// second edit, a purge or a lifecycle action meanwhile is a `409`. The hold
+/// is not counted as a purge (it is not one: the finish check's purge
+/// witness must not see it), and it always ends with the reclaim grace,
+/// committed or not: the job's claims outlive an edit, and their heartbeats
+/// were skipped while it held them.
 async fn update_consensus(
     State(state): State<AppState>,
     admin: AdminUser,
@@ -2675,13 +2724,32 @@ async fn update_consensus(
     ApiJson(body): ApiJson<ConsensusBody>,
 ) -> AppResult<Json<ConsensusResult>> {
     csrf::verify(&method, &headers, &jar)?;
-    let purges = refuse_while_purging(&state, id)?;
+    // Read before the hold is taken, for the check under the row lock below.
+    let purges = state.dispatch_holds.claims_holds_taken(id);
+    let hold = state
+        .dispatch_holds
+        .try_hold_claims_uncounted(id, state.cfg.heartbeat_timeout)
+        .ok_or_else(|| AppError::conflict(ALREADY_RUNNING))?;
+    run_to_completion(consensus_body(state, admin.0.id, id, body, purges, hold)).await
+}
 
+async fn consensus_body(
+    state: AppState,
+    admin_id: Uuid,
+    id: Uuid,
+    body: ConsensusBody,
+    purges: u64,
+    hold: crate::jobs::DispatchHold,
+) -> AppResult<Json<ConsensusResult>> {
     let mut tx = state.pool.begin().await?;
     crate::jobs::lock_job_dispatch(&mut tx, id).await?;
     lock_open_claims(&mut tx, id).await?;
     let job = load_job_for_update(&mut tx, id).await?;
-    refuse_if_purged_since(&state, id, purges)?;
+    // By count alone: the claims hold held now is this edit's own, and no
+    // other can be taken while it is.
+    if state.dispatch_holds.claims_holds_taken(id) != purges {
+        return Err(AppError::conflict(PURGED_WHILE_WAITING));
+    }
     if job.job_type != JobType::OpeningRack {
         return Err(AppError::bad_request("only an opening-rack job has consensus settings"));
     }
@@ -2750,7 +2818,7 @@ async fn update_consensus(
     audit::log_detail(
         &mut tx,
         "job.consensus_changed",
-        admin.0.id,
+        admin_id,
         "job",
         id.to_string(),
         Some(id),
@@ -2758,9 +2826,14 @@ async fn update_consensus(
     )
     .await?;
 
-    // A completed job with racks to analyse again goes back to work. The
-    // first pass is covered (a job completes only once every rack is
-    // settled), so what it hands out now are the unsettled racks.
+    // A completed job with racks to analyse again goes back to work. A job
+    // the server completed has its first pass covered (it completes only
+    // once every rack is settled), so what it hands out now are the
+    // unsettled racks. One an admin force-completed may not: `next_request`
+    // resumes its first pass where it stopped before it reissues anything.
+    // That is the behaviour as built; whether an edit should undo a
+    // force-complete at all is an open question (PLAN.md, "Editing the
+    // consensus").
     let mut reopened_inactive_reason = None;
     let reopened = job.status == JobStatus::Completed && unsettled > 0;
     if reopened {
@@ -2803,7 +2876,7 @@ async fn update_consensus(
         audit::log_status_change(
             &mut tx,
             if fits { "job.activated" } else { "job.deactivated" },
-            admin.0.id,
+            admin_id,
             id,
             "completed",
             if fits { "active" } else { "inactive" },
@@ -2816,6 +2889,10 @@ async fn update_consensus(
         .fetch_one(&mut *tx)
         .await?;
     tx.commit().await?;
+    // Released before the finish check: its purge witness takes a job whose
+    // claims are held for one being purged, and would roll the completion
+    // back. Not `committed()`: see above.
+    drop(hold);
 
     if job.status == JobStatus::Active {
         if reopened {
@@ -2844,6 +2921,9 @@ async fn update_consensus(
 /// Counted inside the same transaction as the deletion that follows, so it
 /// describes exactly what that statement removes. Cheap relative to the delete
 /// itself, and the only record of the job's size that survives it.
+/// `rack_standings` are an opening-rack job's `opening_rack_progress` rows
+/// (left out until the October 2026 audit), `rack_progress` a leave job's
+/// `leave_rack_progress`.
 async fn job_census(conn: &mut sqlx::PgConnection, job_id: Uuid) -> AppResult<String> {
     use sqlx::Row;
     let row = sqlx::query(
@@ -2855,6 +2935,7 @@ async fn job_census(conn: &mut sqlx::PgConnection, job_id: Uuid) -> AppResult<St
              (SELECT count(*) FROM leave_records r JOIN tasks t ON t.id = r.task_id
                WHERE t.job_id = $1)                                                AS leave_records,
              (SELECT count(*) FROM position_analysis_records WHERE job_id = $1)     AS positions,
+             (SELECT count(*) FROM opening_rack_progress WHERE job_id = $1)        AS rack_standings,
              (SELECT count(*) FROM leave_rack_progress WHERE job_id = $1)          AS rack_progress,
              (SELECT count(*) FROM leave_rack_staging WHERE job_id = $1)           AS staged_results,
              (SELECT count(*) FROM leave_generation_artifacts WHERE job_id = $1)   AS artifacts",
@@ -2865,12 +2946,13 @@ async fn job_census(conn: &mut sqlx::PgConnection, job_id: Uuid) -> AppResult<St
 
     Ok(format!(
         "tasks={} claims={} game_results={} leave_records={} positions={} \
-rack_progress={} staged_results={} artifacts={}",
+rack_standings={} rack_progress={} staged_results={} artifacts={}",
         row.get::<i64, _>("tasks"),
         row.get::<i64, _>("claims"),
         row.get::<i64, _>("game_results"),
         row.get::<i64, _>("leave_records"),
         row.get::<i64, _>("positions"),
+        row.get::<i64, _>("rack_standings"),
         row.get::<i64, _>("rack_progress"),
         row.get::<i64, _>("staged_results"),
         row.get::<i64, _>("artifacts"),
@@ -3078,8 +3160,11 @@ async fn purge_job(
     run_to_completion(purge_body(state, admin.0.id, id, hold)).await
 }
 
-const ALREADY_RUNNING: &str = "a purge or delete of this job is running; its result will show \
-     on the job's page and in the audit log when it finishes";
+const ALREADY_RUNNING: &str = "a purge, delete or consensus change of this job is running; its \
+     result will show on the job's page and in the audit log when it finishes";
+
+const PURGED_WHILE_WAITING: &str =
+    "the job was purged while this waited for it; look at it again before acting";
 
 /// The hold a purge or delete runs under, taken in the handler: claims skip
 /// the job while it runs, and submissions for its claims are answered at once
@@ -3098,7 +3183,8 @@ fn hold_for_purge_or_delete(state: &AppState, id: Uuid) -> AppResult<crate::jobs
 
 /// Activating, deactivating or completing a job being purged or deleted would
 /// wait out the whole operation on its row with a pool connection held --
-/// and completing it then finished a job the purge had just emptied.
+/// and completing it then finished a job the purge had just emptied. A job
+/// whose consensus is being changed is refused the same way, for the wait.
 /// Returns the job's purge count, for [`refuse_if_purged_since`].
 fn refuse_while_purging(state: &AppState, id: Uuid) -> AppResult<u64> {
     let taken = state.dispatch_holds.claims_holds_taken(id);
@@ -3116,14 +3202,13 @@ fn refuse_while_purging(state: &AppState, id: Uuid) -> AppResult<u64> {
 /// its hold by the time the waiter wakes.
 fn refuse_if_purged_since(state: &AppState, id: Uuid, taken: u64) -> AppResult<()> {
     if state.dispatch_holds.claims_holds_taken(id) != taken || state.dispatch_holds.claims_held(id) {
-        return Err(AppError::conflict(
-            "the job was purged while this waited for it; look at it again before acting",
-        ));
+        return Err(AppError::conflict(PURGED_WHILE_WAITING));
     }
     Ok(())
 }
 
-/// Runs a purge or a delete on a task of its own, and waits for it.
+/// Runs a purge, a delete or a consensus edit on a task of its own, and waits
+/// for it.
 ///
 /// Spawned so that a request dropped mid-way -- the load balancer's idle
 /// timeout, the admin closing the tab -- does not drop the transaction with
@@ -3604,7 +3689,8 @@ async fn list_derived_data(
                     concat_ws(', ', k.path || ' (' || k.tarball_date || ')',
                                     v.path || ' (' || v.tarball_date || ')',
                                     l.path || ' (' || l.tarball_date || ')') AS made_from,
-                    d.builder = CASE d.role WHEN 'wmp' THEN $1 ELSE $2 END AS buildable,
+                    d.builder = CASE d.role WHEN 'wmp' THEN $1 WHEN 'rit' THEN $2
+                                            WHEN 'wit' THEN $3 END AS buildable,
                     d.state, d.sha256, d.bytes, d.build_target, d.error, d.attempts,
                     d.requested_at, d.built_at
              FROM derived_data d
@@ -3615,6 +3701,7 @@ async fn list_derived_data(
         )
         .bind(state.builders.wmp())
         .bind(state.builders.rit())
+        .bind(state.builders.wit())
         .fetch_all(&state.pool)
         .await?,
     ))
@@ -3670,7 +3757,7 @@ async fn retry_derived_data(
            AND kwg_id = $4 AND klv_id IS NOT DISTINCT FROM $5 AND letterdist_id = $6
            -- A builder this version has: retried, any other row sat pending
            -- for good.
-           AND builder = CASE role WHEN 'wmp' THEN $7 ELSE $8 END",
+           AND builder = CASE role WHEN 'wmp' THEN $7 WHEN 'rit' THEN $8 WHEN 'wit' THEN $9 END",
     )
     .bind(&body.role)
     .bind(&body.name)
@@ -3680,6 +3767,7 @@ async fn retry_derived_data(
     .bind(letterdist_id)
     .bind(state.builders.wmp())
     .bind(state.builders.rit())
+    .bind(state.builders.wit())
     .execute(&mut *tx)
     .await?
     .rows_affected();
@@ -4103,6 +4191,9 @@ struct AuditRow {
     created_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// On the display pool: a filtered page and its count are sequential scans of
+/// the log (KL-32), so they take its statement timeout and stay off the
+/// connections claims and submissions use.
 async fn audit_log(
     State(state): State<AppState>,
     _admin: AdminUser,
@@ -4125,7 +4216,7 @@ async fn audit_log(
     .bind(query.job_id)
     .bind(limit)
     .bind(offset)
-    .fetch_all(&state.pool)
+    .fetch_all(&state.read_pool)
     .await?;
 
     let total = sqlx::query_scalar::<_, i64>(
@@ -4139,7 +4230,7 @@ async fn audit_log(
     .bind(query.actor_user_id)
     .bind(&query.target_type)
     .bind(query.job_id)
-    .fetch_one(&state.pool)
+    .fetch_one(&state.read_pool)
     .await?;
 
     Ok(Json(super::Page { items: rows, total, page: query.page.max(0), per_page: limit }))

@@ -748,7 +748,7 @@ async fn a_job_completes_on_the_batch_that_decides_and_not_before() {
     assert_eq!(test.status, TestStatus::Player1Better);
     assert_eq!(job_status(&db, job).await, "completed");
 
-    // I-STATS-9b: the verdict it completed on is stored with the completion,
+    // I-STATS-9e: the verdict it completed on is stored with the completion,
     // beside the live figures that results still in flight can go on moving.
     let (_, body) = send(&app, get_request(&format!("/api/jobs/{job}"), &[])).await;
     let decided = &body["games"]["decided"];
@@ -780,7 +780,7 @@ async fn a_job_whose_player_2_is_better_completes_saying_so() {
     assert_eq!(body["completion"]["reason"], json!("player2_better"), "{body}");
 }
 
-/// I-STATS-9h (no test): a job that runs no test plays to its target. A
+/// I-STATS-9g (no test): a job that runs no test plays to its target. A
 /// 90-10 batch past its floor -- one that completes a job with a test, above
 /// -- is just games played, and the batch that reaches `max_games` completes
 /// it, with no verdict stored and none reported.

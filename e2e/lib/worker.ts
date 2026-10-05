@@ -7,7 +7,7 @@ import { expect, type APIRequestContext } from '@playwright/test';
  * say.
  */
 
-const CLAIM = { magpie_version: '99.0.0', unsupported_jobs: [] as string[] };
+const CLAIM = { magpie_version: '99.0.0', board_dim: 15, rack_size: 7, unsupported_jobs: [] as string[] };
 
 export interface Assignment {
   worker_uuid: string;
@@ -47,15 +47,22 @@ export function syntheticResult(request: Assignment['task_request']) {
 
 /**
  * A brand-new anonymous worker's first claim, which is how an identity is
- * issued. Retried through "no work right now": the fake workers are taking
- * tasks from the same jobs.
+ * issued, of a task of `jobId`: every other job is sent as one this worker
+ * cannot run, as a worker sends a job it declined, so the claim cannot land
+ * on a seeded job of a type `syntheticResult` has no answer for. Retried
+ * through "no work right now": the fake workers are taking tasks from the
+ * same job.
  */
-export async function firstClaim(api: APIRequestContext): Promise<Assignment> {
+export async function firstClaim(api: APIRequestContext, jobId: string): Promise<Assignment> {
+  const jobs = (await (await api.get('/api/jobs?per_page=500')).json()) as { items: { id: string }[] };
+  const others = jobs.items.map((job) => job.id).filter((id) => id !== jobId);
   let assignment: Assignment | undefined;
   await expect
     .poll(
       async () => {
-        const response = await api.post('/api/worker/task', { data: CLAIM });
+        const response = await api.post('/api/worker/task', {
+          data: { ...CLAIM, unsupported_jobs: others }
+        });
         if (response.status() === 200) {
           const answer = await response.json();
           if (answer.claim_token) assignment = answer as Assignment;
@@ -65,6 +72,7 @@ export async function firstClaim(api: APIRequestContext): Promise<Assignment> {
       { timeout: 60_000, intervals: [1000] }
     )
     .toBe(true);
+  expect(assignment!.job_id, 'the claim is a task of the job asked for').toBe(jobId);
   return assignment!;
 }
 

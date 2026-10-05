@@ -25,7 +25,10 @@
 //! count that cannot correspond to any game, a truncated batch reported as
 //! complete.
 
-use super::handler::{Analysis, GameAggregate, InferenceSummary, MoveEntry, PlyStats, RackOccurrence};
+use super::handler::{
+    Analysis, GameAggregate, InferenceSummary, MoveEntry, PlayerSpec, PlyStats, PositionAnalysis,
+    RackOccurrence,
+};
 use crate::error::{AppError, AppResult};
 
 /// Tiles on a rack. Matches MAGPIE's `RACK_SIZE`; a submission naming more is
@@ -373,9 +376,12 @@ const MAX_FIDELITY_PLIES: i16 = 25;
 ///
 /// A static or simulated analysis carries no solver statistics; a pre-endgame
 /// solve's moves each carry a win percentage, a projected spread and the depth
-/// they were ranked at; an endgame solve reports the one move it chose, with
-/// its spread and depth and no win percentage. Anything else is not what
-/// MAGPIE writes, and stored, it would read as an analysis that never ran.
+/// they were ranked at; an endgame solve reports the one move its solve chose,
+/// with its spread and depth and no win percentage. Only a simulation's moves
+/// carry iterations or per-ply statistics: MAGPIE writes 0 iterations and no
+/// plies for a move it did not simulate, static or solved. Anything else is
+/// not what MAGPIE writes, and stored, it would read as an analysis that never
+/// ran.
 pub fn check_analysis(analysis: Analysis, moves: &[MoveEntry], context: &str) -> AppResult<()> {
     let solved = matches!(analysis, Analysis::Peg | Analysis::Endgame);
     if analysis == Analysis::Endgame && moves.len() != 1 {
@@ -385,6 +391,15 @@ pub fn check_analysis(analysis: Analysis, moves: &[MoveEntry], context: &str) ->
         )));
     }
     for entry in moves {
+        if analysis != Analysis::Sim
+            && (entry.iterations.is_some_and(|n| n > 0) || !entry.plies.is_empty())
+        {
+            return Err(AppError::bad_request(format!(
+                "{context}: a {} analysis of {:?} carries a simulation's iterations or plies",
+                analysis.as_str(),
+                entry.play
+            )));
+        }
         let has_solver_stats = entry.mean_spread.is_some() || entry.fidelity_plies.is_some();
         if !solved && has_solver_stats {
             return Err(AppError::bad_request(format!(
@@ -432,6 +447,72 @@ pub fn check_analysis(analysis: Analysis, moves: &[MoveEntry], context: &str) ->
                 )));
             }
             _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// A task's analyses against the players it was dispatched with: each one a
+/// player of the task could have run.
+///
+/// MAGPIE decides each turn from the mover's own settings (its
+/// `autoplay.c`): a solve when it has `endgame_plies` and the bag is empty
+/// (an endgame) or within its `peg_max_bag` (a pre-endgame), else a
+/// simulation when it has `num_plies`, else the static ranking; and an
+/// inference only before a simulation, and only with `use_inference`. An
+/// endgame solve searches no deeper than the `endgame_plies` it was given.
+/// Which seat moved is not something a position states, so the rule is
+/// against either player -- what neither could have run is impossible, which
+/// is the bar every rule here meets. The other way round is not: a simming
+/// player's turn can be static (a simulation with nothing to rank), and a
+/// solving one's is whatever its bag decides.
+///
+/// Iterations against `max_iterations` are deliberately not checked: an
+/// empty-bag simulation's sample limit is its number of plays, not the
+/// config's, so the bound would not hold.
+pub fn check_analyses_against_players(
+    positions: &[PositionAnalysis],
+    players: &[&PlayerSpec],
+    context: &str,
+) -> AppResult<()> {
+    let simulates = players.iter().any(|p| p.num_plies > 0);
+    // Sent as null for a static player; a simmer states it. Read as "might"
+    // unless it says no.
+    let infers = players.iter().any(|p| p.num_plies > 0 && p.use_inference != Some(false));
+    let deepest_endgame = players.iter().map(|p| p.endgame_plies).filter(|&d| d > 0).max();
+    let runs_peg = players.iter().any(|p| p.endgame_plies > 0 && p.peg_max_bag > 0);
+    let refuse = |position: &PositionAnalysis, why: &str| {
+        let at = match (position.game_index, position.turn_number) {
+            (Some(game), Some(turn)) => format!("game {game}, turn {turn}"),
+            _ => format!("rack {:?}", position.rack),
+        };
+        Err(AppError::bad_request(format!("{context} ({at}): {why}")))
+    };
+    for position in positions {
+        match position.analysis {
+            Analysis::Static => {}
+            Analysis::Sim if !simulates => {
+                return refuse(position, "a simulation, and no player of this task simulates");
+            }
+            Analysis::Sim => {}
+            Analysis::Peg if !runs_peg => {
+                return refuse(position, "a pre-endgame solve, and no player of this task runs one");
+            }
+            Analysis::Peg => {}
+            Analysis::Endgame => {
+                let Some(deepest) = deepest_endgame else {
+                    return refuse(position, "an endgame solve, and no player of this task solves one");
+                };
+                if position.moves.iter().any(|m| m.fidelity_plies.is_some_and(|d| i32::from(d) > deepest)) {
+                    return refuse(
+                        position,
+                        &format!("an endgame solved deeper than any player's {deepest} plies"),
+                    );
+                }
+            }
+        }
+        if position.inference.is_some() && !infers {
+            return refuse(position, "an inference, and no player of this task infers");
         }
     }
     Ok(())
@@ -710,6 +791,102 @@ mod tests {
         assert!(check_analysis(Peg, &[solved(1.0, -1, Some(50.0))], "x").is_err());
     }
 
+    /// U-PLAUS-7: only a simulation's moves carry iterations or per-ply
+    /// statistics. MAGPIE writes `iterations: 0` and no plies for a move it
+    /// did not simulate, static or solved.
+    #[test]
+    fn an_unsimulated_move_carries_no_iterations_or_plies() {
+        use super::Analysis::*;
+        let simulated = MoveEntry {
+            iterations: Some(400),
+            win_percentage: Some(55.0),
+            blended_utility: Some(0.5),
+            plies: vec![PlyStats { ply: 0, bingo_percentage: 10.0, average_score: 30.0 }],
+            ..move_entry(30, 31.5)
+        };
+        assert!(check_analysis(Sim, std::slice::from_ref(&simulated), "x").is_ok());
+        let unsimulated = MoveEntry { iterations: Some(0), ..move_entry(30, 31.5) };
+        assert!(check_analysis(Static, std::slice::from_ref(&unsimulated), "x").is_ok());
+        assert!(check_analysis(Static, &[MoveEntry { iterations: Some(1), ..unsimulated.clone() }], "x")
+            .is_err());
+        let plies_only = MoveEntry { plies: simulated.plies.clone(), ..unsimulated };
+        assert!(check_analysis(Static, &[plies_only], "x").is_err());
+        let solved_iterated = MoveEntry { iterations: Some(5), ..solved(12.0, 4, None) };
+        assert!(check_analysis(Endgame, &[solved_iterated], "x").is_err());
+        let peg_plies = MoveEntry { plies: simulated.plies, ..solved(12.0, 3, Some(62.5)) };
+        assert!(check_analysis(Peg, &[peg_plies], "x").is_err());
+    }
+
+    /// A player as the contract fixtures dispatch one (`assignment-games.json`'s
+    /// simming player 1), with its analysis settings set here.
+    fn player(num_plies: i32, use_inference: Option<bool>, endgame_plies: i32, peg_max_bag: i32) -> PlayerSpec {
+        let assignment: serde_json::Value =
+            serde_json::from_str(include_str!("../../../contract-fixtures/assignment-games.json"))
+                .unwrap();
+        let mut spec: PlayerSpec =
+            serde_json::from_value(assignment["task_request"]["player1"].clone()).unwrap();
+        spec.num_plies = num_plies;
+        spec.use_inference = use_inference;
+        spec.endgame_plies = endgame_plies;
+        spec.peg_max_bag = peg_max_bag;
+        spec
+    }
+
+    fn analysed(analysis: Analysis, moves: Vec<MoveEntry>) -> PositionAnalysis {
+        let mut position = PositionAnalysis::opening_rack("AEINRST".into(), moves, 40);
+        position.analysis = analysis;
+        position.game_index = Some(0);
+        position.turn_number = Some(3);
+        position
+    }
+
+    /// U-PLAUS-6: a position's analysis is one its task's players could have
+    /// run -- a simulation or an inference only if a player simulates (and
+    /// infers), a pre-endgame or endgame solve only if a player solves one,
+    /// and an endgame no deeper than the deepest `endgame_plies` -- checked
+    /// against either player, since a position does not say which seat moved.
+    /// A static analysis passes from any player: a simmer's turn can be static.
+    #[test]
+    fn an_analysis_is_one_the_tasks_players_could_run() {
+        use super::Analysis::*;
+        let check = |position: PositionAnalysis, players: &[&PlayerSpec]| {
+            check_analyses_against_players(&[position], players, "x")
+        };
+        let static_player = player(0, None, 0, 0);
+        let simmer = player(4, Some(false), 0, 0);
+        let inferrer = player(4, Some(true), 0, 0);
+        let solver = player(0, None, 6, 0);
+        let peg_solver = player(0, None, 6, 2);
+        let sim = || analysed(Sim, vec![MoveEntry { win_percentage: Some(50.0), ..move_entry(30, 31.5) }]);
+        let endgame = |depth| analysed(Endgame, vec![solved(12.0, depth, None)]);
+        let peg = || analysed(Peg, vec![solved(12.0, 3, Some(62.5))]);
+
+        // An opening rack from a static player cannot be a simulation.
+        assert!(check(sim(), &[&static_player]).is_err());
+        assert!(check(sim(), &[&simmer]).is_ok());
+        assert!(check(analysed(Static, vec![move_entry(30, 31.5)]), &[&simmer]).is_ok());
+        // Either seat will do.
+        assert!(check(sim(), &[&static_player, &simmer]).is_ok());
+
+        let mut inferred = sim();
+        inferred.inference = Some(InferenceSummary {
+            num_leaves: 3,
+            total_draws: 30,
+            average_equity: 12.0,
+            leaves: Vec::new(),
+        });
+        assert!(check(inferred.clone(), &[&simmer, &static_player]).is_err());
+        assert!(check(inferred, &[&simmer, &inferrer]).is_ok());
+
+        assert!(check(endgame(4), &[&simmer, &static_player]).is_err());
+        assert!(check(endgame(6), &[&simmer, &solver]).is_ok());
+        assert!(check(endgame(7), &[&simmer, &solver]).is_err(), "deeper than it was asked");
+        assert!(check(peg(), &[&simmer, &solver]).is_err(), "solves endgames, not pre-endgames");
+        assert!(check(peg(), &[&static_player, &peg_solver]).is_ok());
+        // `endgame_plies` 0 turns both solvers off, whatever `peg_max_bag` says.
+        assert!(check(peg(), &[&player(0, None, 0, 2)]).is_err());
+    }
+
     #[test]
     fn impossible_move_scores_are_rejected() {
         assert!(check_moves(&[move_entry(74, 80.0)], None, "x").is_ok());
@@ -879,8 +1056,8 @@ mod tests {
 /// submission once read a `position` field the request does not have and
 /// answered with a bare `{"moves": [...]}`, which no opening-rack job could
 /// ever accept. Every fixture here is the worker's own output, never written
-/// by hand: `testdata/README.md` has the command that regenerates each one,
-/// and each test repeats its own.
+/// by hand: `scripts/fake-worker-fixtures.sh` regenerates every one, and
+/// CI runs it with `--check`.
 #[cfg(test)]
 mod fixture_tests {
     use super::super::game::GameHandler;
@@ -890,7 +1067,11 @@ mod fixture_tests {
     };
     use super::super::leave_gen::LeaveGenHandler;
     use super::super::opening_rack::OpeningRackHandler;
-    use super::{check_batch_size, check_rack_occurrence_total, games_dispatched};
+    use super::super::handler::{Analysis, PlayerSpec};
+    use super::{
+        check_analyses_against_players, check_batch_size, check_rack_occurrence_total,
+        games_dispatched,
+    };
     use crate::error::{AppError, AppResult};
     use crate::stats::outcomes::Pentanomial;
     use serde_json::Value;
@@ -898,6 +1079,8 @@ mod fixture_tests {
     const GAMES: &str = include_str!("testdata/fake_worker_games.json");
     const GAMES_CAPTURED: &str = include_str!("testdata/fake_worker_games_captured.json");
     const GAME_PAIRS: &str = include_str!("testdata/fake_worker_game_pairs.json");
+    const GAME_PAIRS_DIVERGENCE: &str =
+        include_str!("testdata/fake_worker_game_pairs_divergence.json");
     const OPENING_RACK: &str = include_str!("testdata/fake_worker_opening_rack.json");
     const LEAVE_GENERATION: &str = include_str!("testdata/fake_worker_leave_generation.json");
     const STALE: &str = include_str!("testdata/fake_worker_stale.json");
@@ -963,12 +1146,19 @@ mod fixture_tests {
         serde_json::from_str(fixture).expect("a fixture is JSON")
     }
 
+    /// The players of the contract assignment a fixture answered, by the key
+    /// its `task_request` gives each (`player`, `player1`, `player2`).
+    fn players(assignment: &str, keys: &[&str]) -> Vec<PlayerSpec> {
+        let assignment: Value = serde_json::from_str(assignment).unwrap();
+        keys.iter()
+            .map(|key| serde_json::from_value(assignment["task_request"][key].clone()).unwrap())
+            .collect()
+    }
+    const ASSIGNMENT_GAMES: &str = include_str!("../../../contract-fixtures/assignment-games.json");
+
     /// U-FAKE-1: a `games` submission, plain and with captured positions.
     ///
-    /// Regenerate with:
-    /// `python3 worker/fake_worker.py --emit-fixture contract-fixtures/assignment-games.json`
-    /// and, for the captured one, the same with
-    /// `--override capture_positions=true --override num_games=1`.
+    /// Emitted by `scripts/fake-worker-fixtures.sh`, which says how.
     #[test]
     fn the_fake_workers_games_submission_passes_validation() {
         let record = games(json(GAMES), BATCH).unwrap();
@@ -980,15 +1170,31 @@ mod fixture_tests {
         assert!(record.positions.iter().all(|p| p.game_index == Some(0) && !p.moves.is_empty()));
         assert!(record.positions[0].previous_move.is_none(), "turn 0 follows nothing");
         assert!(record.positions[1].previous_move.is_some());
+        // Each turn as its mover analyses it: player 1 (who moves first in
+        // game 0) simulates, inferring as the fixture's override has it;
+        // player 2 ranks statically. As MAGPIE does, and as the server holds
+        // a result to (U-PLAUS-6).
+        let mut players = players(ASSIGNMENT_GAMES, &["player1", "player2"]);
+        players[0].use_inference = Some(true);
+        check_analyses_against_players(&record.positions, &[&players[0], &players[1]], "x").unwrap();
+        for position in &record.positions {
+            let simmer = position.turn_number.unwrap() % 2 == 0;
+            let expected = if simmer { Analysis::Sim } else { Analysis::Static };
+            assert_eq!(position.analysis, expected, "turn {:?}", position.turn_number);
+        }
+        assert!(record.positions.iter().any(|p| p.inference.is_some()), "player 1 infers");
+        // Without the override player 1 does not infer, and the same
+        // submission is refused.
+        players[0].use_inference = Some(false);
+        assert!(check_analyses_against_players(&record.positions, &[&players[0], &players[1]], "x")
+            .is_err());
     }
 
     /// U-FAKE-2: a `game_pairs` submission, including the pentanomial
     /// cross-checks -- which the fixture is shown to be exercising, not
     /// skipping, by breaking each one.
     ///
-    /// Regenerate with:
-    /// `python3 worker/fake_worker.py --emit-fixture contract-fixtures/assignment-games.json
-    /// --override job_type='"game_pairs"' --override game_pairs=true`
+    /// Emitted by `scripts/fake-worker-fixtures.sh`, which says how.
     #[test]
     fn the_fake_workers_game_pairs_submission_passes_the_pentanomial_cross_checks() {
         let record = game_pairs(json(GAME_PAIRS), BATCH).unwrap();
@@ -1020,10 +1226,33 @@ mod fixture_tests {
         assert!(error.message.contains("exactly half the games"), "{}", error.message);
     }
 
+    /// U-FAKE-2b: a `game_pairs` submission keeping first divergences, from the
+    /// captured pairs assignment (two static players): the pentanomial
+    /// cross-checks, the divergent subset against the whole (U-PLAUS-8), both
+    /// games' positions at each diverging pair's first divergence, and
+    /// positions its static players could have produced.
+    ///
+    /// Emitted by `scripts/fake-worker-fixtures.sh`, which says how.
+    #[test]
+    fn the_fake_workers_first_divergences_pass_validation() {
+        let assignment = include_str!("../../../contract-fixtures/assignment-game-pairs.json");
+        let pairs = serde_json::from_str::<Value>(assignment).unwrap()["task_request"]["num_games"]
+            .as_i64()
+            .unwrap() as i32;
+        let record = game_pairs(json(GAME_PAIRS_DIVERGENCE), pairs).unwrap();
+        let divergent = record.divergent_games.as_ref().expect("the subset is reported");
+        assert!(divergent.games > 0, "the fixture should have a pair that diverged");
+        super::super::game_pair::check_first_divergences(&record.positions, Some(divergent))
+            .unwrap();
+        assert_eq!(record.positions.len() as i32, divergent.games, "two per diverging pair");
+        let players = players(assignment, &["player1", "player2"]);
+        check_analyses_against_players(&record.positions, &[&players[0], &players[1]], "x").unwrap();
+        assert!(record.positions.iter().all(|p| p.analysis == Analysis::Static));
+    }
+
     /// U-FAKE-3: an `opening_rack` submission answers every requested rack.
     ///
-    /// Regenerate with:
-    /// `python3 worker/fake_worker.py --emit-fixture contract-fixtures/assignment-opening-rack.json`
+    /// Emitted by `scripts/fake-worker-fixtures.sh`, which says how.
     #[test]
     fn the_fake_worker_speaks_the_opening_rack_response_shape() {
         let response: PositionAnalysisResponse =
@@ -1031,17 +1260,21 @@ mod fixture_tests {
         let racks: Vec<&str> = response.racks.iter().map(|r| r.rack.as_str()).collect();
         // The racks of the assignment it answered, in order.
         assert_eq!(racks, ["AEINRST", "?AEILNT", "AABBCDE"]);
-        assert!(response.racks.iter().all(|r| !r.moves.is_empty() && r.num_moves.is_some()));
-        // And it must satisfy the plausibility rules it will be checked against.
+        assert!(response.racks.iter().all(|r| !r.moves.is_empty() && r.num_moves >= 1));
+        // And it must satisfy the plausibility rules it will be checked against,
+        // the assignment's simming player's analyses among them.
         let record = OpeningRackHandler::process_response(response).unwrap();
         assert_eq!(record.positions.len(), 3);
+        let assignment = include_str!("../../../contract-fixtures/assignment-opening-rack.json");
+        let player = &players(assignment, &["player"])[0];
+        check_analyses_against_players(&record.positions, &[player], "x").unwrap();
+        assert!(record.positions.iter().all(|p| p.analysis == Analysis::Sim));
     }
 
     /// U-FAKE-4: a `leave_generation` submission passes the occurrence rules,
     /// both the per-rack ones and the total against the task's games.
     ///
-    /// Regenerate with:
-    /// `python3 worker/fake_worker.py --emit-fixture contract-fixtures/assignment-leave-generation.json`
+    /// Emitted by `scripts/fake-worker-fixtures.sh`, which says how.
     #[test]
     fn the_fake_workers_leave_submission_passes_the_occurrence_rules() {
         let response: LeaveResponse = serde_json::from_str(LEAVE_GENERATION).unwrap();
@@ -1059,10 +1292,7 @@ mod fixture_tests {
     /// it; the variants that only make sense for a game result fall back to a
     /// body with no `racks` for the other two types.
     ///
-    /// Regenerate with, for each assignment (`game_pairs` from the games one,
-    /// with the two `--override`s above):
-    /// `python3 worker/fake_worker.py --mode malformed --emit-fixture
-    /// contract-fixtures/assignment-<type>.json`
+    /// Emitted by `scripts/fake-worker-fixtures.sh`, which says how.
     #[test]
     fn every_malformed_submission_is_rejected_for_the_rule_it_breaks() {
         const DECODE: &str = "malformed task response";
@@ -1134,8 +1364,7 @@ mod fixture_tests {
     /// token it never issued (`accepted: false`, nothing stored) needs the
     /// database, and is `tests/fake_worker.rs`, which posts this fixture.
     ///
-    /// Regenerate with:
-    /// `python3 worker/fake_worker.py --mode stale --emit-fixture contract-fixtures/assignment-games.json`
+    /// Emitted by `scripts/fake-worker-fixtures.sh`, which says how.
     #[test]
     fn a_stale_submission_differs_from_a_valid_one_only_in_its_token() {
         let body = json(STALE);
@@ -1155,8 +1384,7 @@ mod fixture_tests {
     /// only server-side outcome is the heartbeat timeout reclaiming the claim
     /// (`worker_api::a_claim_still_silent_after_the_grace_is_reclaimed`).
     ///
-    /// Regenerate with:
-    /// `python3 worker/fake_worker.py --mode abandon --emit-fixture contract-fixtures/assignment-games.json`
+    /// Emitted by `scripts/fake-worker-fixtures.sh`, which says how.
     #[test]
     fn an_abandoning_worker_submits_nothing() {
         assert_eq!(json(ABANDON), Value::Null);

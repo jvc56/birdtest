@@ -29,7 +29,6 @@ pub struct JobStats {
     pub tasks_completed: i64,
     pub tasks_available: i64,
     pub tasks_claimed: i64,
-    pub results_accepted: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub games: Option<GameStats>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -459,8 +458,7 @@ async fn compute_inner(conn: &mut PgConnection, job: &Job) -> AppResult<JobStats
              COUNT(*)                                            AS total,
              COUNT(*) FILTER (WHERE state = 'completed')         AS completed,
              COUNT(*) FILTER (WHERE state = 'available')         AS available,
-             COUNT(*) FILTER (WHERE state = 'claimed')           AS claimed,
-             COALESCE(SUM(accepted_count), 0)::bigint            AS accepted
+             COUNT(*) FILTER (WHERE state = 'claimed')           AS claimed
          FROM tasks WHERE job_id = $1",
     )
     .bind(job.id)
@@ -493,7 +491,6 @@ async fn compute_inner(conn: &mut PgConnection, job: &Job) -> AppResult<JobStats
 
     let tasks_total: i64 = counts.get("total");
     let tasks_completed: i64 = counts.get("completed");
-    let results_accepted: i64 = counts.get("accepted");
 
     let eta_seconds = estimate_eta(&mut *conn, job, &games, tasks_total, tasks_completed).await?;
     let (workers, other_workers) = worker_contributions_on(&mut *conn, job.id).await?;
@@ -528,7 +525,6 @@ async fn compute_inner(conn: &mut PgConnection, job: &Job) -> AppResult<JobStats
         tasks_completed,
         tasks_available: counts.get("available"),
         tasks_claimed: counts.get("claimed"),
-        results_accepted,
         games,
         opening_racks,
         leave_generation,

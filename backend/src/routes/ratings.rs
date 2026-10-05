@@ -250,24 +250,26 @@ struct HistoryPoint {
 /// A pool with an active job is refit every two minutes -- 720 runs a day, each
 /// with a row per member -- and this is a public page. Returning every run made
 /// its cost and its payload grow for the life of the pool: a month of one
-/// active job at ten members is over 200,000 points on every page view, for a
-/// chart a few hundred pixels wide.
+/// active job at ten members is over 200,000 points on every request. Sized for
+/// the ratings page's chart, a few hundred pixels wide; no page draws the
+/// history now, and the bound stays as the response's.
 const MAX_HISTORY_RUNS: i64 = 500;
 
-/// How many configs the history carries: the chart draws this many
-/// (`SERIES_CAP` in `frontend/src/lib/charts/ratingHistory.ts`).
+/// How many configs the history carries: the six series the ratings page's
+/// chart drew, kept as the response's bound now that only API callers read it.
 const HISTORY_CONFIGS: i64 = 6;
 
-/// The pool's rating history, oldest first: the chart's time axis. Snapshots per
-/// run rather than a mutated current value are what make this possible at all.
+/// The pool's rating history, oldest first. Snapshots per run rather than a
+/// mutated current value are what make this possible at all. API-only: the
+/// ratings page drew it as a chart until the chart was removed.
 ///
 /// Thinned to at most [`MAX_HISTORY_RUNS`] runs, evenly spaced over the pool's
-/// whole history, with the first and the newest always kept -- so the chart
+/// whole history, with the first and the newest always kept -- so a series
 /// still starts where the pool started and ends at the rating the page shows.
 ///
 /// Only the [`HISTORY_CONFIGS`] current members rated highest in the newest
-/// run: the chart draws no more. Every member's points went out on every view
-/// of this public page -- 9.5 MB at 100 members, a second of the display
+/// run. Every member's points went out on every view of what was then a
+/// public page -- 9.5 MB at 100 members, a second of the display
 /// pool's time, and forty at once answered `503` to other readers (the audit's
 /// pass 25) -- and a removed config could take one of the six places.
 async fn pool_history(
@@ -382,6 +384,8 @@ async fn create_pool(
     let mut err = AppError::bad_request("rating pool details are invalid");
     if body.name.trim().is_empty() {
         err = err.with_field("name", "must not be empty");
+    } else if let Some(problem) = super::admin::name_problem(body.name.trim()) {
+        err = err.with_field("name", problem);
     }
     if !matches!(body.variant.as_str(), "classic" | "wordsmog") {
         err = err.with_field("variant", "must be 'classic' or 'wordsmog'");
@@ -423,7 +427,9 @@ async fn create_pool(
              (name, variant, letterdist_id, layout_id, anchor_player_config_id, anchor_rating)
          VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
     )
-    .bind(&body.name)
+    // Trimmed, as a job's and a player config's are: stored as typed, "X"
+    // and "X " were two pools to the unique index and one to a reader.
+    .bind(body.name.trim())
     .bind(&body.variant)
     .bind(body.letterdist_id)
     .bind(body.layout_id)
@@ -624,8 +630,8 @@ struct UpdatePoolBody {
 /// The ratings are only defined up to where the anchor pins them, so this
 /// rescales everyone: the refit commits with the change, so the page never
 /// shows the new anchor beside ratings on the old scale. Past runs keep the
-/// scale they were fitted on, and the history chart steps at the change --
-/// which is what happened.
+/// scale they were fitted on, and the history steps at the change -- which is
+/// what happened.
 ///
 /// A new anchor that is not yet a member is added first: a pool's fixed point
 /// has to be in the pool, as `create_pool` makes it.

@@ -18,8 +18,11 @@ test.beforeAll(async ({ browser, playwright }) => {
   api = await AdminApi.open();
   const suffix = crypto.randomUUID().slice(0, 8);
   const [a, b] = [`e12-a-${suffix}`, `e12-b-${suffix}`];
-  await api.createStaticConfig(a, 'equity');
-  await api.createStaticConfig(b, 'score');
+  // Two simmers, so every position -- either player's turn -- was simulated:
+  // the fake workers shape a position as its mover's config would, as MAGPIE
+  // does, and a static player's carries no simulation statistics.
+  await api.createSimConfig(a);
+  await api.createSimConfig(b);
 
   const admin = await browser.newContext({ storageState: ADMIN_STATE });
   const form = await admin.newPage();
@@ -89,7 +92,7 @@ test('E-12: a signed-in user draws saved positions at random and searches them b
   await expect(shown.getByText('to move', { exact: true })).toHaveCount(1);
   const moves = shown.getByTestId('position-moves');
   expect(await moves.locator('tbody tr').count()).toBeGreaterThan(0);
-  // The fake workers simulate: each move's win percentage and its first two
+  // Both players simulate: each move's win percentage and its first two
   // plies' statistics, the reply's first.
   await expect(moves.locator('thead th')).toContainText(['Win %', 'P1-S', 'P1-BP', 'P2-S', 'P2-BP']);
   // The move played from here: named, marked in the list, and -- unless it

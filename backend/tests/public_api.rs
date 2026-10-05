@@ -168,7 +168,7 @@ async fn opening_rack_job(db: &TestDb, racks_per_batch: i32) -> Uuid {
 // Jobs
 // ---------------------------------------------------------------------------
 
-/// A-PUBLIC-1c: a job's full configuration is public -- the job's settings,
+/// A-PUBLIC-1e: a job's full configuration is public -- the job's settings,
 /// its type's (for a games job the test and its stopping rules) and every
 /// setting of each player config, with files by name and its own id to link
 /// to -- and names no one: no creator, no user id. An unknown job is a 404.
@@ -579,6 +579,7 @@ async fn the_filtered_feed_pages_through_a_contributors_claims() {
             let result = json!({
                 "racks": racks.iter().map(|rack| json!({
                     "rack": rack,
+                    "num_moves": 1,
                     "moves": [{ "move": "8G WUZ", "score": 30, "equity": 32.5 }],
                 })).collect::<Vec<_>>()
             });
@@ -684,6 +685,7 @@ async fn rack_lookup_finds_an_analysed_rack() {
     let result = json!({
         "racks": racks.iter().map(|rack| json!({
             "rack": rack,
+            "num_moves": 2,
             "moves": [
                 { "move": "8G WUZ", "score": 30, "equity": 32.5 },
                 { "move": "8H ZA", "score": 22, "equity": 21.0 },
@@ -751,6 +753,7 @@ async fn a_simulated_position_shows_its_plies_and_its_inference() {
     let cfg = state.cfg.clone();
     let app = birdtest::app(state);
     let job = capturing_games_job(&db).await;
+    db.simulate_player1(job, true).await;
     // Recording four plies, so the read is what keeps it to two.
     sqlx::query(
         "UPDATE player_configs SET num_plies_recorded = 4

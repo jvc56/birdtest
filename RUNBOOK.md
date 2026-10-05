@@ -5,7 +5,17 @@ Copy-pasteable procedures for the scenarios in
 explains why; this one is what to type at 2am. Read the whole procedure before starting any of it.
 
 Placeholders throughout: `$REGION` (default `us-east-1`), `$CLUSTER`
-(`birdtest`), `$BUCKET` (the `backups_bucket` Terraform output).
+(`birdtest`), `$BUCKET` (the `backups_bucket` Terraform output). Nothing below
+sets them, so set them first in every shell you paste into, on your machine
+from a checkout with the stack's Terraform state (the ops task has none of
+these; the blocks that run there say so):
+
+```bash
+REGION=$(terraform -chdir=infra output -raw region)
+CLUSTER=$(terraform -chdir=infra output -raw cluster_name)
+BUCKET=$(terraform -chdir=infra output -raw backups_bucket)
+echo "region=${REGION:?is not set} cluster=${CLUSTER:?is not set} bucket=${BUCKET:?is not set}"
+```
 
 **In bash.** Every block here is bash: in zsh, run `bash` first — stock zsh
 treats a `#` as a word, so a commented line fails, and an apostrophe in a
@@ -43,11 +53,20 @@ psql "$DATABASE_URL" -c "
 
 Purging or deleting a job writes a `*.census` row *before* it destroys
 anything, so `reason` holds the row counts that were about to be lost: that is
-the scope of the restore. Deleting an account anonymizes it and keeps its
+the scope of the restore. A job's census counts its `tasks`, `claims`,
+`game_results`, `leave_records`, `positions` (`position_analysis_records`),
+`rack_standings` (`opening_rack_progress`), `rack_progress`
+(`leave_rack_progress`), `staged_results` (`leave_rack_staging`) and
+`artifacts` (`leave_generation_artifacts`); the rows that hang off those
+(moves, plies, inference, request rows) and a leave job's per-generation
+bookkeeping are copied back with them by §2.2's table list, not counted.
+Deleting an account anonymizes it and keeps its
 claims and results; its census says which counts were destroyed (API keys,
 confirmation codes, reset tokens) and which were kept. No procedure here
 restores an account's name, address, password or keys: its owner registers
-again and makes new keys. Other
+again and makes new keys. Deleting a rating pool writes one too
+(`rating_pool.deleted.census`: the pool's name and how many members and runs
+went with it); §2.6 puts the pool back. Other
 destructive actions
 write their own row but no census — deleting input data (and the derived rows
 it takes) or a player config, an unban, a forced artifact rebuild — so for
@@ -55,10 +74,17 @@ those the query above shows what was done, not how much; a purge's or a
 job deletion's census does not count the data gaps and exports it also
 removes.
 
+What is restorable, and how old it is. The bucket from your machine:
+
 ```bash
 export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
-# What is restorable, and how old it is.
 aws s3 ls "s3://$BUCKET/pg/" | grep manifest | tail -5
+```
+
+and the `backups` table from the ops task (`scripts/prod-sql.sh`, or
+`scripts/prod-shell.sh`), which has `psql` but no `aws`:
+
+```bash
 psql "$DATABASE_URL" -c "SELECT finished_at, ok, dump_bytes, s3_key FROM backups ORDER BY finished_at DESC LIMIT 5"
 ```
 
@@ -1019,9 +1045,10 @@ only for an opening-rack job and
 `games_completed` only for a games or game-pairs job; the statement above leaves
 each at 0 for the job types that do not use it, which is what they hold anyway.
 
-Run `tasks_total`/`tasks_completed` before §2.4's state repair or after it, but
-not between the two `UPDATE tasks` statements above: `tasks_completed` counts
-tasks whose `state` is `completed`, which the second of those recomputes.
+The job's `tasks_total`/`tasks_completed` come after both `UPDATE tasks`
+statements above, and must stay after them if the block is run in pieces:
+`tasks_completed` counts tasks whose `state` is `completed`, which the second
+of those — the state repair — recomputes.
 
 **A purged job that had completed** comes back inactive with no verdict: a
 purge returns a completed job to inactive and clears the match-test verdict it was
@@ -1247,6 +1274,39 @@ before the mistake is activated again with the allocation it had: the
 with `{"allocation": N}` and the CSRF header (a different `N` changes the job's
 share). A job that was completed stays as §2.3 left it.
 
+### 2.6 A deleted rating pool
+
+Deleting a pool removes its `rating_pools` row and, by cascade, its members and
+every run with its ratings and residuals; the games stay in `game_results`,
+so the pool's evidence is intact. Put back the pool and its members from a
+copy, then refit: the ratings come back as a new run, and the old runs — the
+history endpoint's points — are not restored.
+
+1. Get a copy from before the deletion as §2.1 does — the nightly dump into
+   the ops shell's own scratch Postgres, or a PITR instance — and take the
+   pool's id from §0's query (`target_id` of its `rating_pool.deleted` row).
+2. Copy the two rows across, in one transaction. It refuses, and copies
+   nothing, if a pool of the same name has been made since (rename that one
+   first), or if its anchor or a member config has since been deleted
+   (restore that config first, or drop it from `/tmp/pool_members.csv`).
+
+```bash
+# Inside scripts/prod-shell.sh, after §2.1 (source /tmp/restore.env first).
+POOL=''   # the deleted pool's id
+if [[ "$POOL" =~ ^[0-9a-f]{8}-([0-9a-f]{4}-){3}[0-9a-f]{12}$ ]]; then
+  psql "$SCRATCH_URL" -X -v ON_ERROR_STOP=1 \
+    -c "\copy (SELECT * FROM rating_pools WHERE id = '$POOL') TO '/tmp/pool.csv' CSV" \
+    -c "\copy (SELECT * FROM rating_pool_members WHERE pool_id = '$POOL') TO '/tmp/pool_members.csv' CSV"
+  wc -l /tmp/pool.csv /tmp/pool_members.csv   # 1 pool line, one per member
+  psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 --single-transaction \
+    -c "\copy rating_pools FROM '/tmp/pool.csv' CSV" \
+    -c "\copy rating_pool_members FROM '/tmp/pool_members.csv' CSV"
+else echo "set POOL to the deleted pool's id first"; fi
+```
+
+3. Refit it: **Recompute** on the pool's page (`/ratings/<id>`, as an admin),
+   or `POST /api/admin/rating-pools/:id/recompute` with the CSRF header.
+
 ---
 
 ## 3. A missing or altered artifact
@@ -1314,11 +1374,33 @@ allowed to be newer than the database, never older (PLAN.md, "Artifacts: back up
 Do not declare it finished because the page loads.
 
 ```bash
-export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
-# 1. Row counts, against the manifest of the dump that was restored (after a
-#    dump restore, §2.1 or §5: STAMP is the dump's stamp. After §1's PITR there
-#    is no dump; skip this one).
-aws s3 cp "s3://$BUCKET/pg/$STAMP.manifest.json" - | python3 -m json.tool | head -40
+# 1. Row counts, against the manifest of the dump that was restored. After a
+#    dump restore only (§2.1 or §5); after §1's PITR there is no dump, so skip
+#    this one. Inside scripts/prod-shell.sh, where §2.1's first block fetched
+#    the dump's manifest to /tmp/manifest.json (the image has no python3 or
+#    jq, so the comparison is psql's), and before anything writes to the
+#    restored database. Point TARGET_URL at it: "$SCRATCH_URL" after §2.1
+#    (source /tmp/restore.env first), "$DATABASE_URL" after §5.
+#    Every row it prints is a table whose count differs; none is a pass.
+TARGET_URL=${TARGET_URL:-$DATABASE_URL}
+psql "$TARGET_URL" -v ON_ERROR_STOP=1 --set counts="$(cat /tmp/manifest.json)" <<'SQL'
+WITH want AS (
+  SELECT key AS relname, value::text::bigint AS n
+    FROM jsonb_each((:'counts'::jsonb)->'table_row_counts')
+), got AS (
+  -- Exact counts, as scripts/backup.sh takes them for the manifest.
+  SELECT c.relname,
+         (xpath('/row/c/text()',
+                query_to_xml(format('SELECT count(*) AS c FROM %I.%I', n.nspname, c.relname),
+                             false, true, '')))[1]::text::bigint AS n
+    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+   WHERE c.relkind = 'r' AND n.nspname = 'public'
+)
+SELECT relname AS table_name, want.n AS manifest, got.n AS restored
+  FROM want FULL JOIN got USING (relname)
+ WHERE want.n IS DISTINCT FROM got.n
+ ORDER BY 1;
+SQL
 ```
 
 ```sql
@@ -1524,8 +1606,8 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
    else echo "set REPLICA, MANIFEST, REPLICA_REGION and DR_REGION (step 1) first"; fi
    ```
 
-   This needs `kms:Decrypt` on the lost stack's `backups-dr` key (in
-   `$REPLICA_REGION`) and `kms:GenerateDataKey` and `kms:Decrypt` on the new
+   This needs `kms:Decrypt` on the lost stack's DR backups key (alias
+   `alias/birdtest-backups` in `$REPLICA_REGION`; `aws_kms_key.backups_dr`) and `kms:GenerateDataKey` and `kms:Decrypt` on the new
    stack's backups key; both keys leave that to IAM, so an administrator has
    it and a narrower role needs it granted. The copies take the new bucket's
    30-day Object Lock retention.
@@ -1817,6 +1899,32 @@ service keeps no healthy task through a deploy, so the site is down from the
 moment the bad task stops until the old one is healthy, and the `-down`
 alarms may fire and clear. Keep each release's three image tags (in its
 release notes, say): `prod.tfvars` holds only the current ones.
+
+**ECS may have rolled back already.** The service has a deployment circuit
+breaker (`infra/ecs.tf`): a release whose task fails to start three times --
+a configuration the backend refuses, its MAGPIE below `min_magpie_version`, a
+failed migration -- is abandoned, and ECS starts the last task definition that
+ran steadily, after a gap of however long the three attempts took. The site
+then runs the previous release, but Terraform's state still names the new
+task definition, so the next `apply` deploys the broken one again: do the
+steps below anyway, starting at step 2, before any other apply. To tell:
+
+```bash
+export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
+NAME=birdtest   # birdtest-dr for §5's copy
+aws ecs describe-services --region "$REGION" --cluster "$NAME" --services "$NAME" \
+  --query 'services[0].deployments[].[status,rolloutState,taskDefinition]' --output text
+aws ecs describe-services --region "$REGION" --cluster "$NAME" --services "$NAME" \
+  --query 'services[0].events[:10].[createdAt,message]' --output text
+```
+
+The `PRIMARY` deployment's task definition is the one running. A revision
+older than the release's, and events saying the deployment failed and is
+rolling back, are a rollback; the stopped tasks' `stoppedReason` (`aws ecs
+list-tasks --desired-status STOPPED`, then `describe-tasks`) and the backend's
+log say what failed. The breaker cannot help when what fails is
+shared by both releases -- an SSM value, the database -- or on a stack's first
+deployment, which has nothing to go back to: those keep retrying until fixed.
 
 1. If the release added a value to an enum the previous image reads -- a new
    job type, say -- deactivate every job using it first: the previous image

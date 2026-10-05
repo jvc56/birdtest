@@ -60,7 +60,8 @@ pub enum ClaimOutcome {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ShutdownDirective {
-    /// `data_out_of_date`, `magpie_too_old`, or `both`.
+    /// `data_out_of_date`, `magpie_too_old`, or `both` -- or `unsupported_build`,
+    /// which the claim route answers before any job is consulted.
     pub reason: String,
     pub message: String,
     pub required_tarball_dates: Vec<String>,
@@ -483,6 +484,8 @@ pub async fn reclaim_expired_for(
          UPDATE tasks t
          SET active_claim_count = GREATEST(t.active_claim_count - counts.n, 0),
              state = CASE
+                 -- Cannot hold under one slot (a task whose claim lapses has
+                 -- no accepted result): defence against a drifted counter.
                  WHEN t.accepted_count > 0 THEN 'completed'::task_state
                  WHEN GREATEST(t.active_claim_count - counts.n, 0) > 0 THEN 'claimed'::task_state
                  ELSE 'available'::task_state
@@ -1115,16 +1118,14 @@ async fn try_claim_from_job(
                         derived_data: derived,
                     }))
                 }
+                // Including a unique violation. The task was selected while
+                // `available`, under the job's dispatch lock and its own row
+                // lock, so the one-slot index refusing this claim means its
+                // state or counters drifted: re-running selection would pick
+                // the same task again. Fatal skips the job, loudly.
                 Err(err) => {
                     let _ = tx.rollback().await;
-                    // The per-identity partial unique index rejects a second
-                    // slot on the same task. That is not a failure -- this
-                    // worker already holds a slot there -- so re-run selection.
-                    Err(if err.is_unique_violation() {
-                        JobClaimError::Retry
-                    } else {
-                        JobClaimError::Fatal(err)
-                    })
+                    Err(JobClaimError::Fatal(err))
                 }
             }
         }
@@ -1348,6 +1349,7 @@ pub async fn release_claim(
         "UPDATE tasks t
          SET active_claim_count = GREATEST(t.active_claim_count - 1, 0),
              state = CASE
+                 -- Cannot hold under one slot, as in `reclaim_expired_for`.
                  WHEN t.accepted_count > 0 THEN 'completed'::task_state
                  WHEN GREATEST(t.active_claim_count - 1, 0) > 0 THEN 'claimed'::task_state
                  ELSE 'available'::task_state
