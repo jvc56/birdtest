@@ -284,7 +284,8 @@ pub async fn next_request(
 ///
 /// Under the job's dispatch lock, so the in-flight set cannot change under it
 /// -- and so what this costs, every other claim for the job waits on. It is
-/// bounded by the batch, not by the job:
+/// bounded by the batch and by what is open now, not by the job or its
+/// history:
 ///
 /// - **The preference looks at a window.** Only the first
 ///   [`REISSUE_WINDOW_BATCHES`] batches of candidates (unsettled, not in
@@ -298,6 +299,22 @@ pub async fn next_request(
 ///   and found nothing before taking any. Outside the window an unseen rack
 ///   is not looked for; within it, the window is the racks with the fewest
 ///   analyses, which is where the unseen ones are.
+/// - **The preference is a probe per rack, never a hash.** It is asked as a
+///   scalar subquery (`LIMIT 1`, then `IS NOT NULL`), not as `EXISTS`: an
+///   `EXISTS` may be planned as a hashed subplan, which reads every analysis
+///   the identity made in the job (every record of the job, in a generic
+///   plan) to answer for the window's racks. Postgres picks it when its
+///   statistics understate the records -- a database just restored, which
+///   has none, or autovacuum behind -- and it measured 1.2-2.0 s a claim for
+///   an identity with 300,000 analyses, 5.3 s with the table never analysed.
+///   A scalar subquery is never hashed.
+/// - **The in-flight racks are read from what is open.** A task not
+///   completed is `available` or `claimed`: the available reissues are found
+///   through the queue index, the claimed tasks through the open claims'
+///   index (one open claim each, `task_claims_one_slot_idx`; a first-pass
+///   task lists no racks). The seed index found every reissue the job had
+///   ever made and visited each to skip the completed ones -- a cost that
+///   grew with the reissue history, 27-44 ms at 200,000 of them.
 /// - **The in-flight racks are a hashed set.** `NOT IN` over the array's
 ///   `unnest` is a hashed subplan whatever plan the prepared statement
 ///   settles on. `<> ALL($array)` is hashed only in a custom plan, and a
@@ -309,14 +326,19 @@ async fn next_reissue(
     config: &OpeningRackConfig,
     identity: &WorkerIdentity,
 ) -> AppResult<Vec<String>> {
-    // In flight: the racks of every reissue not yet completed -- claimed, or
-    // given back and waiting to go out again. Reissues are the tasks past the
-    // end of the space, which the seed index finds without a walk over the
-    // job's first pass.
+    // In flight: the racks of every reissue not yet completed -- given back
+    // and waiting to go out again (`tasks_queue_idx`), or claimed
+    // (`task_claims_open_idx`: the fleet's open claims, which reclaiming
+    // already reads on every claim). Not `state <> 'completed'` over the seed
+    // index: that visited every reissue the job ever made.
     let in_flight: Vec<String> = sqlx::query_scalar(
-        "SELECT DISTINCT unnest(r.racks)
-         FROM tasks t JOIN opening_rack_requests r ON r.task_id = t.id
-         WHERE t.job_id = $1 AND t.seed >= $2 AND t.state <> 'completed'",
+        "SELECT DISTINCT unnest(r.racks) FROM opening_rack_requests r
+         WHERE r.racks IS NOT NULL AND r.task_id IN (
+             SELECT t.id FROM tasks t
+              WHERE t.job_id = $1 AND t.state = 'available' AND t.seed >= $2
+             UNION ALL
+             SELECT c.task_id FROM task_claims c
+              WHERE c.job_id = $1 AND c.state = 'claimed')",
     )
     .bind(job_id)
     .bind(config.total_racks)
@@ -332,11 +354,11 @@ async fn next_reissue(
              ORDER BY p.results, p.rack
              LIMIT $6
          ) w
-         ORDER BY EXISTS (
-                      SELECT 1 FROM position_analysis_records a
-                      JOIN task_claims c ON c.id = a.task_claim_id
-                      WHERE a.job_id = $1 AND a.game_index IS NULL AND a.rack = w.rack
-                        AND (c.claimed_by_user_id = $3 OR c.claimed_by_anon_uuid = $4)),
+         ORDER BY (SELECT 1 FROM position_analysis_records a
+                   JOIN task_claims c ON c.id = a.task_claim_id
+                   WHERE a.job_id = $1 AND a.game_index IS NULL AND a.rack = w.rack
+                     AND (c.claimed_by_user_id = $3 OR c.claimed_by_anon_uuid = $4)
+                   LIMIT 1) IS NOT NULL,
                   w.results, w.rack
          LIMIT $5",
     )

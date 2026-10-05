@@ -16,8 +16,9 @@
 
 <h1 class="mb-2 text-2xl font-semibold">Fleet</h1>
 <p class="mb-6 text-sm text-muted-foreground">
-  What contributors completed work with over the last seven days, and hold work with now (a claim
-  that lapsed or was declined is not counted). This is the evidence for raising a job's
+  What contributors completed work with over the last seven days, and hold work with now from
+  claims made in that week (a claim that lapsed or was declined is not counted, nor one still open
+  from before the week). This is the evidence for raising a job's
   minimum MAGPIE version: keeping birdtest's pinned data in step with what released MAGPIE installs
   is a human decision, and this is half of what it is made from — the other half is each job's data
   gaps.

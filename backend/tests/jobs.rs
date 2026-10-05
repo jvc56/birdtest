@@ -480,9 +480,10 @@ async fn a_leave_job_takes_a_bingo_bonus_and_no_sim_cutoff() {
 
 /// I-JOB-2: `validate_shared_player_options` reads the two stored configs --
 /// the regression guard for the renamed `winpct_id` column. Two simmers on the
-/// same win% model row are accepted; on different rows they are refused; two
-/// configs with different `movegen_margin` are refused. For both job types
-/// that have two players.
+/// same win% model row are accepted; on different rows they are refused. Two
+/// configs with different `movegen_margin` are accepted: autoplay generates
+/// with a margin of 0 whatever the player says, so the margin changes nothing
+/// a games job plays. For both job types that have two players.
 #[tokio::test]
 async fn two_players_must_share_the_run_wide_settings_magpie_cannot_vary() {
     let db = TestDb::new().await;
@@ -511,14 +512,10 @@ async fn two_players_must_share_the_run_wide_settings_magpie_cannot_vary() {
             "{refused}"
         );
 
-        let (status, refused) = admin.create_job(body(ld, layout, margin_5, margin_7)).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
-        assert!(
-            refused["message"].as_str().unwrap().contains("disagree on movegen_margin"),
-            "{refused}"
-        );
+        let (status, created) = admin.create_job(body(ld, layout, margin_5, margin_7)).await;
+        assert_eq!(status, StatusCode::CREATED, "margins autoplay never reads: {created}");
     }
-    assert_eq!(job_count(&db).await, 2, "only the two accepted jobs exist");
+    assert_eq!(job_count(&db).await, 4, "only the four accepted jobs exist");
 }
 
 /// I-JOB-3: `validate_player_compatibility` reads the players' real
@@ -693,6 +690,52 @@ async fn a_games_or_pairs_jobs_counts_are_held_by_the_schema() {
     }
 }
 
+/// I-JOB-1g: a job's bingo bonus is 0 to 500, at creation and in the schema.
+/// The plausibility rules' score bounds are absolute, set for an ordinary
+/// bonus, so a bonus in the thousands (a typo of 5000 for 50) made every honest
+/// batch implausible and wedged the job.
+#[tokio::test]
+async fn a_jobs_bingo_bonus_is_bounded() {
+    let db = TestDb::new().await;
+    let admin = Admin::new(&db, db.state().await).await;
+    let (ld, layout) = board(&db).await;
+    let kwg = db.input_data("kwg", "NWL23").await;
+    let klv = db.input_data("klv", "NWL23").await;
+    let p1 = admin.static_player("p1", kwg, klv, json!({})).await;
+    let p2 = admin.static_player("p2", kwg, klv, json!({})).await;
+    let with_bonus = |bonus: i32| {
+        let mut body = games_body(ld, layout, p1, p2);
+        body["bingo_bonus"] = json!(bonus);
+        body
+    };
+
+    for bonus in [-1, 501, 5000] {
+        let (status, refused) = admin.create_job(with_bonus(bonus)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bonus}: {refused}");
+        assert_eq!(refused["fields"][0]["field"], "bingo_bonus", "{refused}");
+    }
+    assert_eq!(job_count(&db).await, 0);
+    let mut job = Uuid::nil();
+    for bonus in [0, 500] {
+        let (status, created) = admin.create_job(with_bonus(bonus)).await;
+        assert_eq!(status, StatusCode::CREATED, "{bonus}: {created}");
+        assert_eq!(created["job"]["bingo_bonus"], json!(bonus), "{created}");
+        job = created["job"]["id"].as_str().unwrap().parse().unwrap();
+    }
+
+    for bonus in [-1, 501] {
+        let err = sqlx::query("UPDATE jobs SET bingo_bonus = $2 WHERE id = $1")
+            .bind(job)
+            .bind(bonus)
+            .execute(&db.pool)
+            .await
+            .expect_err("the schema bounds the bonus");
+        let db_err = err.as_database_error().expect("a database error");
+        assert_eq!(db_err.code().as_deref(), Some("23514"), "{bonus}: {db_err}");
+        assert_eq!(db_err.constraint(), Some("jobs_bingo_bonus_check"), "{bonus}");
+    }
+}
+
 /// A games job between two static players, created through the API.
 async fn api_games_job(db: &TestDb, admin: &Admin) -> Uuid {
     let (ld, layout) = board(db).await;
@@ -705,11 +748,14 @@ async fn api_games_job(db: &TestDb, admin: &Admin) -> Uuid {
     created["job"]["id"].as_str().unwrap().parse().unwrap()
 }
 
-/// `(status, allocation, activated_at IS NOT NULL, deactivated_at IS NOT NULL)`.
+/// `(status, allocation, activated_at IS NOT NULL, deactivated on record)`. A
+/// deactivation's only record is its audit row, which says who and when.
 async fn lifecycle(db: &TestDb, job: Uuid) -> (String, Option<i32>, bool, bool) {
     sqlx::query_as(
-        "SELECT status::text, allocation, activated_at IS NOT NULL, deactivated_at IS NOT NULL
-         FROM jobs WHERE id = $1",
+        "SELECT status::text, allocation, activated_at IS NOT NULL,
+                EXISTS (SELECT 1 FROM audit_log a
+                        WHERE a.job_id = j.id AND a.action = 'job.deactivated')
+         FROM jobs j WHERE id = $1",
     )
     .bind(job)
     .fetch_one(&db.pool)

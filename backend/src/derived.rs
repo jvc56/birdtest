@@ -18,10 +18,11 @@
 //!
 //! **Why a job waits for this.** A job whose derived files are not built yet is
 //! not dispatched, the same way a leave-generation job waits for its universe
-//! to be seeded. Dispatching without the hash would mean either sending no
-//! `derived` entry -- so the worker falls back to the old unchecked behaviour,
-//! quietly -- or sending an entry with nothing in it. Waiting is the only
-//! option that cannot be mistaken for success.
+//! to be seeded. Dispatching without the hash would mean a claim carrying no
+//! hash for a file its player asks for, which MAGPIE refuses
+//! (`derived_mismatch`) and which sets the job aside for the run on every
+//! worker that claims it. Waiting is the only option that costs the fleet
+//! nothing.
 
 use crate::artifacts::ArtifactStore;
 use crate::error::{AppError, AppResult};

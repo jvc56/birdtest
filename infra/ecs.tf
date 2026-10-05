@@ -519,3 +519,47 @@ resource "aws_ecs_service" "main" {
   depends_on = [aws_lb_listener.https]
   tags       = local.tags
 }
+
+# The circuit breaker's rollback, said out loud. Three failed launches usually
+# finish inside the `-down` alarms' ten minutes and the old revision is healthy
+# again, and `apply` has already returned, so without this nothing says the
+# release is not live -- while Terraform's state still names it (the next apply
+# of any kind redeploys it), the derived-data builder's schedule runs it (the
+# family's latest revision, derived.tf), and the nightly dumps' manifests name
+# its image. ECS sends SERVICE_DEPLOYMENT_FAILED when the breaker trips, with
+# the service's ARN (`id`) as the event's resource. A local, not inline, so
+# that S-TF-3 can read the pattern at plan time: the ARN is not known until
+# apply, and an encoded pattern holding it is unknown as a whole.
+locals {
+  deploy_failed_pattern = {
+    source      = ["aws.ecs"]
+    detail-type = ["ECS Deployment State Change"]
+    resources   = [aws_ecs_service.main.id]
+    detail = {
+      eventName = ["SERVICE_DEPLOYMENT_FAILED"]
+    }
+  }
+}
+
+resource "aws_cloudwatch_event_rule" "deploy_failed" {
+  name        = "${local.name}-deploy-failed"
+  description = "A deployment of the web service failed and ECS rolled it back (circuit breaker)"
+
+  event_pattern = jsonencode(local.deploy_failed_pattern)
+
+  tags = local.tags
+}
+
+resource "aws_cloudwatch_event_target" "deploy_failed" {
+  rule      = aws_cloudwatch_event_rule.deploy_failed.name
+  target_id = "sns"
+  arn       = aws_sns_topic.alerts.arn
+
+  input_transformer {
+    input_paths = {
+      reason     = "$.detail.reason"
+      deployment = "$.detail.deploymentId"
+    }
+    input_template = "\"birdtest deploy FAILED and ECS rolled the service back to the previous release: <reason> (<deployment>). Terraform's state still names the failed release, so the next apply deploys it again, and until then the derived-data builder runs it: follow RUNBOOK.md, Rolling back a deploy, from step 2, before any other apply. The stopped tasks and the CloudWatch log group ${aws_cloudwatch_log_group.main.name} say what failed.\""
+  }
+}

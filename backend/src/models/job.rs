@@ -86,7 +86,6 @@ pub struct Job {
     /// an hour from it (`scheduler::JOIN_SETTLE`); the ETA's rate is measured
     /// from it.
     pub activated_at: Option<DateTime<Utc>>,
-    pub deactivated_at: Option<DateTime<Utc>>,
 }
 
 impl Job {

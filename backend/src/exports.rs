@@ -646,10 +646,11 @@ async fn mark_ready(
     //
     // The job's status is read `FOR SHARE`, which waits out a transaction
     // changing it and then reads what that committed. A consensus edit
-    // reopening the job demotes its final exports (`unfinalize`) before it
-    // commits; a plain read here, between that statement and the commit,
-    // still saw `completed`, and stored this export final for a job that
-    // was active again.
+    // reopening the job demotes its final exports and fails its running ones
+    // (`unfinalize`) before it commits; a plain read here, between that
+    // statement and the commit, still saw `completed`, and stored this export
+    // final for a job that was active again. Waiting, it re-reads this row as
+    // the edit left it, `failed`, and matches nothing.
     let marked = sqlx::query(
         "UPDATE job_exports
          SET state = 'ready', artifact_key = $2, bytes = $3, sha256 = $4,
@@ -773,15 +774,32 @@ pub async fn purge(conn: &mut sqlx::PgConnection, job_id: Uuid) -> AppResult<Vec
 /// A reopened job's final exports become snapshots: each is still the corpus
 /// as of its `snapshot_at`, but no longer the finished job's, which the job
 /// will have again once it completes. Left final, `newest_ready` would serve
-/// the old corpus as the completed job's once it completed again. An export
-/// still building when the job reopened is marked final only if the job is
-/// still completed when it finishes (`mark_ready`, which waits for the
-/// reopening to commit).
+/// the old corpus as the completed job's once it completed again.
+///
+/// An export still building fails, and is to be taken again. Its snapshot may
+/// have been read while the job was completed, and the job can complete again
+/// before the export finishes -- a large corpus uploads for minutes, an edit
+/// that unsettles a handful of racks is re-completed within one reissue's
+/// analysis -- and `mark_ready`, reading the job completed once more, stored
+/// the corpus from before the edit as the final one: what every download of
+/// the completed job was redirected to until someone exported it again.
+/// Failed here, its `mark_ready` matches no row and removes its objects. (That update reads the job's row `FOR SHARE`
+/// before it locks its own, so one waiting on the reopening re-reads this
+/// row once it commits rather than deadlocking with it.)
 pub async fn unfinalize(conn: &mut sqlx::PgConnection, job_id: Uuid) -> AppResult<()> {
     sqlx::query("UPDATE job_exports SET is_final = FALSE WHERE job_id = $1 AND is_final")
         .bind(job_id)
-        .execute(conn)
+        .execute(&mut *conn)
         .await?;
+    sqlx::query(
+        "UPDATE job_exports
+         SET state = 'failed', completed_at = now(),
+             error = 'the job reopened while this export was building: export it again'
+         WHERE job_id = $1 AND state = 'running'",
+    )
+    .bind(job_id)
+    .execute(&mut *conn)
+    .await?;
     Ok(())
 }
 

@@ -179,7 +179,7 @@
 <form class="card max-w-2xl space-y-4" on:submit|preventDefault={submit} on:input={() => { if (fromSubmit) { error = ''; fromSubmit = false; } }}>
   <div>
     <label class="label" for="name">Name</label>
-    <input id="name" class="input" bind:value={name} placeholder="simmer-NWL23-4ply" required />
+    <input id="name" class="input" bind:value={name} placeholder="simmer-NWL23-4ply" maxlength="100" required />
   </div>
 
   <div class="grid grid-cols-2 gap-3">
@@ -432,7 +432,7 @@
         <label class="label" for="mmargin">Movegen Margin (-mmargin)</label>
         <input id="mmargin" type="number" step="any" class="input" bind:value={movegenMargin} />
         <p class="mt-1 text-xs text-muted-foreground">
-          Shared across both players in a job, same as win% model.
+          Used only by an opening-rack job with the equity recorder; games play with a margin of 0.
         </p>
       </div>
     </div>

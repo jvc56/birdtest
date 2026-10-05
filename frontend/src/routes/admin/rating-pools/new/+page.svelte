@@ -104,7 +104,7 @@
 <form class="card max-w-2xl space-y-4" on:submit|preventDefault={submit} on:input={() => { if (fromSubmit) { error = ''; fromSubmit = false; } }}>
   <div>
     <label class="label" for="name">Pool name</label>
-    <input id="name" class="input" bind:value={name} required placeholder="e.g. CSW24 static and 1-ply" />
+    <input id="name" class="input" bind:value={name} maxlength="100" required placeholder="e.g. CSW24 static and 1-ply" />
   </div>
 
   <div class="grid grid-cols-3 gap-3">

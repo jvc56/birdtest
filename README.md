@@ -843,8 +843,13 @@ has no default — it is the backend image built with `--target derived-builder`
 and it must carry the same MAGPIE as `backend_image`, since the builder version
 recorded beside every hash comes from the binary that produced it.
 
-The three images are built from this repository and pushed to a registry of
-your choice (Terraform creates none), at one tag per release:
+The three images are built from this repository and pushed, at one tag per
+release, to ECR in any region (Terraform creates no repository; the task
+execution role's managed policy covers the pull, and a repository in another
+account must also admit this one in its own policy) or to a public registry. A
+private registry elsewhere — a private GHCR or Docker Hub repository — needs
+`repositoryCredentials`, which the task definitions do not set: every task
+would fail with `CannotPullContainerError`.
 
 ```bash
 docker build --pull --platform linux/amd64 -f docker/Dockerfile --target backend         -t $REGISTRY/birdtest-backend:$TAG .
@@ -867,7 +872,9 @@ A release whose task fails to start three times is rolled back by ECS (the
 service's deployment circuit breaker) to the last task definition that ran
 steadily, and `apply` does not wait to see it: Terraform's state still names
 the new one, and the next apply deploys it again. RUNBOOK.md, "Rolling back a
-deploy", says how to tell and what to do.
+deploy", says how to tell and what to do. The rollback mails the alerts
+topic (`birdtest-deploy-failed`, with ECS's reason), so it is not noticed only
+by looking.
 
 **Check that the alarms reach you** after the first apply (once the SNS
 subscription is confirmed), and after any change to the alerts topic: nothing
@@ -900,6 +907,25 @@ aws ecs run-task --region "$REGION" --cluster "$(tfout cluster_name)" \
 
 Then `AWS/Events` `TriggeredRules` for `birdtest$SUFFIX-backup-failed` is 1 and
 its `FailedInvocations` 0. (RUNBOOK §5 runs the same checks with `SUFFIX=-dr`.)
+
+A deploy the circuit breaker rolls back mails the same topic, through the
+`birdtest$SUFFIX-deploy-failed` rule. ECS's deployment events cannot be sent by
+hand (`aws.ecs` is AWS's own source), so check instead that the rule's pattern
+matches a failed deployment of the live service; delivery is the backup
+mail's, through the same topic and policy:
+
+```bash
+export AWS_PAGER=""
+SERVICE=$(aws ecs describe-services --region "$REGION" --cluster "$(tfout cluster_name)" \
+  --services "birdtest$SUFFIX" --query 'services[0].serviceArn' --output text)
+aws events test-event-pattern --region "$REGION" \
+  --event-pattern "$(aws events describe-rule --region "$REGION" --name "birdtest$SUFFIX-deploy-failed" \
+     --query EventPattern --output text)" \
+  --event "$(jq -nc --arg s "$SERVICE" --arg r "$REGION" '{id: "1", account: "123456789012",
+     source: "aws.ecs", time: "2026-01-01T00:00:00Z", region: $r, resources: [$s],
+     "detail-type": "ECS Deployment State Change", detail: {eventName: "SERVICE_DEPLOYMENT_FAILED"}}')"
+# "Result": true
+```
 
 **SES starts in the sandbox.** A new account's SES sends only to verified
 addresses, so until [production access](https://docs.aws.amazon.com/ses/latest/dg/request-production-access.html)

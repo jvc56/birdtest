@@ -511,16 +511,20 @@ mod tests {
     /// production runs on (`ecs.tf` and `derived.tf` always set the variable),
     /// and a raise that missed it passed CI -- tier 5 checks the compose value
     /// only -- and left production admitting the builds the raise was meant to
-    /// keep out (thirty-third audit, pass 1).
+    /// keep out (thirty-third audit, pass 1). `backend/.env.example` is the
+    /// copy a backend run on the host starts from (README, "Without Docker").
     #[test]
     fn every_copy_of_the_version_floor_agrees() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-        let read = |path: &str| {
-            std::fs::read_to_string(root.join(path)).unwrap_or_else(|e| panic!("{path}: {e}"))
-        };
+        // Compiled in, not read at run time: a unit test reads no file, and
+        // cargo rebuilds this one when any of them changes.
+        macro_rules! source {
+            ($path:literal) => {
+                include_str!(concat!("../../", $path))
+            };
+        }
         let floor = DEFAULT_MIN_MAGPIE_VERSION;
 
-        let tf = read("infra/variables.tf");
+        let tf = source!("infra/variables.tf");
         let block = tf
             .split(r#"variable "min_magpie_version""#)
             .nth(1)
@@ -533,24 +537,33 @@ mod tests {
             .collect();
         assert_eq!(default, [floor], "infra/variables.tf");
         assert_eq!(versions_after(block, "(MIN_MAGPIE_VERSION). "), [floor], "its description");
-        for tf in ["infra/ecs.tf", "infra/derived.tf"] {
+        for (tf, text) in [
+            ("infra/ecs.tf", source!("infra/ecs.tf")),
+            ("infra/derived.tf", source!("infra/derived.tf")),
+        ] {
             assert!(
-                read(tf).contains(r#"{ name = "MIN_MAGPIE_VERSION", value = var.min_magpie_version }"#),
+                text.contains(r#"{ name = "MIN_MAGPIE_VERSION", value = var.min_magpie_version }"#),
                 "{tf} sets the floor from the variable"
             );
         }
 
-        for (path, prefix, copies) in [
-            ("docker-compose.yml", "MIN_MAGPIE_VERSION:-", 2),
-            ("docker-compose.e2e.yml", "MIN_MAGPIE_VERSION: ", 1),
-            ("scripts/e2e_magpie_native.sh", "MIN_MAGPIE_VERSION=", 1),
+        for (path, text, prefix, copies) in [
+            ("docker-compose.yml", source!("docker-compose.yml"), "MIN_MAGPIE_VERSION:-", 2),
+            ("docker-compose.e2e.yml", source!("docker-compose.e2e.yml"), "MIN_MAGPIE_VERSION: ", 1),
+            (
+                "scripts/e2e_magpie_native.sh",
+                source!("scripts/e2e_magpie_native.sh"),
+                "MIN_MAGPIE_VERSION=",
+                1,
+            ),
+            ("backend/.env.example", source!("backend/.env.example"), "MIN_MAGPIE_VERSION=", 1),
         ] {
-            assert_eq!(versions_after(&read(path), prefix), vec![floor; copies], "{path}");
+            assert_eq!(versions_after(text, prefix), vec![floor; copies], "{path}");
         }
 
-        let migration = read("backend/migrations/0001_initial.sql");
+        let migration = source!("backend/migrations/0001_initial.sql");
         let part = |column: &str| {
-            let found = versions_after(&migration, &format!("{column} INT NOT NULL DEFAULT "));
+            let found = versions_after(migration, &format!("{column} INT NOT NULL DEFAULT "));
             assert_eq!(found.len(), 1, "{column}: {found:?}");
             found[0]
         };
@@ -558,7 +571,7 @@ mod tests {
         assert_eq!(columns.join("."), floor, "the jobs table's column defaults");
 
         assert!(
-            read("scripts/dev.py").contains(&format!("({floor} by default)")),
+            source!("scripts/dev.py").contains(&format!("({floor} by default)")),
             "scripts/dev.py's note on the production floor"
         );
     }

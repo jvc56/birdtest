@@ -13,6 +13,9 @@ use uuid::Uuid;
 /// Tiles on a full rack. Leave generation observes full racks, never leaves,
 /// and MAGPIE's `RACK_SIZE` is the same seven: a claim states its build's, and
 /// one of another size is sent away (`unsupported_build`, `routes::worker`).
+/// The server's only copy: job creation bounds an opening-rack job's
+/// `rack_size` by it and plausibility bounds a submitted rack by it (the
+/// schema's `CHECK (rack_size BETWEEN 1 AND 7)` is its SQL mirror).
 pub const RACK_SIZE: usize = 7;
 
 /// The name the server hands MAGPIE for a generation's files inside a scratch
@@ -1404,10 +1407,11 @@ pub async fn ensure_universe(
     Ok(())
 }
 
-/// Close out a generation: derive leave values from `leave_rack_progress`'s
-/// full-rack means as MAGPIE does (see `klv::FullRackLeaves`), build the
-/// generation's KLV, and store the artifact. The next generation's rack
-/// universe is seeded when a claim first asks for work in it.
+/// Close out a generation: write `leave_rack_progress`'s per-rack sums to a
+/// CSV and have the pinned MAGPIE build the generation's KLV from them
+/// (`convert rackequity2klv`, see `generation_klv`), and store the artifact.
+/// The next generation's rack universe is seeded when a claim first asks for
+/// work in it.
 pub async fn run_transition(
     state: &crate::state::AppState,
     job_id: Uuid,

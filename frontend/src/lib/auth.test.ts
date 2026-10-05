@@ -191,3 +191,58 @@ describe('F-AUTH-2 signOut', () => {
     expect(get(session)).toBeNull();
   });
 });
+
+describe('F-AUTH-3 resetSession', () => {
+  it('after a sign-in, a 503 leaves the session unresolved rather than signed out, and the retry finds the user', async () => {
+    const { session, refreshSession, resetSession } = await freshAuth();
+    // The login page is reached signed out.
+    fetchMock.mockResolvedValueOnce(json(401, { code: 'unauthorized', message: 'Not signed in.' }));
+    await refreshSession();
+    expect(get(session)).toBeNull();
+
+    const seen: unknown[] = [];
+    const unsubscribe = session.subscribe((value) => seen.push(value));
+    // Signed in; the deploy's 503, then the user two seconds later.
+    fetchMock.mockResolvedValueOnce(json(503, { code: 'unavailable', message: 'busy' }));
+    await expect(resetSession()).resolves.toBeUndefined();
+    expect(get(session)).toBeUndefined();
+    fetchMock.mockResolvedValueOnce(json(200, ME));
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(get(session)).toEqual(ME);
+    unsubscribe();
+    // null (subscribed), then unresolved, then the user: never null again.
+    expect(seen).toEqual([null, undefined, ME]);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it('a signed-in user whose session lapsed is asked about until the server answers', async () => {
+    const { session, refreshSession, resetSession } = await freshAuth();
+    fetchMock.mockResolvedValueOnce(json(200, ME));
+    await refreshSession();
+    fetchMock.mockResolvedValueOnce(json(502, { code: 'bad_gateway', message: 'deploying' }));
+    await resetSession();
+    expect(get(session)).toBeUndefined();
+    fetchMock.mockResolvedValueOnce(json(401, { code: 'unauthorized', message: 'Expired.' }));
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(get(session)).toBeNull();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it('starts a pending retry over from the first wait', async () => {
+    const { session, refreshSession, resetSession } = await freshAuth();
+    fetchMock.mockResolvedValueOnce(json(503, { code: 'unavailable', message: 'busy' }));
+    await refreshSession();
+    fetchMock.mockResolvedValueOnce(json(503, { code: 'unavailable', message: 'busy' }));
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    // The next wait would be 4 s; a reset asks now and waits 2 s after a failure.
+    fetchMock.mockResolvedValueOnce(json(503, { code: 'unavailable', message: 'busy' }));
+    await resetSession();
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    fetchMock.mockResolvedValueOnce(json(200, ME));
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(get(session)).toEqual(ME);
+  });
+});

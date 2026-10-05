@@ -298,7 +298,7 @@
   <div class="grid grid-cols-2 gap-3">
     <div>
       <label class="label" for="bingo">Bingo Bonus (-bb)</label>
-      <input id="bingo" type="number" min="0" step="1" required class="input" bind:value={bingoBonus} />
+      <input id="bingo" type="number" min="0" max="500" step="1" required class="input" bind:value={bingoBonus} />
     </div>
     {#if jobType !== 'leave_generation'}
       <div>
@@ -494,7 +494,8 @@
         Keeps the position analysed on every turn of every game, with its ranked moves, for
         signed-in users to search on the job's page. It roughly doubles the rows a job produces,
         and a batch is at most {jobType === 'games' ? '1,000 games' : '500 pairs'} while saving.
-        A static player records only the move it played; a simming player, its whole ranking.
+        A static player ranks its plays on every turn, up to the number it records, which slows
+        its games; a simming player's ranking costs nothing extra.
       </p>
       {#if jobType === 'game_pairs' && capturePositions}
         <label class="mt-2 flex items-center gap-2">

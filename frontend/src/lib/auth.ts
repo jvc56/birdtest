@@ -54,6 +54,21 @@ export async function refreshSession(): Promise<Me | null | undefined> {
   }
 }
 
+/**
+ * Asks again after something that changes the session: a sign-in, or a 401
+ * from another request. The answer to the last ask no longer stands, so the
+ * store goes back to unresolved first. A refresh that then meets a 5xx leaves
+ * it unresolved and asks again until it is answered, rather than keeping a
+ * stale `null` (which would send a user who has just signed in back to the
+ * login page) or a stale user (which would keep a lapsed admin on a page whose
+ * polling has stopped). The layout guards wait while it is unresolved.
+ */
+export function resetSession(): Promise<Me | null | undefined> {
+  stopRetrying();
+  session.set(undefined);
+  return refreshSession();
+}
+
 export async function signOut(): Promise<void> {
   try {
     await api.logout();

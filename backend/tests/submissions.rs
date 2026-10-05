@@ -325,10 +325,11 @@ async fn solved_positions_keep_their_analysis_spread_and_depth() {
     let job = capturing_job(&db, 5).await;
     // A player that solves endgames six deep and runs PEG with two in the
     // bag: a task whose players solve nothing cannot report a solve
-    // (`U-PLAUS-6`).
+    // (`U-PLAUS-6`). Three halving stages rank at most four plies deep
+    // (`U-PLAUS-9`), the depth the pre-endgame below reports.
     sqlx::query(
         "UPDATE player_configs
-         SET endgame_plies = 6, peg_max_bag = 2, peg_stage_top_k = '{8,4}',
+         SET endgame_plies = 6, peg_max_bag = 2, peg_stage_top_k = '{8,4,2}',
              peg_scenario_stride = 1, peg_opp_model = 'rational', peg_nested = false
          WHERE id = (SELECT player2_config_id FROM job_game_config WHERE job_id = $1)",
     )

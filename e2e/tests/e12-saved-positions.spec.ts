@@ -5,7 +5,7 @@ import { ADMIN_STATE, SEEDED_DATA, env } from '../lib/env';
 test.use({ storageState: ADMIN_STATE });
 
 /**
- * E-12: a games job made through the form with "Save the positions played"
+ * E-12: a games job made through the form with "Position Recorder"
  * ticked shows a signed-in user one saved position at a time on its board --
  * a random one, or one of a rack's -- and tells a signed-out visitor to sign
  * in. The fake workers play synthetic games, 18 to 26 turns each, whose

@@ -1284,11 +1284,22 @@ history endpoint's points — are not restored.
 
 1. Get a copy from before the deletion as §2.1 does — the nightly dump into
    the ops shell's own scratch Postgres, or a PITR instance — and take the
-   pool's id from §0's query (`target_id` of its `rating_pool.deleted` row).
+   pool's id from §0's output (`target_id` of its `rating_pool.deleted.census`
+   row).
 2. Copy the two rows across, in one transaction. It refuses, and copies
    nothing, if a pool of the same name has been made since (rename that one
    first), or if its anchor or a member config has since been deleted
-   (restore that config first, or drop it from `/tmp/pool_members.csv`).
+   (restore that config first, or drop it from `/tmp/pool_members.csv`), or if
+   the admin who added a member has since been deleted (empty that line's last
+   field, `added_by`). It also refuses — a foreign-key error on
+   `rating_pools_letterdist_id_fkey` or `rating_pools_layout_id_fkey` — if the
+   pool's letter distribution or layout has since been deleted from Input data,
+   which the pool's deletion allowed. Importing the file again does not mend
+   that: a re-imported file has a new id. Nor is there anything left to rate:
+   a job pins its letter distribution and layout too, so the file could go
+   only once every job on it had, and a pool rates only the games of jobs on
+   its own two rows. Skip this copy; if the pool is still wanted, make it again
+   (same name, variant, anchor and members) on the rows the jobs now use.
 
 ```bash
 # Inside scripts/prod-shell.sh, after §2.1 (source /tmp/restore.env first).
@@ -1567,7 +1578,9 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
    one in `$DR_REGION` first. The three images must be pullable from
    `$DR_REGION`: a registry in the lost region is lost with it, so push
    releases to one that is not (ECR with cross-region replication, or a
-   registry outside AWS) — or rebuild them from this repository and the pinned
+   public registry outside AWS: the task definitions set no
+   `repositoryCredentials`, so a private one outside ECR cannot be pulled) —
+   or rebuild them from this repository and the pinned
    MAGPIE commit (README.md, "Deploying") first. And this needs Terraform's
    state for the copy only — it is a new workspace — but step 9's return to the
    default workspace needs the original's, which README.md says to keep off
@@ -1626,6 +1639,19 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
    takes longer than an ECS Exec session lasts, and not finished until its log
    ends `pg_restore exit 0`: step 4's `desired_count=1` against a
    half-restored database serves it.
+
+   Then analyze it, before step 4 starts the service. `pg_restore` restores no
+   planner statistics, and until autovacuum gets to each table every query is
+   planned without them -- a claim's reads among them, which have been planned
+   to read a job's whole history under the dispatch lock that way (PLAN.md,
+   "What these reads cost"). Detached too, and done when its log ends
+   `analyze exit 0`:
+
+   ```bash
+   setsid nohup sh -c 'vacuumdb --analyze-only --jobs=4 --dbname="$0"; echo "analyze exit $?"' \
+     "$DATABASE_URL" > /tmp/analyze.log 2>&1 &
+   tail -f /tmp/analyze.log   # Ctrl-C leaves it running
+   ```
 4. The leave-generation KLVs (`leaves/`) and the imported input data
    (`inputs/`) are in `birdtest-artifacts-dr-<account>`; sync both prefixes
    into the new stack's artifact bucket (`birdtest-dr-artifacts-<account>`)
@@ -1907,7 +1933,16 @@ failed migration -- is abandoned, and ECS starts the last task definition that
 ran steadily, after a gap of however long the three attempts took. The site
 then runs the previous release, but Terraform's state still names the new
 task definition, so the next `apply` deploys the broken one again: do the
-steps below anyway, starting at step 2, before any other apply. To tell:
+steps below anyway, starting at step 2, before any other apply. The signal is
+the alerts topic's `-deploy-failed` mail (`infra/ecs.tf`), which quotes ECS's
+reason: three failed launches usually finish before the `-down` alarms' ten
+minutes, and `apply` has returned long before. Until step 3 two other things
+run the abandoned release: the derived-data builder's schedule starts the
+task family's latest revision, which is the new image (so with a MAGPIE pin
+that moved builder versions, the web task's rows wait for a builder that
+does not take them), and each nightly dump's manifest names the new
+`backend_image` as the code that wrote it -- for a dump taken before step 3,
+the release that actually ran is the previous one. To tell, by hand:
 
 ```bash
 export AWS_PAGER=""   # no pager: one would swallow the rest of a paste

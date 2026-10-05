@@ -234,8 +234,6 @@ CREATE TABLE input_data (
     UNIQUE (path, sha256)
 );
 
-CREATE INDEX input_data_role_name_idx ON input_data (role, name);
-
 -- Staged imports. Phase 1 (a spawned background task) writes; phase 2 reads and
 -- commits. Rows here are proposals, not data -- nothing dispatch or job creation
 -- reads. birdtest runs as a single instance, so a task needs no lease and
@@ -283,20 +281,22 @@ CREATE TABLE input_data_import_rows (
     PRIMARY KEY (import_id, path, sha256)
 );
 
--- Derived files: the wordmaps and rack info tables the server builds a
--- reference copy of, and the hash a worker has to reproduce.
+-- Derived files: the wordmaps, rack info tables and word info tables the
+-- server builds a reference copy of, and the hash a worker has to reproduce.
 --
--- Neither file is ever shipped -- 179 MB and 1.9 GB for CSW24 -- so every
--- machine that needs one builds it from files it already has. What travels
--- instead is the SHA-256 the server's own pinned MAGPIE got from the same
--- inputs: a worker builds its own copy and uses it only if the bytes agree,
--- and declines the task otherwise. See README.md, "MAGPIE on the server".
+-- None of them is ever shipped -- 179 MB and 1.9 GB for a CSW24 wordmap and
+-- rack info table -- so every machine that needs one builds it from files it
+-- already has. What travels instead is the SHA-256 the server's own pinned
+-- MAGPIE got from the same inputs: a worker builds its own copy and uses it
+-- only if the bytes agree, and declines the task otherwise. See README.md,
+-- "MAGPIE on the server".
 --
 -- The key is the whole identity of the file rather than a surrogate, because
 -- what makes two derived files the same file is that they were built from the
--- same inputs by the same builder. A wordmap depends on a .kwg and the letter
--- distribution it is built against; a rack info table depends on a .klv2 as
--- well, because its entries carry precomputed leave values.
+-- same inputs by the same builder. A wordmap and a word info table depend on a
+-- .kwg and the letter distribution they are built against; a rack info table
+-- depends on a .klv2 as well, because its entries carry precomputed leave
+-- values.
 --
 -- `builder` is separate from the MAGPIE version on purpose. A CSW24 wordmap
 -- built in December 2025 and one built nine months later differ in 72,852,152
@@ -421,7 +421,10 @@ CREATE TABLE jobs (
     -- each worker's build to supply, so a task means the same thing on every
     -- MAGPIE release. Leave generation states only the bingo bonus: its bot
     -- does not simulate.
-    bingo_bonus   INT NOT NULL,                              -- -bb
+    -- The bonus is bounded because the plausibility rules' score bounds are
+    -- absolute and assume an ordinary one: a typo of 5000 for 50 would
+    -- refuse every honest batch. Real variants use 0 to 50.
+    bingo_bonus   INT NOT NULL CHECK (bingo_bonus BETWEEN 0 AND 500),  -- -bb
     sim_cutoff    DOUBLE PRECISION NOT NULL CHECK (sim_cutoff >= 0 AND sim_cutoff <= 100),  -- -cutoff
     -- Minimum MAGPIE version workers must have to execute tasks for this job,
     -- as sortable parts. Semver in TEXT compares lexically, where '1.10.0' <
@@ -527,8 +530,7 @@ CREATE TABLE jobs (
     -- clears it, a partial restore recomputes it (RUNBOOK 2.3).
     last_completed_at TIMESTAMPTZ,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    activated_at    TIMESTAMPTZ,
-    deactivated_at  TIMESTAMPTZ
+    activated_at    TIMESTAMPTZ
 );
 
 -- Named, reusable player configurations.
@@ -1620,8 +1622,7 @@ CREATE TABLE rating_pools (
     -- must be pinned; the static bot at 2000 is the convention.
     anchor_player_config_id UUID NOT NULL REFERENCES player_configs(id),
     anchor_rating DOUBLE PRECISION NOT NULL DEFAULT 2000,
-    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (variant, letterdist_id, layout_id, name)
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 -- Which player configs are rated in a pool. Membership is the admin's lever:

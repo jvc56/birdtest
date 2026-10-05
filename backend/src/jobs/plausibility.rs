@@ -29,11 +29,8 @@ use super::handler::{
     Analysis, GameAggregate, InferenceSummary, MoveEntry, PlayerSpec, PlyStats, PositionAnalysis,
     RackOccurrence,
 };
+use super::leave_gen::RACK_SIZE;
 use crate::error::{AppError, AppResult};
-
-/// Tiles on a rack. Matches MAGPIE's `RACK_SIZE`; a submission naming more is
-/// describing something that cannot be dealt.
-const MAX_RACK_TILES: usize = 7;
 
 /// Generous absolute bounds on a per-batch mean score. A word game cannot
 /// average a negative score or a four-figure one; these are set far outside
@@ -167,7 +164,7 @@ pub fn check_rack(rack: &str, context: &str) -> AppResult<()> {
     if tiles == 0 {
         return Err(AppError::bad_request(format!("{context}: empty rack")));
     }
-    if tiles > MAX_RACK_TILES {
+    if tiles > RACK_SIZE {
         return Err(AppError::bad_request(format!(
             "{context}: rack {rack:?} has {tiles} tiles, more than a rack holds"
         )));
@@ -219,7 +216,7 @@ pub fn check_inference(
     let mut previous = i64::MAX;
     for leave in &inference.leaves {
         let tiles = rack_tiles(&leave.leave);
-        if tiles.is_none_or(|tiles| tiles >= MAX_RACK_TILES) {
+        if tiles.is_none_or(|tiles| tiles >= RACK_SIZE) {
             return refuse(format!("{:?} is not a leave", leave.leave));
         }
         if leave.draws < 1 || leave.draws > inference.total_draws || leave.draws > previous {
@@ -369,8 +366,27 @@ pub fn check_moves(moves: &[MoveEntry], num_moves: Option<i32>, context: &str) -
     Ok(())
 }
 
-/// The deepest endgame a solver ranks a move at (`MAX_VARIANT_LENGTH`).
-const MAX_FIDELITY_PLIES: i16 = 25;
+/// The deepest an endgame solve ranks its move at (MAGPIE's
+/// `MAX_VARIANT_LENGTH`, which bounds `endgame_plies`).
+const MAX_ENDGAME_FIDELITY_PLIES: i16 = 25;
+
+/// The deepest a pre-endgame solve ranks a move at: `PEG_EXHAUSTIVE_PLIES`,
+/// the depth of MAGPIE's exhaustive mode -- a schedule of one stage keeping
+/// `i32::MAX` plays, which job creation accepts. Any other schedule ranks its
+/// stage `s` (from 1) at `s + 1` plies, so at most `MAGPIE_MAX_PEG_STAGES + 1`.
+const MAX_PEG_FIDELITY_PLIES: i16 = 40;
+
+/// The deepest a pre-endgame solve with this schedule ranks a move at
+/// (`peg.c`'s `stage_fidelity`): `MAX_PEG_FIDELITY_PLIES` for the exhaustive
+/// one-stage `[i32::MAX]`, else one more than the number of stages. A
+/// schedule the player does not state is given the widest, so the rule can
+/// only refuse what no schedule produces.
+fn deepest_peg_fidelity(stage_top_k: Option<&[i32]>) -> i32 {
+    match stage_top_k {
+        Some([i32::MAX]) | None => i32::from(MAX_PEG_FIDELITY_PLIES),
+        Some(stages) => stages.len() as i32 + 1,
+    }
+}
 
 /// What a position's moves carry, against how it was analysed.
 ///
@@ -423,7 +439,11 @@ pub fn check_analysis(analysis: Analysis, moves: &[MoveEntry], context: &str) ->
                     entry.play
                 )));
             }
-            if !(0..=MAX_FIDELITY_PLIES).contains(&fidelity) {
+            let deepest = match analysis {
+                Analysis::Peg => MAX_PEG_FIDELITY_PLIES,
+                _ => MAX_ENDGAME_FIDELITY_PLIES,
+            };
+            if !(0..=deepest).contains(&fidelity) {
                 return Err(AppError::bad_request(format!(
                     "{context}: play {:?} was ranked at an implausible depth {fidelity}",
                     entry.play
@@ -460,7 +480,9 @@ pub fn check_analysis(analysis: Analysis, moves: &[MoveEntry], context: &str) ->
 /// (an endgame) or within its `peg_max_bag` (a pre-endgame), else a
 /// simulation when it has `num_plies`, else the static ranking; and an
 /// inference only before a simulation, and only with `use_inference`. An
-/// endgame solve searches no deeper than the `endgame_plies` it was given.
+/// endgame solve searches no deeper than the `endgame_plies` it was given,
+/// and a pre-endgame ranks no deeper than its `peg_stage_top_k` schedule
+/// reaches (`deepest_peg_fidelity`).
 /// Which seat moved is not something a position states, so the rule is
 /// against either player -- what neither could have run is impossible, which
 /// is the bar every rule here meets. The other way round is not: a simming
@@ -480,7 +502,11 @@ pub fn check_analyses_against_players(
     // unless it says no.
     let infers = players.iter().any(|p| p.num_plies > 0 && p.use_inference != Some(false));
     let deepest_endgame = players.iter().map(|p| p.endgame_plies).filter(|&d| d > 0).max();
-    let runs_peg = players.iter().any(|p| p.endgame_plies > 0 && p.peg_max_bag > 0);
+    let deepest_peg = players
+        .iter()
+        .filter(|p| p.endgame_plies > 0 && p.peg_max_bag > 0)
+        .map(|p| deepest_peg_fidelity(p.peg_stage_top_k.as_deref()))
+        .max();
     let refuse = |position: &PositionAnalysis, why: &str| {
         let at = match (position.game_index, position.turn_number) {
             (Some(game), Some(turn)) => format!("game {game}, turn {turn}"),
@@ -495,10 +521,20 @@ pub fn check_analyses_against_players(
                 return refuse(position, "a simulation, and no player of this task simulates");
             }
             Analysis::Sim => {}
-            Analysis::Peg if !runs_peg => {
-                return refuse(position, "a pre-endgame solve, and no player of this task runs one");
+            Analysis::Peg => {
+                let Some(deepest) = deepest_peg else {
+                    return refuse(position, "a pre-endgame solve, and no player of this task runs one");
+                };
+                if position.moves.iter().any(|m| m.fidelity_plies.is_some_and(|d| i32::from(d) > deepest)) {
+                    return refuse(
+                        position,
+                        &format!(
+                            "a pre-endgame ranked deeper than any player's schedule reaches \
+                             ({deepest} plies)"
+                        ),
+                    );
+                }
             }
-            Analysis::Peg => {}
             Analysis::Endgame => {
                 let Some(deepest) = deepest_endgame else {
                     return refuse(position, "an endgame solve, and no player of this task solves one");
@@ -566,10 +602,10 @@ pub fn check_rack_occurrences(racks: &[RackOccurrence]) -> AppResult<()> {
         // Leave generation observes full racks only. Anything shorter would
         // name no row of the generation's rack universe.
         let tiles = rack_tiles(&occurrence.rack).unwrap_or(0);
-        if tiles != MAX_RACK_TILES {
+        if tiles != RACK_SIZE {
             return Err(AppError::bad_request(format!(
                 "leave result: rack {:?} has {tiles} tiles; leave generation reports full \
-                 racks of {MAX_RACK_TILES}",
+                 racks of {RACK_SIZE}",
                 occurrence.rack
             )));
         }
@@ -787,8 +823,42 @@ mod tests {
         assert!(check_analysis(Peg, &[solved(12.0, 3, None)], "x").is_err());
         assert!(check_analysis(Peg, &[solved(f64::NAN, 3, Some(50.0))], "x").is_err());
         assert!(check_analysis(Peg, &[solved(1e9, 3, Some(50.0))], "x").is_err());
-        assert!(check_analysis(Peg, &[solved(1.0, 26, Some(50.0))], "x").is_err());
+        assert!(check_analysis(Peg, &[solved(1.0, 41, Some(50.0))], "x").is_err());
         assert!(check_analysis(Peg, &[solved(1.0, -1, Some(50.0))], "x").is_err());
+        assert!(check_analysis(Endgame, &[solved(1.0, 26, None)], "x").is_err());
+    }
+
+    /// U-PLAUS-9: a pre-endgame is ranked no deeper than its schedule reaches.
+    /// MAGPIE's exhaustive mode -- one stage keeping `i32::MAX` plays, which
+    /// job creation accepts -- ranks every play at `PEG_EXHAUSTIVE_PLIES`
+    /// (40), past the endgame's 25; any other schedule ranks stage `s` at
+    /// `s + 1`. Bounded at 25 for both solvers, every captured position of an
+    /// exhaustive player was refused and the job wedged.
+    #[test]
+    fn a_pre_endgame_is_ranked_no_deeper_than_its_schedule_reaches() {
+        use super::Analysis::*;
+        let peg = |depth| analysed(Peg, vec![solved(12.0, depth, Some(62.5))]);
+        assert!(check_analysis(Peg, &peg(40).moves, "x").is_ok());
+        assert!(check_analysis(Endgame, &[solved(12.0, 40, None)], "x").is_err());
+
+        let with_schedule = |stage_top_k: Vec<i32>| {
+            let mut spec = player(0, None, 6, 2);
+            spec.peg_stage_top_k = Some(stage_top_k);
+            spec
+        };
+        let check = |position: PositionAnalysis, players: &[&PlayerSpec]| {
+            check_analyses_against_players(&[position], players, "x")
+        };
+        let exhaustive = with_schedule(vec![i32::MAX]);
+        let five_stages = with_schedule(vec![32, 16, 8, 4, 2]);
+        let one_large_stage = with_schedule(vec![i32::MAX - 1]);
+        assert!(check(peg(40), &[&exhaustive]).is_ok());
+        assert!(check(peg(6), &[&five_stages]).is_ok());
+        assert!(check(peg(7), &[&five_stages]).is_err(), "five stages reach 6 plies");
+        assert!(check(peg(40), &[&five_stages]).is_err());
+        assert!(check(peg(3), &[&one_large_stage]).is_err(), "only i32::MAX is exhaustive");
+        // Either seat will do.
+        assert!(check(peg(40), &[&five_stages, &exhaustive]).is_ok());
     }
 
     /// U-PLAUS-7: only a simulation's moves carry iterations or per-ply

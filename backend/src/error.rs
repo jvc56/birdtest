@@ -14,10 +14,11 @@ pub struct AppError {
     /// Seconds to put in a `Retry-After` header. Only rate-limit rejections set it.
     pub retry_after: Option<u64>,
     /// The Postgres SQLSTATE, when this error came from the database. Callers
-    /// that treat a particular violation as an ordinary outcome -- the
-    /// scheduler losing a race on a unique index -- match on this rather than
-    /// on the message text, which is localised by the server's `lc_messages`
-    /// and is not an interface.
+    /// that treat a particular error as an ordinary outcome -- an export
+    /// finding one already running, a lock not to be had, a leave task's
+    /// random seed already taken -- match on this rather than on the message
+    /// text, which is localised by the server's `lc_messages` and is not an
+    /// interface.
     pub db_code: Option<Box<str>>,
     /// The constraint a database violation names, for a handler that maps
     /// one foreign key to what the caller got wrong (and leaves the rest

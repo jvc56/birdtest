@@ -349,9 +349,10 @@ async fn claim_task(
             err.status,
             err.code,
             format!(
-                "a task claim must carry a JSON body stating `magpie_version`, `board_dim`, \
-                 `rack_size` and `unsupported_jobs`. A MAGPIE that does not state them all \
-                 predates this protocol: update MAGPIE and start contribute again. ({})",
+                "a task claim must carry a JSON body stating `magpie_version`, `board_dim` \
+                 and `rack_size` (and any `unsupported_jobs`). A MAGPIE that does not state \
+                 those three predates this protocol: update MAGPIE and start contribute \
+                 again. ({})",
                 err.message
             ),
         )

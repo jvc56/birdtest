@@ -2005,7 +2005,7 @@ async fn a_second_purge_or_delete_is_refused_while_one_runs() {
     assert!(status.is_success(), "once it has finished: {body}");
 }
 
-/// A-ADMIN-20: a purge that waits for a rating fit (it marks every pool for a
+/// A-ADMIN-29: a purge that waits for a rating fit (it marks every pool for a
 /// refit under their fit locks) does not hold its contributors' rows while it
 /// waits. It gave their counters back first, and every submission of theirs,
 /// for any job, waited on the purge -- holding a pool connection -- for as

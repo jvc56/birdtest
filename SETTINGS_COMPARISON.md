@@ -68,7 +68,7 @@ The 83 "Not stored" rows break down as follows:
 |---:|---|---|---|---|---|
 | 1 | `HELP` | `help` | command | Not stored | Interactive CLI command; no task runs it. |
 | 2 | `SET` | `setoptions` | command | Not stored | Interactive CLI command. A task's settings are applied straight from its request JSON, not through `setoptions`. |
-| 3 | `CGP` | `cgp` | command | Not stored | Loads a position. Opening-rack tasks always start on an empty board: `opening_rack_requests.previous_play` ([L1007](backend/migrations/0001_initial.sql#L1007)) is always NULL, and MAGPIE refuses a task where it isn't. |
+| 3 | `CGP` | `cgp` | command | Not stored | Loads a position. Opening-rack tasks always start on an empty board: the request carries no position to load. |
 | 4 | `MOVES` | `addmoves` | command | Not stored | Interactive CLI command; no task runs it. |
 | 5 | `RACK` | `rack` | command | Run by a job type | Opening-rack job: each task's racks are unranked from `opening_rack_requests.rack_start` ([L1005](backend/migrations/0001_initial.sql#L1005)) + `rack_count` ([L1006](backend/migrations/0001_initial.sql#L1006)), over the space set by `job_opening_rack_config.rack_size` ([L694](backend/migrations/0001_initial.sql#L694)). |
 | 6 | `RANDOM_RACK` | `rrack` | command | Not stored | Interactive CLI command; no task runs it. |

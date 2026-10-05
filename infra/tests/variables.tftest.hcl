@@ -1,8 +1,9 @@
 # S-TF-1, S-TF-2 (TESTING.md): every variable validation refuses a wrong value
 # and lets the right one through. `terraform validate` evaluates no condition,
 # so a validation was otherwise first run by a real plan -- one with a broken
-# regex refused a correct first apply. These plan against mock providers: no
-# credentials, no account, nothing created. `terraform test` from infra/.
+# regex refused a correct first apply. S-TF-3, at the end: the deploy-failed
+# alert. These plan against mock providers: no credentials, no account,
+# nothing created. `terraform test` from infra/.
 #
 # Each refusal run changes one variable from the good set below and names the
 # variables it expects refused; a run that plans instead, or fails anywhere
@@ -34,13 +35,6 @@ mock_provider "aws" {
   mock_data "aws_iam_policy_document" {
     defaults = {
       json = "{\"Version\":\"2012-10-17\",\"Statement\":[]}"
-    }
-  }
-
-  # The ses_dkim_records output indexes the first of these.
-  mock_resource "aws_sesv2_email_identity" {
-    defaults = {
-      dkim_signing_attributes = [{ tokens = ["token1", "token2", "token3"] }]
     }
   }
 }
@@ -126,6 +120,12 @@ run "images_named_by_digest_plan" {
     backend_image         = "registry.example.org/birdtest-backend@sha256:0000000000000000000000000000000000000000000000000000000000000001"
     derived_builder_image = "registry.example.org/birdtest-derived-builder@sha256:0000000000000000000000000000000000000000000000000000000000000002"
   }
+}
+
+# A floor the backend reads as 0.2.0 (`Version::parse_strict`).
+run "a_two_part_magpie_floor_plans" {
+  command = plan
+  variables { min_magpie_version = "0.2" }
 }
 
 # --- One variable at a time, refused -----------------------------------------
@@ -359,6 +359,18 @@ run "a_builder_memory_too_small_for_a_table_is_refused" {
   expect_failures = [var.derived_builder_memory]
 }
 
+run "a_prerelease_magpie_floor_is_refused" {
+  command = plan
+  variables { min_magpie_version = "0.2.0-rc1" }
+  expect_failures = [var.min_magpie_version]
+}
+
+run "a_magpie_floor_with_a_v_is_refused" {
+  command = plan
+  variables { min_magpie_version = "v0.2.0" }
+  expect_failures = [var.min_magpie_version]
+}
+
 run "too_little_builder_disk_is_refused" {
   command = plan
   variables { derived_builder_ephemeral_storage_gib = 20 }
@@ -402,4 +414,30 @@ run "a_sender_at_a_lookalike_domain_is_refused" {
   command = plan
   variables { mail_from_address = "noreply@notbirdtest.org" }
   expect_failures = [var.mail_from_address]
+}
+
+# --- S-TF-3: alerts -----------------------------------------------------------
+
+# A circuit-breaker rollback mails the alerts topic. The service's ARN in the
+# pattern and the delivery itself need a real account (TESTING.md); what plans
+# is that the rule exists, matches the failed deployment and only that, on one
+# resource, and is wired to the topic.
+run "a_failed_deploy_is_alerted" {
+  command = plan
+  assert {
+    condition     = local.deploy_failed_pattern.source == ["aws.ecs"] && local.deploy_failed_pattern["detail-type"] == ["ECS Deployment State Change"]
+    error_message = "The deploy-failed rule must match ECS deployment state changes."
+  }
+  assert {
+    condition     = local.deploy_failed_pattern.detail == { eventName = ["SERVICE_DEPLOYMENT_FAILED"] }
+    error_message = "The deploy-failed rule must match only a failed deployment."
+  }
+  assert {
+    condition     = length(local.deploy_failed_pattern.resources) == 1
+    error_message = "The deploy-failed rule must name the one web service."
+  }
+  assert {
+    condition     = aws_cloudwatch_event_target.deploy_failed.rule == "birdtest-deploy-failed"
+    error_message = "The deploy-failed rule must have a target (the alerts topic)."
+  }
 }

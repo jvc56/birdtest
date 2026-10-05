@@ -387,8 +387,9 @@ variable "desired_count" {
     Number of ECS tasks. Must be 1 (0 only while the stack is being built or
     rebuilt). The correctness of a claim rests on Postgres's locks, but much
     around it is in-process: the dispatch holds (`jobs::DispatchHolds`) that
-    keep claims off a job being purged, deleted or seeded and answer its
-    submissions at once, and the purge count the finish check compares to
+    keep claims off a job being purged, deleted, seeded or having its
+    consensus edited and answer its submissions at once, and the purge count
+    the finish check compares to
     tell that a purge landed under it; input-data imports, job exports and
     leave-generation transitions, which a starting instance fails or releases
     when it finds them open, taking them to be a dead process's; the
@@ -436,6 +437,16 @@ variable "min_magpie_version" {
   EOT
   type        = string
   default     = "0.1.1"
+
+  # What the backend's `Version::parse_strict` takes, which it holds this to at
+  # startup (config.rs): two or three dot-separated runs of digits, after
+  # trimming. Nine digits at most per part keeps each within its i32. A
+  # `v0.2.0` or `0.2.0-rc1` otherwise planned and applied, and the web task
+  # and the derived builder (same environment) both refused to start.
+  validation {
+    condition     = can(regex("^[0-9]{1,9}\\.[0-9]{1,9}(\\.[0-9]{1,9})?$", trimspace(var.min_magpie_version)))
+    error_message = "min_magpie_version must be major.minor or major.minor.patch, digits only (no 'v', no '-rc1'), as the backend reads MIN_MAGPIE_VERSION."
+  }
 }
 
 variable "github_token_parameter_arn" {

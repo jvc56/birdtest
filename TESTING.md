@@ -68,10 +68,10 @@ at tier 5 names a symptom.
 
 | Tier | Tests | Where |
 |---|---|---|
-| 1 Unit | 245 | `#[cfg(test)]` in `jobs::plausibility` (29), `inputdata` (30), `jobs::racks` (16), `stats::bradley_terry` (30), `stats::match_test` (10), `stats::outcomes` (7), `error` (8), `config` (8), `extract` (7), `routes::admin` (14), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (5), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (7), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (8), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `board`, `exports`, `jobs`, `jobs::leave_gen`, `routes` (1 each); `jobs::game_pair` (3), `artifacts` (2) |
-| 1F Frontend unit | 211 | Vitest, `frontend/src/lib/`: `format.test.ts` (45), `jobSettings.test.ts` (13), `matchScore.test.ts` (4), `matchTest.test.ts` (4), `moveList.test.ts` (5), `compare.test.ts` (3), `consensus.test.ts` (8), `cgp.test.ts` (16), `api.test.ts` (18), `auth.test.ts` (13), `accountRules.test.ts` (9), `sse.test.ts` (12), `importWatch.test.ts` (10), `poller.test.ts` (7), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (3), and `charts/`: `ratingDotPlot.test.ts` (19), `labels.test.ts` (2), `residuals.test.ts` (11), `pentanomial.test.ts` (5) |
-| 2 Integration | 179 | `backend/tests/`: `leave_gen.rs` (33), `ratings.rs` (31), `scheduler.rs` (19), `jobs.rs` (19), `stats.rs` (19), `input_data.rs` (14), `derived.rs` (9), `leave_generation.rs` (8), `exports.rs` (13), `submissions.rs` (6), `artifacts.rs` (5), `audit.rs` (3) |
-| 3 API | 240 | `backend/tests/`: `worker_api.rs` (47), `admin_api.rs` (59), `auth_routes.rs` (28), `worker_routes.rs` (23), `boundaries.rs` (18), `public_api.rs` (22), `admin_routes.rs` (13), `authz.rs` (7), `account.rs` (10), `auth_api.rs` (5), `finish.rs` (7), `fake_worker.rs` (1) |
+| 1 Unit | 248 | `#[cfg(test)]` in `jobs::plausibility` (30), `inputdata` (30), `jobs::racks` (17), `stats::bradley_terry` (30), `stats::match_test` (10), `stats::outcomes` (7), `error` (8), `config` (8), `extract` (7), `routes::admin` (15), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (5), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (7), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (8), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `board`, `exports`, `jobs`, `jobs::leave_gen`, `routes` (1 each); `jobs::game_pair` (3), `artifacts` (2) |
+| 1F Frontend unit | 214 | Vitest, `frontend/src/lib/`: `format.test.ts` (45), `jobSettings.test.ts` (13), `matchScore.test.ts` (4), `matchTest.test.ts` (4), `moveList.test.ts` (5), `compare.test.ts` (3), `consensus.test.ts` (8), `cgp.test.ts` (16), `api.test.ts` (18), `auth.test.ts` (16), `accountRules.test.ts` (9), `sse.test.ts` (12), `importWatch.test.ts` (10), `poller.test.ts` (7), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (3), and `charts/`: `ratingDotPlot.test.ts` (19), `labels.test.ts` (2), `residuals.test.ts` (11), `pentanomial.test.ts` (5) |
+| 2 Integration | 182 | `backend/tests/`: `leave_gen.rs` (33), `ratings.rs` (31), `scheduler.rs` (19), `jobs.rs` (20), `stats.rs` (19), `input_data.rs` (14), `derived.rs` (9), `leave_generation.rs` (8), `exports.rs` (15), `submissions.rs` (6), `artifacts.rs` (5), `audit.rs` (3) |
+| 3 API | 246 | `backend/tests/`: `worker_api.rs` (52), `admin_api.rs` (59), `auth_routes.rs` (28), `worker_routes.rs` (24), `boundaries.rs` (18), `public_api.rs` (22), `admin_routes.rs` (13), `authz.rs` (7), `account.rs` (10), `auth_api.rs` (5), `finish.rs` (7), `fake_worker.rs` (1) |
 | 4 Contract | 15 | `routes::worker::contract_fixtures`, over 18 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
 | 5 End-to-end | 21 | Playwright journeys `E-1`..`E-18` (`E-11` in three tests, `E-12` in two) in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
 | 6 MAGPIE smoke | 15 cases + 16 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-16` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 16 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (6), `magpie_leave.rs` (7), `magpie_routes.rs` (3) |
@@ -79,9 +79,9 @@ at tier 5 names a symptom.
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
 directly to assert one. With the tier-6 tests selected, `cargo nextest run
---run-ignored all` runs 687 backend tests (the per-tier counts above are
-from `cargo nextest list --run-ignored all` and `vitest`, after October 2026's
-third feature batch).
+--run-ignored all` runs 707 backend tests (the per-tier counts above are
+from `cargo nextest list --run-ignored all` and `vitest`, after the thirty-third
+audit's second pass).
 
 Tier 2 was the largest gap and the highest value.
 `sqlx::query` is checked at runtime, so the compiler sees opaque text. Two bugs
@@ -128,7 +128,7 @@ incidentally by higher tiers.
 | `ratings.rs` | 2 | Covered (`I-RATE-*`) |
 | `jobstats.rs` | 2 | Covered (`I-STATS-*`) |
 | `audit.rs` | 2 | Covered (`I-AUDIT-*`) |
-| `artifacts.rs` | 2 | Covered (`I-ART-*`, needs `TEST_S3_ENDPOINT`) |
+| `artifacts.rs` | 1 + 2 | Covered (`U-ART-1`; `I-ART-*`, needs `TEST_S3_ENDPOINT`) |
 | `exports.rs` | 2 | Covered (`I-EXPORT-*`, needs `TEST_S3_ENDPOINT`) |
 | `sse.rs` | 3 | Covered (`sse::tests`, `A-PUBLIC-5`, `-6`, `-6a`) |
 | `ratelimit.rs` | 3 | Covered (`A-AUTH-11`, `A-WORKER-14`, `A-BOUND-1`, `-2`) |
@@ -163,7 +163,7 @@ incidentally by higher tiers.
 | `scripts/dev.py` | Manual | Deliberate — see [Not tested](#what-is-deliberately-not-tested) |
 | `scripts/backup.sh`, `restore-drill.sh`, `restore-roundtrip.sh`, `restore-job.sh`, RUNBOOK §1's re-apply step | Nightly | Covered (`S-BACKUP-*`) |
 | `scripts/scrub.sql` | 3 | Covered (`S-SCRUB-1`, `-2`) |
-| `infra/` variable validations | CI (`terraform`) | Covered (`S-TF-1`, `-2`: `terraform test` against mock providers) |
+| `infra/` variable validations, the deploy-failed alert | CI (`terraform`) | Covered (`S-TF-1`, `-2`, `-3`: `terraform test` against mock providers) |
 | `scripts/dev-restore.sh` | CI (`scripts`) | Covered (`S-BACKUP-6`: its `SCRUB` rule against a stub `COMPOSE`, and that the scrub is the copy's) |
 | birdtest ↔ MAGPIE wire | 4 + 6 | Covered — `C-1`..`C-9` on both sides, and tier 6 |
 
@@ -175,7 +175,12 @@ Pure logic, no I/O. Rust idiom: `#[cfg(test)] mod tests` in the same file as the
 code.
 
 **May not**: open a socket, connect to a database, or read a file. Fixture bytes
-come from `include_bytes!`; anything that needs a path uses a `tempdir`.
+come from `include_bytes!`, and the repository files a consistency test compares
+(`U-CFG-5`, the SES alarm check in `email.rs`) from `include_str!`, so cargo
+rebuilds the test when one changes and the test binary carries them; anything
+that needs a path uses a `tempdir`, and a test may read back what it wrote
+there. Two narrow exceptions: `email.rs`'s stand-in for SES listens on loopback,
+and `U-ARCHIVE-11` reads the process's own `/proc/self/status` for its peak memory.
 
 ### Covered before the list
 
@@ -414,7 +419,8 @@ process environment, so no test mutates `std::env` under another.
 - `U-CFG-5` Every hand-kept copy of the default version floor equals
   `DEFAULT_MIN_MAGPIE_VERSION`: Terraform's `min_magpie_version` default (and
   its description), which `ecs.tf` and `derived.tf` pass through; both compose
-  files; `scripts/e2e_magpie_native.sh`; the `jobs` table's three column
+  files; `scripts/e2e_magpie_native.sh`; `backend/.env.example`, which a
+  backend run on the host starts from; the `jobs` table's three column
   defaults; and `scripts/dev.py`'s note. A raise that missed Terraform passed
   CI and left production admitting the builds it was meant to keep out
   (thirty-third audit, pass 1). *(Covered:
@@ -491,8 +497,8 @@ The two that were missing:
 - `U-PLAUS-5` A position's moves match how it was analysed: a static or
   simulated position's carry no solver spread or depth, a pre-endgame's each
   carry a win percentage, a finite spread within bounds and a depth from 0 to
-  25, and an endgame position reports exactly the one move its solve chose,
-  with a spread and depth and no simulation statistics. *(Covered:
+  40, and an endgame position reports exactly the one move its solve chose,
+  with a spread, a depth from 0 to 25 and no simulation statistics. *(Covered:
   `plausibility::tests::a_positions_moves_match_its_analysis`.)*
 - `U-PLAUS-4` A negative `num_moves` is refused (cast to `usize` it was larger
   than any list), and per-ply statistics must be numbered from 0 in order, with
@@ -524,6 +530,14 @@ The two that were missing:
   more pairs sit outside bucket 2 than diverged. *(Covered:
   `game_pair::tests::the_divergent_subset_agrees_with_the_whole`.)*
   (Thirty-third audit, pass 1.)
+- `U-PLAUS-9` A pre-endgame is ranked no deeper than its schedule reaches:
+  stage `s` of a `peg_stage_top_k` at `s + 1` plies, and MAGPIE's exhaustive
+  mode -- the one stage `[2147483647]`, which job creation accepts -- at
+  `PEG_EXHAUSTIVE_PLIES` (40), past the endgame's 25. Checked against either
+  player; only `i32::MAX` itself is exhaustive. *(Covered:
+  `plausibility::tests::a_pre_endgame_is_ranked_no_deeper_than_its_schedule_reaches`.)*
+  (Thirty-third audit, pass 2: one 25-ply bound for both solvers refused every
+  captured position of an exhaustive player, and the job wedged.)
 
 ### `U-STATS-*` — pinned numbers (`stats/match_test.rs`, `stats/outcomes.rs`, `stats/bradley_terry.rs`)
 
@@ -776,7 +790,7 @@ path, nothing recognisable, and a bomb by compression ratio.)
   `artifacts::tests::a_link_lasts_no_longer_than_its_credentials`,
   `artifacts::tests::presign_ttl_is_the_shorter_less_a_minute_and_never_zero`,
   offline. That ECS hands out credentials with an hour left is not testable
-  here.)* (Audit of 2026-10-05.)
+  here.)* (Thirty-third audit, pass 1.)
 
 ---
 
@@ -1113,6 +1127,16 @@ Test the pure functions; do not snapshot the SVG.
 - `F-AUTH-2` `signOut` clears the store even if the request fails, so the UI
   cannot be left showing a session that is gone, and stops a refresh waiting
   to ask again. *(Covered: `auth.test.ts`.)*
+- `F-AUTH-3` `resetSession` asks again from unresolved, for the two callers
+  whose session has just changed: the login page after a sign-in, and the
+  import watcher after a 401. Through `refreshSession` alone, a sign-in that
+  met a deploy's 503 kept the `null` the login page was reached with, and the
+  guard on the next page sent the now signed-in user back to sign in; an
+  admin whose import poll met a 401 and then a 5xx kept the stale user, and
+  nothing asked again. *(Covered: `auth.test.ts` — `null`, then a sign-in
+  meeting a 503 goes unresolved and then to the user, never `null` again; a
+  signed-in user reset into a 502 then a 401 ends `null` and stops asking; a
+  reset starts a pending retry's wait over from 2 s.)*
 
 ### `F-ACCOUNT-*` — `lib/accountRules.ts`
 
@@ -1163,7 +1187,7 @@ server refuses. Each rule mirrors one in `routes/auth.rs`, with its wording.
   At the image's 65 s Nginx closed connections the ALB (300 s) still pooled,
   and a page request sent on one as it closed was answered 502. *(Covered:
   `nginxConfig.test.ts`; that it fails at 65 was checked by hand, and the
-  template passes `nginx -t` in the image.)* (Audit of 2026-10-05.)
+  template passes `nginx -t` in the image.)* (Thirty-third audit, pass 1.)
 
 ## 2. Integration
 
@@ -1548,12 +1572,26 @@ The single most important group. Every entry is about a decision made in SQL.
   handed a full batch all the same (fewest analyses first, then by rack, none
   in flight), and another identity the next racks; with the first pass split
   between two identities, each is handed the other's racks first within the
-  window of four batches it looks at. The preference used to walk every
-  unsettled rack until it found a batch the identity had not analysed, under
-  the dispatch lock: 5.7 s a claim at 1,000,000 racks for an identity that had
-  seen them all (PLAN.md, "What these reads cost"). *(Covered:
+  window of four batches it looks at, and nothing past it: with the other's
+  racks pushed beyond the window, it is handed racks it has seen, where a walk
+  would have found the other's (the test fails with the window widened to
+  every rack; the second pass added this, since the rest passed against the
+  walk too). The preference used to walk every unsettled rack until it found
+  a batch the identity had not analysed, under the dispatch lock: 5.7 s a
+  claim at 1,000,000 racks for an identity that had seen them all (PLAN.md,
+  "What these reads cost"). *(Covered:
   `worker_api::a_reissue_looks_at_a_window_of_racks_not_every_one`; the
-  timing, measured by hand.)*
+  timing, and that the preference is planned as a probe per rack whatever the
+  statistics, measured by hand.)* (Thirty-third audit, pass 1.)
+- `I-OR-REISSUE-2` **A reissue's in-flight read does not grow with the job's
+  reissue history.** With two reissues completed, one claimed and one declined
+  back to `available`, the next reissue leaves out exactly the open two's
+  racks and is handed the completed ones'. The in-flight racks were read by
+  visiting every reissue the job had ever made, under the dispatch lock:
+  27–44 ms at 200,000 completed reissues, against 2–5 ms now (PLAN.md, "What
+  these reads cost"). *(Covered:
+  `worker_api::a_reissue_leaves_out_the_open_reissues_and_only_those`; the
+  timing, measured by hand.)* (Thirty-third audit, pass 2.)
 
 ### `I-EXPECT-*` — capability negotiation (`jobs/mod.rs::expected_data`)
 
@@ -1630,6 +1668,12 @@ job creation touches needs one caller here.
   (KL-87). *(Covered:
   `jobs::a_games_or_pairs_jobs_counts_are_held_by_the_schema`.)* (Thirty-third
   audit, pass 1.)
+- `I-JOB-1g` **A job's bingo bonus is 0 to 500**, refused by name at creation
+  (-1, 501, 5000) and by the `jobs` CHECK below the API; both ends are kept as
+  stated. The plausibility rules' score bounds are absolute, set for an
+  ordinary bonus, so a bonus in the thousands made every honest batch
+  implausible and wedged the job. *(Covered:
+  `jobs::a_jobs_bingo_bonus_is_bounded`.)* (Thirty-third audit, pass 2.)
 - `I-OR-EDIT-1` **An opening-rack job's consensus changes after creation, and
   the job follows** (`PATCH /api/admin/jobs/:id/consensus`). A job wanting one
   analysis per rack still keeps a progress row per rack, so raising its
@@ -1656,7 +1700,7 @@ job creation touches needs one caller here.
   Postgres re-evaluates on the row the edit committed. Neither purge witness
   sees an edit. *(Covered:
   `worker_api::a_finish_check_overtaken_by_a_consensus_edit_does_not_complete_the_job`,
-  driven as `I-STATS-9d` drives the purge.)*
+  driven as `I-STATS-9d` drives the purge.)* (Thirty-third audit, pass 1.)
 - `I-OR-EDIT-4` **A consensus edit in progress costs a claim or a submission
   no lock wait.** While an edit of an active job holds its locks, a claim
   skips the job (a `204` in well under the dispatch lock's two seconds), a
@@ -1664,10 +1708,21 @@ job creation touches needs one caller here.
   five), and a second edit is a `409`; once the edit is done, the claim's
   result is accepted. *(Covered:
   `worker_api::a_consensus_edit_in_progress_costs_claims_and_submissions_no_wait`.)*
+  (Thirty-third audit, pass 1.)
+- `I-OR-EDIT-5` **An edit that is refused, or changes nothing, holds
+  nothing.** It is answered before the hold or a lock is taken, so a lapsed
+  claim of the job is reclaimed at once after it: a games job's `400`, an
+  opening-rack job's share out of range, and its settings sent back unchanged.
+  Checked only under the locks, each held the job's claims off while it took
+  them and then left the reclaim grace, a heartbeat timeout in which the job's
+  lapsed claims were not reclaimed. *(Covered:
+  `worker_api::a_refused_or_unchanged_consensus_edit_holds_nothing`.)*
+  (Thirty-third audit, pass 2.)
 - `I-JOB-2` **`validate_shared_player_options` runs against real rows.** Two
   configs with different `winpct_id` are rejected; two with the same are
-  accepted; two with different `movegen_margin` are rejected. The regression
-  guard for the renamed column. *(Covered:
+  accepted; two with different `movegen_margin` are accepted, since autoplay
+  generates with a margin of 0 whatever a player states (thirty-third audit,
+  pass 2: they were refused). The regression guard for the renamed column. *(Covered:
   `jobs::two_players_must_share_the_run_wide_settings_magpie_cannot_vary`. A
   static player has no model, so a static player against a simmer is accepted:
   `admin_api::a_games_job_may_pit_a_static_player_against_a_simmer`.)*
@@ -2376,9 +2431,20 @@ runs against a real MinIO.
   `exports::results_and_positions_are_read_in_one_snapshot`.)*
 - `I-EXPORT-15` An export finishing while its completed job is being reopened
   (a consensus edit past its `unfinalize`, not yet committed) waits for the
-  reopening and is a snapshot. It read the job's committed `completed` and
-  came back final for a job active again. *(Covered:
-  `exports::an_export_finishing_while_its_job_reopens_is_a_snapshot`.)*
+  reopening and fails with it, removing its objects (a snapshot, as first
+  fixed, until the second pass made `unfinalize` fail running exports:
+  `I-EXPORT-16`). It read the job's committed `completed` and came back final
+  for a job active again. *(Covered:
+  `exports::an_export_finishing_while_its_job_reopens_fails`.)*
+- `I-EXPORT-16` An export whose snapshot was read while its job was completed
+  fails when a consensus edit reopens the job, even when the job has completed
+  again before the export finishes; nothing redirects to it, and the next
+  export is the completed job's final corpus. It was stored final — the corpus
+  from before the edit's analyses, served as the completed job's until someone
+  exported again — since `mark_ready` saw only the job's status at the end.
+  *(Covered:
+  `exports::an_export_spanning_a_reopening_and_a_second_completion_fails`.)*
+  (Thirty-third audit, pass 2.)
 
 ### `I-DATA-*` — the pinned-row invariant
 
@@ -3013,6 +3079,12 @@ below.
   changes nothing. *(Covered:
   `admin_api::allocations_are_set_together_and_checked_as_a_whole`; the route's
   authorization and CSRF pair, `authz`.)*
+- `A-ADMIN-29` A purge waiting on a running rating fit holds up no submission:
+  it marks every pool for a refit, under their fit locks, before it gives its
+  contributors' counters back, so a contributor's submission for another job
+  goes through while the purge waits. (A delete keeps the same order.)
+  *(Covered: `admin_api::a_purge_waiting_on_a_rating_fit_holds_up_no_submissions`.)*
+  (The test predates the entry, and cited `A-ADMIN-20`; thirty-third audit.)
 
 ### `A-RATE-*` — `routes/ratings.rs`
 
@@ -3981,21 +4053,33 @@ run that breaks one variable expects only that one.
   its edge plan; a value past each edge — the name suffix, regions, zones,
   images, storage and retention bounds, Fargate's CPU and memory pairs for the
   web, backup and builder tasks, disk sizes, dump jobs, the alert address, the
-  SES domain and sender, the public URL and the mail rate — is refused by the
-  variable that guards it. `desired_count` above one (or below zero) is refused:
+  SES domain and sender, the public URL, the mail rate and the MAGPIE floor
+  (`v0.2.0` and `0.2.0-rc1` refused, `0.2` planned: what the backend's
+  `Version::parse_strict` reads at startup) — is refused by the variable that
+  guards it. `desired_count` above one (or below zero) is refused:
   the single-instance rule (KL-82). Broken on purpose, each side shows: with
   the count's bound at two, `two_tasks_are_refused` fails; with a certificate
   regex that no real ARN matches, the good plan fails. *(Covered:
-  `infra/tests/variables.tftest.hcl`, 50 runs.)* (Audit of 2026-10-05: a
-  validation was first evaluated by a real plan, since `terraform validate`
-  evaluates none.)
+  `infra/tests/variables.tftest.hcl`, 54 runs with `S-TF-2`'s and `S-TF-3`'s.)*
+  (Thirty-third audit, pass 1: a validation was first evaluated by a real plan,
+  since `terraform validate` evaluates none. Pass 2 added the MAGPIE floor, the
+  one value the backend refuses at startup that the plan let through.)
 - `S-TF-2` The cross-variable rules KL-62 left open: `derived_builder_image`
   at another tag than `backend_image`, or tagged beside an untagged one, is
   refused, and the same tag, no tag on either (`latest`), or images named by
   digest plan; an ACM ARN from another region, or another kind of ARN, is
   refused; a sender outside `ses_domain`, or at a domain whose name merely ends
   in it, is refused, and one at a subdomain, in any case, plans. *(Covered:
-  `infra/tests/variables.tftest.hcl`.)* (Audit of 2026-10-05.)
+  `infra/tests/variables.tftest.hcl`.)* (Thirty-third audit, pass 1.)
+- `S-TF-3` A deployment the circuit breaker rolls back mails the alerts topic:
+  the `-deploy-failed` rule matches `aws.ecs`'s "ECS Deployment State Change"
+  with `eventName` `SERVICE_DEPLOYMENT_FAILED` only, on one resource, and has
+  the topic's target. That the resource is the web service's ARN, and that the
+  mail arrives, are known only at apply (below; README's "Check that the
+  alarms reach you" checks the pattern against the live service). *(Covered:
+  `infra/tests/variables.tftest.hcl`, `a_failed_deploy_is_alerted`.)*
+  (Thirty-third audit, pass 2: a rollback was silent, and the next apply
+  redeployed the release it abandoned.)
 
 ---
 
@@ -4019,7 +4103,10 @@ tokens, that `sqlx` maps types, that S3 stores bytes. We test our *use* of them
 validate`, by the variable validations' plans ([Terraform](#terraform)), and by
 applying it. Asserting what the plan builds tests the plan, not the
 deployment, and the failure mode that matters — an apply that breaks
-production — is not reachable from a test suite.
+production — is not reachable from a test suite. `S-TF-3` reads the one
+alert rule whose pattern the plan knows; that EventBridge delivers ECS's
+deployment event to the topic, and the service ARN in its pattern, need a real
+account (a mock apply fails on the random ARNs the mocks make).
 Backup *restores* are covered by the monthly drill, which is the real check.
 
 **The SES mail backend, against SES.** Every tier runs `console` or `file`;
@@ -4299,8 +4386,10 @@ GitHub Actions.
 6. **scripts** — `scripts/dev-restore-check.sh`: `dev-restore.sh`'s `SCRUB`
    rule against a stub `COMPOSE`, with no Docker; `scripts/runbook-check.sh`:
    every bash block in RUNBOOK.md and README.md parses, fences labelled and
-   placed so none goes unread, and each `aws` block turns the pager off first
-   (five minutes at most).
+   placed so none goes unread, and each `aws` block turns the pager off first;
+   and `scripts/fake-worker-fixtures.sh --check`: the fake worker's captured
+   submissions in `backend/src/jobs/testdata/` are what it emits now
+   (`U-FAKE-6`) (five minutes at most).
 7. **magpie-contract** — MAGPIE's half of the contract: check out MAGPIE at the
    commit `docker/Dockerfile` pins, copy this branch's `contract-fixtures/` over its
    `test/birdtest_contract/`, and run `magpie_test contribute`; then
