@@ -78,8 +78,9 @@ services:
 
   # Four workers, so the per-identity rate limit (one request a second) still
   # leaves a dashboard visibly moving. Player 1 wins 60% of divergent games,
-  # which drives every game-pairs job the suite makes to an SPRT verdict soon
-  # after its minimum and gives the ratings journey decisive evidence.
+  # which drives every game-pairs job the suite runs the match test on (those
+  # created with `test_enabled`) to a verdict soon after its minimum, and gives
+  # the ratings journey decisive evidence.
   #
   # Defined here and nowhere else: the development stack has no fake worker
   # (its contributors are real MAGPIE -- README.md, scripts/dev.py), so the

@@ -384,11 +384,18 @@ variable "task_memory" {
 
 variable "desired_count" {
   description = <<-EOT
-    Number of ECS tasks. Must be 1. Claiming is coordinated through Postgres,
-    but three things are not: input-data imports run as an in-process task that
-    a starting instance marks failed if it finds one running, rate limits are
-    in-memory per process, and SSE subscribers only hear submissions made to
-    their own instance. See PLAN.md's primary/secondary split before raising it.
+    Number of ECS tasks. Must be 1 (0 only while the stack is being built or
+    rebuilt). The correctness of a claim rests on Postgres's locks, but much
+    around it is in-process: the dispatch holds (`jobs::DispatchHolds`) that
+    keep claims off a job being purged, deleted or seeded and answer its
+    submissions at once, and the purge count the finish check compares to
+    tell that a purge landed under it; input-data imports, job exports and
+    leave-generation transitions, which a starting instance fails or releases
+    when it finds them open, taking them to be a dead process's; the
+    scheduler's and the finish check's in-memory state; rate limits, which are
+    per process; and SSE, whose subscribers hear only submissions made to their
+    own instance. See PLAN.md's primary/secondary split and KL-82 before raising
+    it.
   EOT
   type        = number
   default     = 1
@@ -406,6 +413,14 @@ variable "acm_certificate_arn" {
     site cannot be served without TLS.
   EOT
   type        = string
+
+  # A certificate from another region (ACM's are regional), or another ARN
+  # altogether, was refused only by the HTTPS listener, half-way through the
+  # apply (KL-62).
+  validation {
+    condition     = can(regex("^arn:aws[a-z-]*:acm:${var.region}:[0-9]{12}:certificate/[^/]+$", var.acm_certificate_arn))
+    error_message = "acm_certificate_arn must be an ACM certificate ARN in region, the stack's region: ACM certificates are regional."
+  }
 }
 
 variable "min_magpie_version" {
@@ -441,6 +456,17 @@ variable "mail_from_address" {
   validation {
     condition     = can(regex("^[^@\\s]+@[^@\\s]+$", var.mail_from_address)) && !endswith(var.mail_from_address, ".example")
     error_message = "mail_from_address must be a real address within ses_domain."
+  }
+
+  # SES sends from an address in a verified domain or one of its subdomains;
+  # outside them every mail failed, and only the -mail-failed alarm said so
+  # (KL-62).
+  validation {
+    condition = (
+      endswith(lower(var.mail_from_address), "@${lower(var.ses_domain)}") ||
+      endswith(lower(var.mail_from_address), ".${lower(var.ses_domain)}")
+    )
+    error_message = "mail_from_address must be at ses_domain or one of its subdomains: SES sends only from a verified domain."
   }
 }
 

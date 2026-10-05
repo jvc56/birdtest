@@ -2,7 +2,7 @@
 # Every contract bug the audit found in MAGPIE was invisible to both
 # repositories' unit tests and obvious the first time a real task ran
 # This runs one small job of every type and asserts
-# the results land, then the M-5..M-11 cases (see scripts/e2e_magpie.py).
+# the results land, then the M-5..M-16 cases (no M-8; see scripts/e2e_magpie.py).
 name: Nightly MAGPIE end-to-end
 
 # Read-only: the token reaches the backend container (for MAGPIE-DATA
@@ -109,7 +109,7 @@ jobs:
           python-version: "3.12"
       - run: pip install requests
 
-      - name: Every tier-6 case (M-1 to M-11)
+      - name: Every tier-6 case (M-1 to M-16)
         run: >-
           python3 scripts/e2e_magpie.py
           --magpie magpie/bin/magpie

@@ -8,6 +8,14 @@ server {
     absolute_redirect off;
     server_tokens off;
 
+    # Longer than the load balancer keeps an idle connection to its targets
+    # (`idle_timeout` on `aws_lb.main`, infra/ecs.tf: 300 s). At the image's
+    # 65 s Nginx closed pooled connections the ALB still thought open, and a
+    # request it sent on one as it closed was answered 502 -- AWS's own first
+    # cause of a 502. The target must outlast the load balancer, not the
+    # reverse.
+    keepalive_timeout 310s;
+
     # In production the ALB splits /api off to the backend target group. There
     # is no ALB in compose, so Nginx does the same routing itself — which also
     # keeps the app on a single origin, so the session cookie and the CSRF

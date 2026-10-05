@@ -3,9 +3,10 @@
 # The backend needs a MAGPIE build. It runs one for every wordmap, rack info
 # table and leave-generation KLV, reads the builder versions out of the binary
 # at startup, and refuses to bind without it — see README.md's "MAGPIE on the
-# server". Set MAGPIE_BIN to a local checkout's bin/magpie (`make magpie
-# BUILD=portable_release`) and MAGPIE_ROOT to the checkout, which is mounted so
-# the container can run it.
+# server". Set MAGPIE_ROOT (default ../MAGPIE; see .env.example) to a MAGPIE
+# checkout with a built bin/magpie (`make magpie BUILD=portable_release`): the
+# checkout is mounted, and the backend runs its bin/magpie. MAGPIE_BIN set in
+# the shell or .env does nothing here; the services set it themselves.
 #
 # For local development use `scripts/dev.py`, which brings this up, seeds it,
 # and runs real `magpie contribute` processes against it. There is no "worker"

@@ -36,6 +36,19 @@ variable "derived_builder_image" {
     condition     = length(trimspace(var.derived_builder_image)) > 0
     error_message = "derived_builder_image is the backend image built with --target derived-builder, at the same tag as backend_image."
   }
+
+  # One tag per release (README.md, "Deploying"): a release that moved one
+  # image and not the other left rows keyed to the web task's builder that
+  # nothing built (KL-62). A missing tag is `latest`, as Docker reads it. An
+  # image named by digest carries no tag to compare, and is let through.
+  validation {
+    condition = (
+      strcontains(var.derived_builder_image, "@") || strcontains(var.backend_image, "@") ||
+      try(regex(":([^:/]+)$", var.derived_builder_image)[0], "latest") ==
+      try(regex(":([^:/]+)$", var.backend_image)[0], "latest")
+    )
+    error_message = "derived_builder_image must be at the same tag as backend_image: the builder must carry the backend's MAGPIE."
+  }
 }
 
 variable "derived_builder_cpu" {

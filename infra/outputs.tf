@@ -21,11 +21,13 @@ output "ssm_parameter_names" {
 }
 
 # As records, not bare tokens: each is `<token>._domainkey.<ses_domain>`
-# CNAME `<token>.dkim.amazonses.com`, which the tokens alone did not say.
+# CNAME `<token>.dkim.amazonses.com`, which the tokens alone did not say. A
+# splat rather than `[0]`: the same tokens, and an empty map, not an error, in
+# the plans infra/tests makes against a mock provider, which has no block.
 output "ses_dkim_records" {
   description = "Add these CNAME records (name => value) to finish SES domain verification."
   value = {
-    for token in aws_sesv2_email_identity.domain.dkim_signing_attributes[0].tokens :
+    for token in flatten(aws_sesv2_email_identity.domain.dkim_signing_attributes[*].tokens) :
     "${token}._domainkey.${var.ses_domain}" => "${token}.dkim.amazonses.com"
   }
 }

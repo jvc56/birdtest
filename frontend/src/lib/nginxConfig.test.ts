@@ -40,3 +40,36 @@ describe('F-NGINX-1 the proxy keeps a cut stream visible', () => {
     expect(api).toMatch(/proxy_buffering\s+off\s*;/);
   });
 });
+
+// Deployed, every page and asset reaches this Nginx from the ALB over a pooled
+// connection, which the ALB keeps for its idle timeout. Nginx's own default
+// closed it at 65 s while the ALB, raised to 300 s, still counted it open, and
+// a request sent on it as it closed was answered 502.
+describe('F-NGINX-2 Nginx keeps an idle connection longer than the load balancer', () => {
+  const read = (...path: string[]) => readFileSync(join(__dirname, '..', '..', ...path), 'utf8');
+  const uncommented = (text: string) =>
+    text
+      .split('\n')
+      .map((line) => line.replace(/#.*$/, ''))
+      .join('\n');
+
+  /** Seconds in an Nginx time: `310`, `310s`, `5m`, `1h`. */
+  function seconds(value: string): number {
+    const match = /^(\d+)(s|m|h)?$/.exec(value);
+    expect(match, `not a time Nginx reads: ${value}`).not.toBeNull();
+    const [, n, unit] = match!;
+    return Number(n) * ({ s: 1, m: 60, h: 3600 } as Record<string, number>)[unit ?? 's'];
+  }
+
+  it('sets keepalive_timeout above aws_lb.main.idle_timeout', () => {
+    const nginx = uncommented(read('docker', 'default.conf.template'));
+    const keepalive = [...nginx.matchAll(/^\s*keepalive_timeout\s+([^\s;]+)[^;]*;/gm)];
+    expect(keepalive, 'one keepalive_timeout, in the server block').toHaveLength(1);
+
+    const ecs = uncommented(read('..', 'infra', 'ecs.tf'));
+    const alb = /resource\s+"aws_lb"\s+"main"\s*\{[^}]*?\bidle_timeout\s*=\s*(\d+)/.exec(ecs);
+    expect(alb, 'no idle_timeout on aws_lb.main in infra/ecs.tf').not.toBeNull();
+
+    expect(seconds(keepalive[0][1])).toBeGreaterThan(Number(alb![1]));
+  });
+});
