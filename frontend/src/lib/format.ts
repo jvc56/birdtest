@@ -322,6 +322,11 @@ export function jobTitle(job: { name?: string | null; job_type: string }): strin
  * labelled with its time; a completed job whose newest export is one is offered
  * its final export. A leave job's snapshot is as of its last merge, which runs
  * every half hour while it runs, and says so.
+ *
+ * A completed opening-rack job's final export also becomes a snapshot when its
+ * consensus settings change, even to ones that leave it completed: it was read
+ * after the job completed, under the old settings. The export does not record
+ * which happened, so that job's label names both.
  */
 export function exportSummary(
   jobExport: { state: string; is_final: boolean; snapshot_at: string | null } | null,
@@ -332,9 +337,11 @@ export function exportSummary(
   const snapshot = built && !jobExport.is_final;
   let label: string | null = null;
   if (snapshot) {
-    label = completed
-      ? `Snapshot as of ${datetime(jobExport.snapshot_at)}, taken while the job was still running — not its final results`
-      : `Snapshot as of ${datetime(jobExport.snapshot_at)} — job still running`;
+    const at = datetime(jobExport.snapshot_at);
+    if (!completed) label = `Snapshot as of ${at} — job still running`;
+    else if (job.job_type === 'opening_rack')
+      label = `Snapshot as of ${at} — not the job's final results: read before it completed, or before its consensus settings last changed`;
+    else label = `Snapshot as of ${at}, read before the job completed — not its final results`;
   } else if (built) {
     label = 'Final results';
   }

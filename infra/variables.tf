@@ -338,9 +338,12 @@ variable "restore_drill_enabled" {
 
 variable "alert_email" {
   description = <<-EOT
-    Where backup failure and staleness alarms are delivered. No default on
-    purpose: an unmonitored backup is the failure mode this whole design
-    exists to avoid, so `terraform apply` should refuse to run without it.
+    Where every alarm the stack raises is delivered: the site down, a deploy
+    the circuit breaker rolled back, the database's storage, CPU and failure
+    events, mail failures and SES reputation, and backup and restore-drill
+    failures. No default on purpose: an unmonitored backup is the failure mode
+    this whole design exists to avoid, so `terraform apply` should refuse to
+    run without it.
     SNS sends a subscription confirmation that has to be accepted once.
   EOT
   type        = string
@@ -450,9 +453,22 @@ variable "min_magpie_version" {
 }
 
 variable "github_token_parameter_arn" {
-  description = "Optional SSM SecureString parameter ARN holding a GitHub token for input-data imports. Empty for none."
+  description = <<-EOT
+    Optional ARN (not the name) of an SSM SecureString parameter in `region`,
+    encrypted with the default aws/ssm key, holding a GitHub token for
+    input-data imports (README "Deploying"). Empty for none.
+  EOT
   type        = string
   default     = ""
+
+  # The value is both the task's secret source and the execution role's policy
+  # resource. A parameter name was refused by IAM half-way through the apply;
+  # an ARN in another region planned and applied, and every task then failed
+  # to start (KL-62).
+  validation {
+    condition     = var.github_token_parameter_arn == "" || can(regex("^arn:aws[a-z-]*:ssm:${var.region}:[0-9]{12}:parameter/.+$", var.github_token_parameter_arn))
+    error_message = "github_token_parameter_arn must be empty or the ARN of an SSM parameter in region, the stack's region (not the parameter's name): the execution role's policy needs the ARN, and a task cannot read a parameter in another region."
+  }
 }
 
 # The next three had placeholder defaults under birdtest.example. Forgotten,

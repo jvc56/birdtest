@@ -123,8 +123,7 @@ async fn list_jobs(
                  AND (j.last_completed_at IS NULL
                       OR j.last_completed_at < now() - interval '24 hours')
                  AND NOT EXISTS (SELECT 1 FROM task_claims c
-                                 JOIN tasks t ON t.id = c.task_id
-                                 WHERE t.job_id = j.id AND c.state = 'claimed')
+                                 WHERE c.job_id = j.id AND c.state = 'claimed')
                 ) AS stalled
          FROM jobs j
          LEFT JOIN job_game_config gc ON gc.job_id = j.id
@@ -1022,8 +1021,12 @@ fn leave_cursor(cursor: Option<&[String]>) -> (Option<i32>, Option<String>) {
     }
 }
 
+/// Only a time this feed can have produced: none before 1970. chrono holds
+/// times far before 4713 BC, where `timestamptz` starts, and Postgres refused
+/// such a cursor at the bind (22008, "timestamp out of range"): a `500` on a
+/// public route, for a cursor that should have read as no cursor.
 fn micros_to_time(raw: &str) -> Option<chrono::DateTime<chrono::Utc>> {
-    chrono::DateTime::from_timestamp_micros(raw.parse().ok()?)
+    chrono::DateTime::from_timestamp_micros(raw.parse().ok()?).filter(|t| t.timestamp() >= 0)
 }
 
 /// A move's first two plies of simulation statistics, as a JSON array column

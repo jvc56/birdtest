@@ -651,7 +651,9 @@ export interface JobExport {
   positions_row_count: number | null;
   /**
    * True for a completed job's final corpus; false for a snapshot read while
-   * the job was still taking results (and for an export not yet built).
+   * the job was still taking results, for a completed job's export whose
+   * consensus settings were changed after it was built, and for an export not
+   * yet built.
    */
   is_final: boolean;
   /** When the snapshot it was read in was taken; null until built. */
@@ -788,8 +790,12 @@ export const api = {
     anchor_player_config_id: string;
     anchor_rating?: number;
   }) => post<{ id: string }>('/api/admin/rating-pools', body),
+  /** `run_id` is null when the config is already a member: nothing is
+   *  logged or refitted. */
   addRatingPoolMember: (poolId: string, player_config_id: string) =>
-    post<{ run_id: string }>(`/api/admin/rating-pools/${poolId}/members`, { player_config_id }),
+    post<{ run_id: string | null }>(`/api/admin/rating-pools/${poolId}/members`, {
+      player_config_id
+    }),
   removeRatingPoolMember: (poolId: string, configId: string) =>
     del<{ run_id: string }>(`/api/admin/rating-pools/${poolId}/members/${configId}`),
   recomputeRatingPool: (poolId: string) =>
@@ -934,6 +940,12 @@ export interface RatingRun {
   jobs_used: number;
 }
 
+/** A config in a rating pool now, whether or not a fit has rated it yet. */
+export interface RatingPoolMember {
+  player_config_id: string;
+  name: string;
+}
+
 export interface RatingPoolDetail {
   id: string;
   name: string;
@@ -942,6 +954,12 @@ export interface RatingPoolDetail {
   layout: string;
   anchor_player_config_id: string;
   anchor_rating: number;
+  /**
+   * The pool's members now, by name, the anchor among them. Not the set
+   * `ratings` covers, which is the latest fit's: a config added since (or
+   * whose refit failed) has no rating yet, and one removed since still has.
+   */
+  members: RatingPoolMember[];
   run: RatingRun | null;
   ratings: RatingRow[];
   residuals: RatingResidual[];

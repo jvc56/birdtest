@@ -259,13 +259,10 @@ async fn refuse_unsettled(state: &AppState, job: &Job) -> AppResult<()> {
     // here first, through the same statement dispatch uses, so "open" below
     // means live.
     crate::scheduler::reclaim_lapsed(state, &[job.id]).await?;
-    let settling = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS (SELECT 1 FROM task_claims c JOIN tasks t ON t.id = c.task_id
-                        WHERE t.job_id = $1 AND c.state = 'claimed')",
-    )
-    .bind(job.id)
-    .fetch_one(&state.pool)
-    .await?;
+    let settling = sqlx::query_scalar::<_, bool>(crate::routes::worker::JOB_HAS_OPEN_CLAIM)
+        .bind(job.id)
+        .fetch_one(&state.pool)
+        .await?;
     if settling {
         return Err(AppError::conflict(
             "this job completed with claims still in flight, and their results are still \
@@ -585,8 +582,8 @@ async fn read_snapshot(
         .await?;
     let (is_final, taken_at): (bool, chrono::DateTime<chrono::Utc>) = sqlx::query_as(
         "SELECT CASE WHEN j.status <> 'completed' THEN FALSE
-                     ELSE NOT EXISTS (SELECT 1 FROM task_claims c JOIN tasks t ON t.id = c.task_id
-                                      WHERE t.job_id = j.id AND c.state = 'claimed')
+                     ELSE NOT EXISTS (SELECT 1 FROM task_claims c
+                                      WHERE c.job_id = j.id AND c.state = 'claimed')
                       AND NOT EXISTS (SELECT 1 FROM leave_rack_staging s WHERE s.job_id = j.id)
                 END,
                 clock_timestamp()
@@ -602,12 +599,11 @@ async fn read_snapshot(
     // what matters is whether there is anything to export, and a capture job
     // nobody contributed positions to should not grow an empty artifact.
     let captured = may_capture_positions(job.job_type)
-        && sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS (SELECT 1 FROM position_analysis_records WHERE job_id = $1)",
-        )
-        .bind(job.id)
-        .fetch_one(&mut *tx)
-        .await?;
+        && sqlx::query_scalar::<_, i32>(POSITIONS_CAPTURED)
+            .bind(job.id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .is_some();
     let positions = if captured {
         Some(upload_rows(state, &mut tx, positions_key, positions_query(), job.id).await?)
     } else {
@@ -617,6 +613,19 @@ async fn read_snapshot(
     tracing::debug!(%export_id, is_final, "export snapshot read");
     Ok(Snapshot { results, positions, is_final, taken_at })
 }
+
+/// Whether the job has a captured position: its newest, through the results
+/// feed's index (`position_analysis_records_feed_idx`), and `LIMIT 1`.
+///
+/// Asked as `EXISTS (... WHERE job_id = $1)` it was a sequential scan for a job
+/// that had captured positions, for the reason `leave_gen::universe_exists`
+/// gives: with few distinct jobs Postgres expects a match within a few rows of
+/// the heap's start, but a job's records sit together after every older job's.
+/// 129-139 ms behind 1.5 million older records, and the table is the largest
+/// that grows without bound -- read inside the export's snapshot, holding back
+/// vacuum (KL-94). Public so a test can check its plan (`I-EXPORT-17`).
+pub const POSITIONS_CAPTURED: &str = "SELECT 1 FROM position_analysis_records WHERE job_id = $1
+     ORDER BY submitted_at DESC, id DESC LIMIT 1";
 
 /// Whether the export's row says `ready` -- or cannot be read to say it does
 /// not.

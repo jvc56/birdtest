@@ -761,8 +761,8 @@ A first deployment, in order (each step is described below):
    diff** and confirm. A version other than the one contributors install pins
    digests their files do not have, and every worker declines every task.
    The import's GitHub calls are 60 an hour per address without
-   `github_token_parameter_arn`; set it first if more than a few imports are
-   expected. Then make player configs and jobs. A job whose players need a
+   `github_token_parameter_arn`; set it first (below, after the two SSM
+   parameters) if more than a few imports are expected. Then make player configs and jobs. A job whose players need a
    wordmap, a rack info table or a word info table is not dispatched until
    the derived-data builder (every five minutes) has built them:
    `/admin/derived-data` shows the queue.
@@ -828,6 +828,24 @@ aws ssm put-parameter --name /birdtest/SESSION_SIGNING_KEY --type SecureString -
 To rotate the password later, run the same `modify-db-instance` and
 `put-parameter` pair, then force a new ECS deployment so tasks re-read SSM
 (RUNBOOK.md, "Rotating the database password").
+
+The GitHub token for input-data imports is optional and goes in a third
+parameter, made the same way; a fine-grained token with read-only access to
+public repositories is enough. Keep the default `aws/ssm` key (no `--key-id`):
+the tasks' execution role has no `kms:Decrypt`, so under a key of your own
+every task fails to start. `github_token_parameter_arn` takes the parameter's
+ARN, not its name, in the stack's region (the plan refuses anything else; KL-62):
+add it to `infra/prod.tfvars` and apply.
+
+```bash
+export AWS_PAGER=""
+# In the shell above: AWS_REGION set to the stack's region.
+read -rsp 'GitHub token: ' GITHUB_TOKEN; echo   # not echoed, not in the history
+aws ssm put-parameter --name /birdtest/GITHUB_TOKEN --type SecureString --overwrite \
+  --value "$GITHUB_TOKEN"
+aws ssm get-parameter --name /birdtest/GITHUB_TOKEN --query Parameter.ARN --output text
+# arn:aws:ssm:<region>:<account>:parameter/birdtest/GITHUB_TOKEN, for prod.tfvars
+```
 
 `acm_certificate_arn` has no default either. The site is HTTPS-only — port 80
 redirects — because the backend sets `Secure` cookies, which a browser will not
@@ -970,8 +988,9 @@ scripts/prod-sql.sh "UPDATE users SET is_admin = true WHERE lower(username) = lo
 ```
 
 `alert_email` has no default: `terraform apply` refuses to run without
-somewhere to send backup failures, because an unmonitored backup is the failure
-mode the whole design exists to avoid. SNS emails a subscription confirmation
+somewhere to send alarms (every one the stack raises, backup failures among
+them), because an unmonitored backup is the failure mode the whole design
+exists to avoid. SNS emails a subscription confirmation
 that has to be accepted once.
 
 The backend image carries a pinned MAGPIE, built from a commit the image

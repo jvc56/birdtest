@@ -804,7 +804,8 @@ async fn a_reset_token_is_single_use_spent_by_any_reset_and_expires() {
 /// A-AUTH-13: with `DEV_LOGIN` -- the local compose stack's, and nowhere
 /// else's -- `GET /api/dev/login` signs the browser in as an account by name
 /// and sends it to a path on this site; an unknown name is a 404, and
-/// anything but a path goes to `/`. Without it the route does not exist.
+/// anything but a path goes to `/` -- a path with a byte that is not visible
+/// ASCII included. Without it the route does not exist.
 #[tokio::test]
 async fn the_dev_login_signs_a_browser_in_only_where_it_is_enabled() {
     let db = TestDb::new().await;
@@ -833,10 +834,20 @@ async fn the_dev_login_signs_a_browser_in_only_where_it_is_enabled() {
     assert_eq!(status, StatusCode::OK, "{me}");
     assert_eq!(me["id"], serde_json::json!(user));
 
-    for next in ["//evil.example/", "/\\evil.example", "https://evil.example/"] {
+    // A tab is dropped by the browser, making `//evil.example`; a line break
+    // is no header value, and panicked the handler.
+    for next in [
+        "//evil.example/",
+        "/\\evil.example",
+        "https://evil.example/",
+        "/\t/evil.example",
+        "/\n",
+        "/jobs\r\n",
+    ] {
         let path = format!("/api/dev/login?username=tester&next={}", utf8(next));
         let response = send_raw(&app, get_request(&path, &[])).await;
-        assert_eq!(response.headers.get("location").unwrap(), "/", "{next}");
+        assert_eq!(response.status, StatusCode::SEE_OTHER, "{next:?}: {response:?}");
+        assert_eq!(response.headers.get("location").unwrap(), "/", "{next:?}");
     }
     let response = send_raw(&app, get_request("/api/dev/login?username=nobody", &[])).await;
     assert_eq!(response.status, StatusCode::NOT_FOUND, "{response:?}");

@@ -1039,15 +1039,8 @@ pub(crate) async fn finish_idle_job(state: &AppState, job_id: Uuid) -> AppResult
     if job.status != JobStatus::Active || job.job_type == JobType::LeaveGeneration {
         return Ok(false);
     }
-    let in_flight: bool = sqlx::query_scalar(
-        "SELECT EXISTS (
-             SELECT 1 FROM task_claims c JOIN tasks t ON t.id = c.task_id
-             WHERE t.job_id = $1 AND c.state = 'claimed'
-         )",
-    )
-    .bind(job_id)
-    .fetch_one(&state.pool)
-    .await?;
+    let in_flight: bool =
+        sqlx::query_scalar(JOB_HAS_OPEN_CLAIM).bind(job_id).fetch_one(&state.pool).await?;
     if in_flight {
         return Ok(false);
     }
@@ -1151,7 +1144,7 @@ const MIN_STATS_PUSH_INTERVAL: std::time::Duration = std::time::Duration::from_s
 /// check is triggered *by* submissions, so a job whose contributors all stop
 /// between checks would not be evaluated again until work resumed — which for a
 /// job that has already reached its stopping point means never, leaving it
-/// `active` and holding its allocation. The `EXISTS` below is
+/// `active` and holding its allocation. [`JOB_HAS_OPEN_CLAIM`] is
 /// bounded by the number of claims open across the fleet, not by anything that
 /// grows with the job, and it is only reached when the debounce would otherwise
 /// skip.
@@ -1159,16 +1152,27 @@ async fn should_check_finish(state: &AppState, job_id: Uuid) -> AppResult<bool> 
     if state.finish_checks.should_check(job_id) {
         return Ok(true);
     }
-    Ok(sqlx::query_scalar::<_, bool>(
-        "SELECT NOT EXISTS (
-             SELECT 1 FROM task_claims c JOIN tasks t ON t.id = c.task_id
-             WHERE t.job_id = $1 AND c.state = 'claimed'
-         )",
-    )
-    .bind(job_id)
-    .fetch_one(&state.pool)
-    .await?)
+    let in_flight: bool =
+        sqlx::query_scalar(JOB_HAS_OPEN_CLAIM).bind(job_id).fetch_one(&state.pool).await?;
+    Ok(!in_flight)
 }
+
+/// Whether the job has a claim open: the finish checks' "anything still in
+/// flight", and an export's of a completed job.
+///
+/// Asked of `task_claims` alone, through its own `job_id` (copied from the
+/// task at claim time and never changed), not by joining `tasks` for the job:
+/// that walked every claim open in the fleet with a `tasks` probe each until
+/// one was this job's -- all of them for a job whose last claims are landing,
+/// the very submissions that decide it -- and without statistics (after a
+/// restore, before ANALYZE) Postgres turned it round into a scan of every task
+/// the job ever had: 311 ms at 250,000. This way it is the open-claims index
+/// and those claims' rows, bounded by the fleet's open claims, with or without
+/// statistics; the export's final check, the job list's `stalled` and leave
+/// generation's in-flight reads ask the same way. Public so a test can check
+/// its plan (`I-STATS-9k`).
+pub const JOB_HAS_OPEN_CLAIM: &str =
+    "SELECT EXISTS (SELECT 1 FROM task_claims c WHERE c.job_id = $1 AND c.state = 'claimed')";
 
 /// Whether the job is done: for a games or pairs job with a match test, its
 /// decision (only after `min_units`) or the hard cap; for one without, its

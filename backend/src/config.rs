@@ -513,8 +513,9 @@ mod tests {
     /// only -- and left production admitting the builds the raise was meant to
     /// keep out (thirty-third audit, pass 1). `backend/.env.example` is the
     /// copy a backend run on the host starts from (README, "Without Docker"),
-    /// and the root `.env.example` the one a compose user copies to `.env`,
-    /// which also says the contribute branch's version meets it.
+    /// and the root `.env.example` the one a compose user copies to `.env`;
+    /// both, and `docker-compose.yml`, also say what the contribute branch
+    /// reports, which has to meet it.
     #[test]
     fn every_copy_of_the_version_floor_agrees() {
         // Compiled in, not read at run time: a unit test reads no file, and
@@ -549,6 +550,8 @@ mod tests {
             );
         }
 
+        // What the files that set the floor say the contribute branch reports.
+        const REPORTS: &str = "`birdtest-contribute` reports ";
         for (path, text, prefix, copies) in [
             ("docker-compose.yml", source!("docker-compose.yml"), "MIN_MAGPIE_VERSION:-", 2),
             ("docker-compose.e2e.yml", source!("docker-compose.e2e.yml"), "MIN_MAGPIE_VERSION: ", 1),
@@ -559,8 +562,10 @@ mod tests {
                 1,
             ),
             ("backend/.env.example", source!("backend/.env.example"), "MIN_MAGPIE_VERSION=", 1),
+            ("backend/.env.example", source!("backend/.env.example"), REPORTS, 1),
             (".env.example", source!(".env.example"), "MIN_MAGPIE_VERSION=", 1),
-            (".env.example", source!(".env.example"), "`birdtest-contribute` reports ", 1),
+            (".env.example", source!(".env.example"), REPORTS, 1),
+            ("docker-compose.yml", source!("docker-compose.yml"), REPORTS, 1),
         ] {
             assert_eq!(versions_after(text, prefix), vec![floor; copies], "{path}");
         }

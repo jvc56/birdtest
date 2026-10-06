@@ -70,6 +70,21 @@ pub async fn acquire(
     // already serialized on that row lock (`issue_claim` bumps
     // `claims_issued`), so taking the advisory lock first costs a little more
     // of the same wait and nothing new.
+    //
+    // Leave generation has the most to lose without it. Every read
+    // `leave_gen::next_step` makes -- which racks are below target, which are
+    // out with an open claim, whether any claim for the generation is still in
+    // flight -- is invisible to a concurrent claim transaction until that one
+    // commits. Unserialized, a claim still being issued was not counted as in
+    // flight, so the generation it belonged to could be closed while its task
+    // went out, and that task's work landed in a generation whose KLV was
+    // already built; and two claims could both find the generation complete and
+    // both start its transition. The lock is transaction-scoped -- released at
+    // commit or rollback, or with a dropped connection -- and is not held across
+    // the transition itself, which would hold a transaction open across an S3
+    // upload: what stops a second transition is the
+    // `leave_generation_transitions` row this lock makes safe to test and write
+    // (`leave_gen::claim_transition`).
     if !super::try_lock_job_dispatch(&mut *conn, job.id).await? {
         return Ok(Acquired::Busy);
     }
@@ -80,7 +95,7 @@ pub async fn acquire(
     // is replayed rather than skipped, since nothing else would ever revisit
     // those seeds.
     //
-    // Leave generation does this itself, under its claim lock and only for the
+    // Leave generation does this itself, under this same lock and only for the
     // current generation (see `generate_leave_gen`).
     if !matches!(job.job_type, JobType::LeaveGeneration) {
         if let Some(task_id) = next_available(conn, job.id, identity, None).await? {

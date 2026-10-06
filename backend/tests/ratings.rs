@@ -1042,6 +1042,48 @@ async fn adding_a_config_that_is_already_a_member_changes_nothing() {
     assert_eq!(logged, 0, "nothing logged");
 }
 
+/// A-RATE-10: the detail lists the pool's members as they are now, not as
+/// the latest fit rated them. A never-fitted pool lists its anchor; a member
+/// added since the fit (or whose refit failed -- the membership commits
+/// first) is listed with no rating; and one removed since is rated but not
+/// listed. The page built its membership from the ratings, so it offered such
+/// a member under "Add" and gave it no Remove button.
+#[tokio::test]
+async fn the_detail_lists_members_the_latest_fit_has_not_rated() {
+    let db = TestDb::new().await;
+    let app = birdtest::app(db.state().await);
+    let f = fixture(&db).await;
+    let path = format!("/api/rating-pools/{}", f.pool);
+    let member = |id: Uuid, name: &str| json!({ "player_config_id": id, "name": name });
+
+    let (status, never_fitted) = send(&app, get_request(&path, &[])).await;
+    assert_eq!(status, StatusCode::OK, "{never_fitted}");
+    assert_eq!(never_fitted["ratings"], json!([]), "{never_fitted}");
+    assert_eq!(
+        never_fitted["members"],
+        json!([member(f.anchor, "a-anchor"), member(f.rival, "b-rival")]),
+        "by name, the anchor among them"
+    );
+
+    ratings::recompute(&db.pool, f.pool, Trigger::Manual).await.unwrap();
+    let newcomer = db.static_player("c-newcomer", f.admin).await;
+    add_member(&db, f.pool, newcomer).await;
+    remove_member(&db, f.pool, f.rival).await;
+
+    let (status, after) = send(&app, get_request(&path, &[])).await;
+    assert_eq!(status, StatusCode::OK, "{after}");
+    assert_eq!(
+        after["members"],
+        json!([member(f.anchor, "a-anchor"), member(newcomer, "c-newcomer")]),
+        "{after}"
+    );
+    let rated: Vec<&serde_json::Value> =
+        after["ratings"].as_array().unwrap().iter().map(|r| &r["player_config_id"]).collect();
+    assert_eq!(rated.len(), 2, "{after}");
+    assert!(rated.contains(&&json!(f.rival)), "still rated by the latest fit");
+    assert!(!rated.contains(&&json!(newcomer)), "not rated until the next fit");
+}
+
 /// A-RATE-4b: adding a config that does not exist is a 400 on its field, and
 /// to a pool that does not exist a 404 -- not the 409 "still referenced" a
 /// bare foreign-key failure maps to. Neither refits anything.

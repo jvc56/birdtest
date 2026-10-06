@@ -854,7 +854,7 @@ async fn results_and_positions_are_read_in_one_snapshot() {
     )
     .await;
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
-    wait_for_lock_waiter(&db, "SELECT EXISTS (SELECT 1 FROM position_analysis_records").await;
+    wait_for_lock_waiter(&db, "SELECT 1 FROM position_analysis_records WHERE job_id").await;
     let task: Uuid = sqlx::query_scalar(
         "INSERT INTO tasks (job_id, seed, state) VALUES ($1, 999, 'completed') RETURNING id",
     )
@@ -1069,4 +1069,87 @@ async fn an_export_spanning_a_reopening_and_a_second_completion_fails() {
     let export = export_and_wait(&app, job, &headers).await;
     assert_eq!(export["state"], "ready", "{export}");
     assert_eq!(export["is_final"], true, "{export}");
+}
+
+/// I-EXPORT-17: whether a job captured positions is asked through the results
+/// feed's index, not by a scan of every older job's records. Asked as
+/// `EXISTS`, Postgres expects a match within a few rows of the heap's start,
+/// but a job's records sit after every older job's; with 30,000 of an older
+/// job's records laid down first, and 4,000 of this one's, analysed, that form
+/// is a `Seq Scan`. [`POSITIONS_CAPTURED`] is an index-only scan of
+/// `position_analysis_records_feed_idx`, custom and generic, and answers for a
+/// job with records and one without.
+///
+/// [`POSITIONS_CAPTURED`]: birdtest::exports::POSITIONS_CAPTURED
+#[tokio::test]
+async fn whether_a_job_captured_positions_is_one_index_probe() {
+    use birdtest::exports::POSITIONS_CAPTURED;
+    let db = TestDb::new().await;
+    let admin = db.user("root", true).await;
+    let older = db.bare_job("opening_rack", admin).await;
+    let job = db.bare_job("games", admin).await;
+    let none = db.bare_job("games", admin).await;
+    for (id, tasks, racks) in [(older, 30_000, 1), (job, 200, 20)] {
+        sqlx::query(
+            "WITH t AS (
+                 INSERT INTO tasks (job_id, seed, state, accepted_count, completed_at)
+                 SELECT $1, s, 'completed', 1, now() FROM generate_series(1, $2) s
+                 RETURNING id
+             ), c AS (
+                 INSERT INTO task_claims
+                     (task_id, job_id, claim_token, state, claimed_by_user_id, completed_at)
+                 SELECT id, $1, gen_random_uuid(), 'completed', $3, now() FROM t
+                 RETURNING id, task_id
+             )
+             INSERT INTO position_analysis_records
+                 (task_claim_id, task_id, job_id, rack, analysis, num_moves)
+             SELECT c.id, c.task_id, $1, 'R' || k, 'static', 1
+             FROM c, generate_series(1, $4) k",
+        )
+        .bind(id)
+        .bind(tasks)
+        .bind(admin)
+        .bind(racks)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+    sqlx::query("ANALYZE position_analysis_records").execute(&db.pool).await.unwrap();
+
+    // The data is what made the old form scan the table, so the assertions
+    // below are not vacuous.
+    let old: Vec<String> = sqlx::query_scalar(&format!(
+        "EXPLAIN SELECT EXISTS (SELECT 1 FROM position_analysis_records WHERE job_id = '{job}')"
+    ))
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert!(old.join("\n").contains("Seq Scan on position_analysis_records"), "{old:?}");
+
+    for mode in ["auto", "force_generic_plan"] {
+        let mut tx = db.pool.begin().await.unwrap();
+        for statement in [
+            format!("SET LOCAL plan_cache_mode = {mode}"),
+            format!("PREPARE captured AS {POSITIONS_CAPTURED}"),
+        ] {
+            sqlx::raw_sql(&statement).execute(&mut *tx).await.unwrap();
+        }
+        let plan: Vec<String> = sqlx::query_scalar(&format!("EXPLAIN EXECUTE captured('{job}')"))
+            .fetch_all(&mut *tx)
+            .await
+            .unwrap();
+        let plan = plan.join("\n");
+        assert!(!plan.contains("Seq Scan"), "{mode}: {plan}");
+        assert!(plan.contains("position_analysis_records_feed_idx"), "{mode}: {plan}");
+        tx.rollback().await.unwrap();
+    }
+
+    for (id, captured) in [(job, true), (none, false)] {
+        let answer = sqlx::query_scalar::<_, i32>(POSITIONS_CAPTURED)
+            .bind(id)
+            .fetch_optional(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(answer.is_some(), captured, "{id}");
+    }
 }

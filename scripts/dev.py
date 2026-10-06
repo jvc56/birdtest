@@ -315,8 +315,9 @@ DERIVED_CHECK_SECS = 15
 
 
 def queued_derived_files() -> Optional[int]:
-    """How many wordmaps and rack info tables are waiting to be built, or None
-    when the stack's database cannot be asked."""
+    """How many derived files (wordmaps, rack info tables, word info tables)
+    are waiting to be built, or None when the stack's database cannot be
+    asked."""
     result = subprocess.run(
         ["docker", "compose", "exec", "-T", "postgres", "psql", "-U", "birdtest", "-d", "birdtest",
          "-Atq", "-c", "SELECT COUNT(*) FROM derived_data WHERE state = 'pending'"],
@@ -336,7 +337,8 @@ def build_derived_files(args) -> None:
     queued = queued_derived_files()
     if not queued:
         return
-    log(f"building {queued} queued wordmap / rack info table file(s)")
+    log(f"building {queued} queued derived file(s) "
+        "(wordmaps, rack info tables, word info tables)")
     run = ["run", "--rm"]
     if args.rebuild:
         run.append("--build")

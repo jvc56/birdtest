@@ -580,7 +580,11 @@ Ratings are **displayed on the ratings pages and nowhere else**:
   the residual table showing where the fit disagrees with the games. A config
   with no path of games to the anchor is listed as unrated rather than drawn.
   Admin membership controls appear inline here for admins, with the anchor
-  (config and rating) and a Delete button.
+  (config and rating) and a Delete button. They work from the pool's members,
+  which the detail serves apart from the fit's ratings: a member the latest fit
+  has not rated -- added since, or its refit failed -- is listed as not yet
+  rated, with a Remove button, and is not offered under Add (thirty-third
+  audit, pass 4; the page had derived membership from the ratings).
 - **No history chart.** The page once drew each config's rating across the
   stored runs; it was removed as more noise than signal on a page read for the
   latest fit. `GET /api/rating-pools/:id/history` still serves those series to
@@ -1404,6 +1408,10 @@ leave-generation job's 3,199,724 progress rows. Warm times, best of two:
 | Opening-rack "unseen first" **as it is now** — a scalar subquery, `(SELECT 1 … LIMIT 1) IS NOT NULL`, which Postgres never hashes | every reissue claim of a consensus job | 22–23 ms custom with current statistics (a window of 2,000 with 5,000 in flight, the same dataset), 25–27 ms with the understated ones; generic, 30–37 ms with JIT off and 116 ms with it on |
 | Opening-rack finish check — **as it was**, `EXISTS` a task and `NOT EXISTS` one not completed | the submission that settles the job's last rack, before its worker is answered; the idle and post-edit checks | 395–414 ms at 3,200,000 tasks over 11 jobs (607 ms with a claim per task): both were sequential scans of `tasks`, every job's history, the second the whole table exactly when the job was done. Measured by the thirty-third audit's third pass |
 | Opening-rack finish check **as it is now** — a first task by seed, none available, no open claim | the same | 0.32–0.37 ms done, 1.0 ms with reissues in flight, custom or generic; bounded by the fleet's open claims, not by history (`I-STATS-9j`) |
+| "Anything still in flight" — **as it was**, `task_claims` joined to `tasks` for the job | inline on most submissions (the finish check when the debounce would skip), an idle job's check, an export of a completed job, the job list's `stalled`, leave generation's in-flight reads | 4.8 ms for a job with no open claims of its own and 600 open in the fleet, just after a restart (a `tasks_pkey` probe per open claim; 69 ms fully cold, about 0.1 ms more per open claim); without statistics — after a `pg_restore`, before ANALYZE — a scan of every task the job ever had: 311 ms at 250,000. Measured by the thirty-third audit's fourth pass on 2.2 million tasks and 2.33 million claims |
+| "Anything still in flight" **as it is now** — `task_claims.job_id`, no join | the same | 0.17–0.27 ms, and 0.04–0.08 ms without statistics: the open-claims index, bounded by the fleet's open claims (`I-STATS-9k`) |
+| An export's "has this job captured positions" — **as it was**, an `EXISTS` | once per export of a games or pairs job, inside its snapshot | a sequential scan of every older job's records, for a job that did capture: 129–147 ms behind 1.5 million, custom or generic (the same dataset) |
+| An export's "has this job captured positions" **as it is now** — `ORDER BY` the feed index's order, `LIMIT 1` | the same | 0.02–0.05 ms, an index-only scan of `position_analysis_records_feed_idx` (`I-EXPORT-17`) |
 | Materializing a generation's rack universe | once per generation | **56–66 s** (measured as a SQL copy inside the transition, which is where it used to run; it now runs from the first claim of the generation it belongs to, off the critical path) |
 
 What the numbers settled:
@@ -2808,9 +2816,11 @@ that catch a worker reporting work it did not do:
   compared rather than its size; order is not part of the contract. The range is
   re-expanded from `rack_start`/`rack_count` against the job's pinned
   distribution, which costs what dispatching it cost. This matters in both
-  directions: too few racks and the task still *completes*, leaving a hole in
-  the space nothing revisits, because the job's finish condition only asks
-  whether every task completed; racks from nowhere are stored as analyses of
+  directions: too few racks and the task still *completes*, but a rack it
+  skipped has no `opening_rack_progress` row (a rack has one from its first
+  analysis), so nothing reissues it, and the job, whose finish check counts
+  settled racks against the space (`OPENING_RACK_FINISHED`), never completes;
+  racks from nowhere are stored as analyses of
   this job and added to `jobs.racks_analyzed`, the progress counter the
   dashboard reads.
 - **A leave batch must not report more rack occurrences than its games could
@@ -3432,7 +3442,7 @@ recorder is a fourth instance of an established pattern rather than new machiner
 ```c
   const MoveList *move_list;  // the ranked candidates this turn
   int game_number;            // which game of the batch
-  int pair_game_number;       // 0 or 1 within a pair; 0 when not pairing
+  int pair_game_number;       // 0 for an unpaired game; 1 or 2 within a pair
   int turn_number;            // turn within the game
 ```
 
@@ -3444,7 +3454,7 @@ they ignore the new fields.
 
 **The `positions` recorder** is `AUTOPLAY_RECORDER_TYPE_POSITION` alongside the
 existing enum values, registered through `autoplay_results_set_recorder()` with the
-same seven function pointers the others use, and selectable through the options
+same eight function pointers the others use, and selectable through the options
 string — so `autoplay games,positions` works from the command line too, which makes
 the recorder testable without birdtest in the loop. Per turn it records the CGP via
 `game_get_cgp`, the rack of the player on turn, the provenance fields, and the top
@@ -3486,35 +3496,18 @@ key on `(task_id, game_index, turn_number)` — one pair of columns rather than
 three — and it is what makes the batch-size check meaningful, since a paired
 batch of N pairs has game indices `[0, 2N)` and `all_games.games` is `2N`.
 
-**Emitting it.** The existing `str_func` produces the `-hr false` summary lines the
-client parses for game results; positions are far too large for that shape, and the
-client reads results in-process anyway, so the recorder exposes a typed accessor
-instead:
-
-```c
-typedef struct AutoplayPosition {
-  char *cgp;
-  char *rack;
-  int game_number;
-  int pair_game_number;
-  int turn_number;
-  int num_moves;               // how many were ranked, before truncation
-  AutoplayPositionMove *moves; // num_plays_recorded of them
-  int num_stored_moves;
-} AutoplayPosition;
-
-// Borrowed, owned by the recorder; valid until the next autoplay run.
-const AutoplayPosition *autoplay_results_get_positions(
-    const AutoplayResults *results, int *count);
-```
-
-This mirrors `autoplay_results_get_game_summary()`, added for exactly this reason —
-so the client reads results out of the structs instead of parsing formatted output.
-`config_contribute_games` serializes the array into the `positions` field of its
-submission, and sets the recorder option when the task request asks for it, so
-`capture_positions` on the birdtest job becomes `autoplay games,positions` on the
-MAGPIE invocation, and with `capture_first_divergence` on a pairs job,
-`autoplay games,divergentpositions`.
+**Emitting it.** Positions are far too large for a `-hr false`-style summary, and
+the client reads results in-process anyway, so nothing is parsed from text: each
+recorder has a `json_func` beside its `str_func` and writes its own share of one
+result object. The positions recorder keeps its captures per worker thread and
+renders them on consolidate (`positions_data_consolidate`) into the `positions`
+key, each position's plays through `autoplay_results_write_ranked_plays_json`;
+the game recorder writes `all_games` and, for pairs, `divergent_games`.
+`config_contribute_games` takes the whole object from `autoplay_results_get_json()`
+and submits it as the task's result, and sets the recorder option when the task request asks
+for it, so `capture_positions` on the birdtest job becomes
+`autoplay games,positions` on the MAGPIE invocation, and with
+`capture_first_divergence` on a pairs job, `autoplay games,divergentpositions`.
 
 #### Wire format
 
@@ -5486,6 +5479,8 @@ The full request and response shapes are in [The Worker API Contract](#the-worke
 
 All Admin API endpoints require the requesting user to have `is_admin = TRUE`. A non-admin session is rejected with `403 Forbidden`; a request with no session — worker credentials or not — gets `401`.
 
+Every action on a job below — activate, deactivate, complete, allocations, consensus, purge, delete, export, merge-progress and rebuild-artifacts — answers `409` while a purge, delete or consensus change of that job is running ([Editing the consensus](#opening-rack-consensus)): each holds the job off the fleet, and an action that waited on it would hold a pool connection until it finished.
+
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/api/admin/player-configs` | List all player configurations, as stored (file ids, creator). The public `GET /api/player-configs` and `/:id` serve every setting with files by name, and not who made it. |
@@ -5496,10 +5491,10 @@ All Admin API endpoints require the requesting user to have `is_admin = TRUE`. A
 | `POST` | `/api/admin/jobs/:id/deactivate` | Set a job to inactive. Workers will no longer be assigned tasks from it. Refused (`409`) for a completed job. Audited (`job.deactivated`); that row is the record of who and when, and the job row keeps no `deactivated_at` beside it. |
 | `POST` | `/api/admin/jobs/:id/activate` | Activate an inactive job. Body: `{ "allocation": int }`. Sets allocation and transitions status to active. |
 | `PUT` | `/api/admin/jobs/allocations` | Set several jobs' allocations at once. Body: `{ "allocations": [{ "job_id": uuid, "allocation": int }] }`. Checked as a whole -- the active jobs must sum to at most 100% as the request leaves them -- under the activation lock, every named row locked in id order first. Above 0% a job is active (activated if it was not); 0% leaves it inactive (deactivated if it was active, its last allocation kept). A completed job, a job named twice or an allocation outside 0–100 refuses the whole request. Audited per job: `job.allocation_changed` (from what to what), and `job.activated` / `job.deactivated` for a status change. The `/admin/allocation` page sends it. |
-| `PATCH` | `/api/admin/jobs/:id/consensus` | Change an opening-rack job's consensus settings. Body: any of `{ "min_results_per_rack", "max_results_per_rack", "consensus_pct" }`; only those sent change. Refuses (`400`) what creation refuses, and any other job type. Restates every rack, then reopens a completed job left with unsettled racks (active if its allocation fits, inactive otherwise) and completes an active one left with none. Answers `{ job, config, unsettled_racks, reopened, reopened_inactive_reason }`. Audited as `job.consensus_changed`. See [Editing the consensus](#opening-rack-consensus). |
+| `PATCH` | `/api/admin/jobs/:id/consensus` | Change an opening-rack job's consensus settings. Body: any of `{ "min_results_per_rack", "max_results_per_rack", "consensus_pct" }`; only those sent change. Refuses (`400`) what creation refuses, and any other job type. Restates every rack, then reopens a completed job left with unsettled racks (active if its allocation fits, inactive otherwise) and completes an active one left with none. Answers `{ job, config, unsettled_racks, reopened, reopened_inactive_reason }`. `409` while a purge, delete or another consensus change of the job is running. Audited as `job.consensus_changed`. See [Editing the consensus](#opening-rack-consensus). |
 | `POST` | `/api/admin/jobs/:id/complete` | Force-complete a job immediately, regardless of task progress. Refused (`409`) for a job that is already completed. |
-| `POST` | `/api/admin/jobs/:id/purge` | Delete every claim, result, leave-gen progress and staged-result row, selection cursor, artifact row and task for a job, reset its dispatch counter and rejoin it at parity with the other jobs (`claims_baseline`), then re-seed its initial state. Ratings are untouched: they belong to rating pools, and the sweep refits a pool whose evidence changed. Returns `{ tasks_reset }`. Writes a census of what it destroyed to the audit log first. `409` while a purge or delete of the job is already running: each runs to completion on a task of its own, so a second click stacked a second behind the first's locks. |
-| `DELETE` | `/api/admin/jobs/:id` | Delete a job and all its tasks. `409` while a purge or delete of it is running, as above. |
+| `POST` | `/api/admin/jobs/:id/purge` | Delete every claim, result, leave-gen progress and staged-result row, selection cursor, artifact row and task for a job, reset its dispatch counter and rejoin it at parity with the other jobs (`claims_baseline`), then re-seed its initial state. Ratings are untouched: they belong to rating pools, and the sweep refits a pool whose evidence changed. Returns `{ tasks_reset }`. Writes a census of what it destroyed to the audit log first. `409` while a purge, delete or consensus change of the job is already running: each runs to completion on a task of its own, so a second click stacked a second behind the first's locks. |
+| `DELETE` | `/api/admin/jobs/:id` | Delete a job and all its tasks. `409` while a purge, delete or consensus change of it is running, as above. |
 | `DELETE` | `/api/admin/users/:id` | Delete a user account: anonymize it in place, keeping its claims and records so no donated compute is lost (see Admin API semantics). |
 | `POST` | `/api/admin/workers/ban` | Ban a worker by user ID or anonymous UUID. One ban per identity: a second is `409`, so that unban means what it says. The reason is at most 1,000 characters and holds no NUL (`400`). |
 | `GET` | `/api/admin/workers/bans` | Every ban in force, newest first, with the id lifting it takes. (Nothing listed them before the thirteenth audit; a mistaken ban needed SQL.) |
@@ -5615,7 +5610,7 @@ default; its requests never carry it). The new-job form has an input for each
 (the cutoff only where the job can simulate). Rating
 pools do not scope by them (KL-75).
 
-Beyond role matching, creation enforces eight rules the schema cannot express:
+Beyond role matching, creation enforces seven rules the schema cannot express:
 
 - **Settings a worker can run and a test can evaluate.** `variant` is `classic` or `wordsmog`; batch sizes at least 1 (`racks_per_batch`
   at most 10,000; `games_per_batch` at most 10,000 games, 1,000 when the job
@@ -5755,7 +5750,7 @@ do not exist.
 | `GET` | `/api/users` | List all registered user accounts with contribution stats. Paginated. |
 | `GET` | `/api/workers` | Contributor stats for all workers (anonymous and authenticated) — compute time, games, racks, tasks and the last result — paginated, ranked by compute time or by `?sort=compute\|games\|racks\|tasks`. |
 | `GET` | `/api/rating-pools` | Rating pools with their conditions, member counts and last fit time. |
-| `GET` | `/api/rating-pools/:id` | Latest fit for one pool: run provenance, every member's rating with uncertainty, and the residuals. |
+| `GET` | `/api/rating-pools/:id` | One pool: its members now (`members`: config id and name, the anchor among them) and its latest fit, with run provenance, each rated config's rating with uncertainty, and the residuals. The two sets can differ: a member added since the fit (or whose refit failed) has no rating yet, and one removed since is still rated. |
 | `GET` | `/api/rating-pools/:id/history` | Stored runs' ratings, oldest first, thinned to at most 500 runs evenly spaced over the pool's history, for the six current members rated highest in the newest run. No page draws it now. |
 
 **Rack lookup** canonicalizes the query before matching: uppercased, whitespace
@@ -6136,8 +6131,9 @@ birdtest/
     ├── ops.tf                      # the ops task: psql and the restore script inside the VPC
     ├── ssm.tf                      # the two SSM parameters' names and ARNs (never managed or read)
     └── tests/
-        └── variables.tftest.hcl    # S-TF-1/2: every variable validation, against mock
-                                    # providers (`terraform test`, CI)
+        └── variables.tftest.hcl    # S-TF-1..3: every variable validation and the
+                                    # deploy-failed alert, against mock providers
+                                    # (`terraform test`, CI)
 ```
 
 ---
@@ -8471,11 +8467,15 @@ says so in its implemented option, rather than being removed.
   one index probe now, whatever the history (`I-LEAVE-25`).
 
 **KL-18. `leave_rack_progress` keeps every generation's rows for the life of the job.**
-- **Context:** About 430 MB a generation for English, never read again once that
-  generation's artifact is verified.
+- **Context:** About 430 MB a generation for English. Once a generation's
+  artifact is verified, its rows are read again only by `rebuild-artifacts`, the
+  job's export (`leave_rack_progress` for every generation, `exports.rs`) and
+  its public results feed (every generation, newest first, `routes/public.rs`).
 - **Problem:** Storage that grows with every generation.
 - **Options considered:** drop or archive a closed generation's rows, keeping the
-  hash.
+  hash. Dropped, they also go from the export and the public feed, which would
+  then hold only the current generation; archived, both would have to read the
+  archive.
 - **Option implemented:** Kept.
 - **Justification:** The rows are what `rebuild-artifacts` derives a KLV from,
   and the design treats the object store as derivable from the database.
@@ -8546,8 +8546,11 @@ says so in its implemented option, rather than being removed.
 
 **KL-25. Per-ply statistics are a row each, and a move's id exists only for them.**
 - **Context:**
-  - `position_analysis_plies` (≈88 bytes a ply with its key) is read only by the
-    export, which folds a move's plies straight back into an array.
+  - `position_analysis_plies` (≈88 bytes a ply with its key) is read by the
+    export, which folds a move's plies straight back into an array, and by the
+    public rack lookup and saved positions, which show each move's first two
+    (`FIRST_PLIES`, `routes/public.rs`); the `float8[]` option below rewrites
+    both reads.
   - `position_analysis_moves.id` is referenced only by the plies.
 - **Problem:** Storage and inserts on the submit path.
 - **Options considered:**
@@ -9801,7 +9804,12 @@ says so in its implemented option, rather than being removed.
   must have `backend_image`'s tag (a missing tag is `latest`; an image named by
   digest is let through, having none to compare); `acm_certificate_arn` must be
   an ACM ARN in `region`; `mail_from_address` must be at `ses_domain` or a
-  subdomain of it.
+  subdomain of it. Pass 4 added `github_token_parameter_arn`, which none of
+  the three covered: empty, or an SSM parameter ARN in `region`. A parameter's
+  name went into the execution role's policy, which IAM refused half-way
+  through the apply; another region's ARN applied, and then no task could read
+  its secret. README "Deploying" now says how to make the parameter (default
+  `aws/ssm` key: the execution role has no `kms:Decrypt`).
 - **Justification:** The reason for leaving them was that `terraform validate`
   does not exercise a validation's condition: only a plan against real values
   shows it refuses the wrong ones and not the right, and one that refuses a
@@ -10018,12 +10026,18 @@ says so in its implemented option, rather than being removed.
     refuses a job that would pin two files under one name, so only a server bug
     reaches it.
   - `MAGPIE_VERSION` went to 0.1.1 in the first of `birdtest-contribute`'s
-    unpushed commits, and later ones changed results without a bump (a
+    commits since 0.1.0, and later ones changed results without a bump (a
     simulating opening-rack player ranks every play, short opening racks,
     racks with designated letters refused); the version's comment lists less
-    than 0.1.1 holds. No build of an intermediate commit exists outside this
-    machine — the remote is still 0.1.0 — so the version floor has nothing to
-    exclude yet (thirty-second audit).
+    than 0.1.1 holds (thirty-second audit). 0.1.1 and every commit up to
+    dbf8df3b are now on the remote, so a build of any of them reports 0.1.1,
+    dbf8df3b's included, which still captures a forced turn as the previous
+    simulation's analysis (B2-3, fixed in the unpushed 1a0ae932). None can
+    claim from this server: their claim states no `board_dim` or `rack_size`
+    (added in c3c6a875, also unpushed), which `ClaimBody` requires, so the
+    floor still has nothing to exclude. Nothing is deployed, so no bump; the
+    first result-changing commit after a deployment bumps the version and the
+    floor together (thirty-third audit, pass 4).
   - `magpie contribute` installs no SIGINT or SIGTERM handler, so Ctrl-C or
     `docker stop` leaves the open claim to lapse on the heartbeat timeout,
     though the decline path exists and the REPL's `stop` uses it.
@@ -10521,8 +10535,10 @@ weakening the isolation the separate bucket exists to create. Instead **the back
 task writes a `backups` row into Postgres when it finishes**: the backend reads its
 own database and needs no new S3 permission, and the row carries the manifest's
 figures (bytes, sha256, row counts, times). A
-restored database also restores the backup history, which is confusing but harmless
-if `restored_at` context is displayed. Failed runs insert a row with `ok = false` so
+restored database also restores the backup history: the rows from before the restore
+are the source's runs, shown as they were and not marked as restored, which is harmless
+— staleness is measured from the newest successful run, and the next nightly run adds
+its own row. Failed runs insert a row with `ok = false` so
 the admin page shows the failure rather than a gap. The table is insert-only and
 nothing in the request path reads it.
 

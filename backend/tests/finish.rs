@@ -400,6 +400,108 @@ async fn the_opening_rack_finish_check_reads_indexes_not_every_jobs_tasks() {
     assert!(!finished(job).await, "a task out on a claim");
 }
 
+/// I-STATS-9k: the "anything still in flight" probe reads the open-claims
+/// index, not the job's tasks. The finish checks run it inline on most
+/// submissions and an export asks it of a completed job; joined to `tasks` for
+/// the job, it walked every open claim in the fleet with a `tasks` probe each,
+/// and without statistics -- after a restore, before ANALYZE -- read every
+/// task the job ever had. Thirty thousand of a job's tasks laid down, a
+/// completed claim each, and another job's two hundred claims open, with the
+/// two tables' statistics removed (where the old form scans the job's tasks):
+/// [`JOB_HAS_OPEN_CLAIM`] reads `task_claims_open_idx` and no `tasks`, custom
+/// and generic, with statistics and without, and answers for each job.
+#[tokio::test]
+async fn the_in_flight_probe_reads_the_open_claims_not_the_jobs_tasks() {
+    use birdtest::routes::worker::JOB_HAS_OPEN_CLAIM;
+    let db = TestDb::new().await;
+    let admin = db.user("planner", true).await;
+    let done = db.bare_job("games", admin).await;
+    let busy = db.bare_job("games", admin).await;
+    sqlx::query(
+        "INSERT INTO tasks (job_id, seed, state, accepted_count, completed_at)
+         SELECT $1, s, 'completed', 1, now() FROM generate_series(0, 29999) s",
+    )
+    .bind(done)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO tasks (job_id, seed, state, active_claim_count)
+         SELECT $1, s, 'claimed', 1 FROM generate_series(0, 199) s",
+    )
+    .bind(busy)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO task_claims (task_id, job_id, claim_token, state, claimed_by_user_id, completed_at)
+         SELECT id, job_id, gen_random_uuid(),
+                CASE WHEN state = 'completed' THEN 'completed' ELSE 'claimed' END::claim_state,
+                $1, completed_at
+         FROM tasks",
+    )
+    .bind(admin)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query("ANALYZE tasks").execute(&db.pool).await.unwrap();
+    sqlx::query("ANALYZE task_claims").execute(&db.pool).await.unwrap();
+
+    for statistics in [true, false] {
+        let mut tx = db.pool.begin().await.unwrap();
+        if !statistics {
+            // As after a restore, before ANALYZE. TestDb connects as a
+            // superuser; the rollback puts them back.
+            sqlx::raw_sql(
+                "DELETE FROM pg_statistic
+                 WHERE starelid IN ('tasks'::regclass, 'task_claims'::regclass);
+                 UPDATE pg_class SET reltuples = -1
+                 WHERE oid IN ('tasks'::regclass, 'task_claims'::regclass)",
+            )
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+            // The data is what made the old form read the job's tasks, so the
+            // assertions below are not vacuous.
+            let old: Vec<String> = sqlx::query_scalar(&format!(
+                "EXPLAIN SELECT EXISTS (SELECT 1 FROM task_claims c JOIN tasks t ON t.id = c.task_id
+                                        WHERE t.job_id = '{done}' AND c.state = 'claimed')"
+            ))
+            .fetch_all(&mut *tx)
+            .await
+            .unwrap();
+            assert!(old.join("\n").contains("on tasks t"), "{old:?}");
+        }
+        for mode in ["auto", "force_generic_plan"] {
+            for statement in [
+                format!("SET LOCAL plan_cache_mode = {mode}"),
+                format!("PREPARE in_flight AS {JOB_HAS_OPEN_CLAIM}"),
+            ] {
+                sqlx::raw_sql(&statement).execute(&mut *tx).await.unwrap();
+            }
+            let plan: Vec<String> =
+                sqlx::query_scalar(&format!("EXPLAIN EXECUTE in_flight('{done}')"))
+                    .fetch_all(&mut *tx)
+                    .await
+                    .unwrap();
+            let plan = plan.join("\n");
+            assert!(plan.contains("task_claims_open_idx"), "{statistics} {mode}: {plan}");
+            assert!(!plan.contains("on tasks"), "{statistics} {mode}: {plan}");
+            assert!(!plan.contains("Seq Scan"), "{statistics} {mode}: {plan}");
+            sqlx::raw_sql("DEALLOCATE in_flight").execute(&mut *tx).await.unwrap();
+        }
+        for (job, open) in [(done, false), (busy, true)] {
+            let answer: bool = sqlx::query_scalar(JOB_HAS_OPEN_CLAIM)
+                .bind(job)
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+            assert_eq!(answer, open, "{statistics}");
+        }
+        tx.rollback().await.unwrap();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // A job whose last results landed with nobody to check them
 // ---------------------------------------------------------------------------

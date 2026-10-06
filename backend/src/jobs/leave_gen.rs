@@ -691,37 +691,6 @@ pub async fn release_orphaned_transitions(pool: &sqlx::PgPool) -> AppResult<u64>
     .rows_affected())
 }
 
-/// Serialize this job's claim decisions against each other.
-///
-/// Every read `next_step` makes -- which racks are below target, which are out
-/// with an open claim, whether any claim for the generation is still in flight
-/// -- is invisible to a *concurrent* claim transaction until that transaction
-/// commits. Two consequences:
-///
-/// - a claim still being issued is not counted as in flight, so the generation
-///   it belongs to could be closed while its task was going out, and the work
-///   that task did would land in a generation whose KLV was already built;
-/// - two claims could both find the generation complete and both start its
-///   transition.
-///
-/// The lock is taken per job, so claims for other jobs are unaffected, and it is
-/// transaction-scoped: it is released when the claim transaction commits or
-/// rolls back, whichever happens, and a dropped connection releases it too.
-/// It is *not* held across the transition itself -- that would hold a Postgres
-/// transaction open across an S3 upload -- so what stops a second transition is
-/// the `leave_generation_transitions` row this lock makes it safe to test and
-/// write.
-///
-/// It is [`super::try_lock_job_dispatch`], which every job type now takes for
-/// the same underlying reason; leave generation just has the most to lose by
-/// not holding it -- and the most to gain from the bounded wait, since seeding
-/// a generation's rack universe holds this lock for tens of seconds.
-///
-/// `false` means another claim holds it and this one should move on.
-pub async fn lock_claim_decisions(conn: &mut PgConnection, job_id: Uuid) -> AppResult<bool> {
-    super::try_lock_job_dispatch(conn, job_id).await
-}
-
 /// What the scheduler should do next for a leave-generation job.
 pub enum LeaveGenStep {
     /// Dispatch this forced-rack partition. Boxed: the request carries its
@@ -916,14 +885,15 @@ enum Selected {
     Step(LeaveGenStep),
 }
 
-/// Claims of this generation still `claimed`.
+/// Claims of this generation still `claimed`: the fleet's open claims, by
+/// their own `job_id`, not the job's tasks (see
+/// `routes::worker::JOB_HAS_OPEN_CLAIM`).
 async fn claims_in_flight(conn: &mut PgConnection, job_id: Uuid, generation: i32) -> AppResult<i64> {
     Ok(sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*)
          FROM task_claims c
          JOIN leave_requests r ON r.task_id = c.task_id
-         JOIN tasks t ON t.id = c.task_id
-         WHERE t.job_id = $1 AND r.generation = $2 AND c.state = 'claimed'",
+         WHERE c.job_id = $1 AND r.generation = $2 AND c.state = 'claimed'",
     )
     .bind(job_id)
     .bind(generation)
@@ -996,9 +966,10 @@ async fn nothing_to_hand_out(
 }
 
 /// The generation is complete. Whoever writes this row owns its transition;
-/// everyone else waits. Safe to test and write without re-reading because
-/// `lock_claim_decisions` holds the job's lock for the rest of this
-/// transaction, so no other claim is between its own test and its own write.
+/// everyone else waits. Safe to test and write without re-reading because the
+/// claim holds the job's dispatch lock (taken in `registry::acquire`) for the
+/// rest of this transaction, so no other claim is between its own test and its
+/// own write.
 ///
 /// A row whose transition never finished is taken over rather than trusted
 /// forever -- see TRANSITION_TAKEOVER_AFTER. Taking over bumps `attempts`,
@@ -1252,9 +1223,8 @@ async fn furthest_below_target(
         "WITH out_now AS (
              SELECT unnest(r.forced_racks) AS rack
              FROM task_claims c
-             JOIN tasks t ON t.id = c.task_id
              JOIN leave_requests r ON r.task_id = c.task_id
-             WHERE t.job_id = $1 AND r.generation = $2 AND c.state = 'claimed'
+             WHERE c.job_id = $1 AND r.generation = $2 AND c.state = 'claimed'
              UNION
              SELECT unnest(r.forced_racks)
              FROM leave_rack_staging s

@@ -251,8 +251,9 @@ const DISPATCH_LOCK_WAIT_MS: u32 = 2_000;
 /// out of the rest of that request. The caller must not
 /// issue further statements on this connection, since the timed-out statement
 /// aborted the transaction; every caller returns straight away and the claim
-/// path rolls back.
-pub(crate) async fn try_lock_job_dispatch(
+/// path rolls back. Public for the tests that make a leave claim decision by
+/// hand, under the lock a claim takes.
+pub async fn try_lock_job_dispatch(
     conn: &mut PgConnection,
     job_id: Uuid,
 ) -> AppResult<bool> {

@@ -63,5 +63,6 @@ client → server fixture into the type that handles it and runs a result throug
 its job type's validation, as a submission would be; server → client fixtures
 are compared with what the wire types serialize by field structure. MAGPIE's
 `test/contribute_test.c` checks the other half: every key its client reads is
-in the assignments, and its result serializers produce every key in the
-results.
+in the assignments, its result serializers produce every key in the results,
+and the claim and decline bodies it builds match `claim-request.json` (with
+this build's board and rack size) and `decline-missing-data.json` key for key.

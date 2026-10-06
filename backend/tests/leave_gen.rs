@@ -593,7 +593,7 @@ async fn next_step(db: &TestDb, job: Uuid) -> Step {
     .unwrap();
     let job_data = birdtest::jobs::load_job_data(&mut tx, job_row.id).await.unwrap();
     let player = birdtest::jobs::load_player_spec(&mut tx, config.player_config_id).await.unwrap();
-    leave_gen::lock_claim_decisions(&mut tx, job).await.unwrap();
+    birdtest::jobs::try_lock_job_dispatch(&mut tx, job).await.unwrap();
     let step = leave_gen::next_step(&mut tx, job, &config, &job_data, &player).await.unwrap();
     let step = match step {
         LeaveGenStep::Transition { .. } => Step::Transition,

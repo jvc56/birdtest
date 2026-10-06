@@ -258,10 +258,15 @@
 
   {#if simming}
     <div class="grid grid-cols-2 gap-3">
-      <div><label class="label" for="iters">Maximum Total Iterations (-i)</label><input id="iters" type="number" class="input" bind:value={maxIterations} /></div>
-      <div><label class="label" for="num_plies">Plies (-pl)</label><input id="num_plies" type="number" class="input" bind:value={numPlies} /></div>
-      <div><label class="label" for="np">Moves Generated (-np)</label><input id="np" type="number" class="input" bind:value={numPlays} /></div>
-      <div><label class="label" for="npr">Plies Recorded (shplies)</label><input id="npr" type="number" class="input" bind:value={numPliesRecorded} /></div>
+      <!-- The server's minimums: a simmer simulates at least 1 ply, and with one
+           candidate MAGPIE plays it without simulating. -->
+      <div><label class="label" for="iters">Maximum Total Iterations (-i)</label><input id="iters" type="number" min="1" class="input" bind:value={maxIterations} /></div>
+      <div><label class="label" for="num_plies">Plies (-pl)</label><input id="num_plies" type="number" min="1" class="input" bind:value={numPlies} /></div>
+      <div>
+        <label class="label" for="np">Moves Generated (-np)</label><input id="np" type="number" min="2" class="input" bind:value={numPlays} />
+        <p class="mt-1 text-xs text-muted-foreground">At least 2: with one, MAGPIE plays it without simulating.</p>
+      </div>
+      <div><label class="label" for="npr">Plies Recorded (shplies)</label><input id="npr" type="number" min="1" class="input" bind:value={numPliesRecorded} /></div>
       <div><label class="label" for="sc">Stopping % (-sc)</label><input id="sc" type="number" step="any" min="0" max="100" class="input" bind:this={stoppingInput} bind:value={stoppingPct} /></div>
       <p class="text-sm">No time limit: a simulation stops at its iteration budget, so what it finds does not depend on the contributor's hardware.</p>
       <label class="flex items-end gap-2 text-sm">

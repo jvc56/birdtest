@@ -122,6 +122,12 @@ run "images_named_by_digest_plan" {
   }
 }
 
+# README "Deploying", step 6's optional parameter, by its ARN in region.
+run "a_github_token_parameter_in_the_region_plans" {
+  command = plan
+  variables { github_token_parameter_arn = "arn:aws:ssm:us-east-1:123456789012:parameter/birdtest/GITHUB_TOKEN" }
+}
+
 # A floor the backend reads as 0.2.0 (`Version::parse_strict`).
 run "a_two_part_magpie_floor_plans" {
   command = plan
@@ -401,6 +407,21 @@ run "an_arn_that_is_not_a_certificate_is_refused" {
   command = plan
   variables { acm_certificate_arn = "arn:aws:iam::123456789012:server-certificate/birdtest" }
   expect_failures = [var.acm_certificate_arn]
+}
+
+# A name went into the execution role's policy, which IAM refused half-way
+# through the apply.
+run "a_github_token_parameter_name_is_refused" {
+  command = plan
+  variables { github_token_parameter_arn = "/birdtest/GITHUB_TOKEN" }
+  expect_failures = [var.github_token_parameter_arn]
+}
+
+# Applied, and then no task could read its secret.
+run "a_github_token_parameter_from_another_region_is_refused" {
+  command = plan
+  variables { github_token_parameter_arn = "arn:aws:ssm:us-west-2:123456789012:parameter/birdtest/GITHUB_TOKEN" }
+  expect_failures = [var.github_token_parameter_arn]
 }
 
 run "a_sender_outside_the_ses_domain_is_refused" {

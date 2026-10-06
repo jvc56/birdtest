@@ -115,6 +115,13 @@ struct RunSummary {
     jobs_used: i32,
 }
 
+/// A config in the pool now, rated or not.
+#[derive(Serialize)]
+struct PoolMember {
+    player_config_id: Uuid,
+    name: String,
+}
+
 #[derive(Serialize)]
 struct PoolDetail {
     id: Uuid,
@@ -124,6 +131,11 @@ struct PoolDetail {
     layout: String,
     anchor_player_config_id: Uuid,
     anchor_rating: f64,
+    /// Who is in the pool now, by name. Not the same set as `ratings`, which
+    /// is the latest fit's: a config added since (or whose refit failed) is a
+    /// member with no rating yet, and one removed since is rated but no longer
+    /// a member. The page's membership controls work from this list.
+    members: Vec<PoolMember>,
     run: Option<RunSummary>,
     ratings: Vec<RatingRow>,
     /// Actual-versus-predicted for every head-to-head, worst first. This is
@@ -167,6 +179,20 @@ async fn pool_detail(
         pairs_used: row.get("pairs_used"),
         jobs_used: row.get("jobs_used"),
     });
+
+    let members = sqlx::query(
+        "SELECT m.player_config_id, c.name
+         FROM rating_pool_members m
+         JOIN player_configs c ON c.id = m.player_config_id
+         WHERE m.pool_id = $1
+         ORDER BY c.name, m.player_config_id",
+    )
+    .bind(id)
+    .fetch_all(&state.read_pool)
+    .await?
+    .iter()
+    .map(|row| PoolMember { player_config_id: row.get("player_config_id"), name: row.get("name") })
+    .collect();
 
     let mut ratings = Vec::new();
     if let Some(run) = run.as_ref() {
@@ -230,6 +256,7 @@ async fn pool_detail(
         layout: pool_row.get("layout"),
         anchor_player_config_id: pool_row.get("anchor_player_config_id"),
         anchor_rating: pool_row.get("anchor_rating"),
+        members,
         run,
         ratings,
         residuals,

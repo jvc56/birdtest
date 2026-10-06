@@ -499,7 +499,7 @@ Every label is in Title Case, and the player-config form uses the same names, wi
 | 2 | Leaves | `klv_id` | `k1`/`k2` (`leaves`) | leave jobs |
 | 3 | Sorted By | `sort_strategy` | `s1`/`s2` | n/a |
 | 4 | Move Recorder | `recorder_type` | `r1`/`r2` | every job but an opening-rack static analysis |
-| 5 | Moves Generated | `num_plays` | `np1`/`np2` (`numplays`) | n/a |
+| 5 | Moves Generated | `num_plays` | `np1`/`np2` (`numplays`) | leave jobs; games and pairs jobs that record no positions and have no simmer (a static player's list only holds the best move it plays) |
 | 6 | Plies (0 = static) | `num_plies` | `pl1`/`pl2` (`plies`) | n/a |
 | 7 | Uses Inference ("—" for a static player) | `use_inference` | `si1`/`si2` (`sinfer`) | static players, opening-rack jobs (Fix 2) |
 | 8 | Uses Preendgame ("yes (bag ≤ 2)" or "no"; no without the endgame) | `peg_max_bag` | `pegbag1`/`pegbag2` | opening-rack jobs; leave jobs |
@@ -536,7 +536,8 @@ How the "Never read by" column affects the display:
   set, an opening-rack job's (with the recorder and move-gen margin when its
   player simulates), and a games or pairs job's recorder and move-gen margin
   (autoplay generates with MAGPIE's own record type and a margin of 0), with
-  its plays and plies recorded when it records no positions.
+  its plays and plies recorded when it records no positions, and then its
+  moves generated too when no player simulates.
 - A simulation-only row (7, 10–12 and 15–22) shows "—" for a static player, and a
   pre-endgame row (24–30) shows "—" for a player that does not run it. So do
   Plies Recorded for a static player, which records no plies, and Movegen
