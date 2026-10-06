@@ -32,7 +32,7 @@ while [ $# -gt 0 ]; do
     --build) build=1 ;;
     --keep) keep=1 ;;
     --) shift; playwright_args=("$@"); break ;;
-    -h|--help) sed -n '2,19p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,/^set /{/^#/p}' "$0"; exit 0 ;;
     *) echo "unknown argument: $1 (see --help)" >&2; exit 2 ;;
   esac
   shift

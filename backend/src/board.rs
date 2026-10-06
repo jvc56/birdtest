@@ -7,9 +7,11 @@
 
 use serde::Serialize;
 
-/// The board every MAGPIE the fleet runs is built for (`BOARD_DIM`). A layout
-/// of another size, or one MAGPIE otherwise refuses, loads on no worker: each
-/// fails the task, and after five in a row `magpie contribute` stops.
+/// The board every MAGPIE the fleet runs is built for (`BOARD_DIM`): a claim
+/// states its build's, and one of another size is sent away
+/// (`unsupported_build`, `routes::worker`). A layout of another size, or one
+/// MAGPIE otherwise refuses, loads on no worker: each fails the task, and after
+/// five in a row `magpie contribute` stops.
 pub const MAGPIE_BOARD_DIM: usize = 15;
 
 /// One square of a layout, by MAGPIE's symbol for it (`bonus_square.h`).

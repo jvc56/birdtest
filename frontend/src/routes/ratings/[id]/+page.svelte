@@ -2,15 +2,18 @@
   import { onMount } from 'svelte';
   import { page } from '$app/stores';
   import { goto } from '$app/navigation';
-  import { api, type PlayerConfig, type RatingPoolDetail } from '$lib/api';
+  import { api, errorText, type PlayerConfig, type RatingPoolDetail } from '$lib/api';
   import { session } from '$lib/auth';
   import RatingDotPlot from '$lib/components/RatingDotPlot.svelte';
   import ResidualMatrix from '$lib/components/ResidualMatrix.svelte';
   import { ratingCell, stderrCell } from '$lib/charts/ratingDotPlot';
+  import { poolMembership } from '$lib/ratingPool';
 
   let pool: RatingPoolDetail | null = null;
   let configs: PlayerConfig[] = [];
   let error = '';
+  /** What a change that went through but changed nothing says instead. */
+  let notice = '';
   let loadError = '';
   let busy = false;
   let addConfigId = '';
@@ -20,26 +23,18 @@
 
   $: poolId = $page.params.id as string;
   $: isAdmin = $session?.is_admin ?? false;
-  $: candidates = configs.filter(
-    (c) => !pool?.ratings.some((r) => r.player_config_id === c.id)
-  );
-
+  // From the pool's membership, not the latest fit's ratings: a member added
+  // since that fit, or whose refit failed, is listed as not yet rated, with a
+  // Remove button, and is not offered under "Add" (the anchor of a pool never
+  // fitted included).
+  $: membership = pool ? poolMembership(pool, configs) : null;
+  $: members = pool?.members ?? [];
+  $: others = membership?.others ?? [];
   // The anchor form starts from the pool as stored, and again after every
   // reload, so an unsaved edit never survives a change that moved the pool.
-  // Members as the latest fit rated them -- plus the anchor itself, which a
-  // pool that has never been fitted has rated no one, itself included.
-  $: members = pool ? poolMembers(pool, configs) : [];
-  $: others = configs.filter((c) => !members.some((m) => m.id === c.id));
   $: anchorChanged =
     !!pool &&
     (anchorId !== pool.anchor_player_config_id || anchorRating !== pool.anchor_rating);
-
-  function poolMembers(pool: RatingPoolDetail, configs: PlayerConfig[]) {
-    const rated = pool.ratings.map((r) => ({ id: r.player_config_id, name: r.name }));
-    if (rated.some((m) => m.id === pool.anchor_player_config_id)) return rated;
-    const anchor = configs.find((c) => c.id === pool.anchor_player_config_id);
-    return [{ id: pool.anchor_player_config_id, name: anchor?.name ?? 'the current anchor' }, ...rated];
-  }
 
   async function load() {
     pool = await api.ratingPool(poolId);
@@ -47,17 +42,25 @@
     anchorRating = pool.anchor_rating;
   }
 
-  function saveAnchor() {
+  async function saveAnchor() {
     if (!pool) return;
+    const id = anchorId;
     const rating = anchorRating;
-    if (rating == null || !Number.isFinite(rating)) {
-      error = 'The anchor rating must be a number.';
+    // The server's bound (`MAX_ABS_ANCHOR_RATING`), checked here so the admin
+    // is told before a request rather than after it.
+    if (rating == null || !Number.isFinite(rating) || Math.abs(rating) > 10000) {
+      error = 'The anchor rating must be a number between -10000 and 10000.';
       return;
     }
     const body: { anchor_player_config_id?: string; anchor_rating?: number } = {};
-    if (anchorId !== pool.anchor_player_config_id) body.anchor_player_config_id = anchorId;
+    if (id !== pool.anchor_player_config_id) body.anchor_player_config_id = id;
     if (rating !== pool.anchor_rating) body.anchor_rating = rating;
-    mutate(() => api.updateRatingPool(poolId, body));
+    // A refused change leaves what was typed in the form to correct, rather
+    // than the reload's stored values.
+    if (!(await mutate(() => api.updateRatingPool(poolId, body)))) {
+      anchorId = id;
+      anchorRating = rating;
+    }
   }
 
   async function removePool() {
@@ -75,7 +78,7 @@
       await api.deleteRatingPool(poolId);
       goto('/ratings');
     } catch (e) {
-      error = e instanceof Error ? e.message : String(e);
+      error = errorText(e);
       busy = false;
     }
   }
@@ -102,23 +105,28 @@
   }
 
   /** Membership changes refit the whole pool, so the page reloads everything
-   *  rather than patching one row: every other rating has moved too. */
-  async function mutate(action: () => Promise<unknown>) {
+   *  rather than patching one row: every other rating has moved too. Says
+   *  whether the change itself succeeded. */
+  async function mutate(action: () => Promise<unknown>): Promise<boolean> {
     busy = true;
     error = '';
+    notice = '';
+    let ok = true;
     try {
       await action();
     } catch (e) {
-      error = e instanceof Error ? e.message : String(e);
+      ok = false;
+      error = errorText(e);
     }
     // Reloaded either way: a change whose refit failed has still committed.
     try {
       await load();
     } catch (e) {
-      error ||= e instanceof Error ? e.message : String(e);
+      error ||= errorText(e);
     } finally {
       busy = false;
     }
+    return ok;
   }
 </script>
 
@@ -150,6 +158,8 @@
 
     {#if error}
       <p class="text-sm text-destructive">{error}</p>
+    {:else if notice}
+      <p class="text-sm text-muted-foreground">{notice}</p>
     {/if}
 
     <div class="card space-y-3">
@@ -184,12 +194,42 @@
               <td class="text-right tabular-nums">{row.pairs_played.toLocaleString()}</td>
               {#if isAdmin}
                 <td class="text-right">
-                  {#if !row.is_anchor}
+                  <!-- A config removed since the latest fit is still rated by it. -->
+                  {#if !membership?.memberIds.has(row.player_config_id)}
+                    <span class="text-xs text-muted-foreground">removed</span>
+                  {:else if !row.is_anchor}
                     <button
                       class="btn-secondary text-xs"
                       disabled={busy}
                       on:click={() =>
                         mutate(() => api.removeRatingPoolMember(poolId, row.player_config_id))}
+                    >
+                      Remove
+                    </button>
+                  {/if}
+                </td>
+              {/if}
+            </tr>
+          {/each}
+          {#each membership?.unrated ?? [] as member}
+            <tr>
+              <td>
+                {member.name}
+                {#if member.player_config_id === pool.anchor_player_config_id}
+                  <span class="ml-1 text-xs text-warning">anchor</span>
+                {/if}
+              </td>
+              <td class="text-right text-muted-foreground">not yet rated</td>
+              <td class="text-right text-muted-foreground">—</td>
+              <td class="text-right text-muted-foreground">—</td>
+              {#if isAdmin}
+                <td class="text-right">
+                  {#if member.player_config_id !== pool.anchor_player_config_id}
+                    <button
+                      class="btn-secondary text-xs"
+                      disabled={busy}
+                      on:click={() =>
+                        mutate(() => api.removeRatingPoolMember(poolId, member.player_config_id))}
                     >
                       Remove
                     </button>
@@ -208,7 +248,7 @@
             <label class="label" for="add-config">Add a player config</label>
             <select id="add-config" class="input" bind:value={addConfigId} disabled={busy}>
               <option value="">Select…</option>
-              {#each candidates as config}
+              {#each others as config}
                 <option value={config.id}>{config.name}</option>
               {/each}
             </select>
@@ -218,8 +258,13 @@
             disabled={busy || !addConfigId}
             on:click={() =>
               mutate(async () => {
-                await api.addRatingPoolMember(poolId, addConfigId);
+                // Null for a config that is already a member: neither logged
+                // nor refitted.
+                const { run_id } = await api.addRatingPoolMember(poolId, addConfigId);
                 addConfigId = '';
+                if (run_id === null) {
+                  notice = 'Already a member: nothing changed. Use Recompute to refit.';
+                }
               })}
           >
             Add
@@ -249,7 +294,7 @@
             <select id="anchor-config" class="input" bind:value={anchorId} disabled={busy}>
               <optgroup label="Members">
                 {#each members as member}
-                  <option value={member.id}>{member.name}</option>
+                  <option value={member.player_config_id}>{member.name}</option>
                 {/each}
               </optgroup>
               {#if others.length}
@@ -268,6 +313,8 @@
               class="input"
               type="number"
               step="any"
+              min="-10000"
+              max="10000"
               bind:value={anchorRating}
               disabled={busy}
             />
@@ -278,8 +325,8 @@
         </div>
         <p class="text-xs text-muted-foreground">
           Every rating is measured from the anchor, so moving it or its rating refits the pool on
-          the new scale. Earlier runs keep the scale they were fitted on, so the history chart steps
-          at the change. A config that is not a member joins the pool as its anchor.
+          the new scale. Earlier runs keep the scale they were fitted on. A config that is not a
+          member joins the pool as its anchor.
         </p>
         <div class="flex flex-wrap items-center gap-3 border-t border-border pt-3">
           <button class="btn-destructive" disabled={busy} on:click={removePool}>

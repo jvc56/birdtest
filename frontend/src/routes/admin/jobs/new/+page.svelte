@@ -3,7 +3,8 @@
   import { goto } from '$app/navigation';
   import { api, errorText, type InputData, type JobType, type PlayerConfig } from '$lib/api';
   import { blankFields, jobTypeLabel, leavePlayerConflict, parseTargetRackCounts, targetsText, unchosenText } from '$lib/format';
-  import { consensusProblem as checkConsensus } from '$lib/consensus';
+  import { consensusFields, consensusProblem as checkConsensus } from '$lib/consensus';
+  import { confidenceProblem as checkConfidence } from '$lib/matchTest';
 
   let configs: PlayerConfig[] = [];
   let files: InputData[] = [];
@@ -74,13 +75,17 @@
   $: selectedConfig = configs.find((config) => config.id === playerConfigId);
   $: selectedStatic = selectedConfig ? selectedConfig.num_plies === 0 : false;
   $: consensusProblem =
-    jobType !== 'opening_rack' || selectedStatic || maxResults <= 1
+    jobType !== 'opening_rack' || selectedStatic
       ? null
       : checkConsensus({
           min_results_per_rack: minResults,
           max_results_per_rack: maxResults,
           consensus_pct: consensusPct
         });
+  $: confidenceProblem =
+    (jobType === 'games' || jobType === 'game_pairs') && testEnabled
+      ? checkConfidence(confidencePct)
+      : null;
   $: openingRackConflict =
     jobType !== 'opening_rack' || !selectedConfig
       ? null
@@ -139,13 +144,13 @@
           ...common,
           player_config_id: playerConfigId,
           // A static player's analyses always agree, so it gets one per rack.
-          ...(selectedStatic || maxResults <= 1
+          ...(selectedStatic
             ? { min_results_per_rack: 1, max_results_per_rack: 1 }
-            : {
+            : consensusFields({
                 min_results_per_rack: minResults,
                 max_results_per_rack: maxResults,
                 consensus_pct: consensusPct
-              })
+              }))
         };
       case 'games':
         return {
@@ -198,6 +203,11 @@
     }
     if (consensusProblem) {
       error = `Analyses per rack: ${consensusProblem}`;
+      fromSubmit = true;
+      return;
+    }
+    if (confidenceProblem) {
+      error = `Confidence %: ${confidenceProblem}`;
       fromSubmit = true;
       return;
     }
@@ -298,7 +308,7 @@
   <div class="grid grid-cols-2 gap-3">
     <div>
       <label class="label" for="bingo">Bingo Bonus (-bb)</label>
-      <input id="bingo" type="number" min="0" step="1" required class="input" bind:value={bingoBonus} />
+      <input id="bingo" type="number" min="0" max="500" step="1" required class="input" bind:value={bingoBonus} />
     </div>
     {#if jobType !== 'leave_generation'}
       <div>
@@ -362,13 +372,14 @@
             <label class="label" for="maxres">Maximum Analyses Per Rack</label>
             <input id="maxres" type="number" min="1" max="100" class="input" bind:value={maxResults} />
           </div>
+          <!-- No `min`: the share must be above 50, which no `min` can say (51 blocked the
+               50.5 the server takes); `consensusProblem` says what it must be. -->
           <div>
             <label class="label" for="consensus">Consensus %</label>
             <input
               id="consensus"
               type="number"
-              min="51"
-              max="100"
+                max="100"
               step="any"
               class="input"
               bind:value={consensusPct}
@@ -465,17 +476,19 @@
     </div>
     {#if testEnabled}
       <div class="grid grid-cols-2 gap-3">
+        <!-- No `min` or `max`: the server takes anything strictly between 50 and 100, which
+             no inclusive bound can say (`min="50.1"` blocked 50.05); `confidenceProblem` says
+             what it must be. -->
         <div>
           <label class="label" for="confidence">Confidence %</label>
           <input
             id="confidence"
             type="number"
             step="any"
-            min="50.1"
-            max="99.99"
             class="input"
             bind:value={confidencePct}
           />
+          {#if confidenceProblem}<p class="field-error">{confidenceProblem}</p>{/if}
           <p class="mt-1 text-xs text-muted-foreground">
             The chance of naming a winner between two equal players is at most about
             {Math.round((100 - confidencePct) * 100) / 100}%. Higher takes more {units.toLowerCase()}
@@ -493,7 +506,8 @@
         Keeps the position analysed on every turn of every game, with its ranked moves, for
         signed-in users to search on the job's page. It roughly doubles the rows a job produces,
         and a batch is at most {jobType === 'games' ? '1,000 games' : '500 pairs'} while saving.
-        A static player records only the move it played; a simming player, its whole ranking.
+        A static player ranks its plays on every turn, up to the number it records, which slows
+        its games; a simming player's ranking costs nothing extra.
       </p>
       {#if jobType === 'game_pairs' && capturePositions}
         <label class="mt-2 flex items-center gap-2">

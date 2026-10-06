@@ -125,7 +125,7 @@
     {/if}
 
     <form class="flex gap-2" on:submit|preventDefault={create}>
-      <input class="input max-w-xs" bind:value={label} placeholder="Label (optional)" />
+      <input class="input max-w-xs" bind:value={label} maxlength="100" placeholder="Label (optional)" />
       <button class="btn-primary">Generate key</button>
     </form>
     {#if error}<p class="field-error">{error}</p>{/if}

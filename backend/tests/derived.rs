@@ -611,7 +611,7 @@ async fn a_leave_job_queues_its_wordmap_and_never_a_table() {
     assert_eq!(roles, ["wmp"]);
 }
 
-/// I-DERIVED-9: a player asking for a word info table queues one, named for its
+/// I-DERIVED-11: a player asking for a word info table queues one, named for its
 /// lexicon and built from the `.kwg` alone -- no wordmap, no leaves -- and its
 /// job is not dispatched until it is built. Then a claim pins its hash and
 /// tells only that player to load it. A leave job's player may ask for one

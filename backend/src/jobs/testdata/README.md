@@ -23,29 +23,24 @@ mode builds the submission through the same function a running worker uses, for
 worker 0 under the default `--seed`, against a claim response from
 `contract-fixtures/`, and prints it without contacting a server.
 
-Regenerate every one, from the repository root:
+`scripts/fake-worker-fixtures.sh` regenerates every one, and is the one list of
+how each is made: which assignment, which `--mode`, which `--override`s. CI
+runs it with `--check`, which emits them to a scratch directory and fails on
+any that differs from the committed file, so a change to the fake cannot leave
+them behind. After changing `fake_worker.py` (or a contract fixture), from the
+repository root:
 
 ```sh
-T=backend/src/jobs/testdata; F=contract-fixtures; W="python3 worker/fake_worker.py"
-PAIRS="--override job_type=\"game_pairs\" --override game_pairs=true"
-
-$W --emit-fixture $F/assignment-games.json > $T/fake_worker_games.json
-$W --emit-fixture $F/assignment-games.json \
-   --override capture_positions=true --override num_games=1 > $T/fake_worker_games_captured.json
-$W --emit-fixture $F/assignment-games.json $PAIRS > $T/fake_worker_game_pairs.json
-$W --emit-fixture $F/assignment-opening-rack.json > $T/fake_worker_opening_rack.json
-$W --emit-fixture $F/assignment-leave-generation.json > $T/fake_worker_leave_generation.json
-
-$W --mode malformed --emit-fixture $F/assignment-games.json > $T/fake_worker_malformed_games.json
-$W --mode malformed --emit-fixture $F/assignment-games.json $PAIRS > $T/fake_worker_malformed_game_pairs.json
-$W --mode malformed --emit-fixture $F/assignment-opening-rack.json > $T/fake_worker_malformed_opening_rack.json
-$W --mode malformed --emit-fixture $F/assignment-leave-generation.json > $T/fake_worker_malformed_leave_generation.json
-$W --mode stale --emit-fixture $F/assignment-games.json > $T/fake_worker_stale.json
-$W --mode abandon --emit-fixture $F/assignment-games.json > $T/fake_worker_abandon.json
+scripts/fake-worker-fixtures.sh
 ```
 
-There is no `game_pairs` assignment fixture; the pairs request is the games one
-with its `job_type` and `game_pairs` overridden, which is all that differs.
+The `game_pairs` fixtures come from two assignments: the games one under the
+`game_pairs` tag (`--override job_type='"game_pairs"'`), whose players are a
+simmer and a static player, and `contract-fixtures/assignment-game-pairs.json`
+itself, the captured pairs request -- two static players keeping first
+divergences -- for `fake_worker_game_pairs_divergence.json`. Each position is
+shaped by the player on turn, as MAGPIE's are: simulated for a simmer, static
+otherwise.
 
 What each mode prints (see `emit_fixture` in the script):
 

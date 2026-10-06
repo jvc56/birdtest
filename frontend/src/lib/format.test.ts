@@ -317,11 +317,26 @@ describe('F-FMT-14 exportSummary', () => {
 
   it("offers a completed job whose newest export is a snapshot its final one", () => {
     const summary = exportSummary(snapshot, done);
-    expect(summary.label).toContain('not its final results');
+    expect(summary.label).toBe(
+      `Snapshot as of ${datetime(at)}, read before the job completed — not its final results`
+    );
     expect(summary.button).toBe('Build the final export');
     expect(exportSummary({ ...snapshot, state: 'expired' }, done).button).toBe(
       'Build the final export'
     );
+  });
+
+  it("does not say a completed opening-rack job's demoted export was read while it ran", () => {
+    // A consensus edit demotes the final export of a job it leaves completed:
+    // read after the job completed, but under the old settings.
+    const opening = { status: 'completed', job_type: 'opening_rack' };
+    const summary = exportSummary(snapshot, opening);
+    expect(summary.label).toBe(
+      `Snapshot as of ${datetime(at)} — not the job's final results: read before it completed, ` +
+        'or before its consensus settings last changed'
+    );
+    expect(summary.label).not.toContain('running');
+    expect(summary.button).toBe('Build the final export');
   });
 
   it("labels a completed job's final export, and offers it again", () => {

@@ -188,8 +188,8 @@ async fn main() -> Result<()> {
     }
 
     // Rating runs are snapshots, one per fit, and a pool with an active job
-    // takes one every two minutes for as long as the job runs. Past a month the
-    // last run of each day is all the history chart can show anyway.
+    // takes one every two minutes for as long as the job runs. Past a month
+    // only the last run of each day is kept (`ratings::thin_old_runs`).
     {
         let db = state.pool.clone();
         tokio::spawn(async move {

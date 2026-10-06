@@ -27,7 +27,11 @@ swallows the rest of the paste.
 | `frontend/` | SvelteKit SPA (dark mode only), built statically and served by Nginx in production. |
 | `worker/` | `fake_worker.py`, a synthetic client used by the **end-to-end suite only** — see [TESTING.md](TESTING.md). Local development uses real MAGPIE; the contributor client is MAGPIE itself, see [Worker Client](PLAN.md#worker-client-1). |
 | `infra/` | Terraform: VPC, ALB, ECS Fargate, RDS Postgres, S3, SES, SSM, backups. |
-| `scripts/` | `dev.py` (the local development command), `seed.py` (empty database → work flowing), plus backup, restore-drill and local snapshot scripts. |
+| `scripts/` | `dev.py` (the local development command), `seed.py` (empty database → work flowing), `e2e_magpie.py` and `e2e_magpie_native.sh` (tier 6, real MAGPIE), `prod-sql.sh` and `prod-shell.sh` (SQL and a shell inside the production VPC), `restore-job.sh` (a selective restore), plus backup, restore-drill, local snapshot and check scripts. |
+| `docker/` | The Dockerfile for the backend (with its pinned MAGPIE), the derived-file builder and the fake worker. |
+| `e2e/` | Tier 5: the Playwright journeys and `run.sh`, which runs them on a stack of their own. |
+| `fixtures/` | Tier 5's stand-in for GitHub: MAGPIE-DATA tarballs and the Nginx config that serves them. |
+| `contract-fixtures/` | One example of each worker API message, parsed by both birdtest's and MAGPIE's tests. |
 
 Tile distributions and every other input file are no longer carried in the
 repo: they are imported from a MAGPIE-DATA tarball into the `input_data` table
@@ -72,8 +76,8 @@ database get 25% each. The games and pairs jobs stop at 100,000 games or pairs
 if their test has not decided first, and neither test is acted on before
 50,000 games or pairs. Their players use a
 wordmap and a rack info table; the workers share one ~1.9 GB copy of the
-table (dev.py runs them with `-ritmmap true`, so it is mapped rather than read
-into each), and `--no-rit` seeds players without one.
+table (MAGPIE maps it by default rather than reading it into each), and
+`--no-rit` seeds players without one.
 
 The workers run in the background and write to
 `.dev-workers/worker-NN/contribute.log`. With `--worker-windows` each runs in
@@ -162,10 +166,10 @@ The fresh database is seeded with:
 | `--threads` | 2 | Threads inside each contributor |
 | `--max-tasks` | 0 | Tasks each contributor runs before exiting; 0 runs until stopped |
 | `--idle-wait` | 5 | Seconds a contributor waits when there is no work |
-| `--build-threads` | `$MAGPIE_THREADS`, or every core | Threads the server's wordmap / rack info table builder gives MAGPIE |
+| `--build-threads` | `$MAGPIE_THREADS`, or every core | Threads the server's derived-file builder (wordmaps, rack info tables, word info tables) gives MAGPIE |
 | `--api-key` | anonymous | Contribute under an account instead of anonymously |
-| `--leavegen-job`, `--opening-rack-job`, `--games-job`, `--pairs-job` | none | The jobs to start with, which stack: see above |
-| `--lexicon`, `--variant` | CSW24, classic | What the games and pairs jobs play |
+| `--leavegen-job`, `--opening-rack-job`, `--games-job`, `--pairs-job`, `--sim-games-job`, `--sim-pairs-job` | none | The jobs to start with, which stack: see above. Each also comes as `<flag>-ab`, the same job on the two-letter `english_ab` data |
+| `--lexicon`, `--variant` | CSW24, classic | The lexicon of every job not on the `-ab` data, and of its players; the variant of every job (left unset, `seed.py`'s default, classic) |
 | `--tarball-date` | your `DATA_VERSION` | Which MAGPIE-DATA version to import |
 | `--min-magpie-version` | your build's version | The version floor, on the server and on the job |
 | `--web-port`, `--backend-port` | 5173, 8080 | Host ports |
@@ -326,11 +330,11 @@ one copy of it in memory; see [MAGPIE on the server](#magpie-on-the-server). See
 ### Running the tests
 
 ```bash
-cd backend && cargo test --lib --bins     # unit and contract tests; no services
-cd backend && TEST_DATABASE_URL=postgres://birdtest:birdtest@localhost:5432/birdtest \
+(cd backend && cargo test --lib --bins)  # unit and contract tests; no services
+(cd backend && TEST_DATABASE_URL=postgres://birdtest:birdtest@localhost:5432/birdtest \
   TEST_S3_ENDPOINT=http://localhost:9000 \
-  cargo nextest run                       # plus the integration and API tests in backend/tests/
-cd frontend && npm run check && npm test
+  cargo nextest run)                      # plus the integration and API tests in backend/tests/
+(cd frontend && npm run check && npm test)
 MAGPIE_ROOT=../MAGPIE e2e/run.sh          # the Playwright journeys, on a stack of their own
 MAGPIE_ROOT=../MAGPIE scripts/e2e_magpie_native.sh   # real `magpie contribute` tasks (tier 6)
 ```
@@ -383,9 +387,14 @@ back is an image change (RUNBOOK, "Rolling back a deploy").
 ### Without Docker
 
 The backend and frontend still run directly on the host if you would rather:
-`cargo run` in `backend/` (see `.env.example`) and `npm run dev` in `frontend/`.
-You need a Postgres to point `DATABASE_URL` at — `docker compose up -d postgres
-minio minio-init` gives you one without the rest of the stack.
+`cargo run` in `backend/` and `npm run dev` in `frontend/`. The backend reads a
+`backend/.env` if there is one: copy `backend/.env.example` (not the root
+`.env.example`, which is compose's) to it, which sets everything a local run
+needs — `DATABASE_URL`, `SESSION_SIGNING_KEY`, `MAGPIE_BIN` (a built MAGPIE
+checkout's `bin/magpie`), `S3_ENDPOINT` and the MinIO credentials — and
+adjust `MAGPIE_BIN` if your checkout is not at `../MAGPIE`. You need a Postgres
+and MinIO for it to point at — `docker compose up -d postgres minio
+minio-init` gives you both without the rest of the stack.
 
 `scripts/dev.py` and `scripts/seed.py` need only `requests`.
 
@@ -416,7 +425,7 @@ costs.
 
 A derived file records nothing reliable about how it was built, and MAGPIE's
 CLI finds both by lexicon name alone. Recording the input digests — the
-wordmap's `.wmp.src` sidecar does that for the `.kwg` — shows a file was built
+wordmap's `.wmp.src` sidecar did that for the `.kwg` — shows a file was built
 *from* the right inputs and still trusts the builder, which is not a
 theoretical gap: a CSW24 wordmap built in December 2025 and one built in
 September 2026 differ in 72,852,152 bytes (and 60 bytes of size) with the same
@@ -472,10 +481,10 @@ compared" below.
 
    ```text
    "derived": [
-     { "role": "wmp", "name": "CSW24", "sha256": "1830…", "bytes": 178929167,
+     { "role": "wmp", "name": "CSW24", "sha256": "1830…",
        "builder": "wmp-1", "build_target": "nehalem" },
      { "role": "rit", "name": "CSW24.CSW_quackle_leaves", "sha256": "6da8…",
-       "bytes": 1885416048, "builder": "rit-1", "build_target": "nehalem" }
+       "builder": "rit-1", "build_target": "nehalem" }
    ]
    ```
 
@@ -489,8 +498,8 @@ compared" below.
 ### Decisions worth knowing
 
 - **Every hash is tied to its builder.** MAGPIE's `src/def/builder_defs.h`
-  carries `WMP_BUILDER_VERSION`, `RIT_BUILDER_VERSION` and
-  `KLV_BUILDER_VERSION`, separate from `MAGPIE_VERSION` and bumped whenever a
+  carries `WMP_BUILDER_VERSION`, `RIT_BUILDER_VERSION`, `WIT_BUILDER_VERSION`
+  and `KLV_BUILDER_VERSION`, separate from `MAGPIE_VERSION` and bumped whenever a
   change alters that builder's output, even with an unchanged file format.
   `test/builder_hash_test.c` pins the output for `CSW21_ab` and fails until a
   change that alters it bumps the version *and* the hash; CI runs it on every
@@ -498,7 +507,8 @@ compared" below.
   the new version, and old ones stay for workers still on the old builder until
   the version floor passes them.
 - **The server asks the binary, not its configuration.** `magpie builders`
-  prints the three versions and the build target as JSON; the backend reads it
+  prints the four builder versions, `magpie_version` and the build target as
+  JSON; the backend reads it
   at startup and refuses to start if it cannot. A configured value would drift
   the first time an image changed without the variable.
 - **A worker declines on a hash, not a builder version.** Declining as soon as
@@ -531,8 +541,8 @@ compared" below.
 - **No input digests in file headers.** They would still help CLI users, who
   have no server, but it is a format change to both `.wmp` and `.rit` —
   invalidating every one in existence — for a check weaker than the one the
-  fleet now has. The `.wmp.src` sidecar stays, for the CLI and for a server
-  that pins nothing.
+  fleet now has. The `.wmp.src` sidecar is gone: the contribute path was its
+  only reader, and every claim pins a wordmap's hash.
 - **Leave generation keeps tables off**: its KLV changes every generation, and
   a 1.9 GB table per generation on every worker would cost far more than it
   saves.
@@ -614,8 +624,7 @@ every one of the 431 leave values.
 ### What is not covered
 
 - **The CLI.** `magpie` outside `contribute` still finds a table by lexicon
-  name and checks nothing about it, and reads the `.wmp.src` sidecar only on
-  the contribute path. A CLI user is analysing their own positions on their
+  name and checks nothing about it. A CLI user is analysing their own positions on their
   own data.
 - **Data updates.** A tarball that changes a `.kwg` makes a new `input_data`
   row, so a job pinning the old one keeps its old derived files, correctly.
@@ -744,6 +753,19 @@ A first deployment, in order (each step is described below):
    identities, so the first admin's confirmation mail arrives only if their
    address is in `ses_domain` or verified on its own (below, "SES starts in the
    sandbox").
+8. Import the input data. A new stack has none, and no job or player config
+   can be made without it: signed in as the admin, open **Admin → Input
+   data**, enter the MAGPIE-DATA version contributors' MAGPIE downloads --
+   the `DATA_VERSION` in `download_data.sh` at the commit `docker/Dockerfile`
+   pins, `20260925` today -- and the branch or tag (`main`), then **Fetch and
+   diff** and confirm. A version other than the one contributors install pins
+   digests their files do not have, and every worker declines every task.
+   The import's GitHub calls are 60 an hour per address without
+   `github_token_parameter_arn`; set it first (below, after the two SSM
+   parameters) if more than a few imports are expected. Then make player configs and jobs. A job whose players need a
+   wordmap, a rack info table or a word info table is not dispatched until
+   the derived-data builder (every five minutes) has built them:
+   `/admin/derived-data` shows the queue.
 
 `infra/` is a complete Terraform description of the AWS side. Keep the stack's
 variables in `infra/prod.tfvars` (not committed: it names the account's
@@ -807,6 +829,24 @@ To rotate the password later, run the same `modify-db-instance` and
 `put-parameter` pair, then force a new ECS deployment so tasks re-read SSM
 (RUNBOOK.md, "Rotating the database password").
 
+The GitHub token for input-data imports is optional and goes in a third
+parameter, made the same way; a fine-grained token with read-only access to
+public repositories is enough. Keep the default `aws/ssm` key (no `--key-id`):
+the tasks' execution role has no `kms:Decrypt`, so under a key of your own
+every task fails to start. `github_token_parameter_arn` takes the parameter's
+ARN, not its name, in the stack's region (the plan refuses anything else; KL-62):
+add it to `infra/prod.tfvars` and apply.
+
+```bash
+export AWS_PAGER=""
+# In the shell above: AWS_REGION set to the stack's region.
+read -rsp 'GitHub token: ' GITHUB_TOKEN; echo   # not echoed, not in the history
+aws ssm put-parameter --name /birdtest/GITHUB_TOKEN --type SecureString --overwrite \
+  --value "$GITHUB_TOKEN"
+aws ssm get-parameter --name /birdtest/GITHUB_TOKEN --query Parameter.ARN --output text
+# arn:aws:ssm:<region>:<account>:parameter/birdtest/GITHUB_TOKEN, for prod.tfvars
+```
+
 `acm_certificate_arn` has no default either. The site is HTTPS-only — port 80
 redirects — because the backend sets `Secure` cookies, which a browser will not
 keep over plain HTTP. The API is not redirected but refused (`426`), so a
@@ -821,8 +861,13 @@ has no default — it is the backend image built with `--target derived-builder`
 and it must carry the same MAGPIE as `backend_image`, since the builder version
 recorded beside every hash comes from the binary that produced it.
 
-The three images are built from this repository and pushed to a registry of
-your choice (Terraform creates none), at one tag per release:
+The three images are built from this repository and pushed, at one tag per
+release, to ECR in any region (Terraform creates no repository; the task
+execution role's managed policy covers the pull, and a repository in another
+account must also admit this one in its own policy) or to a public registry. A
+private registry elsewhere — a private GHCR or Docker Hub repository — needs
+`repositoryCredentials`, which the task definitions do not set: every task
+would fail with `CannotPullContainerError`.
 
 ```bash
 docker build --pull --platform linux/amd64 -f docker/Dockerfile --target backend         -t $REGISTRY/birdtest-backend:$TAG .
@@ -840,6 +885,14 @@ the emulated release builds to be slow.
 
 The backend image fetches MAGPIE at `docker/Dockerfile`'s `MAGPIE_COMMIT`
 from GitHub, so that commit must be pushed to `birdtest-contribute` first.
+
+A release whose task fails to start three times is rolled back by ECS (the
+service's deployment circuit breaker) to the last task definition that ran
+steadily, and `apply` does not wait to see it: Terraform's state still names
+the new one, and the next apply deploys it again. RUNBOOK.md, "Rolling back a
+deploy", says how to tell and what to do. The rollback mails the alerts
+topic (`birdtest-deploy-failed`, with ECS's reason), so it is not noticed only
+by looking.
 
 **Check that the alarms reach you** after the first apply (once the SNS
 subscription is confirmed), and after any change to the alerts topic: nothing
@@ -872,6 +925,25 @@ aws ecs run-task --region "$REGION" --cluster "$(tfout cluster_name)" \
 
 Then `AWS/Events` `TriggeredRules` for `birdtest$SUFFIX-backup-failed` is 1 and
 its `FailedInvocations` 0. (RUNBOOK §5 runs the same checks with `SUFFIX=-dr`.)
+
+A deploy the circuit breaker rolls back mails the same topic, through the
+`birdtest$SUFFIX-deploy-failed` rule. ECS's deployment events cannot be sent by
+hand (`aws.ecs` is AWS's own source), so check instead that the rule's pattern
+matches a failed deployment of the live service; delivery is the backup
+mail's, through the same topic and policy:
+
+```bash
+export AWS_PAGER=""
+SERVICE=$(aws ecs describe-services --region "$REGION" --cluster "$(tfout cluster_name)" \
+  --services "birdtest$SUFFIX" --query 'services[0].serviceArn' --output text)
+aws events test-event-pattern --region "$REGION" \
+  --event-pattern "$(aws events describe-rule --region "$REGION" --name "birdtest$SUFFIX-deploy-failed" \
+     --query EventPattern --output text)" \
+  --event "$(jq -nc --arg s "$SERVICE" --arg r "$REGION" '{id: "1", account: "123456789012",
+     source: "aws.ecs", time: "2026-01-01T00:00:00Z", region: $r, resources: [$s],
+     "detail-type": "ECS Deployment State Change", detail: {eventName: "SERVICE_DEPLOYMENT_FAILED"}}')"
+# "Result": true
+```
 
 **SES starts in the sandbox.** A new account's SES sends only to verified
 addresses, so until [production access](https://docs.aws.amazon.com/ses/latest/dg/request-production-access.html)
@@ -916,8 +988,9 @@ scripts/prod-sql.sh "UPDATE users SET is_admin = true WHERE lower(username) = lo
 ```
 
 `alert_email` has no default: `terraform apply` refuses to run without
-somewhere to send backup failures, because an unmonitored backup is the failure
-mode the whole design exists to avoid. SNS emails a subscription confirmation
+somewhere to send alarms (every one the stack raises, backup failures among
+them), because an unmonitored backup is the failure mode the whole design
+exists to avoid. SNS emails a subscription confirmation
 that has to be accepted once.
 
 The backend image carries a pinned MAGPIE, built from a commit the image

@@ -25,8 +25,7 @@ impl JobHandler for OpeningRackHandler {
             return Err(template.mismatch("opening_rack"));
         };
         let row = sqlx::query(
-            "SELECT variant, letter_distribution, board_layout, rack_start, rack_count,
-                    racks, previous_play
+            "SELECT variant, letter_distribution, board_layout, rack_start, rack_count, racks
              FROM opening_rack_requests WHERE task_id = $1",
         )
         .bind(task_id)
@@ -40,7 +39,6 @@ impl JobHandler for OpeningRackHandler {
             variant: row.get("variant"),
             letter_distribution: row.get("letter_distribution"),
             board_layout: row.get("board_layout"),
-            previous_play: row.get("previous_play"),
             bingo_bonus: template.data.bingo_bonus,
             sim_cutoff: template.data.sim_cutoff,
             player: player.clone(),
@@ -66,7 +64,7 @@ impl JobHandler for OpeningRackHandler {
             // A worker cannot have reported more moves than it says it ranked.
             super::plausibility::check_moves(
                 &analysis.moves,
-                analysis.num_moves,
+                Some(analysis.num_moves),
                 "opening rack",
             )?;
             let rack = PositionAnalysis::opening_rack(
@@ -110,7 +108,6 @@ impl JobHandler for OpeningRackHandler {
             &record.positions,
             player.num_plays_recorded,
             player.num_plies_recorded,
-            false,
         )
         .await?;
 
@@ -269,7 +266,6 @@ pub async fn next_request(
             board_layout: job_data.layout_name.clone(),
             racks,
             seed: next_start as u64,
-            previous_play: None,
             bingo_bonus: job_data.bingo_bonus,
             sim_cutoff: job_data.sim_cutoff,
             player: player.clone(),
@@ -286,56 +282,101 @@ pub async fn next_request(
 /// and refusing would leave a rack wanting more analyses than the fleet has
 /// workers unsettled for good.
 ///
-/// Under the job's dispatch lock, so the in-flight set cannot change under it.
+/// Under the job's dispatch lock, so the in-flight set cannot change under it
+/// -- and so what this costs, every other claim for the job waits on. It is
+/// bounded by the batch and by what is open now, not by the job or its
+/// history:
+///
+/// - **The preference looks at a window.** Only the first
+///   [`REISSUE_WINDOW_BATCHES`] batches of candidates (unsettled, not in
+///   flight, fewest analyses first) are asked whether this identity analysed
+///   them, and the unseen among them go first. It used to walk the unsettled
+///   racks until it had found a batch this identity had not analysed, a
+///   probe of its analyses per rack stepped over. An identity is an account,
+///   every machine under it one identity, and once it has analysed the whole
+///   first pass -- the owner's own machines, early on -- it has analysed every
+///   rack: each of its reissues walked all of them (3.2 million for English)
+///   and found nothing before taking any. Outside the window an unseen rack
+///   is not looked for; within it, the window is the racks with the fewest
+///   analyses, which is where the unseen ones are.
+/// - **The preference is a probe per rack, never a hash.** It is asked as a
+///   scalar subquery (`LIMIT 1`, then `IS NOT NULL`), not as `EXISTS`: an
+///   `EXISTS` may be planned as a hashed subplan, which reads every analysis
+///   the identity made in the job (every record of the job, in a generic
+///   plan) to answer for the window's racks. Postgres picks it when its
+///   statistics understate the records -- a database just restored, which
+///   has none, or autovacuum behind -- and it measured 1.2-2.0 s a claim for
+///   an identity with 300,000 analyses, 5.3 s with the table never analysed.
+///   A scalar subquery is never hashed.
+/// - **The in-flight racks are read from what is open.** A task not
+///   completed is `available` or `claimed`: the available reissues are found
+///   through the queue index, the claimed tasks through the open claims'
+///   index (one open claim each, `task_claims_one_slot_idx`; a first-pass
+///   task lists no racks). The seed index found every reissue the job had
+///   ever made and visited each to skip the completed ones -- a cost that
+///   grew with the reissue history, 27-44 ms at 200,000 of them.
+/// - **The in-flight racks are a hashed set.** `NOT IN` over the array's
+///   `unnest` is a hashed subplan whatever plan the prepared statement
+///   settles on. `<> ALL($array)` is hashed only in a custom plan, and a
+///   generic one compared each rack stepped over with every rack in flight,
+///   which are the very racks at the front of the order.
 async fn next_reissue(
     conn: &mut PgConnection,
     job_id: Uuid,
     config: &OpeningRackConfig,
     identity: &WorkerIdentity,
 ) -> AppResult<Vec<String>> {
-    // In flight: the racks of every reissue not yet completed -- claimed, or
-    // given back and waiting to go out again. Reissues are the tasks past the
-    // end of the space, which the seed index finds without a walk over the
-    // job's first pass.
+    // In flight: the racks of every reissue not yet completed -- given back
+    // and waiting to go out again (`tasks_queue_idx`), or claimed
+    // (`task_claims_open_idx`: the fleet's open claims, which reclaiming
+    // already reads on every claim). Not `state <> 'completed'` over the seed
+    // index: that visited every reissue the job ever made.
     let in_flight: Vec<String> = sqlx::query_scalar(
-        "SELECT DISTINCT unnest(r.racks)
-         FROM tasks t JOIN opening_rack_requests r ON r.task_id = t.id
-         WHERE t.job_id = $1 AND t.seed >= $2 AND t.state <> 'completed'",
+        "SELECT DISTINCT unnest(r.racks) FROM opening_rack_requests r
+         WHERE r.racks IS NOT NULL AND r.task_id IN (
+             SELECT t.id FROM tasks t
+              WHERE t.job_id = $1 AND t.state = 'available' AND t.seed >= $2
+             UNION ALL
+             SELECT c.task_id FROM task_claims c
+              WHERE c.job_id = $1 AND c.state = 'claimed')",
     )
     .bind(job_id)
     .bind(config.total_racks)
     .fetch_all(&mut *conn)
     .await?;
 
-    let batch = config.racks_per_batch as i64;
-    let pick = |others: bool, taken: Vec<String>, limit: i64| {
-        sqlx::query_scalar::<_, String>(
-            "SELECT p.rack FROM opening_rack_progress p
+    let batch = i64::from(config.racks_per_batch);
+    Ok(sqlx::query_scalar::<_, String>(
+        "SELECT w.rack FROM (
+             SELECT p.rack, p.results FROM opening_rack_progress p
              WHERE p.job_id = $1 AND NOT p.settled
-               AND p.rack <> ALL($2) AND p.rack <> ALL($3)
-               AND ($6 OR NOT EXISTS (
-                   SELECT 1 FROM position_analysis_records a
-                   JOIN task_claims c ON c.id = a.task_claim_id
-                   WHERE a.job_id = $1 AND a.game_index IS NULL AND a.rack = p.rack
-                     AND (c.claimed_by_user_id = $4 OR c.claimed_by_anon_uuid = $5)))
+               AND p.rack NOT IN (SELECT unnest($2::text[]))
              ORDER BY p.results, p.rack
-             LIMIT $7",
-        )
-        .bind(job_id)
-        .bind(in_flight.clone())
-        .bind(taken)
-        .bind(identity.user_id())
-        .bind(identity.anon_uuid())
-        .bind(others)
-        .bind(limit)
-    };
-    let mut racks = pick(false, Vec::new(), batch).fetch_all(&mut *conn).await?;
-    if (racks.len() as i64) < batch {
-        let more = pick(true, racks.clone(), batch - racks.len() as i64).fetch_all(&mut *conn).await?;
-        racks.extend(more);
-    }
-    Ok(racks)
+             LIMIT $6
+         ) w
+         ORDER BY (SELECT 1 FROM position_analysis_records a
+                   JOIN task_claims c ON c.id = a.task_claim_id
+                   WHERE a.job_id = $1 AND a.game_index IS NULL AND a.rack = w.rack
+                     AND (c.claimed_by_user_id = $3 OR c.claimed_by_anon_uuid = $4)
+                   LIMIT 1) IS NOT NULL,
+                  w.results, w.rack
+         LIMIT $5",
+    )
+    .bind(job_id)
+    .bind(&in_flight)
+    .bind(identity.user_id())
+    .bind(identity.anon_uuid())
+    .bind(batch)
+    .bind(batch * REISSUE_WINDOW_BATCHES)
+    .fetch_all(&mut *conn)
+    .await?)
 }
+
+/// How many batches of candidates a reissue asks whether the claiming
+/// identity analysed them ([`next_reissue`]): enough that a fleet of a few
+/// identities finds a batch it has not seen among the racks with the fewest
+/// analyses, few enough that a claim stays a bounded number of probes.
+const REISSUE_WINDOW_BATCHES: i64 = 4;
 
 /// Writes the typed request row for a task: the range it covers, or, for a
 /// task reissuing racks a consensus still wants, the racks themselves.
@@ -351,8 +392,8 @@ pub async fn insert_request(
     sqlx::query(
         "INSERT INTO opening_rack_requests
              (task_id, variant, letter_distribution, board_layout, rack_start,
-              rack_count, racks, previous_play, player_config_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, $8)",
+              rack_count, racks, player_config_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
     )
     .bind(task_id)
     .bind(&job_data.variant)
@@ -602,12 +643,15 @@ mod tests {
         assert_eq!(record.positions[0].moves.len(), 3);
     }
 
-    /// Builds that predate the field reported everything they ranked, so the
-    /// list's own length is the honest answer for them.
+    /// Every MAGPIE the version floor admits states the count, so an analysis
+    /// without one is not a response to read a count into.
     #[test]
-    fn an_absent_ranked_count_falls_back_to_the_reported_list() {
-        let record = process(vec![analysis("AEINRST", 4, None)]).unwrap();
-        assert_eq!(record.positions[0].num_moves, 4);
+    fn an_analysis_without_its_ranked_count_is_malformed() {
+        let mut rack = analysis("AEINRST", 4, None);
+        rack.as_object_mut().unwrap().remove("num_moves");
+        let response = serde_json::json!({ "racks": [rack] });
+        let error = serde_json::from_value::<PositionAnalysisResponse>(response).unwrap_err();
+        assert!(error.to_string().contains("num_moves"), "{error}");
     }
 
     /// A worker cannot report more moves than it says it generated.

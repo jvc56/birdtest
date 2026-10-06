@@ -229,7 +229,7 @@ mod tests {
     // so a rewrite that agrees with itself but not with the documented
     // boundary fails here.
 
-    /// I-STATS-1 (maths): n = 1000, σ² = 1/16, α = 0.05, tuned at 1000 units
+    /// U-STATS-1: n = 1000, σ² = 1/16, α = 0.05, tuned at 1000 units
     /// of variance ¼, gives a half-width of 0.025806505014905885…
     #[test]
     fn the_half_width_is_the_documented_boundary() {
@@ -238,7 +238,7 @@ mod tests {
         assert_eq!(half_width(0, 0.25, 0.05, rho2), f64::INFINITY);
     }
 
-    /// I-STATS-1 (maths): W21 L7 D2 at 95%, floor 10 and cap 1,000 (n* = 100):
+    /// U-STATS-1: W21 L7 D2 at 95%, floor 10 and cap 1,000 (n* = 100):
     /// mean 11/15, interval 0.476214864843405827… to 0.990451801823260840…
     #[test]
     fn a_games_tally_gets_the_documented_interval() {
@@ -253,7 +253,7 @@ mod tests {
         assert_eq!(few.upper, 1.0);
     }
 
-    /// I-STATS-2 (maths): the pentanomial [1, 3, 7, 3, 2] at 90%, floor and
+    /// U-STATS-2: the pentanomial [1, 3, 7, 3, 2] at 90%, floor and
     /// cap 16 (n* = 16, variance 1/16): mean 17/32, half-width
     /// 0.181952165436550379…, and inconclusive at its cap.
     #[test]
@@ -265,7 +265,7 @@ mod tests {
         assert_eq!(result.status, TestStatus::Inconclusive);
     }
 
-    /// I-STATS-9 (maths): over 1,000 games without a draw at 95% (floor 100,
+    /// U-STATS-3: over 1,000 games without a draw at 95% (floor 100,
     /// cap 10,000, so n* = 1000), 548 wins is the fewest that decide: its
     /// lower bound is 0.500229941162600039…, and 547's is
     /// 0.499220820372402546…. The mirror images decide for player 2 and run.
@@ -285,8 +285,9 @@ mod tests {
         assert_eq!(at(453).status, TestStatus::Running);
     }
 
-    /// Every pair split is no evidence either way: the interval stays around
-    /// an even score however many there are, and the job ends inconclusive.
+    /// U-STATS-3: every pair split is no evidence either way: the interval
+    /// stays around an even score however many there are, and the job ends
+    /// inconclusive.
     #[test]
     fn identical_pairs_alone_never_decide() {
         let sample = Sample::from_pentanomial(&Pentanomial { counts: [0, 0, 10_000, 0, 0] });
@@ -363,7 +364,7 @@ mod tests {
         verdicts
     }
 
-    /// I-STATS-9 (simulation): checked after every batch, the test names a
+    /// U-STATS-3b: checked after every batch, the test names a
     /// winner between equal players in at most about α of runs. A plain 95%
     /// interval checked as often names one in several times that.
     #[test]
@@ -376,7 +377,7 @@ mod tests {
         assert_eq!(p1 + p2 + inconclusive, runs);
     }
 
-    /// I-STATS-9 (simulation): a player scoring 53.5% per game (about +24
+    /// U-STATS-3b: a player scoring 53.5% per game (about +24
     /// Elo) is found better in nearly every run before the cap.
     #[test]
     fn a_better_player_is_found() {

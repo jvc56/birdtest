@@ -184,8 +184,8 @@ export async function waitForResults(api: APIRequestContext, jobId: string, time
   await expect
     .poll(
       async () =>
-        (await body<{ results_accepted: number }>(await api.get(`/api/jobs/${jobId}`), 'job stats'))
-          .results_accepted,
+        (await body<{ tasks_completed: number }>(await api.get(`/api/jobs/${jobId}`), 'job stats'))
+          .tasks_completed,
       { timeout: timeoutMs, intervals: [1000] }
     )
     .toBeGreaterThan(0);

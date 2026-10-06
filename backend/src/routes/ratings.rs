@@ -115,6 +115,13 @@ struct RunSummary {
     jobs_used: i32,
 }
 
+/// A config in the pool now, rated or not.
+#[derive(Serialize)]
+struct PoolMember {
+    player_config_id: Uuid,
+    name: String,
+}
+
 #[derive(Serialize)]
 struct PoolDetail {
     id: Uuid,
@@ -124,6 +131,11 @@ struct PoolDetail {
     layout: String,
     anchor_player_config_id: Uuid,
     anchor_rating: f64,
+    /// Who is in the pool now, by name. Not the same set as `ratings`, which
+    /// is the latest fit's: a config added since (or whose refit failed) is a
+    /// member with no rating yet, and one removed since is rated but no longer
+    /// a member. The page's membership controls work from this list.
+    members: Vec<PoolMember>,
     run: Option<RunSummary>,
     ratings: Vec<RatingRow>,
     /// Actual-versus-predicted for every head-to-head, worst first. This is
@@ -167,6 +179,20 @@ async fn pool_detail(
         pairs_used: row.get("pairs_used"),
         jobs_used: row.get("jobs_used"),
     });
+
+    let members = sqlx::query(
+        "SELECT m.player_config_id, c.name
+         FROM rating_pool_members m
+         JOIN player_configs c ON c.id = m.player_config_id
+         WHERE m.pool_id = $1
+         ORDER BY c.name, m.player_config_id",
+    )
+    .bind(id)
+    .fetch_all(&state.read_pool)
+    .await?
+    .iter()
+    .map(|row| PoolMember { player_config_id: row.get("player_config_id"), name: row.get("name") })
+    .collect();
 
     let mut ratings = Vec::new();
     if let Some(run) = run.as_ref() {
@@ -230,6 +256,7 @@ async fn pool_detail(
         layout: pool_row.get("layout"),
         anchor_player_config_id: pool_row.get("anchor_player_config_id"),
         anchor_rating: pool_row.get("anchor_rating"),
+        members,
         run,
         ratings,
         residuals,
@@ -250,24 +277,26 @@ struct HistoryPoint {
 /// A pool with an active job is refit every two minutes -- 720 runs a day, each
 /// with a row per member -- and this is a public page. Returning every run made
 /// its cost and its payload grow for the life of the pool: a month of one
-/// active job at ten members is over 200,000 points on every page view, for a
-/// chart a few hundred pixels wide.
+/// active job at ten members is over 200,000 points on every request. Sized for
+/// the ratings page's chart, a few hundred pixels wide; no page draws the
+/// history now, and the bound stays as the response's.
 const MAX_HISTORY_RUNS: i64 = 500;
 
-/// How many configs the history carries: the chart draws this many
-/// (`SERIES_CAP` in `frontend/src/lib/charts/ratingHistory.ts`).
+/// How many configs the history carries: the six series the ratings page's
+/// chart drew, kept as the response's bound now that only API callers read it.
 const HISTORY_CONFIGS: i64 = 6;
 
-/// The pool's rating history, oldest first: the chart's time axis. Snapshots per
-/// run rather than a mutated current value are what make this possible at all.
+/// The pool's rating history, oldest first. Snapshots per run rather than a
+/// mutated current value are what make this possible at all. API-only: the
+/// ratings page drew it as a chart until the chart was removed.
 ///
 /// Thinned to at most [`MAX_HISTORY_RUNS`] runs, evenly spaced over the pool's
-/// whole history, with the first and the newest always kept -- so the chart
+/// whole history, with the first and the newest always kept -- so a series
 /// still starts where the pool started and ends at the rating the page shows.
 ///
 /// Only the [`HISTORY_CONFIGS`] current members rated highest in the newest
-/// run: the chart draws no more. Every member's points went out on every view
-/// of this public page -- 9.5 MB at 100 members, a second of the display
+/// run. Every member's points went out on every view of what was then a
+/// public page -- 9.5 MB at 100 members, a second of the display
 /// pool's time, and forty at once answered `503` to other readers (the audit's
 /// pass 25) -- and a removed config could take one of the six places.
 async fn pool_history(
@@ -382,6 +411,8 @@ async fn create_pool(
     let mut err = AppError::bad_request("rating pool details are invalid");
     if body.name.trim().is_empty() {
         err = err.with_field("name", "must not be empty");
+    } else if let Some(problem) = super::admin::name_problem(body.name.trim()) {
+        err = err.with_field("name", problem);
     }
     if !matches!(body.variant.as_str(), "classic" | "wordsmog") {
         err = err.with_field("variant", "must be 'classic' or 'wordsmog'");
@@ -423,7 +454,9 @@ async fn create_pool(
              (name, variant, letterdist_id, layout_id, anchor_player_config_id, anchor_rating)
          VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
     )
-    .bind(&body.name)
+    // Trimmed, as a job's and a player config's are: stored as typed, "X"
+    // and "X " were two pools to the unique index and one to a reader.
+    .bind(body.name.trim())
     .bind(&body.variant)
     .bind(body.letterdist_id)
     .bind(body.layout_id)
@@ -488,7 +521,8 @@ struct MemberBody {
     player_config_id: Uuid,
 }
 
-/// Adds a config and refits the pool.
+/// Adds a config and refits the pool; a config already a member is answered
+/// `run_id: null`, neither logged nor refitted.
 ///
 /// The refit is the whole point of the endpoint: a new member brings its games
 /// in as evidence, which moves every other rating too, so there is no such
@@ -514,7 +548,7 @@ async fn add_member(
         .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| AppError::not_found("rating pool not found"))?;
-    sqlx::query(
+    let added = sqlx::query(
         "INSERT INTO rating_pool_members (pool_id, player_config_id, added_by)
          VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
     )
@@ -530,7 +564,15 @@ async fn add_member(
             "player_config_id",
             body.player_config_id,
         )
-    })?;
+    })?
+    .rows_affected();
+    // A config that is already a member -- a second click, or the anchor,
+    // which the pool was created with -- adds nothing, and is answered so
+    // rather than logged as an addition and refitted, as a removal's second
+    // click is.
+    if added == 0 {
+        return Ok(Json(serde_json::json!({ "run_id": null })));
+    }
     audit::log(
         &mut tx,
         "rating_pool.member_added",
@@ -624,8 +666,8 @@ struct UpdatePoolBody {
 /// The ratings are only defined up to where the anchor pins them, so this
 /// rescales everyone: the refit commits with the change, so the page never
 /// shows the new anchor beside ratings on the old scale. Past runs keep the
-/// scale they were fitted on, and the history chart steps at the change --
-/// which is what happened.
+/// scale they were fitted on, and the history steps at the change -- which is
+/// what happened.
 ///
 /// A new anchor that is not yet a member is added first: a pool's fixed point
 /// has to be in the pool, as `create_pool` makes it.

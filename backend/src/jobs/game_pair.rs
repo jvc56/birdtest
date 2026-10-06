@@ -23,7 +23,7 @@ impl JobHandler for GamePairHandler {
         template: &JobTemplate,
         task_id: Uuid,
     ) -> AppResult<Self::Request> {
-        super::load_game_request(conn, template, task_id, true).await
+        super::load_game_request(conn, template, task_id).await
     }
 
     fn process_response(response: Self::Response) -> AppResult<Self::Record> {
@@ -100,6 +100,7 @@ impl JobHandler for GamePairHandler {
                     "divergent_games must be even and no larger than the total games played",
                 ));
             }
+            check_divergent_against_the_whole(&response.all_games, &pentanomial, divergent)?;
         }
 
         let positions =
@@ -121,6 +122,49 @@ impl JobHandler for GamePairHandler {
     ) -> AppResult<()> {
         super::insert_game_results(conn, template, task_id, claim_id, record).await
     }
+}
+
+/// The divergent subset against the whole batch it was taken from.
+///
+/// MAGPIE counts a pair as not divergent only when its two games played the
+/// same moves throughout (`play_autoplay_game_or_game_pair`), the first mover
+/// swapped between them: the same game from both seats, so player 1 won one
+/// and lost the other, or drew both, and the pair is in pentanomial bucket 2.
+/// So the games outside the subset are each count's difference, with as many
+/// wins as losses and an even number of draws, and every pair outside bucket 2
+/// is a divergent one. A subset that breaks this is a broken client's, and it
+/// is what the job page's divergent-games table would have shown as where the
+/// configs differ.
+fn check_divergent_against_the_whole(
+    all: &GameAggregate,
+    pentanomial: &[i64; 5],
+    divergent: &GameAggregate,
+) -> AppResult<()> {
+    let (wins, losses, ties) = (
+        i64::from(all.wins) - i64::from(divergent.wins),
+        i64::from(all.losses) - i64::from(divergent.losses),
+        i64::from(all.ties) - i64::from(divergent.ties),
+    );
+    if wins < 0 || losses < 0 || ties < 0 {
+        return Err(AppError::bad_request(
+            "divergent_games has more wins, losses or draws than all_games",
+        ));
+    }
+    if wins != losses || ties % 2 != 0 {
+        return Err(AppError::bad_request(
+            "the pairs outside divergent_games must each be a win and a loss or two draws",
+        ));
+    }
+    // Each count is at most the games played, already checked, so this sum
+    // cannot overflow.
+    let unsplit = pentanomial[0] + pentanomial[1] + pentanomial[3] + pentanomial[4];
+    if unsplit > i64::from(divergent.games / 2) {
+        return Err(AppError::bad_request(format!(
+            "{unsplit} pairs were not split, and divergent_games says only {} diverged",
+            divergent.games / 2
+        )));
+    }
+    Ok(())
 }
 
 /// A pairs result that keeps only first divergences
@@ -232,7 +276,6 @@ pub async fn next_request(
             board_layout: job_data.layout_name.clone(),
             seed: next_seed as u64,
             num_games: config.pairs_per_batch,
-            game_pairs: true,
             capture_positions: config.capture_positions,
             capture_first_divergence: config.capture_first_divergence,
             bingo_bonus: job_data.bingo_bonus,
@@ -271,7 +314,7 @@ mod tests {
         }
     }
 
-    /// U-PAIRS-DIV-1: from each divergent pair both games' positions at one
+    /// A-PUBLIC-4f: from each divergent pair both games' positions at one
     /// turn, the same board and tiles (the racks and scores after the board are
     /// in each game's seat order, and differ), and nothing from the others.
     #[test]
@@ -308,6 +351,49 @@ mod tests {
         assert!(refused(&other_rack, Some(1)).contains("different positions"));
         let one_game_twice = [positions[0].clone(), kept(0, 4, board, "AEINRST", "s")];
         assert!(refused(&one_game_twice, Some(1)).contains("game 0 has two"));
+    }
+
+    fn pairs(pentanomial: [i64; 5], all: (i32, i32, i32), divergent: (i32, i32, i32)) -> AppResult<GameResultsRecord> {
+        let aggregate = |(wins, losses, ties): (i32, i32, i32)| serde_json::json!({
+            "games": wins + losses + ties, "wins": wins, "losses": losses, "ties": ties,
+            "p1_score_mean": 420.0, "p1_score_sd": 60.0, "p2_score_mean": 400.0, "p2_score_sd": 55.0,
+        });
+        let response: GameResultsResponse = serde_json::from_value(serde_json::json!({
+            "all_games": aggregate(all),
+            "pentanomial": pentanomial,
+            "divergent_games": aggregate(divergent),
+        }))
+        .unwrap();
+        GamePairHandler::process_response(response)
+    }
+
+    /// U-PLAUS-8: `divergent_games` agrees with the whole. A pair that did not
+    /// diverge is one game from both seats -- a win and a loss for player 1,
+    /// or two draws, in bucket 2 -- so outside the subset wins equal losses,
+    /// draws come in twos, the subset has no count the whole lacks, and no
+    /// more pairs sit outside bucket 2 than diverged.
+    #[test]
+    fn the_divergent_subset_agrees_with_the_whole() {
+        // Three pairs: one won both (diverged), one split identically, one two
+        // draws identically. The subset is the first.
+        assert!(pairs([0, 0, 2, 0, 1], (3, 1, 2), (2, 0, 0)).is_ok());
+        // Every pair diverged; none did.
+        assert!(pairs([0, 0, 2, 0, 1], (3, 1, 2), (3, 1, 2)).is_ok());
+        assert!(pairs([0, 0, 3, 0, 0], (2, 2, 2), (0, 0, 0)).is_ok());
+
+        let refused = |result: AppResult<GameResultsRecord>, why: &str| {
+            let error = result.unwrap_err();
+            assert!(error.message.contains(why), "{why}: {}", error.message);
+        };
+        // A won-both and a lost-both pair, neither diverging: the counts
+        // outside the subset balance, and the pairs still cannot be.
+        refused(pairs([1, 0, 0, 0, 1], (2, 2, 0), (0, 0, 0)), "were not split");
+        // Outside the subset, a win with no loss beside it.
+        refused(pairs([0, 0, 2, 0, 1], (3, 1, 2), (1, 1, 0)), "a win and a loss or two draws");
+        // One draw on its own.
+        refused(pairs([0, 0, 2, 0, 1], (3, 1, 2), (2, 1, 1)), "a win and a loss or two draws");
+        // More draws in the subset than in all of it.
+        refused(pairs([0, 0, 2, 0, 1], (3, 1, 2), (1, 0, 3)), "more wins, losses or draws");
     }
 
     /// A pentanomial that agrees with its tally only by overflowing. Summed as

@@ -351,8 +351,8 @@ async fn every_destructive_admin_action_writes_exactly_its_record() {
             vec![
                 census(
                     "job.purged.census", "job", purged.to_string(), Some(purged),
-                    "tasks=1 claims=1 game_results=1 leave_records=0 positions=0 rack_progress=0 \
-                     staged_results=0 artifacts=0",
+                    "tasks=1 claims=1 game_results=1 leave_records=0 positions=0 rack_standings=0 \
+                     rack_progress=0 staged_results=0 artifacts=0",
                 ),
                 AuditRow { job_id: Some(purged), ..admin_row("job.purged", "job", purged.to_string()) },
             ],
@@ -365,8 +365,8 @@ async fn every_destructive_admin_action_writes_exactly_its_record() {
                 admin_row("job.deleted", "job", deleted.to_string()),
                 census(
                     "job.deleted.census", "job", deleted.to_string(), None,
-                    "tasks=1 claims=1 game_results=1 leave_records=0 positions=0 rack_progress=0 \
-                     staged_results=0 artifacts=0",
+                    "tasks=1 claims=1 game_results=1 leave_records=0 positions=0 rack_standings=0 \
+                     rack_progress=0 staged_results=0 artifacts=0",
                 ),
             ],
         ),

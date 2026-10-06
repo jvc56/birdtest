@@ -168,7 +168,7 @@ async fn opening_rack_job(db: &TestDb, racks_per_batch: i32) -> Uuid {
 // Jobs
 // ---------------------------------------------------------------------------
 
-/// A-PUBLIC-1c: a job's full configuration is public -- the job's settings,
+/// A-PUBLIC-1e: a job's full configuration is public -- the job's settings,
 /// its type's (for a games job the test and its stopping rules) and every
 /// setting of each player config, with files by name and its own id to link
 /// to -- and names no one: no creator, no user id. An unknown job is a 404.
@@ -579,6 +579,7 @@ async fn the_filtered_feed_pages_through_a_contributors_claims() {
             let result = json!({
                 "racks": racks.iter().map(|rack| json!({
                     "rack": rack,
+                    "num_moves": 1,
                     "moves": [{ "move": "8G WUZ", "score": 30, "equity": 32.5 }],
                 })).collect::<Vec<_>>()
             });
@@ -684,6 +685,7 @@ async fn rack_lookup_finds_an_analysed_rack() {
     let result = json!({
         "racks": racks.iter().map(|rack| json!({
             "rack": rack,
+            "num_moves": 2,
             "moves": [
                 { "move": "8G WUZ", "score": 30, "equity": 32.5 },
                 { "move": "8H ZA", "score": 22, "equity": 21.0 },
@@ -751,6 +753,7 @@ async fn a_simulated_position_shows_its_plies_and_its_inference() {
     let cfg = state.cfg.clone();
     let app = birdtest::app(state);
     let job = capturing_games_job(&db).await;
+    db.simulate_player1(job, true).await;
     // Recording four plies, so the read is what keeps it to two.
     sqlx::query(
         "UPDATE player_configs SET num_plies_recorded = 4
@@ -1739,4 +1742,89 @@ async fn a_pairs_position_without_a_partner_turn_says_so() {
     let (_, random) =
         send(&app, get_request(&format!("/api/jobs/{games}/positions/random"), &headers)).await;
     assert!(random.get("partner").is_none(), "{random}");
+}
+
+/// A-PUBLIC-8: a NUL in what an unauthenticated caller sends is the caller's
+/// `400`, not a `500`. Postgres stores no NUL in text and refuses the
+/// statement; that refusal was a 500 and an error line, written at will by
+/// anyone with `?worker=%00` on a public, unlimited route.
+#[tokio::test]
+async fn a_nul_in_a_public_request_is_a_bad_request() {
+    let db = TestDb::new().await;
+    let job = db.games_job(2).await;
+    let app = birdtest::app(db.state().await);
+
+    let (status, body) =
+        send(&app, get_request(&format!("/api/jobs/{job}/results?worker=%00"), &[])).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "bad_request", "{body}");
+    let (status, body) = send(
+        &app,
+        post_json("/api/auth/login", &[], json!({ "username": "\u{0}", "password": "hunter22" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, body) = send(
+        &app,
+        post_json("/api/auth/reset-password/request", &[], json!({ "email": "a\u{0}@b.co" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
+/// A-PUBLIC-3d: a results cursor holding a time before 4713 BC, where
+/// Postgres's `timestamptz` starts, reads as no cursor -- the first page --
+/// like any other cursor this server did not produce. chrono holds such a time
+/// and Postgres refused it at the bind (22008): a `500` on a public route. On
+/// an opening-rack job and a games job, with and without `?worker=`.
+#[tokio::test]
+async fn a_cursor_older_than_postgres_can_hold_reads_as_the_first_page() {
+    let db = TestDb::new().await;
+    let app = birdtest::app(db.state().await);
+    let alice = db.user("alice", false).await;
+    let games = db.games_job(2).await;
+    for second in 1..=3 {
+        game_result_at(&db, games, Some(alice), None, &format!("2026-02-01T00:00:0{second}Z")).await;
+    }
+    let racks = opening_rack_job(&db, 3).await;
+    let task: Uuid = sqlx::query_scalar(
+        "INSERT INTO tasks (job_id, seed, state, accepted_count, completed_at)
+         VALUES ($1, 0, 'completed', 1, now()) RETURNING id",
+    )
+    .bind(racks)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "WITH c AS (
+             INSERT INTO task_claims
+                 (task_id, job_id, claim_token, state, claimed_by_user_id, completed_at)
+             VALUES ($1, $2, gen_random_uuid(), 'completed', $3, now()) RETURNING id
+         )
+         INSERT INTO position_analysis_records
+             (task_claim_id, task_id, job_id, rack, analysis, num_moves)
+         SELECT c.id, $1, $2, rack, 'static', 1 FROM c, unnest(ARRAY['AEINRST', 'EIQSTUW']) rack",
+    )
+    .bind(task)
+    .bind(racks)
+    .bind(alice)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    // About 29,700 BC, with an id of each feed's kind.
+    let ancient = "-1000000000000000000".to_string();
+    for (job, id) in [(racks, "1".to_string()), (games, Uuid::new_v4().to_string())] {
+        let cursor = birdtest::routes::encode_cursor(&[ancient.clone(), id]);
+        for worker in ["", "&worker=alice"] {
+            let first = format!("/api/jobs/{job}/results?per_page=2{worker}");
+            let (status, expected) = send(&app, get_request(&first, &[])).await;
+            assert_eq!(status, StatusCode::OK, "{first}: {expected}");
+            assert_eq!(expected["items"].as_array().unwrap().len(), 2, "{first}: {expected}");
+            let path = format!("{first}&cursor={cursor}");
+            let (status, body) = send(&app, get_request(&path, &[])).await;
+            assert_eq!(status, StatusCode::OK, "{path}: {body}");
+            assert_eq!(body["items"], expected["items"], "{path}: the first page");
+        }
+    }
 }

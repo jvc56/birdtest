@@ -145,27 +145,59 @@ describe('F-SET-1 job settings', () => {
 
   it('marks the player settings each job never reads', () => {
     expect(muted(playerRows([staticPlayer], unusedPlayerSettings(leave)))).toEqual([
-      'Leaves', 'Move Recorder', 'Uses Preendgame', 'Uses Endgame', 'Moves Recorded', 'Plies Recorded',
+      'Leaves', 'Move Recorder', 'Moves Generated', 'Uses Preendgame', 'Uses Endgame', 'Moves Recorded',
+      'Plies Recorded',
       'Movegen Margin', ...SOLVER_LABELS.slice(2)
     ]);
     // A leave job's simmer would show its win% model muted too (job creation
     // refuses one, but the set names it).
     expect(unusedPlayerSettings(leave).has('win_pct')).toBe(true);
-    // What it plays with is not muted.
+    // What it plays with is not muted. (It plays statically: autoplay keeps
+    // only the best move, whatever the list it generates into holds.)
     for (const used of ['Lexicon', 'Plies', 'Sorted By', 'Wordmap']) {
       expect(byLabel(playerRows([staticPlayer], unusedPlayerSettings(leave)), used).unused).toBeUndefined();
     }
-    // An opening rack infers nothing and never reaches the end of a game.
+    // An opening rack infers nothing and never reaches the end of a game; a
+    // simmer ranks every play whatever its recorder, so neither the recorder
+    // nor the move-gen margin is read.
     expect(muted(playerRows([simPlayer], unusedPlayerSettings(opening)))).toEqual([
-      'Uses Inference', 'Uses Preendgame', 'Uses Endgame', 'Inference Margin', ...SOLVER_LABELS.slice(2)
+      'Move Recorder', 'Uses Inference', 'Uses Preendgame', 'Uses Endgame', 'Inference Margin',
+      'Movegen Margin', ...SOLVER_LABELS.slice(2)
     ]);
-    // A games job reads what is recorded only when it records positions.
-    expect(muted(playerRows([staticPlayer], unusedPlayerSettings(config)))).toEqual(['Moves Recorded', 'Plies Recorded']);
+    // A static opening-rack analysis is the one reader of both.
+    const staticOpening = { ...opening, players: [{ ...staticPlayer, role: 'player' }] };
+    expect(muted(playerRows([staticPlayer], unusedPlayerSettings(staticOpening)))).toEqual([
+      'Uses Inference', 'Uses Preendgame', 'Uses Endgame', ...SOLVER_LABELS.slice(2)
+    ]);
+    // A games job generates with MAGPIE's own recorder and a margin of 0, and
+    // reads what is recorded only when it records positions.
+    expect(muted(playerRows([staticPlayer], unusedPlayerSettings(config)))).toEqual([
+      'Move Recorder', 'Moves Recorded', 'Plies Recorded', 'Movegen Margin'
+    ]);
     const capturing = { ...config, games: { ...config.games!, capture_positions: true } };
-    expect(muted(playerRows([staticPlayer], unusedPlayerSettings(capturing)))).toEqual([]);
+    expect(muted(playerRows([staticPlayer], unusedPlayerSettings(capturing)))).toEqual([
+      'Move Recorder', 'Movegen Margin'
+    ]);
+    // Between static players that record no positions, the moves generated
+    // only size the list the best move is kept in: two counts are no
+    // difference. A capture reads it (the ranked moves a position keeps), and
+    // so does a simmer beside them (its candidates), which keeps it live.
+    const twoStatic = { ...config, players: [staticPlayer, { ...staticPlayer, role: 'player 2', id: 'p4' }] };
+    expect(muted(playerRows(twoStatic.players, unusedPlayerSettings(twoStatic)))).toEqual([
+      'Move Recorder', 'Moves Generated', 'Moves Recorded', 'Plies Recorded', 'Movegen Margin'
+    ]);
+    const twoCounts = playerRows([staticPlayer, { ...staticPlayer, num_plays: 15 }], unusedPlayerSettings(twoStatic));
+    expect(byLabel(twoCounts, 'Moves Generated').differs).toBe(false);
+    const capturingStatic = { ...twoStatic, games: { ...twoStatic.games!, capture_positions: true } };
+    expect(unusedPlayerSettings(capturingStatic).has('num_plays')).toBe(false);
+    expect(unusedPlayerSettings(config).has('num_plays')).toBe(false);
+    // A setting the job never reads is no difference between its players, so
+    // two margins are not marked as one in a games job.
+    const twoMargins = playerRows([staticPlayer, { ...staticPlayer, movegen_margin: 9 }], unusedPlayerSettings(config));
+    expect(byLabel(twoMargins, 'Movegen Margin').differs).toBe(false);
     // Every id named is a row of the full table, so none is silently unmatched.
     const every = playerRows([simPlayer, solvingPlayer]).map((r) => r.id);
-    for (const job of [leave, opening, config]) {
+    for (const job of [leave, opening, staticOpening, config, capturing, twoStatic]) {
       for (const id of unusedPlayerSettings(job)) expect(every).toContain(id);
     }
   });

@@ -60,7 +60,8 @@ pub enum ClaimOutcome {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ShutdownDirective {
-    /// `data_out_of_date`, `magpie_too_old`, or `both`.
+    /// `data_out_of_date`, `magpie_too_old`, or `both` -- or `unsupported_build`,
+    /// which the claim route answers before any job is consulted.
     pub reason: String,
     pub message: String,
     pub required_tarball_dates: Vec<String>,
@@ -426,7 +427,7 @@ async fn shutdown_or_idle(
 
 /// Lazy timeout reclamation, run at claim time rather than by a background
 /// process. Each timed-out claim flips to `abandoned`, the task's
-/// `active_claim_count` drops, and a task that was at capacity reopens.
+/// `active_claim_count` drops, and the task returns to `available`.
 ///
 /// Safe against a submission for the same claim racing it: the submit path
 /// holds the claim row locked from its lookup to its commit, and this
@@ -483,6 +484,9 @@ pub async fn reclaim_expired_for(
          UPDATE tasks t
          SET active_claim_count = GREATEST(t.active_claim_count - counts.n, 0),
              state = CASE
+                 -- Neither arm can hold under one slot (a task whose claim
+                 -- lapses has no accepted result, and had no other live
+                 -- claim): defence against a drifted counter.
                  WHEN t.accepted_count > 0 THEN 'completed'::task_state
                  WHEN GREATEST(t.active_claim_count - counts.n, 0) > 0 THEN 'claimed'::task_state
                  ELSE 'available'::task_state
@@ -555,15 +559,17 @@ pub async fn claim(
         }));
     }
 
-    // The outer retry exists for three cases: a leave-gen generation
-    // transition (which creates new work mid-request), a lost race on the
-    // `(job_id, seed)` unique index when two workers generate the same
-    // on-demand task, and a claim that found every job with work outrun
-    // (`JobClaimError::LostRace`). The last is common when many workers claim
-    // at once, so it has more rounds; and the last round takes the first job
-    // with work without the turn check, since an `Idle` while work exists sends
-    // a worker to sleep for seconds -- with equal jobs and 32 workers claiming
-    // together, 67 to 166 claims of 1,920 did (the audit's pass 21).
+    // The outer retry exists for two cases: a unique violation generating a
+    // task (`JobClaimError::Retry`; in practice only a leave-generation task
+    // whose randomly drawn seed collides with one already issued, since every
+    // generation runs under the job's dispatch lock and so no two claims ever
+    // generate the same cursor-seeded task), and a claim that found every job
+    // with work outrun (`JobClaimError::LostRace`). The second is common when
+    // many workers claim at once, so it has more rounds; and the last round
+    // takes the first job with work without the turn check, since an `Idle`
+    // while work exists sends a worker to sleep for seconds -- with equal jobs
+    // and 32 workers claiming together, 67 to 166 claims of 1,920 did (the
+    // audit's pass 21).
     //
     // A job found busy (`JobClaimError::Busy`) is not tried again in the
     // request: waiting on it again cost 2 s a round, and a claim waited 16 s
@@ -746,7 +752,8 @@ fn ratio(job: &Job) -> Option<f64> {
 }
 
 enum JobClaimError {
-    /// Something changed underneath us; re-run job selection.
+    /// Generating a task hit a unique index -- a leave-generation task whose
+    /// randomly drawn seed one already issued holds; re-run job selection.
     Retry,
     /// Claims made while this one was on its way moved the job past another
     /// of the worker's candidates (see `try_claim_from_job`): go on to the
@@ -776,10 +783,10 @@ async fn try_claim_from_job(
     // Before the dispatch lock, because a job with a table still building has
     // nothing to hand out and taking the lock would only make every other
     // claim for it wait. The hashes travel with the claim, so a task issued
-    // before they exist would either carry no `derived` entry -- which a
-    // worker reads as "this server does not check derived files", falling back
-    // to whatever is on its disk -- or carry an empty one. Waiting is the only
-    // answer that cannot be mistaken for success.
+    // before they exist would carry no hash for a file a player asks for,
+    // which MAGPIE refuses (`derived_mismatch`) and which sets the job aside
+    // for the run on every worker that claims it. Waiting is the only answer
+    // that costs the fleet nothing.
     //
     // Answered from memory once a job has been found dispatchable: this runs
     // for every candidate job on every claim, and the answer for a
@@ -1115,16 +1122,14 @@ async fn try_claim_from_job(
                         derived_data: derived,
                     }))
                 }
+                // Including a unique violation. The task was selected while
+                // `available`, under the job's dispatch lock and its own row
+                // lock, so the one-slot index refusing this claim means its
+                // state or counters drifted: re-running selection would pick
+                // the same task again. Fatal skips the job, loudly.
                 Err(err) => {
                     let _ = tx.rollback().await;
-                    // The per-identity partial unique index rejects a second
-                    // slot on the same task. That is not a failure -- this
-                    // worker already holds a slot there -- so re-run selection.
-                    Err(if err.is_unique_violation() {
-                        JobClaimError::Retry
-                    } else {
-                        JobClaimError::Fatal(err)
-                    })
+                    Err(JobClaimError::Fatal(err))
                 }
             }
         }
@@ -1348,6 +1353,8 @@ pub async fn release_claim(
         "UPDATE tasks t
          SET active_claim_count = GREATEST(t.active_claim_count - 1, 0),
              state = CASE
+                 -- Neither arm can hold under one slot, as in
+                 -- `reclaim_expired_for`.
                  WHEN t.accepted_count > 0 THEN 'completed'::task_state
                  WHEN GREATEST(t.active_claim_count - 1, 0) > 0 THEN 'claimed'::task_state
                  ELSE 'available'::task_state

@@ -69,10 +69,17 @@ async fn dev_login(
         .add(session_cookie(&state, token))
         .add(csrf_cookie(&state, csrf::generate_token()));
     // A path here, never another site: `//host` and `/\host` are other sites
-    // to a browser.
+    // to a browser. Visible ASCII only: a browser drops a tab or line break
+    // from a `Location` before reading it, so `/<tab>/host` was `//host`, and
+    // a line break is no header value at all -- `Redirect::to` panicked on it.
     let next = query
         .next
-        .filter(|n| n.starts_with('/') && !n.starts_with("//") && !n.contains('\\'))
+        .filter(|n| {
+            n.starts_with('/')
+                && !n.starts_with("//")
+                && !n.contains('\\')
+                && n.bytes().all(|b| (0x21..0x7f).contains(&b))
+        })
         .unwrap_or_else(|| "/".to_string());
     Ok((jar, Redirect::to(&next)))
 }

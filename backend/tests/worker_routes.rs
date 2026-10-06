@@ -167,7 +167,9 @@ async fn a_malformed_magpie_version_is_refused_rather_than_assumed() {
         assert!(body.get("claim_token").is_none(), "{version:?} was handed a task: {body}");
     }
 
-    let (status, body) = claim(&app, &[], json!({ "magpie_version": 1.4, "unsupported_jobs": [] })).await;
+    let not_a_string =
+        json!({ "magpie_version": 1.4, "board_dim": 15, "rack_size": 7, "unsupported_jobs": [] });
+    let (status, body) = claim(&app, &[], not_a_string).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert!(message(&body).contains("magpie_version"), "{body}");
 
@@ -256,11 +258,15 @@ async fn idle_and_each_shutdown_reason_are_distinct_answers() {
 
     // A job on offer with nothing left to hand out: its one batch is out.
     let capped = db.games_job(2).await;
-    sqlx::query("UPDATE job_game_config SET max_games = 2 WHERE job_id = $1")
-        .bind(capped)
-        .execute(&db.pool)
-        .await
-        .unwrap();
+    // No test: its floor of a million would be past the cap.
+    sqlx::query(
+        "UPDATE job_game_config SET max_games = 2, test_enabled = FALSE, min_games = 0
+         WHERE job_id = $1",
+    )
+    .bind(capped)
+    .execute(&db.pool)
+    .await
+    .unwrap();
     first_claim(&app).await;
     let (status, body) = claim(&app, &[], claim_body("1.0.0", &[])).await;
     assert_eq!((status, &body), (StatusCode::NO_CONTENT, &Value::Null), "idle is not a shutdown");
@@ -328,6 +334,49 @@ async fn idle_and_each_shutdown_reason_are_distinct_answers() {
     );
 }
 
+/// A-WORKER-22: a claim states its build's `board_dim` and `rack_size`, and a
+/// build other than 15x15 with 7-tile racks is sent away with an
+/// `unsupported_build` shutdown naming both, whatever jobs are on offer: it is
+/// handed no task and minted no identity. A claim that leaves either out is a
+/// `400` naming them. The default build is served.
+#[tokio::test]
+async fn a_build_for_another_board_or_rack_is_sent_away() {
+    let db = TestDb::new().await;
+    db.games_job(2).await;
+    let app = birdtest::app(db.state().await);
+
+    for (board_dim, rack_size) in [(21, 7), (15, 8), (21, 8)] {
+        let mut body = claim_body("1.0.0", &[]);
+        body["board_dim"] = json!(board_dim);
+        body["rack_size"] = json!(rack_size);
+        let (status, body) = claim(&app, &[], body).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let shutdown = &body["shutdown"];
+        assert_eq!(shutdown["reason"], "unsupported_build", "{body}");
+        assert!(
+            message(shutdown).contains(&format!("BOARD_DIM {board_dim} and RACK_SIZE {rack_size}")),
+            "{body}"
+        );
+        assert!(message(shutdown).contains("15x15 board with 7-tile racks"), "{body}");
+        assert_eq!(shutdown["required_magpie_version"], Value::Null, "{body}");
+        assert_eq!(shutdown["required_tarball_dates"], json!([]), "{body}");
+        assert!(body.get("claim_token").is_none(), "{body}");
+    }
+    for missing in ["board_dim", "rack_size"] {
+        let mut body = claim_body("1.0.0", &[]);
+        body.as_object_mut().unwrap().remove(missing);
+        let (status, body) = claim(&app, &[], body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(message(&body).contains(missing), "{body}");
+    }
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM task_claims").await, 0);
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM anonymous_workers").await, 0);
+
+    let (status, body) = claim(&app, &[], claim_body("1.0.0", &[])).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["claim_token"].is_string(), "{body}");
+}
+
 // --- A-WORKER-7, 8, 9: decline and heartbeat ---------------------------------
 
 /// A-WORKER-7: an assignment names every file the task loads with the digest of
@@ -351,8 +400,13 @@ async fn a_claim_states_its_digests_and_a_missing_data_decline_releases_it_at_on
     // Two static players on two lexicons of their own, one bag, one board.
     assert_eq!(roles, ["klv", "klv", "kwg", "kwg", "layout", "letterdist"], "{assignment}");
     for file in files {
-        let (sha256, bytes, date): (String, i64, String) = sqlx::query_as(
-            "SELECT sha256, bytes, tarball_date FROM input_data WHERE path = $1 AND role = $2",
+        // What MAGPIE reads, and nothing it does not: a size the client never
+        // looks at is a field to keep in step for no one.
+        let mut keys: Vec<&str> = file.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["name", "path", "role", "sha256", "tarball_date"], "{file}");
+        let (sha256, date): (String, String) = sqlx::query_as(
+            "SELECT sha256, tarball_date FROM input_data WHERE path = $1 AND role = $2",
         )
         .bind(file["path"].as_str().unwrap())
         .bind(file["role"].as_str().unwrap())
@@ -360,7 +414,6 @@ async fn a_claim_states_its_digests_and_a_missing_data_decline_releases_it_at_on
         .await
         .unwrap();
         assert_eq!(file["sha256"], json!(sha256), "{file}");
-        assert_eq!(file["bytes"], json!(bytes), "{file}");
         assert_eq!(file["tarball_date"], json!(date), "{file}");
     }
 
@@ -623,7 +676,7 @@ async fn an_accepted_result_is_published_to_the_jobs_live_stream() {
         .unwrap();
     let stats: Value = serde_json::from_str(&payload).unwrap();
     assert_eq!(stats["job"]["id"], json!(job.to_string()), "{stats}");
-    assert_eq!(stats["results_accepted"], json!(1), "{stats}");
+    assert_eq!(stats["tasks_completed"], json!(1), "{stats}");
     assert_eq!(stats["games"]["units_completed"], json!(2), "{stats}");
     assert_eq!(stats["games"]["wins"], json!(1), "{stats}");
 }
@@ -685,6 +738,7 @@ async fn every_implausible_games_result_is_a_400_that_says_why() {
         .execute(&db.pool)
         .await
         .unwrap();
+    db.simulate_player1(job, false).await;
     let app = birdtest::app(db.state().await);
 
     let cases: &[(&str, Build, &str)] = &[
@@ -847,6 +901,14 @@ async fn every_implausible_opening_rack_result_is_a_400_that_says_why() {
             "claims only 0 were generated"),
         ("a negative score", |a| edit(racks_analysed(a), |v| v["racks"][0]["moves"][0]["score"] = json!(-3)),
             "which no play can score"),
+        // The job's player is static: it cannot have simulated (U-PLAUS-6).
+        ("a simulation from a static player", |a| edit(racks_analysed(a), |v| {
+            v["racks"][0]["moves"][0]["win_percentage"] = json!(55.0);
+        }), "no player of this task simulates"),
+        // Nor counted a simulation's iterations (U-PLAUS-7).
+        ("iterations on a static move", |a| edit(racks_analysed(a), |v| {
+            v["racks"][0]["moves"][0]["iterations"] = json!(100);
+        }), "carries a simulation's iterations or plies"),
     ];
     assert_each_refused(&db, &app, racks_analysed, cases).await;
 }

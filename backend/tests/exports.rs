@@ -854,7 +854,7 @@ async fn results_and_positions_are_read_in_one_snapshot() {
     )
     .await;
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
-    wait_for_lock_waiter(&db, "SELECT EXISTS (SELECT 1 FROM position_analysis_records").await;
+    wait_for_lock_waiter(&db, "SELECT 1 FROM position_analysis_records WHERE job_id").await;
     let task: Uuid = sqlx::query_scalar(
         "INSERT INTO tasks (job_id, seed, state) VALUES ($1, 999, 'completed') RETURNING id",
     )
@@ -915,4 +915,241 @@ async fn results_and_positions_are_read_in_one_snapshot() {
     );
     let positions = gunzip(&download(export["positions_download_url"].as_str().unwrap()).await);
     assert!(!positions.contains("\"late\""), "{positions}");
+}
+
+/// I-EXPORT-15: an export that finishes while its completed job is being
+/// reopened -- by a consensus edit whose `unfinalize` has run and whose commit
+/// has not -- waits for the reopening, and fails with it. Its final marker
+/// read the job's committed `completed` in between, so it came back final
+/// for a job that was running again, and the stream would have redirected to
+/// it once the job completed anew.
+#[tokio::test]
+async fn an_export_finishing_while_its_job_reopens_fails() {
+    let db = TestDb::new().await;
+    let (state, bucket) = db.state_with_object_store().await;
+    let app = birdtest::app(state.clone());
+    let admin = db.user("root", true).await;
+    let headers = admin_headers(&state.cfg, admin);
+    let job = completed_capture_job(&db, &app, 1).await;
+    complete(&db, job).await;
+
+    // Held at its results scan, its snapshot taken while the job was completed.
+    let mut reads = db.pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE game_results IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *reads)
+        .await
+        .unwrap();
+    let path = format!("/api/admin/jobs/{job}/export");
+    let (status, body) = send(&app, post_json(&path, &borrowed(&headers), json!({}))).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    wait_for_lock_waiter(&db, "SELECT to_jsonb(r)::text AS row FROM game_results").await;
+
+    // A reopening as the consensus edit makes one: the job's row, the final
+    // exports demoted, the job active again -- not yet committed.
+    let mut reopen = db.pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM jobs WHERE id = $1 FOR UPDATE")
+        .bind(job)
+        .execute(&mut *reopen)
+        .await
+        .unwrap();
+    birdtest::exports::unfinalize(&mut reopen, job).await.unwrap();
+    sqlx::query("UPDATE jobs SET status = 'active' WHERE id = $1")
+        .bind(job)
+        .execute(&mut *reopen)
+        .await
+        .unwrap();
+    reads.commit().await.unwrap();
+    // The export reads the rest and waits to learn what the job is now.
+    wait_for_lock_waiter(&db, "UPDATE job_exports").await;
+    reopen.commit().await.unwrap();
+
+    // It matched no row, and removed the objects it had uploaded.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !bucket.keys().await.is_empty() {
+        assert!(Instant::now() < deadline, "the unclaimed objects were left behind");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let (_, export) = send(&app, get_request(&path, &headers)).await;
+    assert_eq!(export["state"], "failed", "the job was reopened as it finished: {export}");
+    assert_eq!(export["is_final"], false, "{export}");
+    assert!(export["error"].as_str().unwrap_or_default().contains("consensus settings changed"), "{export}");
+}
+
+/// I-EXPORT-16: an export whose snapshot was read while its job was completed
+/// fails when a consensus edit reopens the job, even if the job has completed
+/// again by the time the export finishes. It was stored final -- the corpus
+/// from before the edit's extra analyses, marked as the completed job's --
+/// because `mark_ready` saw only the job's status at the end, and the stream
+/// redirected every download to it until someone exported again (which the
+/// running export had refused meanwhile).
+///
+/// Deterministic: the export is held at its results scan across the
+/// reopening and the second completion, and the app runs on a pool of its
+/// own, named, so the test can see when the export's final update has run.
+#[tokio::test]
+async fn an_export_spanning_a_reopening_and_a_second_completion_fails() {
+    let db = TestDb::new().await;
+    let (mut state, bucket) = db.state_with_object_store().await;
+    let options: sqlx::postgres::PgConnectOptions = db.url.parse().unwrap();
+    let app_pool = sqlx::PgPool::connect_with(options.application_name("export-under-test"))
+        .await
+        .unwrap();
+    state.pool = app_pool.clone();
+    state.read_pool = app_pool.clone();
+    let app = birdtest::app(state.clone());
+    let admin = db.user("root", true).await;
+    let headers = admin_headers(&state.cfg, admin);
+    let job = completed_capture_job(&db, &app, 1).await;
+    complete(&db, job).await;
+
+    // Held at its results scan, its snapshot taken while the job was completed.
+    let mut reads = db.pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE game_results IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *reads)
+        .await
+        .unwrap();
+    let path = format!("/api/admin/jobs/{job}/export");
+    let (status, body) = send(&app, post_json(&path, &borrowed(&headers), json!({}))).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    wait_for_lock_waiter(&db, "SELECT to_jsonb(r)::text AS row FROM game_results").await;
+
+    // A reopening as the consensus edit makes one, committed; then the job's
+    // few unsettled racks are analysed and it completes again.
+    let mut reopen = db.pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM jobs WHERE id = $1 FOR UPDATE")
+        .bind(job)
+        .execute(&mut *reopen)
+        .await
+        .unwrap();
+    birdtest::exports::unfinalize(&mut reopen, job).await.unwrap();
+    sqlx::query("UPDATE jobs SET status = 'active' WHERE id = $1")
+        .bind(job)
+        .execute(&mut *reopen)
+        .await
+        .unwrap();
+    reopen.commit().await.unwrap();
+    complete(&db, job).await;
+
+    // The export reads the rest, uploads both objects and runs its final
+    // update; wait for that statement to have finished.
+    reads.commit().await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let finished: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+                            WHERE application_name = 'export-under-test' AND state = 'idle'
+                              AND ltrim(query) LIKE 'UPDATE job_exports%')",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        if finished {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the export never reached its final update");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let (_, export) = send(&app, get_request(&path, &headers)).await;
+    assert_eq!(export["state"], "failed", "stored as the re-completed job's corpus: {export}");
+    assert_eq!(export["is_final"], false, "{export}");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !bucket.keys().await.is_empty() {
+        assert!(Instant::now() < deadline, "the unclaimed objects were left behind");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Nothing redirects to it, and the job can be exported again: that one
+    // is the completed job's corpus.
+    let (status, _, _) = send_raw(
+        &app,
+        get_request(&format!("/api/admin/jobs/{job}/results/stream"), &headers),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "streamed from the database, not redirected");
+    let export = export_and_wait(&app, job, &headers).await;
+    assert_eq!(export["state"], "ready", "{export}");
+    assert_eq!(export["is_final"], true, "{export}");
+}
+
+/// I-EXPORT-17: whether a job captured positions is asked through the results
+/// feed's index, not by a scan of every older job's records. Asked as
+/// `EXISTS`, Postgres expects a match within a few rows of the heap's start,
+/// but a job's records sit after every older job's; with 30,000 of an older
+/// job's records laid down first, and 4,000 of this one's, analysed, that form
+/// is a `Seq Scan`. [`POSITIONS_CAPTURED`] is an index-only scan of
+/// `position_analysis_records_feed_idx`, custom and generic, and answers for a
+/// job with records and one without.
+///
+/// [`POSITIONS_CAPTURED`]: birdtest::exports::POSITIONS_CAPTURED
+#[tokio::test]
+async fn whether_a_job_captured_positions_is_one_index_probe() {
+    use birdtest::exports::POSITIONS_CAPTURED;
+    let db = TestDb::new().await;
+    let admin = db.user("root", true).await;
+    let older = db.bare_job("opening_rack", admin).await;
+    let job = db.bare_job("games", admin).await;
+    let none = db.bare_job("games", admin).await;
+    for (id, tasks, racks) in [(older, 30_000, 1), (job, 200, 20)] {
+        sqlx::query(
+            "WITH t AS (
+                 INSERT INTO tasks (job_id, seed, state, accepted_count, completed_at)
+                 SELECT $1, s, 'completed', 1, now() FROM generate_series(1, $2) s
+                 RETURNING id
+             ), c AS (
+                 INSERT INTO task_claims
+                     (task_id, job_id, claim_token, state, claimed_by_user_id, completed_at)
+                 SELECT id, $1, gen_random_uuid(), 'completed', $3, now() FROM t
+                 RETURNING id, task_id
+             )
+             INSERT INTO position_analysis_records
+                 (task_claim_id, task_id, job_id, rack, analysis, num_moves)
+             SELECT c.id, c.task_id, $1, 'R' || k, 'static', 1
+             FROM c, generate_series(1, $4) k",
+        )
+        .bind(id)
+        .bind(tasks)
+        .bind(admin)
+        .bind(racks)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+    sqlx::query("ANALYZE position_analysis_records").execute(&db.pool).await.unwrap();
+
+    // The data is what made the old form scan the table, so the assertions
+    // below are not vacuous.
+    let old: Vec<String> = sqlx::query_scalar(&format!(
+        "EXPLAIN SELECT EXISTS (SELECT 1 FROM position_analysis_records WHERE job_id = '{job}')"
+    ))
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert!(old.join("\n").contains("Seq Scan on position_analysis_records"), "{old:?}");
+
+    for mode in ["auto", "force_generic_plan"] {
+        let mut tx = db.pool.begin().await.unwrap();
+        for statement in [
+            format!("SET LOCAL plan_cache_mode = {mode}"),
+            format!("PREPARE captured AS {POSITIONS_CAPTURED}"),
+        ] {
+            sqlx::raw_sql(&statement).execute(&mut *tx).await.unwrap();
+        }
+        let plan: Vec<String> = sqlx::query_scalar(&format!("EXPLAIN EXECUTE captured('{job}')"))
+            .fetch_all(&mut *tx)
+            .await
+            .unwrap();
+        let plan = plan.join("\n");
+        assert!(!plan.contains("Seq Scan"), "{mode}: {plan}");
+        assert!(plan.contains("position_analysis_records_feed_idx"), "{mode}: {plan}");
+        tx.rollback().await.unwrap();
+    }
+
+    for (id, captured) in [(job, true), (none, false)] {
+        let answer = sqlx::query_scalar::<_, i32>(POSITIONS_CAPTURED)
+            .bind(id)
+            .fetch_optional(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(answer.is_some(), captured, "{id}");
+    }
 }

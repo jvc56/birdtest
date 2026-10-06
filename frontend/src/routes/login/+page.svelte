@@ -2,7 +2,7 @@
   import { goto } from '$app/navigation';
   import { page } from '$app/stores';
   import { api } from '$lib/api';
-  import { refreshSession } from '$lib/auth';
+  import { resetSession } from '$lib/auth';
   import { problems, requiredProblem } from '$lib/accountRules';
 
   let username = '';
@@ -23,7 +23,10 @@
     busy = true;
     try {
       await api.login({ username, password });
-      await refreshSession();
+      // From unresolved, not from the `null` this page was reached with: if
+      // `/api/me` cannot answer yet (a deploy's 503), the guard on the page
+      // we go to waits for the retry instead of sending the user back here.
+      await resetSession();
       // Come back to whatever the user was trying to reach before the guard
       // redirected them here -- a path on this site only: `goto` refuses
       // anything else, which left a signed-in user on this page, unmoved.

@@ -128,6 +128,7 @@ async fn purging_a_job_removes_its_captured_positions_through_the_record() {
         .execute(&db.pool)
         .await
         .unwrap();
+    db.simulate_player1(job, false).await;
     let state = db.state().await;
     let app = birdtest::app(state.clone());
 
@@ -975,9 +976,9 @@ async fn player_config(
     send(app, post_json("/api/admin/player-configs", headers, body)).await
 }
 
-/// A simmer is bounded by its iteration budget, never by a time limit: a limit
-/// makes how far a simulation gets depend on the contributor's hardware, and a
-/// null limit means MAGPIE's 60-second default.
+/// I-JOB-14b: a simmer is bounded by its iteration budget, never by a time
+/// limit: a limit makes how far a simulation gets depend on the contributor's
+/// hardware, and a null limit means MAGPIE's 60-second default.
 #[tokio::test]
 async fn a_simming_player_config_is_bounded_by_iterations_not_time() {
     let db = TestDb::new().await;
@@ -996,7 +997,7 @@ async fn a_simming_player_config_is_bounded_by_iterations_not_time() {
         ("no-budget", json!({ "time_limit_secs": 0 }), StatusCode::BAD_REQUEST, Some("max_iterations")),
         ("bounded", json!({ "max_iterations": 100, "time_limit_secs": 0 }), StatusCode::CREATED, None),
         // A simmer's candidates are the top plays by equity in a games job
-        // whatever it says, so `score` would mean two players (A-ADMIN-PC-2b).
+        // whatever it says, so `score` would mean two players (I-JOB-14b).
         (
             "score-simmer",
             json!({ "max_iterations": 100, "time_limit_secs": 0, "sort_strategy": "score" }),
@@ -2004,7 +2005,7 @@ async fn a_second_purge_or_delete_is_refused_while_one_runs() {
     assert!(status.is_success(), "once it has finished: {body}");
 }
 
-/// A-ADMIN-20: a purge that waits for a rating fit (it marks every pool for a
+/// A-ADMIN-29: a purge that waits for a rating fit (it marks every pool for a
 /// refit under their fit locks) does not hold its contributors' rows while it
 /// waits. It gave their counters back first, and every submission of theirs,
 /// for any job, waited on the purge -- holding a pool connection -- for as
@@ -2428,6 +2429,35 @@ async fn a_retry_resets_only_the_build_it_names() {
         "kwg_id": old["kwg_id"], "klv_id": old["klv_id"], "letterdist_id": old["letterdist_id"],
     }))).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    // A word info table has its own builder: the list and Retry read every
+    // role but `wmp` as a rack info table's, so a failed WIT build showed
+    // "no builder of this version" and could not be retried (thirty-third audit, pass 1).
+    let wit = state.builders.wit();
+    sqlx::query(
+        "INSERT INTO derived_data (role, name, builder, kwg_id, letterdist_id, state, attempts, error)
+         VALUES ('wit', 'NWL23', $1, $2, $3, 'failed', 3, 'gone')",
+    )
+    .bind(&wit)
+    .bind(kwg)
+    .bind(ld)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let (status, list) = send(&app, get_request("/api/admin/derived-data", &owned)).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let row = list.as_array().unwrap().iter().find(|r| r["role"] == "wit").unwrap().clone();
+    assert_eq!(row["buildable"], json!(true), "{row}");
+    let (status, body) = send(&app, post_json("/api/admin/derived-data/retry", &headers, json!({
+        "role": row["role"], "name": row["name"], "builder": row["builder"],
+        "kwg_id": row["kwg_id"], "klv_id": row["klv_id"], "letterdist_id": row["letterdist_id"],
+    }))).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let wit_state: String = sqlx::query_scalar("SELECT state FROM derived_data WHERE role = 'wit'")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(wit_state, "pending");
 }
 
 /// I-SCHED-3c: a job with nothing to hand out does not set a newcomer's

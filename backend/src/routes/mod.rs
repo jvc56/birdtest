@@ -33,17 +33,19 @@ pub fn paginate(page: i64, per_page: Option<i64>) -> (i64, i64) {
 ///
 /// The documented pagination convention is `?page=` and
 /// `{items, total, page, per_page}`, and every list endpoint follows it except
-/// this one. `GET /api/jobs/:id/results` reads a job's whole corpus — millions
-/// of rows for a full opening-rack job — where `OFFSET` produces and discards
-/// every row before the page asked for, so page *N* costs *N* pages. It already
-/// deviates by returning `total = -1`, which is why the exception is made here
-/// and nowhere else: the other lists are bounded by things that do not grow
-/// like a job's results do.
+/// two. `GET /api/jobs/:id/results` reads a job's whole corpus — millions of
+/// rows for a full opening-rack job — where `OFFSET` produces and discards
+/// every row before the page asked for, so page *N* costs *N* pages, and `GET
+/// /api/jobs/:id/positions` reads a capturing job's positions, which grow the
+/// same way. Both return `total = -1`, which is why the exception is made for
+/// them and nowhere else: the other lists are bounded by things that do not
+/// grow like a job's results do.
 #[derive(Serialize)]
 pub struct CursorPage<T> {
     pub items: Vec<T>,
-    /// Always `-1`: an exact count of a job's results costs more than it is
-    /// worth to the caller.
+    /// `-1` for a results or positions page: an exact count of a job's results
+    /// costs more than it is worth to the caller. A rack lookup (`?rack=`),
+    /// one page with no cursor, counts the moves it returns.
     pub total: i64,
     pub per_page: i64,
     /// Pass back as `?cursor=` for the next page. Absent on the last one.

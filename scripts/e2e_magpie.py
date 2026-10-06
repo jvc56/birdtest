@@ -362,9 +362,9 @@ def link_tree(source: Path, target: Path, skip: Callable[[Path], bool]) -> None:
 
 
 def derived_file(path: Path) -> bool:
-    # Anything a worker builds for itself: a wordmap and its sidecar, a rack
-    # info table, a word info table, and leave generation's outputs.
-    return (path.name.endswith((".wmp", ".wmp.src", ".rit", ".wit", "_report.txt"))
+    # Anything a worker builds for itself: a wordmap, a rack info table, a word
+    # info table, and leave generation's outputs.
+    return (path.name.endswith((".wmp", ".rit", ".wit", "_report.txt"))
             or "_gen_" in path.name)
 
 
@@ -1071,7 +1071,8 @@ def case_rack_info_table(ctx: Context) -> None:
         # Not dispatched while the table is unbuilt: an anonymous claim finds
         # no work at all, since this is the only active job.
         claim = requests.post(f"{ctx.args.api}/api/worker/task",
-                              json={"magpie_version": "0.1.1", "unsupported_jobs": []},
+                              json={"magpie_version": "0.1.1", "board_dim": 15,
+                                    "rack_size": 7, "unsupported_jobs": []},
                               timeout=30)
         expect(claim.status_code == 204,
                f"a job waiting on its table dispatched: {claim.status_code} {claim.text[:300]}")
@@ -1124,7 +1125,8 @@ def case_word_info_table(ctx: Context) -> None:
                          f"'{data['kwg']}'")
         expect(roles == "wit CSW21_ab pending", f"derived rows before any build: {roles!r}")
         claim = requests.post(f"{ctx.args.api}/api/worker/task",
-                              json={"magpie_version": "0.1.1", "unsupported_jobs": []},
+                              json={"magpie_version": "0.1.1", "board_dim": 15,
+                                    "rack_size": 7, "unsupported_jobs": []},
                               timeout=30)
         expect(claim.status_code == 204,
                f"a job waiting on its table dispatched: {claim.status_code} {claim.text[:300]}")

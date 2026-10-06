@@ -54,13 +54,11 @@ pub const UTILITY_SPREAD_SCALE: f64 = 100.0;
 
 // Endgame and pre-endgame solving: off unless a config asks for it. When it
 // does, a setting it leaves out takes these, MAGPIE's own CLI defaults
-// (`eplies`, `PEG_MAX_BAG`, and `autoplay_solver_settings_set_defaults` in
-// `src/ent/autoplay_solver_settings.h`).
+// (`autoplay_solver_settings_set_defaults` in
+// `src/ent/autoplay_solver_settings.h`). The endgame depth and the
+// pre-endgame's bag have none here: each is its stage's switch (0 is off), so
+// a config that turns a stage on states it. The admin form pre-fills them.
 
-/// `-eplies1`/`-eplies2` when the endgame is on (MAGPIE's `eplies` default).
-pub const ENDGAME_PLIES: i32 = 6;
-/// `-pegbag1`/`-pegbag2` when PEG is on (`PEG_MAX_BAG`).
-pub const PEG_MAX_BAG: i32 = 4;
 /// `-pegtopk1`/`-pegtopk2`: survivors per halving stage.
 pub const PEG_STAGE_TOP_K: [i32; 5] = [32, 16, 8, 4, 2];
 /// `-pegstride1`/`-pegstride2`: full enumeration.

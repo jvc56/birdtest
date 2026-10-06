@@ -18,10 +18,11 @@
 //!
 //! **Why a job waits for this.** A job whose derived files are not built yet is
 //! not dispatched, the same way a leave-generation job waits for its universe
-//! to be seeded. Dispatching without the hash would mean either sending no
-//! `derived` entry -- so the worker falls back to the old unchecked behaviour,
-//! quietly -- or sending an entry with nothing in it. Waiting is the only
-//! option that cannot be mistaken for success.
+//! to be seeded. Dispatching without the hash would mean a claim carrying no
+//! hash for a file its player asks for, which MAGPIE refuses
+//! (`derived_mismatch`) and which sets the job aside for the run on every
+//! worker that claims it. Waiting is the only option that costs the fleet
+//! nothing.
 
 use crate::artifacts::ArtifactStore;
 use crate::error::{AppError, AppResult};
@@ -217,7 +218,6 @@ pub struct ExpectedDerived {
     pub role: String,
     pub name: String,
     pub sha256: String,
-    pub bytes: i64,
     /// The builder that produced this hash, e.g. `wmp-1`.
     pub builder: String,
     /// The instruction-set target the building MAGPIE was compiled for.
@@ -278,7 +278,7 @@ pub async fn status_for_job(
 
     let rows = sqlx::query(&format!(
         "{NEEDS_CTE}
-         SELECT n.role, n.name, d.state, d.sha256, d.bytes, d.build_target
+         SELECT n.role, n.name, d.state, d.sha256, d.build_target
          FROM needs n
          LEFT JOIN derived_data d
            ON d.role = n.role AND d.name = n.name
@@ -313,7 +313,6 @@ pub async fn status_for_job(
                 role,
                 name,
                 sha256: row.get("sha256"),
-                bytes: row.get("bytes"),
                 // What built this hash, as the row records it: the builder
                 // task's target, which this process's need not be.
                 build_target: row
@@ -383,8 +382,9 @@ pub async fn files_for_job(
 ///   immutable and the job's own config has no update endpoint), so the set of
 ///   `derived_data` rows the query looks up cannot grow or shrink;
 /// - a row only ever moves toward `built` -- the builder task writes `built`,
-///   and an admin retry touches `failed` rows only -- and nothing deletes one
-///   (`input_data` refuses a delete while a derived row references it);
+///   and an admin retry touches `failed` rows only -- and a row is deleted
+///   only with an input file nothing pins (`delete_input_data`), so never one
+///   a dispatchable job's answer names;
 /// - the builder identity the query matches on is a constant of the running
 ///   binary, so a deployment with a different MAGPIE starts with an empty
 ///   cache and asks again.
@@ -875,7 +875,6 @@ mod tests {
             role: "wmp".into(),
             name: "NWL23".into(),
             sha256: "0".repeat(64),
-            bytes: 1,
             builder: "wmp-1".into(),
             build_target: "nehalem".into(),
         };

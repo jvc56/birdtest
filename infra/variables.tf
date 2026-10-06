@@ -338,9 +338,12 @@ variable "restore_drill_enabled" {
 
 variable "alert_email" {
   description = <<-EOT
-    Where backup failure and staleness alarms are delivered. No default on
-    purpose: an unmonitored backup is the failure mode this whole design
-    exists to avoid, so `terraform apply` should refuse to run without it.
+    Where every alarm the stack raises is delivered: the site down, a deploy
+    the circuit breaker rolled back, the database's storage, CPU and failure
+    events, mail failures and SES reputation, and backup and restore-drill
+    failures. No default on purpose: an unmonitored backup is the failure mode
+    this whole design exists to avoid, so `terraform apply` should refuse to
+    run without it.
     SNS sends a subscription confirmation that has to be accepted once.
   EOT
   type        = string
@@ -384,11 +387,19 @@ variable "task_memory" {
 
 variable "desired_count" {
   description = <<-EOT
-    Number of ECS tasks. Must be 1. Claiming is coordinated through Postgres,
-    but three things are not: input-data imports run as an in-process task that
-    a starting instance marks failed if it finds one running, rate limits are
-    in-memory per process, and SSE subscribers only hear submissions made to
-    their own instance. See PLAN.md's primary/secondary split before raising it.
+    Number of ECS tasks. Must be 1 (0 only while the stack is being built or
+    rebuilt). The correctness of a claim rests on Postgres's locks, but much
+    around it is in-process: the dispatch holds (`jobs::DispatchHolds`) that
+    keep claims off a job being purged, deleted, seeded or having its
+    consensus edited and answer its submissions at once, and the purge count
+    the finish check compares to
+    tell that a purge landed under it; input-data imports, job exports and
+    leave-generation transitions, which a starting instance fails or releases
+    when it finds them open, taking them to be a dead process's; the
+    scheduler's and the finish check's in-memory state; rate limits, which are
+    per process; and SSE, whose subscribers hear only submissions made to their
+    own instance. See PLAN.md's primary/secondary split and KL-82 before raising
+    it.
   EOT
   type        = number
   default     = 1
@@ -406,6 +417,14 @@ variable "acm_certificate_arn" {
     site cannot be served without TLS.
   EOT
   type        = string
+
+  # A certificate from another region (ACM's are regional), or another ARN
+  # altogether, was refused only by the HTTPS listener, half-way through the
+  # apply (KL-62).
+  validation {
+    condition     = can(regex("^arn:aws[a-z-]*:acm:${var.region}:[0-9]{12}:certificate/[^/]+$", var.acm_certificate_arn))
+    error_message = "acm_certificate_arn must be an ACM certificate ARN in region, the stack's region: ACM certificates are regional."
+  }
 }
 
 variable "min_magpie_version" {
@@ -421,12 +440,35 @@ variable "min_magpie_version" {
   EOT
   type        = string
   default     = "0.1.1"
+
+  # What the backend's `Version::parse_strict` takes, which it holds this to at
+  # startup (config.rs): two or three dot-separated runs of digits, after
+  # trimming. Nine digits at most per part keeps each within its i32. A
+  # `v0.2.0` or `0.2.0-rc1` otherwise planned and applied, and the web task
+  # and the derived builder (same environment) both refused to start.
+  validation {
+    condition     = can(regex("^[0-9]{1,9}\\.[0-9]{1,9}(\\.[0-9]{1,9})?$", trimspace(var.min_magpie_version)))
+    error_message = "min_magpie_version must be major.minor or major.minor.patch, digits only (no 'v', no '-rc1'), as the backend reads MIN_MAGPIE_VERSION."
+  }
 }
 
 variable "github_token_parameter_arn" {
-  description = "Optional SSM SecureString parameter ARN holding a GitHub token for input-data imports. Empty for none."
+  description = <<-EOT
+    Optional ARN (not the name) of an SSM SecureString parameter in `region`,
+    encrypted with the default aws/ssm key, holding a GitHub token for
+    input-data imports (README "Deploying"). Empty for none.
+  EOT
   type        = string
   default     = ""
+
+  # The value is both the task's secret source and the execution role's policy
+  # resource. A parameter name was refused by IAM half-way through the apply;
+  # an ARN in another region planned and applied, and every task then failed
+  # to start (KL-62).
+  validation {
+    condition     = var.github_token_parameter_arn == "" || can(regex("^arn:aws[a-z-]*:ssm:${var.region}:[0-9]{12}:parameter/.+$", var.github_token_parameter_arn))
+    error_message = "github_token_parameter_arn must be empty or the ARN of an SSM parameter in region, the stack's region (not the parameter's name): the execution role's policy needs the ARN, and a task cannot read a parameter in another region."
+  }
 }
 
 # The next three had placeholder defaults under birdtest.example. Forgotten,
@@ -441,6 +483,17 @@ variable "mail_from_address" {
   validation {
     condition     = can(regex("^[^@\\s]+@[^@\\s]+$", var.mail_from_address)) && !endswith(var.mail_from_address, ".example")
     error_message = "mail_from_address must be a real address within ses_domain."
+  }
+
+  # SES sends from an address in a verified domain or one of its subdomains;
+  # outside them every mail failed, and only the -mail-failed alarm said so
+  # (KL-62).
+  validation {
+    condition = (
+      endswith(lower(var.mail_from_address), "@${lower(var.ses_domain)}") ||
+      endswith(lower(var.mail_from_address), ".${lower(var.ses_domain)}")
+    )
+    error_message = "mail_from_address must be at ses_domain or one of its subdomains: SES sends only from a verified domain."
   }
 }
 

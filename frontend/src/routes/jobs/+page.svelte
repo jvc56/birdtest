@@ -23,15 +23,17 @@
   onMount(() => load(0));
 
   /**
-   * Every job type counts its own units -- games or pairs, racks analysed,
+   * Every job type counts its own units -- games or pairs, racks settled,
    * generations closed -- because tasks are made on demand and a task count is
-   * only what has been handed out so far. Tasks are the fallback.
+   * only what has been handed out so far. Tasks are the fallback. Racks are
+   * settled ones, as the job's page counts them: a job seeking a consensus has
+   * analysed every rack long before it is done.
    */
   function progress(job: JobListItem): { value: number; max: number; unit: string } {
     if (job.units_completed !== null && job.max_units !== null) {
       const unit =
         job.job_type === 'opening_rack'
-          ? 'racks'
+          ? 'racks settled'
           : job.job_type === 'leave_generation'
             ? 'generations'
             : job.job_type === 'game_pairs'

@@ -38,7 +38,8 @@ CREATE TABLE users (
     -- opening-rack batch's racks, the distinct racks a leave task drew. Summed
     -- from each claim's own figures (`task_claims.games_played`,
     -- `racks_analyzed`), every claim counted: unlike a job's progress, which
-    -- counts one result per task, a contributor did the work of each claim.
+    -- counts an opening rack once however often consensus has it analysed
+    -- again, a contributor did the work of each claim.
     -- Integer milliseconds rather than fractional seconds so that what a purge
     -- takes back is exactly what the submissions added.
     compute_ms           BIGINT NOT NULL DEFAULT 0 CHECK (compute_ms >= 0),
@@ -233,8 +234,6 @@ CREATE TABLE input_data (
     UNIQUE (path, sha256)
 );
 
-CREATE INDEX input_data_role_name_idx ON input_data (role, name);
-
 -- Staged imports. Phase 1 (a spawned background task) writes; phase 2 reads and
 -- commits. Rows here are proposals, not data -- nothing dispatch or job creation
 -- reads. birdtest runs as a single instance, so a task needs no lease and
@@ -282,20 +281,22 @@ CREATE TABLE input_data_import_rows (
     PRIMARY KEY (import_id, path, sha256)
 );
 
--- Derived files: the wordmaps and rack info tables the server builds a
--- reference copy of, and the hash a worker has to reproduce.
+-- Derived files: the wordmaps, rack info tables and word info tables the
+-- server builds a reference copy of, and the hash a worker has to reproduce.
 --
--- Neither file is ever shipped -- 179 MB and 1.9 GB for CSW24 -- so every
--- machine that needs one builds it from files it already has. What travels
--- instead is the SHA-256 the server's own pinned MAGPIE got from the same
--- inputs: a worker builds its own copy and uses it only if the bytes agree,
--- and declines the task otherwise. See README.md, "MAGPIE on the server".
+-- None of them is ever shipped -- 179 MB and 1.9 GB for a CSW24 wordmap and
+-- rack info table -- so every machine that needs one builds it from files it
+-- already has. What travels instead is the SHA-256 the server's own pinned
+-- MAGPIE got from the same inputs: a worker builds its own copy and uses it
+-- only if the bytes agree, and declines the task otherwise. See README.md,
+-- "MAGPIE on the server".
 --
 -- The key is the whole identity of the file rather than a surrogate, because
 -- what makes two derived files the same file is that they were built from the
--- same inputs by the same builder. A wordmap depends on a .kwg and the letter
--- distribution it is built against; a rack info table depends on a .klv2 as
--- well, because its entries carry precomputed leave values.
+-- same inputs by the same builder. A wordmap and a word info table depend on a
+-- .kwg and the letter distribution they are built against; a rack info table
+-- depends on a .klv2 as well, because its entries carry precomputed leave
+-- values.
 --
 -- `builder` is separate from the MAGPIE version on purpose. A CSW24 wordmap
 -- built in December 2025 and one built nine months later differ in 72,852,152
@@ -420,7 +421,10 @@ CREATE TABLE jobs (
     -- each worker's build to supply, so a task means the same thing on every
     -- MAGPIE release. Leave generation states only the bingo bonus: its bot
     -- does not simulate.
-    bingo_bonus   INT NOT NULL,                              -- -bb
+    -- The bonus is bounded because the plausibility rules' score bounds are
+    -- absolute and assume an ordinary one: a typo of 5000 for 50 would
+    -- refuse every honest batch. Real variants use 0 to 50.
+    bingo_bonus   INT NOT NULL CHECK (bingo_bonus BETWEEN 0 AND 500),  -- -bb
     sim_cutoff    DOUBLE PRECISION NOT NULL CHECK (sim_cutoff >= 0 AND sim_cutoff <= 100),  -- -cutoff
     -- Minimum MAGPIE version workers must have to execute tasks for this job,
     -- as sortable parts. Semver in TEXT compares lexically, where '1.10.0' <
@@ -526,8 +530,7 @@ CREATE TABLE jobs (
     -- clears it, a partial restore recomputes it (RUNBOOK 2.3).
     last_completed_at TIMESTAMPTZ,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    activated_at    TIMESTAMPTZ,
-    deactivated_at  TIMESTAMPTZ
+    activated_at    TIMESTAMPTZ
 );
 
 -- Named, reusable player configurations.
@@ -548,7 +551,7 @@ CREATE TABLE jobs (
 
 CREATE TABLE player_configs (
     id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    name             TEXT NOT NULL UNIQUE,  -- human-readable label, e.g. "simmer-NWL23-4ply"
+    name             TEXT NOT NULL UNIQUE CHECK (char_length(name) <= 100),  -- e.g. "simmer-NWL23-4ply"
     recorder_type    TEXT NOT NULL,         -- 'best' | 'equity' | 'all'  (-r1 / -r2)
     sort_strategy    TEXT NOT NULL,         -- 'equity' | 'score'  (-s1 / -s2)
     -- The files this player loads, pinned by content rather than named.
@@ -724,7 +727,11 @@ CREATE TABLE job_game_config (
     -- on the player configs, the other two on `jobs`.
     player1_config_id   UUID NOT NULL REFERENCES player_configs(id),
     player2_config_id   UUID NOT NULL REFERENCES player_configs(id),
-    games_per_batch     INT NOT NULL DEFAULT 1,
+    -- Even, as job creation requires: MAGPIE alternates the first mover
+    -- within a task, from player 1, so an odd batch gives player 1 the first
+    -- move in more of the job's games (KL-87). The default is the least such
+    -- batch, so a row written without one is not an odd one.
+    games_per_batch     INT NOT NULL DEFAULT 2,
     -- Whether the job runs the match test (stats/match_test.rs): a confidence
     -- interval for player 1's score that stays valid however often it is
     -- checked, the job stopping once it excludes an even score. Off, it plays
@@ -743,7 +750,15 @@ CREATE TABLE job_game_config (
     -- analyses a position every turn regardless; this decides whether those are
     -- recorded. Off by default: at ~22.5 turns a game it roughly doubles the
     -- rows a job produces.
-    capture_positions   BOOLEAN NOT NULL DEFAULT FALSE
+    capture_positions   BOOLEAN NOT NULL DEFAULT FALSE,
+    -- What `validate_job_body` requires, held here too for a row written any
+    -- other way (a script, a fixture, a restore). The stopping rule reads the
+    -- counts as unsigned: a negative max_games was a cap no job reached, so it
+    -- ran for ever, and a batch of 0 had every claim play the same seed.
+    CONSTRAINT job_game_config_counts CHECK (
+        games_per_batch >= 1 AND max_games >= 1 AND min_games >= 0
+        AND (NOT test_enabled OR min_games BETWEEN 1 AND max_games)
+    )
 );
 
 CREATE TABLE job_game_pair_config (
@@ -771,7 +786,12 @@ CREATE TABLE job_game_pair_config (
     -- itself is where the players disagree.
     capture_first_divergence BOOLEAN NOT NULL DEFAULT FALSE,
     CONSTRAINT job_game_pair_config_divergence_needs_capture
-        CHECK (capture_positions OR NOT capture_first_divergence)
+        CHECK (capture_positions OR NOT capture_first_divergence),
+    -- As job_game_config_counts, in pairs.
+    CONSTRAINT job_game_pair_config_counts CHECK (
+        pairs_per_batch >= 1 AND max_pairs >= 1 AND min_pairs >= 0
+        AND (NOT test_enabled OR min_pairs BETWEEN 1 AND max_pairs)
+    )
 );
 
 CREATE TABLE job_leave_config (
@@ -883,9 +903,11 @@ CREATE TABLE tasks (
     state                task_state NOT NULL DEFAULT 'available',
     -- Denormalized counters used by SKIP LOCKED selection; avoids per-candidate
     -- join/aggregate. A task has one slot: it is claimed by one worker at a
-    -- time and completed by its one accepted result, so each is 0 or 1.
-    accepted_count       INT NOT NULL DEFAULT 0,
-    active_claim_count   INT NOT NULL DEFAULT 0,
+    -- time and completed by its one accepted result, so each is 0 or 1 -- and
+    -- held to it, so a counter that drifted fails the statement that drifted
+    -- it rather than, days later, leaving a job that quietly stops dispatching.
+    accepted_count       INT NOT NULL DEFAULT 0 CHECK (accepted_count IN (0, 1)),
+    active_claim_count   INT NOT NULL DEFAULT 0 CHECK (active_claim_count IN (0, 1)),
     created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
     completed_at         TIMESTAMPTZ
 );
@@ -911,11 +933,11 @@ CREATE INDEX tasks_queue_idx   ON tasks (job_id, created_at) WHERE state = 'avai
 -- claimed_by_user_id carries no ON DELETE clause because a user row is never
 -- deleted: account deletion anonymizes it in place (users.deleted_at, and a
 -- tombstone username and email) and leaves these rows exactly where they are.
--- Removing them instead would take with them the captured in-game positions
--- keyed to those claims -- including the ones other redundant claims
--- deduplicated against, which nothing else holds -- and leave-generation
--- occurrences that were folded into per-rack totals and cannot be subtracted
--- back out. See routes::admin::delete_user.
+-- Removing them instead would take with them the position analyses keyed to
+-- those claims -- an opening-rack batch's, and the in-game positions a games
+-- job captured -- and leave-generation occurrences that were folded into
+-- per-rack totals and cannot be subtracted back out. See
+-- routes::admin::delete_user.
 
 -- 'declined' is distinct from 'abandoned': one is a worker saying "I cannot do
 -- this", the other is a claim that lapsed. Only the first is diagnostic.
@@ -957,28 +979,27 @@ CREATE TABLE task_claims (
 )
 -- Room on each page for a claim's heartbeats. A heartbeat changes only
 -- `last_heartbeat_at`, which no index covers, so it can be a HOT update -- an
--- in-page rewrite that touches none of this table's nine indexes -- but only
+-- in-page rewrite that touches none of this table's eight indexes -- but only
 -- if the row's page has space, and claims are appended, so at the default
 -- fillfactor of 100 a claim's first heartbeat found its page full and wrote a
 -- new entry into every index: two a minute for every claim in flight.
 WITH (fillfactor = 85);
 
--- Prevent a single identity from filling more than one live slot on the same
--- task. 'declined' must be excluded alongside 'abandoned': a worker that
--- declined a task for missing data and then fixed its data has to be able to
--- claim that task again.
+-- A task has one slot: one claim holds it, or one claim completed it, never
+-- two of either and never both -- a completed task is not handed out again.
+-- The claim path keeps it so (a task is selected only while `available`,
+-- under its job's dispatch lock and its own row lock), and the counters on
+-- `tasks` and the job's `tasks_completed` count on it; this makes a breach,
+-- by any two identities, fail at the statement rather than surface as
+-- a counter gone wrong. A task has any number of lapsed and declined claims,
+-- so those are outside it: a worker that declined a task for missing data and
+-- then fixed its data has to be able to claim that task again.
 --
--- Each covers only its own kind of identity: a claim has exactly one, and a
--- NULL key constrains nothing, so indexing the other kind's claims under NULL
--- was dead weight -- nearly half of each index, and an index write per claim
--- insert and per completion that nothing read. A lookup by `= $n` implies the
--- `IS NOT NULL`, so every reader still uses them.
-CREATE UNIQUE INDEX task_claims_user_unique_idx
-    ON task_claims (task_id, claimed_by_user_id)
-    WHERE state NOT IN ('abandoned', 'declined') AND claimed_by_user_id IS NOT NULL;
-CREATE UNIQUE INDEX task_claims_anon_unique_idx
-    ON task_claims (task_id, claimed_by_anon_uuid)
-    WHERE state NOT IN ('abandoned', 'declined') AND claimed_by_anon_uuid IS NOT NULL;
+-- It replaces two per-identity indexes from when a task had several slots and
+-- the thing to stop was one identity taking two of them; one slot covers that
+-- case too.
+CREATE UNIQUE INDEX task_claims_one_slot_idx
+    ON task_claims (task_id) WHERE state IN ('claimed', 'completed');
 
 -- What a worker said it was missing when it declined. The server records gaps
 -- for humans; it does not route on them (the client sends its own unsupported
@@ -1033,7 +1054,6 @@ CREATE TABLE opening_rack_requests (
     -- NULL for a task covering a range, which is every task of a job wanting
     -- one analysis per rack.
     racks             TEXT[] CHECK (racks IS NULL OR cardinality(racks) = rack_count),
-    previous_play     TEXT,                  -- GCG-encoded previous move; required when inference is enabled; NULL for opening racks
     player_config_id  UUID NOT NULL REFERENCES player_configs(id)
 );
 
@@ -1515,10 +1535,11 @@ CREATE TABLE leave_generation_artifacts (
     -- SHA-256 of the KLV bytes as first written. The object store holds the
     -- only copy of these bytes, and an artifact is the one piece of state that
     -- can be silently overwritten -- by a restore that replays a generation
-    -- transition against fewer results, or by a rebuild under a changed
-    -- klv::build. Recording the hash is what turns that from invisible into a
-    -- query; the ON CONFLICT DO NOTHING on insert means the row keeps the
-    -- FIRST hash, so a later mismatch is evidence rather than an overwrite.
+    -- transition against fewer results, or by a rebuild under a changed KLV
+    -- builder (`builder`, below). Recording the hash is what turns that from
+    -- invisible into a query; the ON CONFLICT DO NOTHING on insert means the
+    -- row keeps the FIRST hash, so a later mismatch is evidence rather than an
+    -- overwrite.
     sha256        TEXT NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
     -- SHA-256 of the bytes the object store holds *now*, when they are not
     -- the bytes first written; NULL while they are. Set by every
@@ -1593,7 +1614,7 @@ CREATE TABLE leave_generation_transitions (
 -- meaningful comparison.)
 CREATE TABLE rating_pools (
     id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    name          TEXT NOT NULL UNIQUE,
+    name          TEXT NOT NULL UNIQUE CHECK (char_length(name) <= 100),
     variant       TEXT NOT NULL,
     letterdist_id UUID NOT NULL REFERENCES input_data(id),
     layout_id     UUID NOT NULL REFERENCES input_data(id),
@@ -1602,8 +1623,7 @@ CREATE TABLE rating_pools (
     -- must be pinned; the static bot at 2000 is the convention.
     anchor_player_config_id UUID NOT NULL REFERENCES player_configs(id),
     anchor_rating DOUBLE PRECISION NOT NULL DEFAULT 2000,
-    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (variant, letterdist_id, layout_id, name)
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 -- Which player configs are rated in a pool. Membership is the admin's lever:
@@ -1630,9 +1650,9 @@ CREATE TABLE rating_pool_members (
 --
 -- Kept in full for a month, then thinned to the last run of each UTC day, the
 -- pool's first run aside (ratings::thin_old_runs, hourly). A pool with an
--- active job takes a run every two minutes, and past a month a day is the
--- resolution the history chart draws at anyway. The ratings and residuals
--- below go with their run.
+-- active job takes a run every two minutes, and past a month nothing reads a
+-- run but the history endpoint, which returns at most 500 over the pool's
+-- life. The ratings and residuals below go with their run.
 CREATE TABLE rating_runs (
     id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     pool_id       UUID NOT NULL REFERENCES rating_pools(id) ON DELETE CASCADE,
@@ -1773,7 +1793,10 @@ CREATE INDEX        task_claims_open_idx      ON task_claims (task_id) WHERE sta
 -- can read: a constant `now() - interval '1 hour'`, not a parameter.
 CREATE INDEX        task_claims_completed_idx ON task_claims (completed_at DESC)
     WHERE state = 'completed';
--- Partial for the reason the unique indexes above are.
+-- Each covers only its own kind of identity: a claim has exactly one, and
+-- indexing the other kind's claims under a NULL key nothing looks up was dead
+-- weight -- nearly half of each index. A lookup by `= $n` implies the
+-- `IS NOT NULL`, so every reader still uses them.
 -- Keyed by identity, job and completion time: an identity's completed claims
 -- in one job, newest first, are one backward range -- the results feed's
 -- `?worker=` reads a page through them whatever the contributor's share of the
@@ -1786,15 +1809,19 @@ CREATE INDEX        task_claims_user_idx      ON task_claims (claimed_by_user_id
     WHERE claimed_by_user_id IS NOT NULL;
 CREATE INDEX        task_claims_anon_idx      ON task_claims (claimed_by_anon_uuid, job_id, completed_at)
     WHERE claimed_by_anon_uuid IS NOT NULL;
--- There is no (job_id, state) index. Every job-scoped read of `tasks` -- the
--- detail page's counts, which sum `accepted_count` and so read the heap
--- anyway; the census; the opening-rack finish check, which needs `seed` --
--- is served as well by `tasks_seed_unique_idx (job_id, seed)`, and a state
--- index cost an entry on every task insert and every state change, on the
--- claim and submit paths, for no reader that needed it.
--- (task_id, submitted_at) rather than task_id alone: the per-task "first
--- accepted result" read that every aggregate uses orders on both.
-CREATE INDEX        game_results_task_idx     ON game_results (task_id, submitted_at);
+-- There is no (job_id, state) index. The job-scoped reads of `tasks` -- the
+-- detail page's counts by state, the census -- are served by
+-- `tasks_seed_unique_idx (job_id, seed)` and the heap. The opening-rack finish
+-- check asks for the job's first task by seed there, and for a task not
+-- completed through `tasks_queue_idx` (available) and `task_claims_open_idx`
+-- (claimed), not by state. A state index cost an entry on every task insert
+-- and every state change, on the claim and submit paths, for no reader that
+-- needed it.
+-- For the cascade from `tasks` alone: no reader looks a result up by its task.
+-- It was (task_id, submitted_at) for the per-task "first accepted result" read
+-- every aggregate made while a task could have more than one; with one slot a
+-- task has one result, and the aggregates sum the job's (`jobstats`).
+CREATE INDEX        game_results_task_idx     ON game_results (task_id);
 -- The public results feed for a games or game-pairs job, keyset-paginated like
 -- the opening-rack one. `task_claim_id` is the primary key and so the
 -- tiebreaker, since `game_results` has no serial.

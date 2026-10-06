@@ -29,7 +29,6 @@ pub struct JobStats {
     pub tasks_completed: i64,
     pub tasks_available: i64,
     pub tasks_claimed: i64,
-    pub results_accepted: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub games: Option<GameStats>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -64,7 +63,7 @@ pub struct Completion {
     /// verdict (`player1_better`, `player2_better`, `inconclusive`),
     /// `reached_target` for a games or pairs job that runs no test and played
     /// its games, or `last generation built`. None for an opening-rack job whose racks were all
-    /// analysed.
+    /// settled.
     pub reason: Option<String>,
 }
 
@@ -114,9 +113,6 @@ pub struct GameStats {
     pub divergent: Option<MatchTally>,
     pub min_units: i32,
     pub max_units: i32,
-    pub win_pct: f64,
-    pub loss_pct: f64,
-    pub draw_pct: f64,
     /// The match test over every accepted result, recomputed on each read.
     /// `None` for a job that runs no test: it plays `max_units` and stops, and
     /// an interval nobody acts on would read as a verdict.
@@ -459,8 +455,7 @@ async fn compute_inner(conn: &mut PgConnection, job: &Job) -> AppResult<JobStats
              COUNT(*)                                            AS total,
              COUNT(*) FILTER (WHERE state = 'completed')         AS completed,
              COUNT(*) FILTER (WHERE state = 'available')         AS available,
-             COUNT(*) FILTER (WHERE state = 'claimed')           AS claimed,
-             COALESCE(SUM(accepted_count), 0)::bigint            AS accepted
+             COUNT(*) FILTER (WHERE state = 'claimed')           AS claimed
          FROM tasks WHERE job_id = $1",
     )
     .bind(job.id)
@@ -493,7 +488,6 @@ async fn compute_inner(conn: &mut PgConnection, job: &Job) -> AppResult<JobStats
 
     let tasks_total: i64 = counts.get("total");
     let tasks_completed: i64 = counts.get("completed");
-    let results_accepted: i64 = counts.get("accepted");
 
     let eta_seconds = estimate_eta(&mut *conn, job, &games, tasks_total, tasks_completed).await?;
     let (workers, other_workers) = worker_contributions_on(&mut *conn, job.id).await?;
@@ -528,7 +522,6 @@ async fn compute_inner(conn: &mut PgConnection, job: &Job) -> AppResult<JobStats
         tasks_completed,
         tasks_available: counts.get("available"),
         tasks_claimed: counts.get("claimed"),
-        results_accepted,
         games,
         opening_racks,
         leave_generation,
@@ -790,16 +783,6 @@ fn build_game_stats(
     divergent_pairs: Option<u64>,
     params: &TestParams,
 ) -> GameStats {
-    // Percentages describe every game played, for both job types: the sample
-    // the test runs on is the same games, viewed as pairs.
-    let total = tally.total();
-    let pct = |n: u64| {
-        if total == 0 {
-            0.0
-        } else {
-            100.0 * n as f64 / total as f64
-        }
-    };
     let test = params.enabled.then(|| {
         match_test::evaluate(
             &sample,
@@ -824,9 +807,6 @@ fn build_game_stats(
         divergent: None,
         min_units: params.min_units,
         max_units: params.max_units,
-        win_pct: pct(tally.wins),
-        loss_pct: pct(tally.losses),
-        draw_pct: pct(tally.draws),
         test,
         decided: None,
     }

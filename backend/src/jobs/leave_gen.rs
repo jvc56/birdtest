@@ -11,7 +11,11 @@ use sqlx::{PgConnection, Row};
 use uuid::Uuid;
 
 /// Tiles on a full rack. Leave generation observes full racks, never leaves,
-/// and MAGPIE's `RACK_SIZE` is the same seven.
+/// and MAGPIE's `RACK_SIZE` is the same seven: a claim states its build's, and
+/// one of another size is sent away (`unsupported_build`, `routes::worker`).
+/// The server's only copy: job creation bounds an opening-rack job's
+/// `rack_size` by it and plausibility bounds a submitted rack by it (the
+/// schema's `CHECK (rack_size BETWEEN 1 AND 7)` is its SQL mirror).
 pub const RACK_SIZE: usize = 7;
 
 /// The name the server hands MAGPIE for a generation's files inside a scratch
@@ -687,37 +691,6 @@ pub async fn release_orphaned_transitions(pool: &sqlx::PgPool) -> AppResult<u64>
     .rows_affected())
 }
 
-/// Serialize this job's claim decisions against each other.
-///
-/// Every read `next_step` makes -- which racks are below target, which are out
-/// with an open claim, whether any claim for the generation is still in flight
-/// -- is invisible to a *concurrent* claim transaction until that transaction
-/// commits. Two consequences:
-///
-/// - a claim still being issued is not counted as in flight, so the generation
-///   it belongs to could be closed while its task was going out, and the work
-///   that task did would land in a generation whose KLV was already built;
-/// - two claims could both find the generation complete and both start its
-///   transition.
-///
-/// The lock is taken per job, so claims for other jobs are unaffected, and it is
-/// transaction-scoped: it is released when the claim transaction commits or
-/// rolls back, whichever happens, and a dropped connection releases it too.
-/// It is *not* held across the transition itself -- that would hold a Postgres
-/// transaction open across an S3 upload -- so what stops a second transition is
-/// the `leave_generation_transitions` row this lock makes it safe to test and
-/// write.
-///
-/// It is [`super::try_lock_job_dispatch`], which every job type now takes for
-/// the same underlying reason; leave generation just has the most to lose by
-/// not holding it -- and the most to gain from the bounded wait, since seeding
-/// a generation's rack universe holds this lock for tens of seconds.
-///
-/// `false` means another claim holds it and this one should move on.
-pub async fn lock_claim_decisions(conn: &mut PgConnection, job_id: Uuid) -> AppResult<bool> {
-    super::try_lock_job_dispatch(conn, job_id).await
-}
-
 /// What the scheduler should do next for a leave-generation job.
 pub enum LeaveGenStep {
     /// Dispatch this forced-rack partition. Boxed: the request carries its
@@ -912,14 +885,15 @@ enum Selected {
     Step(LeaveGenStep),
 }
 
-/// Claims of this generation still `claimed`.
+/// Claims of this generation still `claimed`: the fleet's open claims, by
+/// their own `job_id`, not the job's tasks (see
+/// `routes::worker::JOB_HAS_OPEN_CLAIM`).
 async fn claims_in_flight(conn: &mut PgConnection, job_id: Uuid, generation: i32) -> AppResult<i64> {
     Ok(sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*)
          FROM task_claims c
          JOIN leave_requests r ON r.task_id = c.task_id
-         JOIN tasks t ON t.id = c.task_id
-         WHERE t.job_id = $1 AND r.generation = $2 AND c.state = 'claimed'",
+         WHERE c.job_id = $1 AND r.generation = $2 AND c.state = 'claimed'",
     )
     .bind(job_id)
     .bind(generation)
@@ -928,23 +902,29 @@ async fn claims_in_flight(conn: &mut PgConnection, job_id: Uuid, generation: i32
 }
 
 /// Whether any rack of the generation is below target, holding nothing out:
-/// one probe of `leave_rack_progress_pick_idx` from its lowest count.
+/// one probe of `leave_rack_progress_pick_idx` from its lowest count, asked
+/// as [`BELOW_TARGET_PROBE`] (an `ORDER BY` the index supplies, for the
+/// reason [`universe_exists`] gives).
 async fn any_rack_below_target(
     conn: &mut PgConnection,
     job_id: Uuid,
     generation: i32,
     config: &LeaveConfig,
 ) -> AppResult<bool> {
-    Ok(sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS (SELECT 1 FROM leave_rack_progress
-                        WHERE job_id = $1 AND generation = $2 AND occurrence_count < $3)",
-    )
-    .bind(job_id)
-    .bind(generation)
-    .bind(config.target_for(generation))
-    .fetch_one(&mut *conn)
-    .await?)
+    Ok(sqlx::query_scalar::<_, i32>(BELOW_TARGET_PROBE)
+        .bind(job_id)
+        .bind(generation)
+        .bind(config.target_for(generation))
+        .fetch_optional(&mut *conn)
+        .await?
+        .is_some())
 }
+
+/// [`any_rack_below_target`]'s query. Public so a test can check its plan
+/// (`I-LEAVE-25`).
+pub const BELOW_TARGET_PROBE: &str = "SELECT 1 FROM leave_rack_progress
+     WHERE job_id = $1 AND generation = $2 AND occurrence_count < $3
+     ORDER BY occurrence_count LIMIT 1";
 
 /// Whether any accepted result of this generation is still waiting for a merge.
 async fn anything_staged(conn: &mut PgConnection, job_id: Uuid, generation: i32) -> AppResult<bool> {
@@ -986,9 +966,10 @@ async fn nothing_to_hand_out(
 }
 
 /// The generation is complete. Whoever writes this row owns its transition;
-/// everyone else waits. Safe to test and write without re-reading because
-/// `lock_claim_decisions` holds the job's lock for the rest of this
-/// transaction, so no other claim is between its own test and its own write.
+/// everyone else waits. Safe to test and write without re-reading because the
+/// claim holds the job's dispatch lock (taken in `registry::acquire`) for the
+/// rest of this transaction, so no other claim is between its own test and its
+/// own write.
 ///
 /// A row whose transition never finished is taken over rather than trusted
 /// forever -- see TRANSITION_TAKEOVER_AFTER. Taking over bumps `attempts`,
@@ -1242,9 +1223,8 @@ async fn furthest_below_target(
         "WITH out_now AS (
              SELECT unnest(r.forced_racks) AS rack
              FROM task_claims c
-             JOIN tasks t ON t.id = c.task_id
              JOIN leave_requests r ON r.task_id = c.task_id
-             WHERE t.job_id = $1 AND r.generation = $2 AND c.state = 'claimed'
+             WHERE c.job_id = $1 AND r.generation = $2 AND c.state = 'claimed'
              UNION
              SELECT unnest(r.forced_racks)
              FROM leave_rack_staging s
@@ -1306,14 +1286,7 @@ pub async fn seed_generation(
 
     // Idempotent: a universe already seeded (a seeding started twice) is left
     // as it is.
-    let seeded: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM leave_rack_progress WHERE job_id = $1 AND generation = $2)",
-    )
-    .bind(job_id)
-    .bind(generation)
-    .fetch_one(&mut *conn)
-    .await?;
-    if seeded {
+    if universe_exists(&mut *conn, job_id, generation).await? {
         return Ok(total as i64);
     }
     tracing::info!(job_id = %job_id, generation, racks = total, "seeding full-rack universe");
@@ -1367,20 +1340,38 @@ pub async fn seed_generation(
     Ok(total as i64)
 }
 
-/// Whether `generation`'s rack universe has been written. One index probe.
+/// Whether `generation`'s rack universe has been written. Every leave claim
+/// asks, under the job's dispatch lock.
+///
+/// One probe of the primary key, because it is asked as [`UNIVERSE_PROBE`]:
+/// an `ORDER BY` the index supplies, then `LIMIT 1`, outside any `EXISTS`.
+/// Asked as `EXISTS (... WHERE job_id = $1 AND generation = $2)`, it was a
+/// sequential scan once the generation was in the table's statistics: with a
+/// handful of distinct jobs and generations, Postgres expects a match within
+/// a few rows of the heap's start, but a generation's rows sit together
+/// after every older generation's of every leave job, closed ones kept for
+/// the life of the job (KL-18). It measured 133-156 ms a claim over 2 million
+/// older rows, read under the lock, and it grows by 3.2 million rows an
+/// English generation. Inside an `EXISTS` Postgres drops the `ORDER BY`, so
+/// that form stays a sequential scan.
 pub async fn universe_exists(
     conn: &mut PgConnection,
     job_id: Uuid,
     generation: i32,
 ) -> AppResult<bool> {
-    Ok(sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM leave_rack_progress WHERE job_id = $1 AND generation = $2)",
-    )
-    .bind(job_id)
-    .bind(generation)
-    .fetch_one(&mut *conn)
-    .await?)
+    Ok(sqlx::query_scalar::<_, i32>(UNIVERSE_PROBE)
+        .bind(job_id)
+        .bind(generation)
+        .fetch_optional(&mut *conn)
+        .await?
+        .is_some())
 }
+
+/// [`universe_exists`]'s query. Public so a test can check its plan
+/// (`I-LEAVE-25`).
+pub const UNIVERSE_PROBE: &str = "SELECT 1 FROM leave_rack_progress
+     WHERE job_id = $1 AND generation = $2
+     ORDER BY rack LIMIT 1";
 
 /// Make sure `generation`'s rack universe exists, seeding it if it does not.
 ///
@@ -1392,7 +1383,7 @@ pub async fn universe_exists(
 /// wrote it made every worker on the job wait, every time.
 ///
 /// Idempotent and cheap when there is nothing to do: [`seed_generation`]
-/// returns on an `EXISTS` check, which is one index probe.
+/// returns on [`universe_exists`], which is one index probe.
 pub async fn ensure_universe(
     conn: &mut PgConnection,
     job_id: Uuid,
@@ -1403,10 +1394,11 @@ pub async fn ensure_universe(
     Ok(())
 }
 
-/// Close out a generation: derive leave values from `leave_rack_progress`'s
-/// full-rack means as MAGPIE does (see `klv::FullRackLeaves`), build the
-/// generation's KLV, and store the artifact. The next generation's rack
-/// universe is seeded when a claim first asks for work in it.
+/// Close out a generation: write `leave_rack_progress`'s per-rack sums to a
+/// CSV and have the pinned MAGPIE build the generation's KLV from them
+/// (`convert rackequity2klv`, see `generation_klv`), and store the artifact.
+/// The next generation's rack universe is seeded when a claim first asks for
+/// work in it.
 pub async fn run_transition(
     state: &crate::state::AppState,
     job_id: Uuid,

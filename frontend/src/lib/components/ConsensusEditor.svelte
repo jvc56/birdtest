@@ -10,7 +10,7 @@
    */
   import { createEventDispatcher } from 'svelte';
   import { api, errorText } from '$lib/api';
-  import { consensusProblem } from '$lib/consensus';
+  import { consensusFields, consensusProblem } from '$lib/consensus';
   import type { JobConfig } from '$lib/jobSettings';
 
   export let jobId: string;
@@ -40,15 +40,19 @@
   let error = '';
   let notice = '';
 
-  $: problem = consensusProblem({
+  $: typed = {
     min_results_per_rack: minResults,
     max_results_per_rack: maxResults,
     consensus_pct: consensusPct
-  });
+  };
+  $: problem = consensusProblem(typed);
+  // What a save sends: no share at one analysis per rack, whose box is
+  // disabled, so the job keeps its stored one.
+  $: fields = consensusFields(typed);
   $: unchanged =
-    Number(minResults) === settings.min_results_per_rack &&
-    Number(maxResults) === settings.max_results_per_rack &&
-    Number(consensusPct) === settings.consensus_pct;
+    fields.min_results_per_rack === settings.min_results_per_rack &&
+    fields.max_results_per_rack === settings.max_results_per_rack &&
+    (fields.consensus_pct === undefined || fields.consensus_pct === settings.consensus_pct);
 
   async function save() {
     if (busy || problem) return;
@@ -56,11 +60,7 @@
     error = '';
     notice = '';
     try {
-      const result = await api.updateConsensus(jobId, {
-        min_results_per_rack: Number(minResults),
-        max_results_per_rack: Number(maxResults),
-        consensus_pct: Number(consensusPct)
-      });
+      const result = await api.updateConsensus(jobId, fields);
       const racks = `${result.unsettled_racks.toLocaleString()} rack${result.unsettled_racks === 1 ? '' : 's'} unsettled`;
       notice = result.reopened
         ? result.job.status === 'active'
@@ -96,13 +96,14 @@
           <label class="label" for="edit-maxres">Maximum Analyses Per Rack</label>
           <input id="edit-maxres" type="number" min="1" max="100" class="input" bind:value={maxResults} />
         </div>
+        <!-- No `min`: the share must be above 50, which no `min` can say (51 blocked the
+             50.5 the server takes); `consensusProblem` says what it must be. -->
         <div>
           <label class="label" for="edit-consensus">Consensus %</label>
           <input
             id="edit-consensus"
             type="number"
-            min="51"
-            max="100"
+              max="100"
             step="any"
             class="input"
             bind:value={consensusPct}

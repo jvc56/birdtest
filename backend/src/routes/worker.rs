@@ -60,14 +60,15 @@ struct ClientVersion {
     /// The oldest MAGPIE a client may contribute with. Individual jobs can
     /// require newer still, via `min_magpie_version`.
     min_magpie_version: String,
-    /// Where to get MAGPIE. The client cannot update itself -- it is a compiled
-    /// binary, and an auto-updating executable is a far larger security
-    /// proposition than a script re-execing itself -- so this is for humans.
+    /// Where to get MAGPIE, for a human: the client is a compiled binary and
+    /// does not update itself.
     download_url: String,
 }
 
-/// Version negotiation. MAGPIE is the only production client and cannot
-/// replace itself, so this reports a floor rather than offering an update.
+/// The fleet's version floor, for the admin new-job form (which pre-fills a
+/// job's floor from it) and for a human checking a build. No worker asks:
+/// MAGPIE learns the floor, and where to get a newer build, from the shutdown
+/// directive a claim it is too old for answers (`scheduler::claim`).
 async fn client_version(State(state): State<AppState>) -> Json<ClientVersion> {
     Json(ClientVersion {
         min_magpie_version: state.cfg.min_magpie_version.clone(),
@@ -207,6 +208,13 @@ mod recent_artifacts {
 #[derive(Deserialize)]
 struct ClaimBody {
     magpie_version: String,
+    /// The build's compile-time `BOARD_DIM` and `RACK_SIZE`. Neither is in
+    /// the version, and a build with another rack size passes every other
+    /// check while drawing other racks and scoring every bingo differently,
+    /// so the build states both and a claim from one this server's jobs do
+    /// not play with is sent away ([`unsupported_build`]).
+    board_dim: u32,
+    rack_size: u32,
     /// Jobs this worker has already found it cannot run, for any reason.
     /// Attacker-controlled, so it is capped and bound as an array rather than
     /// interpolated.
@@ -237,9 +245,10 @@ struct TaskAssignment {
 
 #[derive(Serialize)]
 struct ExpectedData {
-    /// Named so a client that does not recognise the algorithm can say so and
-    /// run unverified rather than refusing work: an algorithm change should not
-    /// be a fleet-wide outage, and `min_magpie_version` is the lever for that.
+    /// Always `sha256`. Named so that changing it is a change MAGPIE sees:
+    /// a client that does not know the algorithm refuses the task rather than
+    /// run it on input data it cannot check, so a new algorithm ships with a
+    /// MAGPIE release and a `min_magpie_version` floor.
     algorithm: &'static str,
     files: std::sync::Arc<Vec<crate::jobs::ExpectedFile>>,
     /// The files the worker builds for itself -- a wordmap, a rack info table
@@ -248,15 +257,44 @@ struct ExpectedData {
     /// hash is what travels instead: the worker builds its own copy and uses
     /// it only if the bytes agree.
     ///
-    /// Always serialized, empty included. A missing key would be read by a
-    /// client as an older server that checks nothing, which is precisely the
-    /// state this replaces; `[]` says "this job needs no derived file".
+    /// Always serialized, empty included: `[]` says "this job needs no derived
+    /// file". MAGPIE loads no derived file this list does not pin a hash for.
     derived: std::sync::Arc<Vec<crate::derived::ExpectedDerived>>,
 }
 
 #[derive(Serialize)]
 struct ShutdownResponse {
     shutdown: scheduler::ShutdownDirective,
+}
+
+/// The shutdown for a build whose board or rack is not the one every job here
+/// plays with: 15x15 ([`crate::board::MAGPIE_BOARD_DIM`], the only layout size
+/// job creation accepts) and 7 tiles ([`crate::jobs::leave_gen::RACK_SIZE`],
+/// what rack spaces and leave tables are counted in). `None` for a build that
+/// matches.
+///
+/// A shutdown rather than a refusal of each task: nothing about the jobs on
+/// offer changes the answer, and only a rebuild does. A 21x21 build already
+/// failed loudly, but as a task failure five times over and then a layout
+/// error to decode; an 8-tile build failed nothing at all -- its games drew
+/// eight tiles and its opening-rack analyses gave a 7-tile bingo no bonus.
+fn unsupported_build(board_dim: u32, rack_size: u32) -> Option<scheduler::ShutdownDirective> {
+    let supported_dim = crate::board::MAGPIE_BOARD_DIM;
+    let supported_rack = crate::jobs::leave_gen::RACK_SIZE;
+    if board_dim as usize == supported_dim && rack_size as usize == supported_rack {
+        return None;
+    }
+    Some(scheduler::ShutdownDirective {
+        reason: "unsupported_build".to_string(),
+        message: format!(
+            "Every job on this server plays on a {supported_dim}x{supported_dim} board with \
+             {supported_rack}-tile racks; this MAGPIE was built with BOARD_DIM {board_dim} and \
+             RACK_SIZE {rack_size}."
+        ),
+        required_tarball_dates: Vec::new(),
+        required_magpie_version: None,
+        download_url: None,
+    })
 }
 
 /// The task claim: "I am ready for work, here is what I am and what I cannot
@@ -311,13 +349,20 @@ async fn claim_task(
             err.status,
             err.code,
             format!(
-                "a task claim must carry a JSON body stating `magpie_version` and \
-                 `unsupported_jobs`. A MAGPIE that sends neither predates this protocol: \
-                 update MAGPIE and start contribute again. ({})",
+                "a task claim must carry a JSON body stating `magpie_version`, `board_dim` \
+                 and `rack_size` (and any `unsupported_jobs`). A MAGPIE that does not state \
+                 those three predates this protocol: update MAGPIE and start contribute \
+                 again. ({})",
                 err.message
             ),
         )
     })?;
+
+    // Before any job is consulted: a build for another board or rack size can
+    // run no job this server can hold, whatever its version or data.
+    if let Some(directive) = unsupported_build(body.board_dim, body.rack_size) {
+        return Ok(Json(ShutdownResponse { shutdown: directive }).into_response());
+    }
 
     // The newest are kept: MAGPIE appends and never prunes, so a long run's
     // list starts with jobs long gone, and keeping the first 200 dropped the
@@ -568,7 +613,8 @@ fn claims_held_error() -> AppError {
         ..AppError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "unavailable",
-            "this claim's job is being purged or deleted; try again shortly",
+            "this claim's job is being purged, deleted or having its consensus changed; try \
+             again shortly",
         )
     }
 }
@@ -793,7 +839,9 @@ async fn submit_result(
     // A task makes that transition exactly once -- a completed task is not
     // dispatched again, and a claim that lapsed before it was submitted is
     // abandoned, so its late submission is refused above -- which is what
-    // makes counting on the transition safe rather than approximate.
+    // makes counting on the transition safe rather than approximate. The
+    // `COALESCE` and the `= 1` cannot matter under one slot: they are cheap
+    // defence against a counter that drifted, not a second result.
     let task_completed = sqlx::query_scalar::<_, bool>(
         "UPDATE tasks t
          SET accepted_count = t.accepted_count + 1,
@@ -809,13 +857,14 @@ async fn submit_result(
 
     // The contributor's own running totals, which are what the leaderboards
     // read instead of summing this identity's claims: this claim, the time it
-    // was held, and the games and racks it played -- this claim's own, not the
-    // task's first result's (`units`, not `progress`). One statement, on the
-    // row the identity already owns. Deliberately not rolled back by account
-    // deletion: the account is anonymized in place and keeps its claims, so no
-    // donated compute is lost. `purge_job` and `delete_job` *do* decrement
-    // them, because unlike the counters on `jobs` these span every job the
-    // identity ever worked on.
+    // was held, and the games and racks it played -- this claim's own
+    // (`units`), not what it added to the job's progress (`progress`, which
+    // counts an opening rack analysed again for consensus once). One
+    // statement, on the row the identity already owns. Deliberately not rolled
+    // back by account deletion: the account is anonymized in place and keeps
+    // its claims, so no donated compute is lost. `purge_job` and `delete_job`
+    // *do* decrement them, because unlike the counters on `jobs` these span
+    // every job the identity ever worked on.
     let (table, key, id) = match (identity.user_id(), identity.anon_uuid()) {
         (Some(user_id), _) => ("users", "id", user_id),
         (None, Some(uuid)) => ("anonymous_workers", "uuid", uuid),
@@ -966,7 +1015,8 @@ async fn complete_finished(
         tracing::info!(job_id = %job_id, "job auto-completed");
         // No submission is coming to push this to open pages.
         push_after_change(state, job_id);
-        // Completion is final, so this job will never need checking again.
+        // Nothing checks a completed job. A consensus edit that reopens it
+        // starts its counters afresh.
         state.finish_checks.forget(job_id);
     }
     Ok(completed)
@@ -989,15 +1039,8 @@ pub(crate) async fn finish_idle_job(state: &AppState, job_id: Uuid) -> AppResult
     if job.status != JobStatus::Active || job.job_type == JobType::LeaveGeneration {
         return Ok(false);
     }
-    let in_flight: bool = sqlx::query_scalar(
-        "SELECT EXISTS (
-             SELECT 1 FROM task_claims c JOIN tasks t ON t.id = c.task_id
-             WHERE t.job_id = $1 AND c.state = 'claimed'
-         )",
-    )
-    .bind(job_id)
-    .fetch_one(&state.pool)
-    .await?;
+    let in_flight: bool =
+        sqlx::query_scalar(JOB_HAS_OPEN_CLAIM).bind(job_id).fetch_one(&state.pool).await?;
     if in_flight {
         return Ok(false);
     }
@@ -1101,7 +1144,7 @@ const MIN_STATS_PUSH_INTERVAL: std::time::Duration = std::time::Duration::from_s
 /// check is triggered *by* submissions, so a job whose contributors all stop
 /// between checks would not be evaluated again until work resumed — which for a
 /// job that has already reached its stopping point means never, leaving it
-/// `active` and holding its allocation. The `EXISTS` below is
+/// `active` and holding its allocation. [`JOB_HAS_OPEN_CLAIM`] is
 /// bounded by the number of claims open across the fleet, not by anything that
 /// grows with the job, and it is only reached when the debounce would otherwise
 /// skip.
@@ -1109,16 +1152,27 @@ async fn should_check_finish(state: &AppState, job_id: Uuid) -> AppResult<bool> 
     if state.finish_checks.should_check(job_id) {
         return Ok(true);
     }
-    Ok(sqlx::query_scalar::<_, bool>(
-        "SELECT NOT EXISTS (
-             SELECT 1 FROM task_claims c JOIN tasks t ON t.id = c.task_id
-             WHERE t.job_id = $1 AND c.state = 'claimed'
-         )",
-    )
-    .bind(job_id)
-    .fetch_one(&state.pool)
-    .await?)
+    let in_flight: bool =
+        sqlx::query_scalar(JOB_HAS_OPEN_CLAIM).bind(job_id).fetch_one(&state.pool).await?;
+    Ok(!in_flight)
 }
+
+/// Whether the job has a claim open: the finish checks' "anything still in
+/// flight", and an export's of a completed job.
+///
+/// Asked of `task_claims` alone, through its own `job_id` (copied from the
+/// task at claim time and never changed), not by joining `tasks` for the job:
+/// that walked every claim open in the fleet with a `tasks` probe each until
+/// one was this job's -- all of them for a job whose last claims are landing,
+/// the very submissions that decide it -- and without statistics (after a
+/// restore, before ANALYZE) Postgres turned it round into a scan of every task
+/// the job ever had: 311 ms at 250,000. This way it is the open-claims index
+/// and those claims' rows, bounded by the fleet's open claims, with or without
+/// statistics; the export's final check, the job list's `stalled` and leave
+/// generation's in-flight reads ask the same way. Public so a test can check
+/// its plan (`I-STATS-9k`).
+pub const JOB_HAS_OPEN_CLAIM: &str =
+    "SELECT EXISTS (SELECT 1 FROM task_claims c WHERE c.job_id = $1 AND c.state = 'claimed')";
 
 /// Whether the job is done: for a games or pairs job with a match test, its
 /// decision (only after `min_units`) or the hard cap; for one without, its
@@ -1150,25 +1204,42 @@ async fn finish_condition_met(state: &AppState, job: &Job) -> AppResult<Option<c
             // job seeking a consensus, agreed on or analysed its most times.
             // A rack settles in the transaction that stores its analysis, so
             // the running count is exact.
-            sqlx::query_scalar::<_, bool>(
-                "SELECT j.racks_settled >= c.total_racks
-                        AND EXISTS (SELECT 1 FROM tasks t WHERE t.job_id = j.id)
-                        AND NOT EXISTS (SELECT 1 FROM tasks t
-                                        WHERE t.job_id = j.id AND t.state <> 'completed')
-                 FROM jobs j JOIN job_opening_rack_config c ON c.job_id = j.id
-                 WHERE j.id = $1",
-            )
-            .bind(job.id)
-            .fetch_optional(&state.pool)
-            .await?
-            .unwrap_or(false)
-            .then_some(Finish::RacksAnalysed)
+            sqlx::query_scalar::<_, bool>(OPENING_RACK_FINISHED)
+                .bind(job.id)
+                .fetch_optional(&state.pool)
+                .await?
+                .unwrap_or(false)
+                .then_some(Finish::RacksAnalysed)
         }
         // Leave generation completes in `run_transition` once the final
         // generation is aggregated.
         JobType::LeaveGeneration => None,
     })
 }
+
+/// Whether an opening-rack job is done: every rack settled, at least one task
+/// made, and none still out -- nothing `available` (a reissue, or a declined
+/// task, waiting to go out again) and no claim open. A task not completed is
+/// one or the other: `available`, or `claimed` with exactly one open claim
+/// (`task_claims_one_slot_idx`).
+///
+/// Asked through indexes bounded by the job's front, its queue and the
+/// fleet's open claims (`tasks_seed_unique_idx`, `tasks_queue_idx`,
+/// `task_claims_open_idx`), not as `EXISTS` over the job's tasks and
+/// `NOT EXISTS (... state <> 'completed')`: both were planned as sequential
+/// scans of `tasks`, every job's history, the second reading the whole table
+/// exactly when the job was done. 395-414 ms at 3.2 million tasks, on the
+/// submission that settles the job's last rack, before its worker is
+/// answered; 0.3 ms this way. "Any task at all" is a scalar subquery in seed
+/// order, not `EXISTS`, which Postgres would plan the same way again.
+/// Public so a test can check its plan (`I-STATS-9j`).
+pub const OPENING_RACK_FINISHED: &str = "SELECT j.racks_settled >= c.total_racks
+        AND (SELECT 1 FROM tasks t WHERE t.job_id = j.id ORDER BY t.seed LIMIT 1) IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.job_id = j.id AND t.state = 'available')
+        AND NOT EXISTS (SELECT 1 FROM task_claims k
+                        WHERE k.job_id = j.id AND k.state = 'claimed')
+     FROM jobs j JOIN job_opening_rack_config c ON c.job_id = j.id
+     WHERE j.id = $1";
 
 // ---------------------------------------------------------------------------
 
@@ -1226,20 +1297,40 @@ mod contract_fixtures {
                 .expect("claim-request.json no longer parses as ClaimBody");
         assert_eq!(body.magpie_version, "1.4.0");
         assert_eq!(body.unsupported_jobs.len(), 1);
+        // A default build's, which the server dispatches to.
+        assert!(unsupported_build(body.board_dim, body.rack_size).is_none());
     }
 
+    /// C-10
     #[test]
     fn decline_parses_as_a_decline_body() {
-        let body: DeclineBody = serde_json::from_str(include_str!(
+        let fixture: Value = serde_json::from_str(include_str!(
             "../../../contract-fixtures/decline-missing-data.json"
         ))
-        .expect("decline-missing-data.json no longer parses as DeclineBody");
+        .unwrap();
+        let body: DeclineBody = serde_json::from_value(fixture.clone())
+            .expect("decline-missing-data.json no longer parses as DeclineBody");
         assert_eq!(body.reason, "missing_data");
         // One file absent entirely and one present with the wrong bytes: the
         // two cases `actual` exists to tell apart.
         assert_eq!(body.missing.len(), 2);
         assert!(body.missing.iter().any(|m| m.actual.is_none()));
         assert!(body.missing.iter().any(|m| m.actual.is_some()));
+
+        // MAGPIE leaves `actual` out for a file it did not find rather than
+        // writing the fixture's null (its test checks it builds this body
+        // otherwise key for key): the absence reads the same.
+        let mut magpie = fixture;
+        for entry in magpie["missing"].as_array_mut().unwrap() {
+            if entry["actual"].is_null() {
+                entry.as_object_mut().unwrap().remove("actual");
+            }
+        }
+        let theirs: DeclineBody = serde_json::from_value(magpie).unwrap();
+        assert_eq!(
+            theirs.missing.iter().map(|m| m.actual.clone()).collect::<Vec<_>>(),
+            body.missing.iter().map(|m| m.actual.clone()).collect::<Vec<_>>()
+        );
     }
 
     // Captured from a real `magpie contribute` exchange by
@@ -1300,14 +1391,12 @@ mod contract_fixtures {
                 name: "NWL23".into(),
                 path: "lexica/NWL23.kwg".into(),
                 sha256: "3e74af98".into(),
-                bytes: 4_719_596,
                 tarball_date: "20251004".into(),
             }]),
             derived: std::sync::Arc::new(vec![crate::derived::ExpectedDerived {
                 role: "wmp".into(),
                 name: "NWL23".into(),
                 sha256: "214a46d7".into(),
-                bytes: 104_857_600,
                 builder: "wmp-1".into(),
                 build_target: "nehalem".into(),
             }]),
@@ -1352,8 +1441,8 @@ mod contract_fixtures {
         }
     }
 
-    /// C-2: the pairs assignment is a `game_pairs` request -- tagged so, with
-    /// `game_pairs: true` -- and nothing else distinguishes it from games.
+    /// C-2: the pairs assignment is a `game_pairs` request, and only its tag
+    /// says so: no flag in the body repeats it.
     #[test]
     fn the_game_pairs_assignment_is_a_pairs_request() {
         let fixture: Value = serde_json::from_str(GAME_PAIRS_ASSIGNMENT).unwrap();
@@ -1362,7 +1451,10 @@ mod contract_fixtures {
         let TaskRequest::GamePairs(pairs) = request else {
             panic!("assignment-game-pairs.json decoded as {request:?}");
         };
-        assert!(pairs.game_pairs, "a pairs request must say game_pairs: true");
+        assert!(
+            fixture["task_request"].get("game_pairs").is_none(),
+            "the tag says it is a pairs request; a flag repeating it could disagree"
+        );
         assert!(pairs.num_games > 0);
         assert!(fixture.get("worker_uuid").is_none());
     }
@@ -1374,9 +1466,10 @@ mod contract_fixtures {
         let fixture: Value = serde_json::from_str(ANON_UUID_ASSIGNMENT).unwrap();
         let minted: Uuid = serde_json::from_value(fixture["worker_uuid"].clone())
             .expect("anon-uuid-assignment.json carries no worker_uuid");
-        // Its job pins no derived file, and says so rather than leaving the
-        // key out: a missing key reads to a client as a server that checks
-        // nothing.
+        // Its job pins no derived file, and says so with an empty list rather
+        // than leaving the key out: the shape the fixture pins. (MAGPIE reads
+        // the two alike: a player asking for a wordmap or table the list does
+        // not pin is refused, `derived_mismatch`.)
         assert_eq!(fixture["expected_data"]["derived"], serde_json::json!([]));
         let envelope = envelope_for(&fixture, Some(minted));
         assert_same_shape(&fixture, &envelope, "anon-uuid-assignment envelope");
@@ -1426,6 +1519,15 @@ mod contract_fixtures {
         (body.claim_token, record)
     }
 
+    /// The players an assignment dispatched, by the keys its request gives
+    /// them, for the check that a result's analyses are ones they could run.
+    fn assigned_players(fixture: &str, keys: &[&str]) -> Vec<crate::jobs::handler::PlayerSpec> {
+        let value: Value = serde_json::from_str(fixture).unwrap();
+        keys.iter()
+            .map(|key| serde_json::from_value(value["task_request"][key].clone()).unwrap())
+            .collect()
+    }
+
     fn assignment_games(fixture: &str) -> (Uuid, i32) {
         let value: Value = serde_json::from_str(fixture).unwrap();
         let token = serde_json::from_value(value["claim_token"].clone()).unwrap();
@@ -1453,6 +1555,15 @@ mod contract_fixtures {
         assert!(record.pentanomial.is_none());
         assert!(!record.positions.is_empty(), "result-games.json captured no positions");
         assert!(record.positions.iter().all(|p| p.position.is_some() && !p.moves.is_empty()));
+        // Real MAGPIE's static, endgame and pre-endgame turns, against the
+        // two solving players it was dispatched with (U-PLAUS-6).
+        let players = assigned_players(ANON_UUID_ASSIGNMENT, &["player1", "player2"]);
+        crate::jobs::plausibility::check_analyses_against_players(
+            &record.positions,
+            &[&players[0], &players[1]],
+            "result-games.json",
+        )
+        .unwrap();
     }
 
     /// C-3b: a games result from simming players that infer: a first-turn
@@ -1491,6 +1602,13 @@ mod contract_fixtures {
         .unwrap();
         let pentanomial = record.pentanomial.expect("a pairs result without a pentanomial");
         assert_eq!(pentanomial.iter().sum::<i64>() * 2, i64::from(record.all_games.games));
+        let players = assigned_players(GAME_PAIRS_ASSIGNMENT, &["player1", "player2"]);
+        crate::jobs::plausibility::check_analyses_against_players(
+            &record.positions,
+            &[&players[0], &players[1]],
+            "result-game-pairs.json",
+        )
+        .unwrap();
     }
 
     /// C-5: an opening-rack result from a simulating player, statistics and
@@ -1505,6 +1623,14 @@ mod contract_fixtures {
         let best = &record.positions[0].moves[0];
         assert!(best.win_percentage.is_some() && best.blended_utility.is_some());
         assert!(!best.plies.is_empty(), "the simulation's per-ply statistics are missing");
+        let assignment = include_str!("../../../contract-fixtures/assignment-opening-rack.json");
+        let player = &assigned_players(assignment, &["player"])[0];
+        crate::jobs::plausibility::check_analyses_against_players(
+            &record.positions,
+            &[player],
+            "result-opening-rack.json",
+        )
+        .unwrap();
     }
 
     /// C-6
@@ -1529,6 +1655,10 @@ mod contract_fixtures {
                 include_str!("../../../contract-fixtures/shutdown-magpie-too-old.json"),
             ),
             ("both", include_str!("../../../contract-fixtures/shutdown-both.json")),
+            (
+                "unsupported_build",
+                include_str!("../../../contract-fixtures/shutdown-unsupported-build.json"),
+            ),
         ] {
             let value: Value = serde_json::from_str(fixture).unwrap();
             assert_eq!(
@@ -1559,6 +1689,18 @@ mod contract_fixtures {
             !both["shutdown"]["required_magpie_version"].is_null(),
             "the `both` shutdown must name a MAGPIE version to lead with"
         );
+
+        // The build shutdown is the one the server builds itself, for the
+        // build the fixture names.
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../contract-fixtures/shutdown-unsupported-build.json"
+        ))
+        .unwrap();
+        let produced = serde_json::to_value(ShutdownResponse {
+            shutdown: unsupported_build(21, 7).expect("a 21x21 build is not supported"),
+        })
+        .unwrap();
+        assert_eq!(fixture, produced, "shutdown-unsupported-build.json is not what is sent");
     }
 
     #[test]

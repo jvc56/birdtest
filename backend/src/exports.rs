@@ -63,9 +63,12 @@ pub const DOWNLOAD_URL_TTL: std::time::Duration = std::time::Duration::from_secs
 /// once, so each of its lines also carries its rack's standing (`consensus`:
 /// its analyses, its most common best move and how many ranked it first, and
 /// whether it is settled, and without a consensus) from
-/// `opening_rack_progress`, a primary-key probe per line; null for a job
-/// wanting one analysis per rack (which keeps the rows too, see
-/// `opening_rack::record_consensus`, but has no consensus to report), and for an in-game position. Each record's moves come through
+/// `opening_rack_progress`, a primary-key probe per line; null for a rack of
+/// one analysis in a job wanting one per rack (which keeps the rows too, see
+/// `opening_rack::record_consensus`, but has no consensus to report), and for
+/// an in-game position. A rack with several analyses carries it whatever the
+/// job wants now: a job whose maximum was lowered to one still counts their
+/// disagreements in `racks_without_consensus`. Each record's moves come through
 /// `position_analysis_moves_record_idx (record_id, rank)` and each move's plies
 /// through the `(move_id, ply)` unique index, so the cost is an index probe per
 /// record and per simmed move, on a background task (or under the two-stream
@@ -106,7 +109,7 @@ const OPENING_RACK_CORPUS: &str = "
                FROM opening_rack_progress c
                JOIN job_opening_rack_config o ON o.job_id = c.job_id
                WHERE c.job_id = r.job_id AND c.rack = r.rack AND r.game_index IS NULL
-                 AND o.max_results_per_rack > 1
+                 AND (c.results > 1 OR o.max_results_per_rack > 1)
            )))::text AS row
     FROM position_analysis_records r
     WHERE r.job_id = $1";
@@ -256,13 +259,10 @@ async fn refuse_unsettled(state: &AppState, job: &Job) -> AppResult<()> {
     // here first, through the same statement dispatch uses, so "open" below
     // means live.
     crate::scheduler::reclaim_lapsed(state, &[job.id]).await?;
-    let settling = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS (SELECT 1 FROM task_claims c JOIN tasks t ON t.id = c.task_id
-                        WHERE t.job_id = $1 AND c.state = 'claimed')",
-    )
-    .bind(job.id)
-    .fetch_one(&state.pool)
-    .await?;
+    let settling = sqlx::query_scalar::<_, bool>(crate::routes::worker::JOB_HAS_OPEN_CLAIM)
+        .bind(job.id)
+        .fetch_one(&state.pool)
+        .await?;
     if settling {
         return Err(AppError::conflict(
             "this job completed with claims still in flight, and their results are still \
@@ -582,8 +582,8 @@ async fn read_snapshot(
         .await?;
     let (is_final, taken_at): (bool, chrono::DateTime<chrono::Utc>) = sqlx::query_as(
         "SELECT CASE WHEN j.status <> 'completed' THEN FALSE
-                     ELSE NOT EXISTS (SELECT 1 FROM task_claims c JOIN tasks t ON t.id = c.task_id
-                                      WHERE t.job_id = j.id AND c.state = 'claimed')
+                     ELSE NOT EXISTS (SELECT 1 FROM task_claims c
+                                      WHERE c.job_id = j.id AND c.state = 'claimed')
                       AND NOT EXISTS (SELECT 1 FROM leave_rack_staging s WHERE s.job_id = j.id)
                 END,
                 clock_timestamp()
@@ -599,12 +599,11 @@ async fn read_snapshot(
     // what matters is whether there is anything to export, and a capture job
     // nobody contributed positions to should not grow an empty artifact.
     let captured = may_capture_positions(job.job_type)
-        && sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS (SELECT 1 FROM position_analysis_records WHERE job_id = $1)",
-        )
-        .bind(job.id)
-        .fetch_one(&mut *tx)
-        .await?;
+        && sqlx::query_scalar::<_, i32>(POSITIONS_CAPTURED)
+            .bind(job.id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .is_some();
     let positions = if captured {
         Some(upload_rows(state, &mut tx, positions_key, positions_query(), job.id).await?)
     } else {
@@ -614,6 +613,19 @@ async fn read_snapshot(
     tracing::debug!(%export_id, is_final, "export snapshot read");
     Ok(Snapshot { results, positions, is_final, taken_at })
 }
+
+/// Whether the job has a captured position: its newest, through the results
+/// feed's index (`position_analysis_records_feed_idx`), and `LIMIT 1`.
+///
+/// Asked as `EXISTS (... WHERE job_id = $1)` it was a sequential scan for a job
+/// that had captured positions, for the reason `leave_gen::universe_exists`
+/// gives: with few distinct jobs Postgres expects a match within a few rows of
+/// the heap's start, but a job's records sit together after every older job's.
+/// 129-139 ms behind 1.5 million older records, and the table is the largest
+/// that grows without bound -- read inside the export's snapshot, holding back
+/// vacuum (KL-94). Public so a test can check its plan (`I-EXPORT-17`).
+pub const POSITIONS_CAPTURED: &str = "SELECT 1 FROM position_analysis_records WHERE job_id = $1
+     ORDER BY submitted_at DESC, id DESC LIMIT 1";
 
 /// Whether the export's row says `ready` -- or cannot be read to say it does
 /// not.
@@ -643,13 +655,21 @@ async fn mark_ready(
     // overlaps the two. Without the guard a reaped row would come back
     // `ready`, and an admin would be handed a download of an export nobody
     // was sure had finished.
+    //
+    // The job's status is read `FOR SHARE`, which waits out a transaction
+    // changing it and then reads what that committed. A consensus edit
+    // reopening the job demotes its final exports and fails its running ones
+    // (`unfinalize`) before it commits; a plain read here, between that
+    // statement and the commit, still saw `completed`, and stored this export
+    // final for a job that was active again. Waiting, it re-reads this row as
+    // the edit left it, `failed`, and matches nothing.
     let marked = sqlx::query(
         "UPDATE job_exports
          SET state = 'ready', artifact_key = $2, bytes = $3, sha256 = $4,
              row_count = $5, positions_artifact_key = $6, positions_bytes = $7,
              positions_sha256 = $8, positions_row_count = $9,
              is_final = $10 AND (SELECT j.status = 'completed' FROM jobs j
-                                 WHERE j.id = job_exports.job_id),
+                                 WHERE j.id = job_exports.job_id FOR SHARE),
              snapshot_at = $11, completed_at = now()
          WHERE id = $1 AND state = 'running'",
     )
@@ -763,17 +783,39 @@ pub async fn purge(conn: &mut sqlx::PgConnection, job_id: Uuid) -> AppResult<Vec
     Ok(rows.into_iter().flat_map(|(results, positions)| [results, positions]).flatten().collect())
 }
 
-/// A reopened job's final exports become snapshots: each is still the corpus
-/// as of its `snapshot_at`, but no longer the finished job's, which the job
-/// will have again once it completes. Left final, `newest_ready` would serve
-/// the old corpus as the completed job's once it completed again. An export
-/// still building when the job reopened is marked final only if the job is
-/// still completed when it finishes (`mark_ready`).
+/// A completed job whose consensus settings changed has its final exports
+/// become snapshots: each is still the corpus as of its `snapshot_at`, but no
+/// longer the finished job's. Each line carries its rack's standing under the
+/// settings it was read with, which the edit restated; a reopened job will
+/// have a new final corpus once it completes again, and one the edit left
+/// completed has it on its next export. Left final, `newest_ready` would
+/// serve the old standings as the completed job's.
+///
+/// An export still building fails, and is to be taken again. Its snapshot may
+/// have been read before the edit, and `mark_ready`, reading the job
+/// completed -- still, or once more: a large corpus uploads for minutes, an
+/// edit that unsettles a handful of racks is re-completed within one
+/// reissue's analysis -- stored the corpus from before the edit as the final
+/// one: what every download of the completed job was redirected to until
+/// someone exported it again. Failed here, its `mark_ready` matches no row
+/// and removes its objects. (That update reads the job's row `FOR SHARE`
+/// before it locks its own, so one waiting on the edit re-reads this row once
+/// it commits rather than deadlocking with it.)
 pub async fn unfinalize(conn: &mut sqlx::PgConnection, job_id: Uuid) -> AppResult<()> {
     sqlx::query("UPDATE job_exports SET is_final = FALSE WHERE job_id = $1 AND is_final")
         .bind(job_id)
-        .execute(conn)
+        .execute(&mut *conn)
         .await?;
+    sqlx::query(
+        "UPDATE job_exports
+         SET state = 'failed', completed_at = now(),
+             error = 'the job''s consensus settings changed while this export was building: \
+                      export it again'
+         WHERE job_id = $1 AND state = 'running'",
+    )
+    .bind(job_id)
+    .execute(&mut *conn)
+    .await?;
     Ok(())
 }
 

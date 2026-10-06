@@ -2,6 +2,19 @@ use anyhow::{Context, Result};
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use std::time::Duration;
 
+/// `MIN_MAGPIE_VERSION` when unset: the `birdtest-contribute` version the
+/// backend image pins. The branch's version moves whenever a change can alter
+/// what a task computes, and this floor moves with it: it is the only way to
+/// keep a build known to compute something wrong off the fleet. 0.1.0 is below
+/// it because builds reporting it include ones where a capturing static player
+/// played its worst move, and every one of them played a leave task after its
+/// first with the previous task's KLV.
+///
+/// Copied by hand into Terraform's default (the one production runs on), both
+/// compose files, the native e2e script, the jobs table's column defaults and
+/// `scripts/dev.py`; `U-CFG-5` fails when a raise misses one.
+pub const DEFAULT_MIN_MAGPIE_VERSION: &str = "0.1.1";
+
 /// Runtime configuration.
 ///
 /// In development every value comes from the environment (`.env` is loaded on
@@ -46,7 +59,7 @@ pub struct Config {
     /// a client below it is offered nothing and told to update, without any
     /// job being consulted (`scheduler::claim`), and it is the default floor
     /// stamped onto a new job when an admin does not raise it. Also reported
-    /// by `GET /api/worker/client-version` so a client can check itself.
+    /// by `GET /api/worker/client-version`, for the admin job form and humans.
     ///
     /// This is a floor on the *contributor's* build, and it is now also a
     /// floor the backend's own pinned MAGPIE has to clear: the server builds
@@ -247,7 +260,7 @@ impl Config {
             anyhow::bail!("DEV_LOGIN=true is for a local stack, and refused with SECURE_COOKIES=true");
         }
 
-        let min_magpie_version = var_or("MIN_MAGPIE_VERSION", "0.1.1");
+        let min_magpie_version = var_or("MIN_MAGPIE_VERSION", DEFAULT_MIN_MAGPIE_VERSION);
         // Strictly, as a job's floor is: the new-job form offers this value,
         // and one read loosely here ("0.2.0-rc1") was then refused there on
         // every job an admin created without touching the field.
@@ -288,14 +301,7 @@ impl Config {
             s3_bucket: var_or("S3_BUCKET", "birdtest-artifacts"),
             s3_endpoint: var("S3_ENDPOINT"),
             s3_public_endpoint: var("S3_PUBLIC_ENDPOINT"),
-            // 0.1.1 is the `birdtest-contribute` version the backend image
-            // pins. The branch's version moves whenever a change can alter
-            // what a task computes, and this floor moves with it: it is the
-            // only way to keep a build known to compute something wrong off
-            // the fleet. 0.1.0 is below it because builds reporting it
-            // include ones where a capturing static player played its worst
-            // move, and every one of them played a leave task after its
-            // first with the previous task's KLV.
+            // [`DEFAULT_MIN_MAGPIE_VERSION`] says why the default is what it is.
             min_magpie_version,
             magpie_download_url: var_or(
                 "MAGPIE_DOWNLOAD_URL",
@@ -370,7 +376,9 @@ mod tests {
             ("S3_PUBLIC_ENDPOINT", "None", "http://localhost:9000", |c| {
                 c.s3_public_endpoint.clone().unwrap_or_else(|| "None".into())
             }),
-            ("MIN_MAGPIE_VERSION", "0.1.1", "1.10.0", |c| c.min_magpie_version.clone()),
+            ("MIN_MAGPIE_VERSION", DEFAULT_MIN_MAGPIE_VERSION, "1.10.0", |c| {
+                c.min_magpie_version.clone()
+            }),
             ("MAGPIE_DOWNLOAD_URL", "https://github.com/jvc56/MAGPIE", "https://d", |c| {
                 c.magpie_download_url.clone()
             }),
@@ -485,6 +493,96 @@ mod tests {
         }
         assert_eq!(config(&[("MIN_MAGPIE_VERSION", "0.0.0")]).unwrap().min_magpie_version, "0.0.0");
         assert_eq!(config(&[("MIN_MAGPIE_VERSION", "1.10.0")]).unwrap().min_magpie_version, "1.10.0");
+    }
+
+    /// The version written after each `prefix` in `text`, in order.
+    fn versions_after<'a>(text: &'a str, prefix: &str) -> Vec<&'a str> {
+        text.match_indices(prefix)
+            .map(|(at, _)| {
+                let rest = &text[at + prefix.len()..];
+                let end = rest.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(rest.len());
+                rest[..end].trim_end_matches('.')
+            })
+            .collect()
+    }
+
+    /// U-CFG-5: every hand-kept copy of the default version floor is
+    /// [`DEFAULT_MIN_MAGPIE_VERSION`]. Terraform's default is the one
+    /// production runs on (`ecs.tf` and `derived.tf` always set the variable),
+    /// and a raise that missed it passed CI -- tier 5 checks the compose value
+    /// only -- and left production admitting the builds the raise was meant to
+    /// keep out (thirty-third audit, pass 1). `backend/.env.example` is the
+    /// copy a backend run on the host starts from (README, "Without Docker"),
+    /// and the root `.env.example` the one a compose user copies to `.env`;
+    /// both, and `docker-compose.yml`, also say what the contribute branch
+    /// reports, which has to meet it.
+    #[test]
+    fn every_copy_of_the_version_floor_agrees() {
+        // Compiled in, not read at run time: a unit test reads no file, and
+        // cargo rebuilds this one when any of them changes.
+        macro_rules! source {
+            ($path:literal) => {
+                include_str!(concat!("../../", $path))
+            };
+        }
+        let floor = DEFAULT_MIN_MAGPIE_VERSION;
+
+        let tf = source!("infra/variables.tf");
+        let block = tf
+            .split(r#"variable "min_magpie_version""#)
+            .nth(1)
+            .and_then(|rest| rest.split("\nvariable ").next())
+            .expect("infra/variables.tf declares min_magpie_version");
+        let default: Vec<&str> = block
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("default"))
+            .map(|rest| rest.trim_start().trim_start_matches('=').trim().trim_matches('"'))
+            .collect();
+        assert_eq!(default, [floor], "infra/variables.tf");
+        assert_eq!(versions_after(block, "(MIN_MAGPIE_VERSION). "), [floor], "its description");
+        for (tf, text) in [
+            ("infra/ecs.tf", source!("infra/ecs.tf")),
+            ("infra/derived.tf", source!("infra/derived.tf")),
+        ] {
+            assert!(
+                text.contains(r#"{ name = "MIN_MAGPIE_VERSION", value = var.min_magpie_version }"#),
+                "{tf} sets the floor from the variable"
+            );
+        }
+
+        // What the files that set the floor say the contribute branch reports.
+        const REPORTS: &str = "`birdtest-contribute` reports ";
+        for (path, text, prefix, copies) in [
+            ("docker-compose.yml", source!("docker-compose.yml"), "MIN_MAGPIE_VERSION:-", 2),
+            ("docker-compose.e2e.yml", source!("docker-compose.e2e.yml"), "MIN_MAGPIE_VERSION: ", 1),
+            (
+                "scripts/e2e_magpie_native.sh",
+                source!("scripts/e2e_magpie_native.sh"),
+                "MIN_MAGPIE_VERSION=",
+                1,
+            ),
+            ("backend/.env.example", source!("backend/.env.example"), "MIN_MAGPIE_VERSION=", 1),
+            ("backend/.env.example", source!("backend/.env.example"), REPORTS, 1),
+            (".env.example", source!(".env.example"), "MIN_MAGPIE_VERSION=", 1),
+            (".env.example", source!(".env.example"), REPORTS, 1),
+            ("docker-compose.yml", source!("docker-compose.yml"), REPORTS, 1),
+        ] {
+            assert_eq!(versions_after(text, prefix), vec![floor; copies], "{path}");
+        }
+
+        let migration = source!("backend/migrations/0001_initial.sql");
+        let part = |column: &str| {
+            let found = versions_after(migration, &format!("{column} INT NOT NULL DEFAULT "));
+            assert_eq!(found.len(), 1, "{column}: {found:?}");
+            found[0]
+        };
+        let columns = ["min_magpie_major", "min_magpie_minor", "min_magpie_patch"].map(part);
+        assert_eq!(columns.join("."), floor, "the jobs table's column defaults");
+
+        assert!(
+            source!("scripts/dev.py").contains(&format!("({floor} by default)")),
+            "scripts/dev.py's note on the production floor"
+        );
     }
 
     #[test]

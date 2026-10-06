@@ -292,6 +292,43 @@ async fn a_job_keeps_the_name_it_was_created_with() {
     }
 }
 
+/// A-ADMIN-2c: a player config's and a rating pool's names take a job name's
+/// rule -- at most 100 characters, one line, no control characters -- each
+/// refused on the field, and a pool's is stored trimmed as the other two are.
+/// Both took any text, and a pool its name as typed, so "X" and "X " were two
+/// pools (thirty-third audit, pass 1).
+#[tokio::test]
+async fn a_player_config_and_a_pool_take_a_job_names_rule() {
+    let db = TestDb::new().await;
+    let admin = Admin::new(&db).await;
+    let files = files(&db).await;
+    let anchor = created_config(&admin, static_config("anchor", &files)).await;
+    let pool = |name: Value| {
+        json!({
+            "name": name, "variant": "classic", "letterdist_id": files.letterdist,
+            "layout_id": files.layout, "anchor_player_config_id": anchor["id"],
+        })
+    };
+    for name in ["x".repeat(101), "two\nlines".into(), "tab\there".into(), "a\u{2028}b".into()] {
+        let (status, refused) = admin.post("/api/admin/player-configs", static_config(&name, &files)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+        assert_eq!(refused["fields"][0]["field"], "name", "{refused}");
+        let (status, refused) = admin.post("/api/admin/rating-pools", pool(json!(name))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+        assert_eq!(refused["fields"][0]["field"], "name", "{refused}");
+    }
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM player_configs").await, 1);
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM rating_pools").await, 0);
+
+    created_config(&admin, static_config(&"x".repeat(100), &files)).await;
+    let (status, created) = admin.post("/api/admin/rating-pools", pool(json!("  classic  "))).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let stored: String = sqlx::query_scalar("SELECT name FROM rating_pools").fetch_one(&db.pool).await.unwrap();
+    assert_eq!(stored, "classic");
+    let (status, taken) = admin.post("/api/admin/rating-pools", pool(json!("classic "))).await;
+    assert_eq!(status, StatusCode::CONFLICT, "the same name with a space is the same pool: {taken}");
+}
+
 /// A-ADMIN-3: job creation refuses every combination MAGPIE could not run, and
 /// says which: two simmers on different win% models, a lexicon from another
 /// letter distribution, an `input_data` id that does not exist (or is the wrong
@@ -366,6 +403,12 @@ async fn job_creation_refuses_each_impossible_combination_and_says_which() {
     let (status, refusal) = admin.post("/api/admin/player-configs", static_with_model).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{refusal}");
     assert!(message(&refusal).contains("must not name a win% model"), "{refusal}");
+    // A simmer with one candidate play never simulates: MAGPIE plays it.
+    let mut one_candidate = simming_config("one-candidate", &files, Some(winpct));
+    one_candidate["num_plays"] = json!(1);
+    let (status, refusal) = admin.post("/api/admin/player-configs", one_candidate).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refusal}");
+    assert_eq!(refusal["fields"][0]["field"], "num_plays", "{refusal}");
     assert_eq!(count(&db, "SELECT COUNT(*) FROM player_configs").await, 3);
 }
 
@@ -409,12 +452,12 @@ async fn each_lifecycle_action_answers_its_shape_and_a_read_agrees() {
     assert_eq!((&body["id"], &body["status"]), (&json!(job), &json!("inactive")));
     let (_, page) = read().await;
     assert_eq!(page["job"]["status"], "inactive", "{page}");
-    assert_eq!((&page["tasks_total"], &page["results_accepted"]), (&json!(1), &json!(1)), "{page}");
+    assert_eq!((&page["tasks_total"], &page["tasks_completed"]), (&json!(1), &json!(1)), "{page}");
 
     let (status, body) = admin.post(&action("purge"), json!({})).await;
     assert_eq!((status, &body), (StatusCode::OK, &json!({ "tasks_reset": 1 })));
     let (_, page) = read().await;
-    assert_eq!((&page["tasks_total"], &page["results_accepted"]), (&json!(0), &json!(0)), "{page}");
+    assert_eq!((&page["tasks_total"], &page["tasks_completed"]), (&json!(0), &json!(0)), "{page}");
     assert_eq!(page["games"]["units_completed"], json!(0), "{page}");
 
     let (status, body) = admin.post(&action("complete"), json!({})).await;
@@ -542,7 +585,8 @@ async fn a_jobs_derived_data_says_what_it_waits_for() {
 /// A-ADMIN-9: the fleet view counts the workers -- and the claims -- behind
 /// each MAGPIE version the field has claimed with in the last week, most
 /// widely run first. A worker last seen longer ago than that is not part of
-/// the fleet.
+/// the fleet. A claim counts while open or once completed in the week (each
+/// read through its own index); one that lapsed does not.
 #[tokio::test]
 async fn the_fleet_view_counts_workers_by_the_version_they_run() {
     let db = TestDb::new().await;
@@ -568,6 +612,41 @@ async fn the_fleet_view_counts_workers_by_the_version_they_run() {
         fleet,
         json!([
             { "magpie_version": "1.0.0", "workers": 2, "claims": 3 },
+            { "magpie_version": "1.2.3", "workers": 1, "claims": 1 },
+        ])
+    );
+
+    // Completed in the week, though claimed before it: counted. Completed
+    // before the week, or lapsed: not.
+    sqlx::query(
+        "UPDATE task_claims SET state = 'completed', completed_at = now() - interval '1 day',
+                                claimed_at = now() - interval '9 days'
+         WHERE magpie_version = '1.2.3'",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE task_claims SET state = 'completed', completed_at = now() - interval '8 days'
+         WHERE magpie_version = '0.9.0'",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE task_claims SET state = 'abandoned'
+         WHERE id = (SELECT id FROM task_claims WHERE claimed_by_anon_uuid = $1 LIMIT 1)",
+    )
+    .bind(w1.parse::<Uuid>().unwrap())
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let (status, fleet) = admin.get("/api/admin/fleet").await;
+    assert_eq!(status, StatusCode::OK, "{fleet}");
+    assert_eq!(
+        fleet,
+        json!([
+            { "magpie_version": "1.0.0", "workers": 2, "claims": 2 },
             { "magpie_version": "1.2.3", "workers": 1, "claims": 1 },
         ])
     );

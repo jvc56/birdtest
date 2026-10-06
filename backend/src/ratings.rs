@@ -293,7 +293,7 @@ async fn fit_within(
 
     // The cheap question first: have the pool's jobs completed any games, or
     // its members changed, since the last run? `games_completed` is each
-    // job's first-result-per-task running total, kept by the submission that
+    // job's running total of games played, kept by the submission that
     // stores the result, so an unchanged sum is unchanged evidence. Read
     // before the matrix: a result committed in between makes the stored sum
     // short of the fit, and the next sweep refits, which is the safe side.
@@ -534,11 +534,10 @@ const THIN_BATCH: i64 = 1_000;
 ///
 /// Without this, runs grow for the life of a pool: a twenty-member pool with an
 /// active job stores ~720 runs a day with ~210 residual rows each, ~150,000
-/// rows a day that nothing reads once the run is no longer the newest. Past
-/// the window a day is the resolution the history chart draws at anyway -- it
-/// thins to 500 points over the pool's whole life -- so the chart keeps its
-/// shape and its ends and only runs it never showed are deleted. Deleting
-/// everything past the window would have started the chart's past at the
+/// rows a day that nothing reads once the run is no longer the newest but the
+/// history endpoint, which thins to 500 points over the pool's whole life
+/// anyway; a run a day past the window keeps its series' shape and its ends.
+/// Deleting everything past the window would have started the history at the
 /// window's edge instead.
 ///
 /// The newest run -- what the ratings page shows -- always survives, however

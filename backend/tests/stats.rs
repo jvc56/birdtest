@@ -210,7 +210,6 @@ async fn a_games_jobs_stats_sum_every_result_and_test_the_games() {
     assert_eq!(games.units_completed, 30);
     assert_eq!((games.pentanomial, games.divergent_pairs), (None, None));
     assert_eq!((games.min_units, games.max_units), (31, 1000));
-    assert_eq!(games.win_pct, 70.0);
 
     let tally = Tally { wins: 21, losses: 7, draws: 2 };
     let expected = match_test::evaluate(&Sample::from_games(&tally), Unit::Game, 30, 95.0, 31, 1000);
@@ -323,7 +322,7 @@ async fn divergent_pairs_are_reported_but_not_tested() {
 }
 
 /// I-STATS-4: a job with no results reports zeros and an even score whose
-/// interval is every score -- finite, with every percentage 0 -- for both
+/// interval is every score -- finite -- for both
 /// job types, and the whole payload serializes, rather than an error or a NaN.
 #[tokio::test]
 async fn a_job_with_no_results_reports_zeros_not_nan() {
@@ -334,9 +333,6 @@ async fn a_job_with_no_results_reports_zeros_not_nan() {
         assert_eq!((games.wins, games.losses, games.draws, games.units_completed), (0, 0, 0, 0));
         assert_eq!((test.mean, test.lower, test.upper), (0.5, 0.0, 1.0));
         assert_eq!(test.status, TestStatus::Running);
-        for pct in [games.win_pct, games.loss_pct, games.draw_pct] {
-            assert_eq!(pct, 0.0);
-        }
         if games.unit == "pair" {
             assert_eq!(games.pentanomial, Some([0; 5]));
             assert_eq!(games.divergent_pairs, Some(0));
@@ -350,7 +346,6 @@ async fn a_job_with_no_results_reports_zeros_not_nan() {
         assert_eq!(payload["games"]["test"]["mean"], json!(0.5), "{payload}");
         assert_eq!(payload["games"]["test"]["upper"], json!(1.0), "{payload}");
         assert_eq!(payload["games"]["spread_mean"], json!(null), "{payload}");
-        assert_eq!(payload["games"]["win_pct"], json!(0.0), "{payload}");
         assert_eq!(payload["tasks_total"], 0);
         assert_eq!(payload["eta_seconds"], json!(null));
     }
@@ -748,7 +743,7 @@ async fn a_job_completes_on_the_batch_that_decides_and_not_before() {
     assert_eq!(test.status, TestStatus::Player1Better);
     assert_eq!(job_status(&db, job).await, "completed");
 
-    // I-STATS-9b: the verdict it completed on is stored with the completion,
+    // I-STATS-9e: the verdict it completed on is stored with the completion,
     // beside the live figures that results still in flight can go on moving.
     let (_, body) = send(&app, get_request(&format!("/api/jobs/{job}"), &[])).await;
     let decided = &body["games"]["decided"];
@@ -780,7 +775,7 @@ async fn a_job_whose_player_2_is_better_completes_saying_so() {
     assert_eq!(body["completion"]["reason"], json!("player2_better"), "{body}");
 }
 
-/// I-STATS-9h (no test): a job that runs no test plays to its target. A
+/// I-STATS-9g (no test): a job that runs no test plays to its target. A
 /// 90-10 batch past its floor -- one that completes a job with a test, above
 /// -- is just games played, and the batch that reaches `max_games` completes
 /// it, with no verdict stored and none reported.

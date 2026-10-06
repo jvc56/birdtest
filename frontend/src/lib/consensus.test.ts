@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { analysesPerRack, consensusProblem, rackConsensus } from './consensus';
+import {
+  analysesPerRack,
+  consensusFields,
+  consensusProblem,
+  rackConsensus,
+  type ConsensusSettings
+} from './consensus';
 
 describe('F-CONS-1 analysesPerRack', () => {
   it('says one for a job wanting one analysis per rack, and the range and share otherwise', () => {
@@ -39,19 +45,46 @@ describe('F-CONS-3 consensusProblem', () => {
     max_results_per_rack: max,
     consensus_pct: pct
   });
-  it('accepts what the server accepts', () => {
+  it('accepts what the server accepts of the fields sent', () => {
     expect(consensusProblem(settings(1, 1, 100))).toBeNull();
-    // One analysis per rack seeks no agreement, so its share is not checked.
-    expect(consensusProblem(settings(1, 1, 10))).toBeNull();
     expect(consensusProblem(settings(2, 5, 80))).toBeNull();
     expect(consensusProblem(settings(3, 3, 100))).toBeNull();
+    expect(consensusProblem(settings(2, 3, 50.5))).toBeNull();
+    // At one analysis per rack the share is not sent, so a share the server
+    // would refuse is not checked: it checks its own default or stored one.
+    expect(consensusProblem(settings(1, 1, 10))).toBeNull();
   });
-  it('refuses what the server refuses', () => {
+  it('refuses what the server refuses of the fields sent', () => {
     expect(consensusProblem(settings(0, 1, 80))).toMatch(/fewest/);
     expect(consensusProblem(settings(1.5, 2, 80))).toMatch(/fewest/);
     expect(consensusProblem(settings(3, 2, 80))).toMatch(/most/);
     expect(consensusProblem(settings(1, 101, 80))).toMatch(/most/);
     expect(consensusProblem(settings(2, 3, 50))).toMatch(/share/);
     expect(consensusProblem(settings(2, 3, 100.5))).toMatch(/share/);
+    expect(consensusProblem(settings(2, 3, NaN))).toMatch(/share/);
+  });
+  it('checks the fewest and most whatever the most', () => {
+    // The job form once sent these as one analysis per rack, unrefused.
+    expect(consensusProblem(settings(3, 1, 80))).toMatch(/most/);
+    expect(consensusProblem(settings(1, 0, 80))).toMatch(/most/);
+  });
+});
+
+describe('F-CONS-4 consensusFields', () => {
+  it('sends the share only past one analysis per rack', () => {
+    expect(
+      consensusFields({ min_results_per_rack: 1, max_results_per_rack: 1, consensus_pct: 40 })
+    ).toEqual({ min_results_per_rack: 1, max_results_per_rack: 1 });
+    expect(
+      consensusFields({ min_results_per_rack: 2, max_results_per_rack: 5, consensus_pct: 80 })
+    ).toEqual({ min_results_per_rack: 2, max_results_per_rack: 5, consensus_pct: 80 });
+  });
+  it('sends numbers whatever the input bound', () => {
+    const typed = { min_results_per_rack: '2', max_results_per_rack: '3', consensus_pct: '75' };
+    expect(consensusFields(typed as unknown as ConsensusSettings)).toEqual({
+      min_results_per_rack: 2,
+      max_results_per_rack: 3,
+      consensus_pct: 75
+    });
   });
 });

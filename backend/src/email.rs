@@ -340,24 +340,19 @@ mod tests {
 
     /// The alarm on failed mail (infra/ses.tf) matches a field in the log
     /// line: every send's failure must carry it, and the filter must still
-    /// look for it.
+    /// look for it. The sources are compiled in, as a unit test's fixtures are.
     #[test]
     fn every_failed_send_is_logged_as_the_alarm_expects() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let infra = std::fs::read_to_string(root.join("../infra/ses.tf")).unwrap();
+        let infra = include_str!("../../infra/ses.tf");
         assert!(infra.contains(r#"pattern        = "{ $.fields.alarm = \"mail_failed\" }""#));
         // Without whitespace, so that a call split across lines counts.
-        let auth: String = std::fs::read_to_string(root.join("src/routes/auth.rs"))
-            .unwrap()
-            .split_whitespace()
-            .collect();
+        let auth: String = include_str!("routes/auth.rs").split_whitespace().collect();
         let sends = auth.matches("mailer.send(").count() + auth.matches("mailer.send_within(").count();
         assert!(sends >= 3, "{sends}");
         assert_eq!(auth.matches(r#"tracing::error!(alarm="mail_failed","#).count(), sends);
         // And the queue's own failures: SES's answer, a mail that waited too long.
-        let email = std::fs::read_to_string(root.join("src/email.rs")).unwrap();
         // The code, not these tests, which spell the pattern out.
-        let code = email.split("#[cfg(test)]").next().unwrap();
+        let code = include_str!("email.rs").split("#[cfg(test)]").next().unwrap();
         let email: String = code.split_whitespace().collect();
         assert_eq!(email.matches(r#"tracing::error!(alarm="mail_failed","#).count(), 2);
     }

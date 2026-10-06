@@ -3,6 +3,7 @@ use crate::auth::{csrf, AdminUser};
 use crate::backups::{self, BackupStatus};
 use crate::extract::ApiJson;
 use crate::error::{AppError, AppResult};
+use crate::jobs::leave_gen::RACK_SIZE;
 use crate::jobs::registry;
 use crate::models::job::{ConsensusSettings, Job, JobStatus, JobType, OpeningRackConfig, PlayerConfig};
 use crate::state::AppState;
@@ -451,6 +452,14 @@ struct FleetVersion {
 /// What the field is running, over the last week. This is the evidence for
 /// raising a job's floor: the difference between doing it on evidence and doing
 /// it on hope.
+///
+/// The week's completed claims and the claims open now, each through its own
+/// partial index (`task_claims_completed_idx`, `task_claims_open_idx`), so the
+/// read is a week of the fleet's work whatever the table's age. It was every
+/// claim claimed in the week, which no index serves (KL-32): a sequential scan
+/// of every claim ever made, on the main pool with no timeout. A claim that
+/// lapsed or was declined is not counted. On the display pool, for its
+/// statement timeout and to keep the read off the connections claims use.
 async fn fleet(
     State(state): State<AppState>,
     _admin: AdminUser,
@@ -461,12 +470,17 @@ async fn fleet(
                     COUNT(DISTINCT COALESCE(claimed_by_user_id, claimed_by_anon_uuid))
                         AS workers,
                     COUNT(*) AS claims
-             FROM task_claims
-             WHERE claimed_at > now() - interval '7 days'
+             FROM (SELECT magpie_version, claimed_by_user_id, claimed_by_anon_uuid
+                   FROM task_claims
+                   WHERE state = 'completed' AND completed_at > now() - interval '7 days'
+                   UNION ALL
+                   SELECT magpie_version, claimed_by_user_id, claimed_by_anon_uuid
+                   FROM task_claims
+                   WHERE state = 'claimed' AND claimed_at > now() - interval '7 days') c
              GROUP BY magpie_version
              ORDER BY workers DESC",
         )
-        .fetch_all(&state.pool)
+        .fetch_all(&state.read_pool)
         .await?,
     ))
 }
@@ -645,6 +659,10 @@ fn resolve_solver_settings(body: &CreatePlayerConfigBody) -> AppResult<SolverSet
         };
     }
 
+    // MAGPIE's own check is 1 to 16 stages of 2 to `i32::MAX` plays; the
+    // order rule is birdtest's. The one stage `[2147483647]` is MAGPIE's
+    // exhaustive mode (`-pegtopk all`), accepted: it ranks every play at 40
+    // plies, which plausibility allows a pre-endgame.
     let top_k = body.peg_stage_top_k.clone().unwrap_or_else(|| defaults::PEG_STAGE_TOP_K.to_vec());
     if top_k.is_empty() || top_k.len() > MAGPIE_MAX_PEG_STAGES {
         err = err.with_field(
@@ -822,6 +840,17 @@ async fn create_player_config(
                  contributor's hardware, so the iteration budget bounds a simulation instead",
             );
         }
+        // The other way to a simmer that never simulates: autoplay's move
+        // list holds `num_plays` plays, and with one MAGPIE plays it without
+        // simulating (`get_top_simming_move`), every turn -- a static player
+        // pinned, rated and labelled as a simmer.
+        if body.num_plays.unwrap_or(crate::magpie_defaults::NUM_PLAYS) < 2 {
+            err = err.with_field(
+                "num_plays",
+                "a simming player needs at least 2 candidate plays: with one, MAGPIE plays it \
+                 without simulating",
+            );
+        }
         if !err.fields.is_empty() {
             return Err(err);
         }
@@ -997,6 +1026,8 @@ fn validate_player_config_body(body: &CreatePlayerConfigBody) -> AppResult<()> {
     let mut err = AppError::bad_request("player config is invalid");
     if body.name.trim().is_empty() {
         err = err.with_field("name", "must not be empty");
+    } else if let Some(problem) = name_problem(body.name.trim()) {
+        err = err.with_field("name", problem);
     }
     let positive = [
         ("max_iterations", body.max_iterations),
@@ -1085,6 +1116,12 @@ fn validate_player_config_body(body: &CreatePlayerConfigBody) -> AppResult<()> {
 
 /// Player configs are immutable, so there is no update endpoint; deletion is
 /// only allowed while nothing references the config.
+///
+/// Left unindexed on purpose: the request tables, `player_config_ratings` and
+/// `rating_run_residuals` have no index leading with the config, so the check
+/// below and the delete's foreign-key probes scan them. A delete is a rare
+/// admin act on an unused config, and an index would cost an entry on every
+/// request row and every fit (thirty-third audit, pass 1).
 async fn delete_player_config(
     State(state): State<AppState>,
     admin: AdminUser,
@@ -1489,16 +1526,23 @@ fn games_batch_field(mut err: AppError, unit: &str, games_per_unit: i32, batch: 
     err
 }
 
-/// Settings the schema cannot express and no worker or test could run with.
-///
-/// Each of these used to be accepted and fail later, far from the admin who
-/// typed it: a `games_per_batch` of 0 makes every claim generate the seed the
-/// previous claim already took, so the job retries a unique-index violation
-/// forever and dispatches nothing; a confidence of 100% puts a logarithm of
-/// zero in the test's interval, which then never closes. Every problem is
-/// reported at once, like registration does.
-/// The longest job name, in characters (the column's check).
-const MAX_JOB_NAME_CHARS: usize = 100;
+/// The longest name a job, player config or rating pool takes, in characters
+/// (each column's check).
+const MAX_NAME_CHARS: usize = 100;
+
+/// What is wrong with a name as stored (trimmed), if anything. Shown in every
+/// list that names it, in job settings and as a page title: a line, not a
+/// document, and nothing that breaks or hides in one. A player config's and a
+/// pool's name took any text until the thirty-third audit (pass 1).
+pub(crate) fn name_problem(name: &str) -> Option<String> {
+    if name.chars().count() > MAX_NAME_CHARS {
+        Some(format!("at most {MAX_NAME_CHARS} characters"))
+    } else if name.chars().any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')) {
+        Some("one line, with no control characters".into())
+    } else {
+        None
+    }
+}
 
 /// The job's name as stored: trimmed, empty when none was given.
 fn job_name(body: &CreateJobBody) -> String {
@@ -1528,23 +1572,34 @@ fn consensus_problems(mut err: AppError, consensus_pct: f64, min: i32, max: i32)
     err
 }
 
+/// The largest bingo bonus a job may set; real variants use 0 to 50.
+const MAX_BINGO_BONUS: i32 = 500;
+
+/// Settings the schema cannot express and no worker or test could run with.
+///
+/// Each of these used to be accepted and fail later, far from the admin who
+/// typed it: a `games_per_batch` of 0 makes every claim generate the seed the
+/// previous claim already took, so the job retries a unique-index violation
+/// forever and dispatches nothing; a confidence of 100% puts a logarithm of
+/// zero in the test's interval, which then never closes. Every problem is
+/// reported at once, like registration does.
 fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
     let mut err = AppError::bad_request("job settings are invalid");
-    let name = job_name(body);
-    // Shown in every job list and as the job page's title: a line, not a
-    // document, and nothing that breaks or hides in one.
-    if name.chars().count() > MAX_JOB_NAME_CHARS {
-        err = err.with_field("name", format!("at most {MAX_JOB_NAME_CHARS} characters"));
-    } else if name.chars().any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')) {
-        err = err.with_field("name", "one line, with no control characters");
+    if let Some(problem) = name_problem(&job_name(body)) {
+        err = err.with_field("name", problem);
     }
     if !matches!(body.variant.as_str(), "classic" | "wordsmog") {
         err = err.with_field("variant", "must be 'classic' or 'wordsmog'");
     }
     // MAGPIE takes any integer, but a bonus that takes points away from a
-    // bingo is a typo, not a variant anyone plays.
-    if body.bingo_bonus.is_some_and(|b| b < 0) {
-        err = err.with_field("bingo_bonus", "must not be negative");
+    // bingo is a typo, not a variant anyone plays -- and so is one in the
+    // thousands, which the plausibility bounds, absolute and set for an
+    // ordinary bonus, would refuse on every honest batch. The column's CHECK.
+    if body.bingo_bonus.is_some_and(|b| !(0..=MAX_BINGO_BONUS).contains(&b)) {
+        err = err.with_field(
+            "bingo_bonus",
+            format!("must be between 0 and {MAX_BINGO_BONUS}"),
+        );
     }
     if let Some(cutoff) = body.sim_cutoff {
         // The range MAGPIE's -cutoff accepts, and the column's CHECK.
@@ -1626,8 +1681,8 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
                     format!("must be between 1 and {MAX_RACKS_PER_BATCH}"),
                 );
             }
-            if !(1..=7).contains(rack_size) {
-                err = err.with_field("rack_size", "must be between 1 and 7");
+            if !(1..=RACK_SIZE as i32).contains(rack_size) {
+                err = err.with_field("rack_size", format!("must be between 1 and {RACK_SIZE}"));
             }
             consensus_problems(err, *consensus_pct, *min_results_per_rack, *max_results_per_rack)
         }
@@ -1798,12 +1853,18 @@ async fn validate_opening_rack_player(
     Ok(())
 }
 
-/// MAGPIE has one value for these for the whole run, not one per player, even
-/// though they live on `player_configs` (so that table stays the exhaustive
+/// MAGPIE has one win% model for the whole run, not one per player, even
+/// though it lives on `player_configs` (so that table stays the exhaustive
 /// source of what a job asked for -- see the migration comment on
-/// `winpct_id`/`movegen_margin`). A `games`/`game_pairs` job whose two
-/// player configs disagree on one of these can't be honored, so job creation
-/// rejects it here rather than leaving one worker's value to win silently.
+/// `winpct_id`). A `games`/`game_pairs` job whose two player configs disagree
+/// on it can't be honored, so job creation rejects it here rather than
+/// leaving one worker's value to win silently.
+///
+/// `movegen_margin` is not compared: autoplay generates every move with a
+/// margin of 0 and its own record type, so in a games or pairs job a player's
+/// margin (and recorder) is never read -- only an opening-rack static analysis
+/// reads them. Refusing two margins refused a job over a difference that
+/// changes nothing it plays.
 ///
 /// The win% model is compared by `input_data` id rather than by name: the id
 /// is what pins the bytes, and two rows can share a name across tarball
@@ -1817,8 +1878,7 @@ async fn validate_shared_player_options(
         return Ok(());
     }
     let row = sqlx::query(
-        "SELECT p1.winpct_id AS p1_winpct_id, p2.winpct_id AS p2_winpct_id,
-                p1.movegen_margin AS p1_movegen_margin, p2.movegen_margin AS p2_movegen_margin
+        "SELECT p1.winpct_id AS p1_winpct_id, p2.winpct_id AS p2_winpct_id
          FROM player_configs p1, player_configs p2
          WHERE p1.id = $1 AND p2.id = $2",
     )
@@ -1841,13 +1901,6 @@ async fn validate_shared_player_options(
             "player configs disagree on the win% model, which MAGPIE cannot vary per player",
         ));
     }
-    let p1_movegen_margin: f64 = row.get("p1_movegen_margin");
-    let p2_movegen_margin: f64 = row.get("p2_movegen_margin");
-    if p1_movegen_margin != p2_movegen_margin {
-        return Err(AppError::bad_request(
-            "player configs disagree on movegen_margin, which MAGPIE cannot vary per player",
-        ));
-    }
     Ok(())
 }
 
@@ -1867,7 +1920,7 @@ async fn validate_capture_play_cap(
     // How many plays and plies a captured position keeps is one setting for
     // the whole run in MAGPIE, which reads both from player 1: player 2's
     // would be shown on the job page and never applied. So they must agree,
-    // as `movegen_margin` must (see `validate_shared_player_options`).
+    // as the win% model must (see `validate_shared_player_options`).
     let recorded = sqlx::query_as::<_, (Uuid, i32, i32)>(
         "SELECT id, num_plays_recorded, num_plies_recorded FROM player_configs WHERE id = ANY($1)",
     )
@@ -2188,7 +2241,7 @@ async fn insert_job_config(
             // distribution, so one whose racks cannot be spelt is refused now
             // rather than at the first claim.
             let job_data = crate::jobs::load_job_data(&mut *conn, job.id).await?;
-            crate::jobs::racks::RackIndex::new(&job_data.letterdist, crate::jobs::leave_gen::RACK_SIZE)?;
+            crate::jobs::racks::RackIndex::new(&job_data.letterdist, RACK_SIZE)?;
             sqlx::query(
                 "INSERT INTO job_leave_config
                      (job_id, player_config_id, num_iterations,
@@ -2248,7 +2301,7 @@ async fn activate_job(
 
     let mut tx = state.pool.begin().await?;
     let job = load_job_for_update(&mut tx, id).await?;
-    refuse_if_purged_since(&state, id, purges)?;
+    refuse_if_purged_since(&state.dispatch_holds, id, purges)?;
     if job.status == JobStatus::Completed {
         return Err(AppError::conflict("a completed job cannot be reactivated"));
     }
@@ -2419,7 +2472,7 @@ async fn set_allocations(
                     "the job is completed, and a completed job cannot be reactivated",
                 )
             }
-            Some(_) => refuse_if_purged_since(&state, row.job_id, purges[&row.job_id])?,
+            Some(_) => refuse_if_purged_since(&state.dispatch_holds, row.job_id, purges[&row.job_id])?,
         }
     }
     if !err.fields.is_empty() {
@@ -2496,7 +2549,7 @@ async fn set_allocations(
             }
             changed.push(row.job_id);
         } else if active {
-            sqlx::query("UPDATE jobs SET status = 'inactive', deactivated_at = now() WHERE id = $1")
+            sqlx::query("UPDATE jobs SET status = 'inactive' WHERE id = $1")
                 .bind(row.job_id)
                 .execute(&mut *tx)
                 .await?;
@@ -2550,15 +2603,17 @@ async fn deactivate_job(
 
     let mut tx = state.pool.begin().await?;
     let before = load_job_for_update(&mut tx, id).await?;
-    refuse_if_purged_since(&state, id, purges)?;
-    // Completion is final. Flipping a completed job to inactive would be a
-    // way around that rule: activation only refuses jobs that are *currently*
-    // completed, so deactivate-then-activate would restart it.
+    refuse_if_purged_since(&state.dispatch_holds, id, purges)?;
+    // Completion is final as far as the lifecycle actions go (only a purge,
+    // or an opening-rack job's consensus edit, takes a job out of it).
+    // Flipping a completed job to inactive would be a way around that rule:
+    // activation only refuses jobs that are *currently* completed, so
+    // deactivate-then-activate would restart it.
     if before.status == JobStatus::Completed {
         return Err(AppError::conflict("a completed job cannot be deactivated"));
     }
     let job = sqlx::query_as::<_, Job>(
-        "UPDATE jobs SET status = 'inactive', deactivated_at = now() WHERE id = $1 RETURNING *",
+        "UPDATE jobs SET status = 'inactive' WHERE id = $1 RETURNING *",
     )
     .bind(id)
     .fetch_one(&mut *tx)
@@ -2591,7 +2646,7 @@ async fn complete_job(
 
     let mut tx = state.pool.begin().await?;
     let before = load_job_for_update(&mut tx, id).await?;
-    refuse_if_purged_since(&state, id, purges)?;
+    refuse_if_purged_since(&state.dispatch_holds, id, purges)?;
     // Already completed -- by the server's own finish check, say, while the
     // admin's page was stale -- is a conflict, not a second completion on
     // record (the audit's pass 23).
@@ -2614,7 +2669,10 @@ async fn complete_job(
     )
     .await?;
     tx.commit().await?;
-    // Completion is final: the job's finish-check counters are never read again.
+    // Nothing checks a completed job, so its finish-check counters go. Not
+    // final for an opening-rack job: a consensus edit that unsettles racks
+    // reopens it (and, force-completed mid-first-pass, it then resumes that
+    // pass; see `update_consensus`), and its counters start afresh.
     state.finish_checks.forget(id);
     super::worker::push_after_change(&state, id);
     Ok(Json(job))
@@ -2652,8 +2710,10 @@ struct ConsensusResult {
 /// The job then starts or stops to match. A completed job the change leaves
 /// with unsettled racks is reopened: active at its allocation if the other
 /// active jobs leave room for it, inactive otherwise (the admin then makes
-/// room and activates it), and its final exports become snapshots, since the
-/// job will have a new final corpus once it completes again. An active job
+/// room and activates it). Either way a completed job's final exports become
+/// snapshots, since the standings they carry are the old settings': the job
+/// has a new final corpus once it completes again, or, left completed, once
+/// it is exported again. An active job
 /// the change leaves with every rack settled completes now, or with its last
 /// in-flight claim's submission. An inactive job keeps its status, and
 /// completes when next activated if there is nothing left for it to do.
@@ -2665,6 +2725,27 @@ struct ConsensusResult {
 /// starts after reads the new settings once this commits); then the job's
 /// row. Claims and submissions read the settings fresh rather than from the
 /// job's cached template, which keeps them as the job was created.
+///
+/// And under the hold a purge takes (`jobs::DispatchHolds`), on a task of its
+/// own ([`run_to_completion`]), for the same reasons: restating a full
+/// English job rewrites millions of rows, and for that long every claim
+/// considering the job waited out the dispatch lock's bounded wait on a pool
+/// connection, and every submission for one of its claims its five-second
+/// claim lock, which is how a purge used to fill the pool. With the hold,
+/// claims skip the job, those submissions are answered `503` at once, and a
+/// second edit, a purge or a lifecycle action meanwhile is a `409`. The hold
+/// is not counted as a purge (it is not one: the finish check's purge
+/// witness must not see it), and it always ends with the reclaim grace,
+/// committed or not: the job's claims outlive an edit, and their heartbeats
+/// were skipped while it held them.
+///
+/// So the request is checked, and one that changes nothing answered, before
+/// any of that is taken, and checked again under the locks (the settings may
+/// have changed between). Checked only under them, a refused edit -- a games
+/// job, a typo in the share -- or a double click's second, unchanged one
+/// still held the job's claims and submissions off while it locked them, and
+/// ended with the grace: its lapsed claims, a games job's included, were not
+/// reclaimed for a heartbeat timeout.
 async fn update_consensus(
     State(state): State<AppState>,
     admin: AdminUser,
@@ -2675,53 +2756,48 @@ async fn update_consensus(
     ApiJson(body): ApiJson<ConsensusBody>,
 ) -> AppResult<Json<ConsensusResult>> {
     csrf::verify(&method, &headers, &jar)?;
-    let purges = refuse_while_purging(&state, id)?;
+    {
+        let mut conn = state.pool.acquire().await?;
+        let job = sqlx::query_as::<_, Job>("SELECT * FROM jobs WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&mut *conn)
+            .await?
+            .ok_or_else(|| AppError::not_found("no such job"))?;
+        let (before, new) = consensus_request(&mut conn, &job, &body, false).await?;
+        if new == before.consensus() {
+            return Ok(Json(unchanged_consensus(&mut conn, job, before).await?));
+        }
+    }
+    // Read before the hold is taken, for the check under the row lock below.
+    let purges = state.dispatch_holds.claims_holds_taken(id);
+    let hold = state
+        .dispatch_holds
+        .try_hold_claims_uncounted(id, state.cfg.heartbeat_timeout)
+        .ok_or_else(|| AppError::conflict(ALREADY_RUNNING))?;
+    run_to_completion(consensus_body(state, admin.0.id, id, body, purges, hold)).await
+}
 
+async fn consensus_body(
+    state: AppState,
+    admin_id: Uuid,
+    id: Uuid,
+    body: ConsensusBody,
+    purges: u64,
+    hold: crate::jobs::DispatchHold,
+) -> AppResult<Json<ConsensusResult>> {
     let mut tx = state.pool.begin().await?;
     crate::jobs::lock_job_dispatch(&mut tx, id).await?;
     lock_open_claims(&mut tx, id).await?;
     let job = load_job_for_update(&mut tx, id).await?;
-    refuse_if_purged_since(&state, id, purges)?;
-    if job.job_type != JobType::OpeningRack {
-        return Err(AppError::bad_request("only an opening-rack job has consensus settings"));
+    // By count alone: the claims hold held now is this edit's own, and no
+    // other can be taken while it is.
+    if state.dispatch_holds.claims_holds_taken(id) != purges {
+        return Err(AppError::conflict(PURGED_WHILE_WAITING));
     }
-    let before = sqlx::query_as::<_, OpeningRackConfig>(
-        "SELECT * FROM job_opening_rack_config WHERE job_id = $1 FOR UPDATE",
-    )
-    .bind(id)
-    .fetch_one(&mut *tx)
-    .await?;
+    let (before, new) = consensus_request(&mut tx, &job, &body, true).await?;
     let old = before.consensus();
-    let new = ConsensusSettings {
-        consensus_pct: body.consensus_pct.unwrap_or(old.consensus_pct),
-        min_results_per_rack: body.min_results_per_rack.unwrap_or(old.min_results_per_rack),
-        max_results_per_rack: body.max_results_per_rack.unwrap_or(old.max_results_per_rack),
-    };
-    let err = consensus_problems(
-        AppError::bad_request("consensus settings are invalid"),
-        new.consensus_pct,
-        new.min_results_per_rack,
-        new.max_results_per_rack,
-    );
-    if !err.fields.is_empty() {
-        return Err(err);
-    }
-    validate_opening_rack_player(&mut tx, before.player_config_id, new.max_results_per_rack).await?;
-
     if new == old {
-        let unsettled: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM opening_rack_progress WHERE job_id = $1 AND NOT settled",
-        )
-        .bind(id)
-        .fetch_one(&mut *tx)
-        .await?;
-        return Ok(Json(ConsensusResult {
-            job,
-            config: before,
-            unsettled_racks: unsettled,
-            reopened: false,
-            reopened_inactive_reason: None,
-        }));
+        return Ok(Json(unchanged_consensus(&mut tx, job, before).await?));
     }
 
     let config = sqlx::query_as::<_, OpeningRackConfig>(
@@ -2750,7 +2826,7 @@ async fn update_consensus(
     audit::log_detail(
         &mut tx,
         "job.consensus_changed",
-        admin.0.id,
+        admin_id,
         "job",
         id.to_string(),
         Some(id),
@@ -2758,9 +2834,14 @@ async fn update_consensus(
     )
     .await?;
 
-    // A completed job with racks to analyse again goes back to work. The
-    // first pass is covered (a job completes only once every rack is
-    // settled), so what it hands out now are the unsettled racks.
+    // A completed job with racks to analyse again goes back to work. A job
+    // the server completed has its first pass covered (it completes only
+    // once every rack is settled), so what it hands out now are the
+    // unsettled racks. One an admin force-completed may not: `next_request`
+    // resumes its first pass where it stopped before it reissues anything.
+    // That is the behaviour as built; whether an edit should undo a
+    // force-complete at all is an open question (PLAN.md, "Editing the
+    // consensus").
     let mut reopened_inactive_reason = None;
     let reopened = job.status == JobStatus::Completed && unsettled > 0;
     if reopened {
@@ -2803,12 +2884,20 @@ async fn update_consensus(
         audit::log_status_change(
             &mut tx,
             if fits { "job.activated" } else { "job.deactivated" },
-            admin.0.id,
+            admin_id,
             id,
             "completed",
             if fits { "active" } else { "inactive" },
         )
         .await?;
+    }
+    // Any change to a completed job's settings, not only one that reopens
+    // it: each line of an export carries its rack's standing under the
+    // settings it was read with, and an edit that leaves every rack settled
+    // still restates them (a lower share turns racks settled without a
+    // consensus into agreed ones). Left final, the export went on being
+    // served as the completed job's corpus with the old standings.
+    if job.status == JobStatus::Completed {
         crate::exports::unfinalize(&mut tx, id).await?;
     }
     let job = sqlx::query_as::<_, Job>("SELECT * FROM jobs WHERE id = $1")
@@ -2816,12 +2905,25 @@ async fn update_consensus(
         .fetch_one(&mut *tx)
         .await?;
     tx.commit().await?;
+    // Released before the finish check: its purge witness takes a job whose
+    // claims are held for one being purged, and would roll the completion
+    // back. Not `committed()`: see above.
+    drop(hold);
 
+    // After the commit, nothing here is the edit failing: it committed, and
+    // a 5xx would skip the finish check below and invite a second edit.
+    // Logged instead, as the purge does.
     if job.status == JobStatus::Active {
         if reopened {
             // As activation does: the builder may have moved since the job
             // last dispatched.
-            request_derived_data(&state, id).await?;
+            if let Err(err) = request_derived_data(&state, id).await {
+                tracing::error!(
+                    job_id = %id, error = %err.message,
+                    "could not queue a reopened job's derived file builds; deactivating and \
+                     activating it queues them"
+                );
+            }
         }
         // A check paced out under the old settings must not delay the one
         // that can now complete it -- or wait on racks they unsettled.
@@ -2835,8 +2937,70 @@ async fn update_consensus(
         }
     }
     super::worker::push_after_change(&state, id);
-    let job = crate::jobstats::load_job(&state.pool, id).await?;
+    // The job as the finish check left it, or else as the edit committed it.
+    let job = match crate::jobstats::load_job(&state.pool, id).await {
+        Ok(job) => job,
+        Err(err) => {
+            tracing::warn!(job_id = %id, error = %err.message, "reloading an edited job failed; answering with it as committed");
+            job
+        }
+    };
     Ok(Json(ConsensusResult { job, config, unsettled_racks: unsettled, reopened, reopened_inactive_reason }))
+}
+
+/// An edit's request, checked: the job's settings as they stand (`FOR UPDATE`
+/// when `lock`), and what the body makes of them. Only an opening-rack job
+/// has them, and the result must be what creation would accept.
+async fn consensus_request(
+    conn: &mut sqlx::PgConnection,
+    job: &Job,
+    body: &ConsensusBody,
+    lock: bool,
+) -> AppResult<(OpeningRackConfig, ConsensusSettings)> {
+    if job.job_type != JobType::OpeningRack {
+        return Err(AppError::bad_request("only an opening-rack job has consensus settings"));
+    }
+    let before = sqlx::query_as::<_, OpeningRackConfig>(if lock {
+        "SELECT * FROM job_opening_rack_config WHERE job_id = $1 FOR UPDATE"
+    } else {
+        "SELECT * FROM job_opening_rack_config WHERE job_id = $1"
+    })
+    .bind(job.id)
+    .fetch_one(&mut *conn)
+    .await?;
+    let old = before.consensus();
+    let new = ConsensusSettings {
+        consensus_pct: body.consensus_pct.unwrap_or(old.consensus_pct),
+        min_results_per_rack: body.min_results_per_rack.unwrap_or(old.min_results_per_rack),
+        max_results_per_rack: body.max_results_per_rack.unwrap_or(old.max_results_per_rack),
+    };
+    let err = consensus_problems(
+        AppError::bad_request("consensus settings are invalid"),
+        new.consensus_pct,
+        new.min_results_per_rack,
+        new.max_results_per_rack,
+    );
+    if !err.fields.is_empty() {
+        return Err(err);
+    }
+    validate_opening_rack_player(&mut *conn, before.player_config_id, new.max_results_per_rack).await?;
+    Ok((before, new))
+}
+
+/// The answer to an edit that changes nothing: the job and its settings as
+/// they are, and nothing written.
+async fn unchanged_consensus(
+    conn: &mut sqlx::PgConnection,
+    job: Job,
+    config: OpeningRackConfig,
+) -> AppResult<ConsensusResult> {
+    let unsettled: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM opening_rack_progress WHERE job_id = $1 AND NOT settled",
+    )
+    .bind(job.id)
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(ConsensusResult { job, config, unsettled_racks: unsettled, reopened: false, reopened_inactive_reason: None })
 }
 
 /// What a job is about to lose, as a single line for `audit_log.reason`.
@@ -2844,6 +3008,9 @@ async fn update_consensus(
 /// Counted inside the same transaction as the deletion that follows, so it
 /// describes exactly what that statement removes. Cheap relative to the delete
 /// itself, and the only record of the job's size that survives it.
+/// `rack_standings` are an opening-rack job's `opening_rack_progress` rows
+/// (left out until the October 2026 audit), `rack_progress` a leave job's
+/// `leave_rack_progress`.
 async fn job_census(conn: &mut sqlx::PgConnection, job_id: Uuid) -> AppResult<String> {
     use sqlx::Row;
     let row = sqlx::query(
@@ -2855,6 +3022,7 @@ async fn job_census(conn: &mut sqlx::PgConnection, job_id: Uuid) -> AppResult<St
              (SELECT count(*) FROM leave_records r JOIN tasks t ON t.id = r.task_id
                WHERE t.job_id = $1)                                                AS leave_records,
              (SELECT count(*) FROM position_analysis_records WHERE job_id = $1)     AS positions,
+             (SELECT count(*) FROM opening_rack_progress WHERE job_id = $1)        AS rack_standings,
              (SELECT count(*) FROM leave_rack_progress WHERE job_id = $1)          AS rack_progress,
              (SELECT count(*) FROM leave_rack_staging WHERE job_id = $1)           AS staged_results,
              (SELECT count(*) FROM leave_generation_artifacts WHERE job_id = $1)   AS artifacts",
@@ -2865,12 +3033,13 @@ async fn job_census(conn: &mut sqlx::PgConnection, job_id: Uuid) -> AppResult<St
 
     Ok(format!(
         "tasks={} claims={} game_results={} leave_records={} positions={} \
-rack_progress={} staged_results={} artifacts={}",
+rack_standings={} rack_progress={} staged_results={} artifacts={}",
         row.get::<i64, _>("tasks"),
         row.get::<i64, _>("claims"),
         row.get::<i64, _>("game_results"),
         row.get::<i64, _>("leave_records"),
         row.get::<i64, _>("positions"),
+        row.get::<i64, _>("rack_standings"),
         row.get::<i64, _>("rack_progress"),
         row.get::<i64, _>("staged_results"),
         row.get::<i64, _>("artifacts"),
@@ -3078,8 +3247,11 @@ async fn purge_job(
     run_to_completion(purge_body(state, admin.0.id, id, hold)).await
 }
 
-const ALREADY_RUNNING: &str = "a purge or delete of this job is running; its result will show \
-     on the job's page and in the audit log when it finishes";
+const ALREADY_RUNNING: &str = "a purge, delete or consensus change of this job is running; its \
+     result will show on the job's page and in the audit log when it finishes";
+
+const PURGED_WHILE_WAITING: &str =
+    "the job was purged while this waited for it; look at it again before acting";
 
 /// The hold a purge or delete runs under, taken in the handler: claims skip
 /// the job while it runs, and submissions for its claims are answered at once
@@ -3098,7 +3270,8 @@ fn hold_for_purge_or_delete(state: &AppState, id: Uuid) -> AppResult<crate::jobs
 
 /// Activating, deactivating or completing a job being purged or deleted would
 /// wait out the whole operation on its row with a pool connection held --
-/// and completing it then finished a job the purge had just emptied.
+/// and completing it then finished a job the purge had just emptied. A job
+/// whose consensus is being changed is refused the same way, for the wait.
 /// Returns the job's purge count, for [`refuse_if_purged_since`].
 fn refuse_while_purging(state: &AppState, id: Uuid) -> AppResult<u64> {
     let taken = state.dispatch_holds.claims_holds_taken(id);
@@ -3114,16 +3287,23 @@ fn refuse_while_purging(state: &AppState, id: Uuid) -> AppResult<u64> {
 /// the check exists to prevent. Compared by count, not by whether a hold is
 /// held: a purge of a job with nothing to do after its commit has released
 /// its hold by the time the waiter wakes.
-fn refuse_if_purged_since(state: &AppState, id: Uuid, taken: u64) -> AppResult<()> {
-    if state.dispatch_holds.claims_holds_taken(id) != taken || state.dispatch_holds.claims_held(id) {
-        return Err(AppError::conflict(
-            "the job was purged while this waited for it; look at it again before acting",
-        ));
+///
+/// A hold held with the count unchanged is a consensus edit's, which is not
+/// counted: one that took its hold after the first check and now queues on
+/// this row behind the action. Refused too, since the edit is about to
+/// restate the job, but as running, not as a purge: nothing was purged.
+fn refuse_if_purged_since(holds: &crate::jobs::DispatchHolds, id: Uuid, taken: u64) -> AppResult<()> {
+    if holds.claims_holds_taken(id) != taken {
+        return Err(AppError::conflict(PURGED_WHILE_WAITING));
+    }
+    if holds.claims_held(id) {
+        return Err(AppError::conflict(ALREADY_RUNNING));
     }
     Ok(())
 }
 
-/// Runs a purge or a delete on a task of its own, and waits for it.
+/// Runs a purge, a delete or a consensus edit on a task of its own, and waits
+/// for it.
 ///
 /// Spawned so that a request dropped mid-way -- the load balancer's idle
 /// timeout, the admin closing the tab -- does not drop the transaction with
@@ -3604,7 +3784,8 @@ async fn list_derived_data(
                     concat_ws(', ', k.path || ' (' || k.tarball_date || ')',
                                     v.path || ' (' || v.tarball_date || ')',
                                     l.path || ' (' || l.tarball_date || ')') AS made_from,
-                    d.builder = CASE d.role WHEN 'wmp' THEN $1 ELSE $2 END AS buildable,
+                    d.builder = CASE d.role WHEN 'wmp' THEN $1 WHEN 'rit' THEN $2
+                                            WHEN 'wit' THEN $3 END AS buildable,
                     d.state, d.sha256, d.bytes, d.build_target, d.error, d.attempts,
                     d.requested_at, d.built_at
              FROM derived_data d
@@ -3615,6 +3796,7 @@ async fn list_derived_data(
         )
         .bind(state.builders.wmp())
         .bind(state.builders.rit())
+        .bind(state.builders.wit())
         .fetch_all(&state.pool)
         .await?,
     ))
@@ -3670,7 +3852,7 @@ async fn retry_derived_data(
            AND kwg_id = $4 AND klv_id IS NOT DISTINCT FROM $5 AND letterdist_id = $6
            -- A builder this version has: retried, any other row sat pending
            -- for good.
-           AND builder = CASE role WHEN 'wmp' THEN $7 ELSE $8 END",
+           AND builder = CASE role WHEN 'wmp' THEN $7 WHEN 'rit' THEN $8 WHEN 'wit' THEN $9 END",
     )
     .bind(&body.role)
     .bind(&body.name)
@@ -3680,6 +3862,7 @@ async fn retry_derived_data(
     .bind(letterdist_id)
     .bind(state.builders.wmp())
     .bind(state.builders.rit())
+    .bind(state.builders.wit())
     .execute(&mut *tx)
     .await?
     .rows_affected();
@@ -4103,6 +4286,9 @@ struct AuditRow {
     created_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// On the display pool: a filtered page and its count are sequential scans of
+/// the log (KL-32), so they take its statement timeout and stay off the
+/// connections claims and submissions use.
 async fn audit_log(
     State(state): State<AppState>,
     _admin: AdminUser,
@@ -4125,7 +4311,7 @@ async fn audit_log(
     .bind(query.job_id)
     .bind(limit)
     .bind(offset)
-    .fetch_all(&state.pool)
+    .fetch_all(&state.read_pool)
     .await?;
 
     let total = sqlx::query_scalar::<_, i64>(
@@ -4139,7 +4325,7 @@ async fn audit_log(
     .bind(query.actor_user_id)
     .bind(&query.target_type)
     .bind(query.job_id)
-    .fetch_one(&state.pool)
+    .fetch_one(&state.read_pool)
     .await?;
 
     Ok(Json(super::Page { items: rows, total, page: query.page.max(0), per_page: limit }))
@@ -4164,6 +4350,31 @@ async fn load_job_for_update(conn: &mut sqlx::PgConnection, id: Uuid) -> AppResu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// I-OR-EDIT-6: an action that waited on a job's row is told a purge
+    /// happened only when one did. A consensus edit's hold, which is not
+    /// counted, is refused as running: it read "the job was purged".
+    #[test]
+    fn an_action_that_waited_on_an_edit_is_not_told_the_job_was_purged() {
+        let holds = crate::jobs::DispatchHolds::default();
+        let job = Uuid::new_v4();
+        let grace = std::time::Duration::from_secs(1);
+        let taken = holds.claims_holds_taken(job);
+        assert!(refuse_if_purged_since(&holds, job, taken).is_ok());
+
+        let edit = holds.try_hold_claims_uncounted(job, grace).unwrap();
+        let err = refuse_if_purged_since(&holds, job, taken).unwrap_err();
+        assert_eq!((err.status, err.message.as_str()), (StatusCode::CONFLICT, ALREADY_RUNNING));
+        drop(edit);
+        assert!(refuse_if_purged_since(&holds, job, taken).is_ok());
+
+        let purge = holds.try_hold_claims(job, grace).unwrap();
+        let err = refuse_if_purged_since(&holds, job, taken).unwrap_err();
+        assert_eq!(err.message, PURGED_WHILE_WAITING);
+        drop(purge);
+        let err = refuse_if_purged_since(&holds, job, taken).unwrap_err();
+        assert_eq!(err.message, PURGED_WHILE_WAITING, "by count, after the hold is gone");
+    }
 
     /// Nothing MAGPIE's loader (`board_layout.c`) refuses is accepted, and what
     /// it loads is too, but for parser quirks birdtest is stricter about (e.g. a
@@ -4435,6 +4646,23 @@ mod tests {
         assert!(validate_job_body(&body(leave.clone())).is_ok());
         leave["racks_per_task"] = serde_json::json!(MAX_RACKS_PER_TASK + 1);
         assert_eq!(fields(validate_job_body(&body(leave))), ["racks_per_task"]);
+    }
+
+    /// An opening rack holds at least a tile and at most the full rack every
+    /// build is held to; the bound is the one constant, not a second seven.
+    #[test]
+    fn an_opening_rack_is_one_tile_to_a_full_rack() {
+        let racks = |rack_size: i32| {
+            body(serde_json::json!({
+                "job_type": "opening_rack",
+                "player_config_id": Uuid::nil(),
+                "rack_size": rack_size,
+            }))
+        };
+        assert!(validate_job_body(&racks(1)).is_ok());
+        assert!(validate_job_body(&racks(RACK_SIZE as i32)).is_ok());
+        assert_eq!(fields(validate_job_body(&racks(0))), ["rack_size"]);
+        assert_eq!(fields(validate_job_body(&racks(RACK_SIZE as i32 + 1))), ["rack_size"]);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
   import { api, errorText, type ImportDetail, type InputData } from '$lib/api';
-  import { refreshSession } from '$lib/auth';
+  import { resetSession } from '$lib/auth';
   import { createImportWatcher } from '$lib/importWatch';
 
   let files: InputData[] = [];
@@ -58,9 +58,10 @@
     },
     onError: (e) => (error = errorText(e)),
     forget: () => remember(null),
-    // Refreshed, the session store lets the admin layout send the admin to
-    // sign in and back here, where the kept id resumes.
-    signedOut: () => refreshSession()
+    // Asked again from unresolved, the session store lets the admin layout
+    // send the admin to sign in and back here, where the kept id resumes; a
+    // `/api/me` that cannot answer yet is asked until it does.
+    signedOut: () => resetSession()
   });
 
   // The import in this browser's storage, if any, is watched again: its first

@@ -176,7 +176,7 @@ async fn try_next_step(db: &TestDb, job: Uuid) -> birdtest::error::AppResult<Ste
     let player = birdtest::jobs::load_player_spec(&mut tx, config.player_config_id)
         .await
         .unwrap();
-    assert!(leave_gen::lock_claim_decisions(&mut tx, job).await.unwrap());
+    assert!(birdtest::jobs::try_lock_job_dispatch(&mut tx, job).await.unwrap());
     let step = match leave_gen::next_step(&mut tx, job, &config, &job_data, &player).await? {
         LeaveGenStep::Dispatch(request) => Step::Dispatch {
             generation: request.generation,

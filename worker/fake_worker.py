@@ -32,21 +32,23 @@ import uuid
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
-import requests
-
 logger = logging.getLogger("fake-worker")
+
+# The version every claim reports: past any floor a job sets, so the fake is
+# offered every job, and the floor filter is tested in the Rust tiers.
+MAGPIE_VERSION = "99.0.0"
 
 
 @dataclass
 class Stats:
     claimed: int = 0
-    declined: int = 0
     shutdown: int = 0
     submitted: int = 0
     accepted: int = 0
     rejected: int = 0
     no_work: int = 0
     rate_limited: int = 0
+    unavailable: int = 0
     errors: int = 0
     lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -56,11 +58,11 @@ class Stats:
 
     def summary(self) -> str:
         return (
-            f"claimed={self.claimed} declined={self.declined} "
+            f"claimed={self.claimed} "
             f"shutdown={self.shutdown} submitted={self.submitted} "
             f"accepted={self.accepted} rejected={self.rejected} "
             f"no_work={self.no_work} rate_limited={self.rate_limited} "
-            f"errors={self.errors}"
+            f"unavailable={self.unavailable} errors={self.errors}"
         )
 
 
@@ -287,50 +289,82 @@ class _SyntheticGame:
         self.on_turn = 1 - seat
 
 
+def _simulates(player: dict) -> bool:
+    """Whether MAGPIE simulates a turn of this player's: it does when the
+    player has plies to simulate, and ranks statically when it has none."""
+    return (player.get("num_plies") or 0) > 0
+
+
+def _ranked_move(rng: random.Random, move: dict, player: dict, plies_recorded: int) -> dict:
+    """One ranked move as MAGPIE writes it for `player`.
+
+    A simulated move carries how often the simulation played it out, its win
+    percentage, its blended utility and per-ply statistics, as many plies as
+    the player simulates and are recorded; a static player's carries 0
+    iterations and nothing more. The server refuses either shape from the
+    other player (`plausibility::check_analysis`,
+    `check_analyses_against_players`).
+    """
+    entry = {"move": move["move"], "score": move["score"], "equity": move["equity"], "iterations": 0}
+    if not _simulates(player):
+        return entry
+    # Most for the leaders, in a real simulation.
+    entry["iterations"] = rng.randint(20, 400)
+    entry["win_percentage"] = round(rng.uniform(20, 80), 3)
+    # The win%+spread blend, sometimes used to rank moves instead.
+    entry["blended_utility"] = round(rng.uniform(0, 1), 3)
+    plies = min(player["num_plies"], plies_recorded)
+    if plies:
+        entry["plies"] = [
+            {
+                "ply": p,
+                "bingo_percentage": round(rng.uniform(0, 25), 3),
+                "average_score": round(rng.uniform(25, 45), 3),
+            }
+            for p in range(plies)
+        ]
+    return entry
+
+
+def _players(request: dict) -> List[dict]:
+    """A games or pairs request's players, by seat: player 1 sits in seat 0,
+    as MAGPIE seats them, whichever seat moves first."""
+    return [request.get("player1") or {}, request.get("player2") or {}]
+
+
+def _recorded(request: dict) -> Tuple[int, int]:
+    """How many plays and plies a captured position keeps: player 1's, which
+    MAGPIE reads for the whole run (and job creation holds player 2 to)."""
+    player1 = request.get("player1") or {}
+    return player1.get("num_plays_recorded") or 10, player1.get("num_plies_recorded") or 0
+
+
 def _synthetic_position(game: "_SyntheticGame", rng: random.Random, game_index: int,
-                        turn: int, ranked: List[dict], previous: Optional[dict]) -> dict:
-    """One captured position of `game` as it stands, its moves `ranked`."""
+                        turn: int, ranked: List[dict], previous: Optional[dict],
+                        player: dict, plies_recorded: int) -> dict:
+    """One captured position of `game` as it stands, its moves `ranked`, as
+    `player` -- the one on turn -- analysed it: simulated, or statically."""
+    simulates = _simulates(player)
     position = {
         "game_index": game_index,
         "turn_number": turn,
         "rack": game.rack_string(game.on_turn),
         "position": game.cgp(),
         "num_moves": rng.randint(len(ranked), 400),
-        # Every move below carries a simulation's statistics.
-        "analysis": "sim",
-        "moves": [
-            {
-                "move": move["move"],
-                "score": move["score"],
-                "equity": move["equity"],
-                # How often the simulation played this move out: most for
-                # the leaders.
-                "iterations": rng.randint(20, 400),
-                # Absent for a static player, which simulates nothing.
-                "win_percentage": round(rng.uniform(20, 80), 3),
-                # Same nullability as win_percentage: the win%+spread
-                # blend, sometimes used to rank moves instead.
-                "blended_utility": round(rng.uniform(0, 1), 3),
-                "plies": [
-                    {
-                        "ply": p,
-                        "bingo_percentage": round(rng.uniform(0, 25), 3),
-                        "average_score": round(rng.uniform(25, 45), 3),
-                    }
-                    for p in range(2)
-                ],
-            }
-            for move in ranked
-        ],
+        "analysis": "sim" if simulates else "static",
+        "moves": [_ranked_move(rng, move, player, plies_recorded) for move in ranked],
     }
     # Absent on the first turn of a game: nothing preceded it.
     if previous is not None:
         position["previous_move"] = previous["move"]
         position["previous_move_score"] = previous["score"]
-        # What the simmer inferred the opponent kept, from that move: MAGPIE
-        # infers only from a move, so never on a game's first turn or after
-        # a pass.
-        if previous["score"] or "exch" in previous["move"]:
+        # What a simmer that infers inferred the opponent kept, from that
+        # move: MAGPIE infers only before a simulation, only with
+        # `use_inference`, and only from a move, so never on a game's first
+        # turn or after a pass.
+        if simulates and player.get("use_inference") and (
+            previous["score"] or "exch" in previous["move"]
+        ):
             position["inference"] = _synthetic_inference(rng)
     # The move played from here: the top of the ranking, which is what the
     # synthetic game plays.
@@ -369,7 +403,8 @@ def _add_first_divergences(result: dict, request: dict, rng: random.Random,
     CGP has the racks and scores the other way round, its mover in the other
     seat. Its player ranks the moves differently, so the pair diverges here.
     """
-    top_moves = (request.get("player1") or {}).get("num_plays_recorded") or 10
+    players = _players(request)
+    top_moves, top_plies = _recorded(request)
     distribution = request.get("letter_distribution", "english")
     positions = []
     for pair in divergent_pairs:
@@ -382,12 +417,16 @@ def _add_first_divergences(result: dict, request: dict, rng: random.Random,
             previous = game.ranked_moves(1)[0]
             game.play(previous)
             turn += 1
+        # The first game's mover is the player in the seat on turn; in the
+        # second, which started from the other seat, the other player.
+        mover, other = players[game.on_turn], players[1 - game.on_turn]
         ranked = game.ranked_moves(top_moves)
-        first = _synthetic_position(game, rng, pair * 2, turn, ranked, previous)
+        first = _synthetic_position(game, rng, pair * 2, turn, ranked, previous, mover, top_plies)
         # The other game: the same position from the other seat, and another
         # player's ranking, which puts a different move first.
         second_ranked = ranked[1:] + ranked[:1] if len(ranked) > 1 else ranked
-        second = _synthetic_position(game, rng, pair * 2 + 1, turn, second_ranked, previous)
+        second = _synthetic_position(game, rng, pair * 2 + 1, turn, second_ranked, previous,
+                                     other, top_plies)
         board, racks, scores, *rest = second["position"].split(" ")
         swapped_racks = "/".join(reversed(racks.split("/")))
         swapped_scores = "/".join(reversed(scores.split("/")))
@@ -408,7 +447,8 @@ def _add_captured_positions(result: dict, request: dict, rng: random.Random,
     """
     if not request.get("capture_positions"):
         return
-    top_moves = (request.get("player1") or {}).get("num_plays_recorded") or 10
+    players = _players(request)
+    top_moves, top_plies = _recorded(request)
     distribution = request.get("letter_distribution", "english")
     positions = []
     for game_index in range(games):
@@ -421,7 +461,9 @@ def _add_captured_positions(result: dict, request: dict, rng: random.Random,
             if game.over():
                 break
             ranked = game.ranked_moves(top_moves)
-            positions.append(_synthetic_position(game, rng, game_index, turn, ranked, previous))
+            positions.append(_synthetic_position(
+                game, rng, game_index, turn, ranked, previous, players[game.on_turn], top_plies
+            ))
             # The player plays their top move, as a static player does.
             previous = ranked[0]
             game.play(previous)
@@ -509,9 +551,12 @@ def _result_for(request: dict, rng: random.Random, p1_win_probability: float) ->
         # One analysis per rack in the batch, keyed by the rack itself: the
         # request carries `racks` (the server batches them, since the rack space
         # runs to millions) and the response is matched up rack by rack.
+        # The job's one player analyses every rack: simulated or static as
+        # it is, which is what the server stores the analysis as.
+        player = request.get("player") or {}
         analyses = []
         for rack in request["racks"]:
-            count = rng.randint(2, 6)
+            count = min(rng.randint(2, 6), player.get("num_plays_recorded") or 10)
             moves = []
             # Ranked best-first, so equity descends down the list.
             equity = rng.uniform(20.0, 45.0)
@@ -520,30 +565,15 @@ def _result_for(request: dict, rng: random.Random, p1_win_probability: float) ->
                 # A play uses at least one tile; a one-tile rack is legal, so
                 # the lower bound cannot assume two.
                 tiles = rng.randint(1, len(rack))
-                moves.append(
-                    {
-                        "move": f"8{chr(ord('D') + i)} {rack[:tiles]}",
-                        "score": rng.randint(12, 90),
-                        "equity": round(equity, 3),
-                        # A simulation's, as the plies below are: the server
-                        # stores a rack with them as a simulated analysis.
-                        "iterations": rng.randint(20, 400),
-                        "win_percentage": round(rng.uniform(20, 80), 3),
-                        "blended_utility": round(rng.uniform(0, 1), 3),
-                        "plies": [
-                            {
-                                "ply": p,
-                                "bingo_percentage": round(rng.uniform(0, 25), 3),
-                                "average_score": round(rng.uniform(25, 45), 3),
-                            }
-                            for p in range(2)
-                        ],
-                    }
-                )
+                play = {
+                    "move": f"8{chr(ord('D') + i)} {rack[:tiles]}",
+                    "score": rng.randint(12, 90),
+                    "equity": round(equity, 3),
+                }
+                moves.append(_ranked_move(rng, play, player, player.get("num_plies_recorded") or 0))
             # How many were ranked before truncation to the job's
             # num_plays_recorded, which is generally far more than is reported.
-            # MAGPIE sends it; a submission that omits it is read as having
-            # reported everything it ranked.
+            # Required: MAGPIE always sends it.
             analyses.append(
                 {"rack": rack, "moves": moves, "num_moves": count + rng.randint(0, 200)}
             )
@@ -634,7 +664,8 @@ def emit_fixture(args: argparse.Namespace) -> None:
     assignment is a claim response (`contract-fixtures/assignment-*.json`);
     each `--override KEY=JSON` replaces one field of its `task_request` first,
     which is how a `game_pairs` or position-capturing request is derived from
-    the games assignment. The random stream is worker 0's under `--seed`, so
+    the games assignment. A dotted key reaches into an object:
+    `player1.use_inference=true`. The random stream is worker 0's under `--seed`, so
     the output is the first submission a `--workers 1` run would make.
 
     What is printed depends on the mode:
@@ -648,7 +679,11 @@ def emit_fixture(args: argparse.Namespace) -> None:
         assignment = json.load(f)
     for override in args.override:
         key, _, value = override.partition("=")
-        assignment["task_request"][key] = json.loads(value)
+        *path, field = key.split(".")
+        target = assignment["task_request"]
+        for step in path:
+            target = target[step]
+        target[field] = json.loads(value)
     rng = random.Random(f"{args.seed}:0")
 
     if args.mode == "malformed":
@@ -675,7 +710,7 @@ def emit_fixture(args: argparse.Namespace) -> None:
 class FakeWorker:
     # A task costs two requests and the worker endpoints are rate limited per
     # identity, so throttling is expected under load.
-    RATE_LIMIT_RETRIES = 5
+    RETRIES = 5
 
     def __init__(self, args: argparse.Namespace, index: int, stats: Stats):
         self.args = args
@@ -690,6 +725,10 @@ class FakeWorker:
         # Left unset until the server issues one. A client-invented UUID is
         # rejected: birdtest only accepts identities it handed out.
         self.worker_uuid: Optional[str] = None
+        # Imported here, so `--emit-fixture` runs on a bare Python: it is what
+        # CI re-emits the committed fixtures with.
+        import requests
+
         self.session = requests.Session()
         # Each simulated worker gets its own stream so concurrent runs stay
         # reproducible regardless of thread interleaving.
@@ -697,8 +736,6 @@ class FakeWorker:
 
     @property
     def headers(self) -> dict:
-        if self.args.api_key:
-            return {"Authorization": f"Bearer {self.args.api_key}"}
         if self.worker_uuid:
             return {"X-Worker-UUID": self.worker_uuid}
         # No header at all on the first claim, which is how a worker asks to be
@@ -710,9 +747,12 @@ class FakeWorker:
 
     def claim(self) -> Optional[dict]:
         # The body is required: the version drives the per-job floor filter, so
-        # a server that had to assume one would be guessing.
+        # a server that had to assume one would be guessing. The board and rack
+        # are a default MAGPIE build's, the only one the server dispatches to.
         body = {
-            "magpie_version": self.args.magpie_version,
+            "magpie_version": MAGPIE_VERSION,
+            "board_dim": BOARD_DIM,
+            "rack_size": RACK_SIZE,
             "unsupported_jobs": self.unsupported,
         }
         response = self.session.post(
@@ -725,6 +765,8 @@ class FakeWorker:
             self.stats.bump("no_work")
             return None
         if response.status_code == 429:
+            # A throttle, not a lack of work: wait as told, and the run loop
+            # asks again.
             self.stats.bump("rate_limited")
             time.sleep(float(response.headers.get("Retry-After", "1")))
             return None
@@ -741,58 +783,32 @@ class FakeWorker:
             return None
         self.stats.bump("claimed")
         # Adopt the identity the server assigned and use it from here on.
-        if not self.args.api_key and not self.worker_uuid:
+        if not self.worker_uuid:
             self.worker_uuid = assignment.get("worker_uuid")
         return assignment
 
-    def decline(self, assignment: dict, reason: str) -> None:
-        """Give a claim straight back, the way a worker with missing data does."""
-        missing = []
-        if reason == "missing_data":
-            for entry in assignment.get("expected_data", {}).get("files", []):
-                missing.append(
-                    {
-                        "role": entry["role"],
-                        "name": entry["name"],
-                        "expected": entry["sha256"],
-                        # None means "not found at all", which is what a
-                        # contributor who never installed the file reports.
-                        "actual": None,
-                    }
-                )
-        response = self.session.post(
-            self._url("/api/worker/decline"),
-            headers=self.headers,
-            json={
-                "claim_token": assignment["claim_token"],
-                "reason": reason,
-                "missing": missing,
-            },
-            timeout=30,
-        )
-        response.raise_for_status()
-        self.stats.bump("declined")
-        # Remembering is the whole point: a client that declines and forgets
-        # spins on claim -> decline -> claim.
-        job_id = assignment.get("job_id")
-        if job_id and job_id not in self.unsupported:
-            self.unsupported.append(job_id)
-
     def submit(self, claim_token: str, result: dict) -> None:
-        # Back off and retry rather than counting a throttle as a rejection —
-        # "the server rate limited me" and "the server refused my data" are the
-        # distinction this whole harness exists to make.
-        for attempt in range(self.RATE_LIMIT_RETRIES):
+        # Back off and retry rather than counting a throttle or an outage as a
+        # rejection — "the server could not take this now" and "the server
+        # refused my data" are the distinction this whole harness exists to
+        # make. As MAGPIE does: a 429 or a 5xx (the server's 503 while a job is
+        # purged, or while it stores other large results) is retried after its
+        # `Retry-After`, and only another 4xx is a refusal.
+        for attempt in range(self.RETRIES):
             response = self.session.post(
                 self._url("/api/worker/result"),
                 headers=self.headers,
                 json={"claim_token": claim_token, "result": result},
                 timeout=60,
             )
-            if response.status_code != 429:
+            if response.status_code == 429:
+                self.stats.bump("rate_limited")
+            elif response.status_code >= 500:
+                self.stats.bump("unavailable")
+            else:
                 break
-            self.stats.bump("rate_limited")
-            if attempt == self.RATE_LIMIT_RETRIES - 1:
+            if attempt == self.RETRIES - 1:
+                self.stats.bump("errors")
                 return
             time.sleep(float(response.headers.get("Retry-After", "1")))
 
@@ -801,7 +817,7 @@ class FakeWorker:
         if response.status_code >= 400:
             # Expected in `malformed` mode; a finding anywhere else.
             self.stats.bump("rejected")
-            logger.debug("submission rejected: %s %s", response.status_code, response.text[:200])
+            logger.info("submission rejected: %s %s", response.status_code, response.text[:200])
             return
 
         # A stale claim token is silently ignored by design, and reported as
@@ -811,11 +827,9 @@ class FakeWorker:
         else:
             self.stats.bump("rejected")
 
-    def run(self, deadline: Optional[float]) -> None:
+    def run(self) -> None:
         completed = 0
         while self.args.tasks == 0 or completed < self.args.tasks:
-            if deadline and time.monotonic() > deadline:
-                return
             try:
                 assignment = self.claim()
             except Exception:
@@ -830,23 +844,7 @@ class FakeWorker:
                 return
 
             if assignment is None:
-                if self.args.stop_when_idle:
-                    return
                 time.sleep(self.args.idle_wait)
-                continue
-
-            if self.args.mode in ("decline", "decline-version", "decline-job-type"):
-                reason = {
-                    "decline": "missing_data",
-                    "decline-version": "magpie_version",
-                    "decline-job-type": "unknown_job_type",
-                }[self.args.mode]
-                try:
-                    self.decline(assignment, reason)
-                except Exception:
-                    self.stats.bump("errors")
-                    logger.warning("decline failed", exc_info=True)
-                completed += 1
                 continue
 
             try:
@@ -863,9 +861,9 @@ class FakeWorker:
                 continue
             token, result = submission
 
-            if self.args.work_seconds:
-                time.sleep(self.args.work_seconds)
-
+            # Submitted at once, so a claim is never held near the heartbeat
+            # timeout and the fake sends no heartbeats (MAGPIE does, every 30
+            # s, through a solve that can take minutes).
             try:
                 self.submit(token, result)
             except Exception:
@@ -873,16 +871,16 @@ class FakeWorker:
                 logger.warning("submit failed", exc_info=True)
 
             completed += 1
-            if self.args.delay:
-                time.sleep(self.args.delay)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Synthetic birdtest worker for testing the server without MAGPIE."
     )
-    parser.add_argument("--server-url", default="http://localhost:8080")
-    parser.add_argument("--api-key", help="authenticate instead of running anonymously")
+    # No default: the only server it may be pointed at is a disposable test
+    # stack's (the e2e suite's passes its own), and the development stack's
+    # address, the old default, is one it must never be.
+    parser.add_argument("--server-url", help="the test stack's backend; required unless --emit-fixture")
     parser.add_argument(
         "--workers", type=int, default=1,
         help="simulated workers running concurrently, for exercising claim races",
@@ -893,25 +891,12 @@ def main() -> None:
     )
     parser.add_argument(
         "--mode",
-        choices=[
-            "normal", "malformed", "stale", "abandon",
-            "decline", "decline-version", "decline-job-type",
-        ],
+        choices=["normal", "malformed", "stale", "abandon"],
         default="normal",
         help=(
             "normal: plausible results. malformed: submissions the server should "
             "reject. stale: submit under a claim token that was never issued. "
-            "abandon: claim and never submit, so the heartbeat timeout reclaims. "
-            "decline: report every expected file as missing, accumulating an "
-            "unsupported set across claims until the server says to shut down. "
-            "decline-version / decline-job-type: the other two decline reasons."
-        ),
-    )
-    parser.add_argument(
-        "--magpie-version", default="99.0.0",
-        help=(
-            "the version reported with every claim. Sent as-is, so '0.1.0' or "
-            "nonsense exercises the floor filter and the magpie_too_old shutdown."
+            "abandon: claim and never submit, so the heartbeat timeout reclaims."
         ),
     )
     parser.add_argument(
@@ -919,18 +904,7 @@ def main() -> None:
         help="bias player 1's results, to drive the match test to a chosen verdict",
     )
     parser.add_argument("--seed", default="birdtest", help="makes a run reproducible")
-    parser.add_argument("--delay", type=float, default=0.0, help="seconds between tasks")
-    parser.add_argument(
-        "--work-seconds", type=float, default=0.0,
-        help="pretend a task takes this long, to hold a claim open",
-    )
     parser.add_argument("--idle-wait", type=float, default=1.0)
-    parser.add_argument(
-        "--stop-when-idle", action="store_true",
-        help="exit on the first 204 instead of waiting for more work",
-    )
-    parser.add_argument("--timeout", type=float, default=0.0, help="give up after N seconds")
-    parser.add_argument("--verbose", action="store_true")
     parser.add_argument(
         "--emit-fixture", metavar="ASSIGNMENT_JSON",
         help=(
@@ -947,18 +921,14 @@ def main() -> None:
     if args.emit_fixture:
         emit_fixture(args)
         return
+    if not args.server_url:
+        parser.error("--server-url is required")
 
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     stats = Stats()
-    deadline = time.monotonic() + args.timeout if args.timeout else None
     workers = [FakeWorker(args, i, stats) for i in range(args.workers)]
-    threads = [
-        threading.Thread(target=w.run, args=(deadline,), daemon=True) for w in workers
-    ]
+    threads = [threading.Thread(target=w.run, daemon=True) for w in workers]
 
     started = time.monotonic()
     for thread in threads:
@@ -975,6 +945,7 @@ def main() -> None:
         "rejected": stats.rejected,
         "no_work": stats.no_work,
         "rate_limited": stats.rate_limited,
+        "unavailable": stats.unavailable,
         "errors": stats.errors,
         "elapsed_seconds": round(elapsed, 3),
     }))

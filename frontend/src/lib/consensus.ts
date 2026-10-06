@@ -14,18 +14,42 @@ export interface ConsensusSettings {
   max_results_per_rack: number;
 }
 
+/** The consensus fields a request sends: the share only past one analysis per rack. */
+export interface ConsensusFields {
+  min_results_per_rack: number;
+  max_results_per_rack: number;
+  consensus_pct?: number;
+}
+
 /**
- * What is wrong with consensus settings, as the server would refuse them, or
- * null: checked before a job is created with them and before they are
- * changed on one. One analysis per rack is always fine, whatever the share.
+ * The consensus fields a request sends, from the settings typed: the share
+ * only when a rack can have more than one analysis. One analysis per rack
+ * seeks no agreement, so its share box is disabled, and whatever it holds is
+ * left out rather than refused: the server then checks the share it already
+ * has, its default 100% at creation or the job's stored one on a change.
  */
-export function consensusProblem(c: ConsensusSettings): string | null {
+export function consensusFields(c: ConsensusSettings): ConsensusFields {
   const min = Number(c.min_results_per_rack);
   const max = Number(c.max_results_per_rack);
-  const pct = Number(c.consensus_pct);
+  return {
+    min_results_per_rack: min,
+    max_results_per_rack: max,
+    ...(max > 1 ? { consensus_pct: Number(c.consensus_pct) } : {})
+  };
+}
+
+/**
+ * What is wrong with the fields `consensusFields` sends, as the server's
+ * `consensus_problems` would refuse them, or null: checked before a job is
+ * created with them and before they are changed on one. The fewest and most
+ * are checked whatever the most; the share only when it is sent.
+ */
+export function consensusProblem(c: ConsensusSettings): string | null {
+  const { min_results_per_rack: min, max_results_per_rack: max, consensus_pct: pct } =
+    consensusFields(c);
   if (!(Number.isInteger(min) && min >= 1 && min <= 100)) return 'The fewest analyses must be a whole number from 1 to 100.';
   if (!(Number.isInteger(max) && max >= min && max <= 100)) return 'The most analyses must be at least the fewest, and at most 100.';
-  if (max > 1 && !(pct > 50 && pct <= 100)) return 'The share that must agree must be above 50% and at most 100%.';
+  if (pct !== undefined && !(pct > 50 && pct <= 100)) return 'The share that must agree must be above 50% and at most 100%.';
   return null;
 }
 

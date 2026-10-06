@@ -70,6 +70,21 @@ pub async fn acquire(
     // already serialized on that row lock (`issue_claim` bumps
     // `claims_issued`), so taking the advisory lock first costs a little more
     // of the same wait and nothing new.
+    //
+    // Leave generation has the most to lose without it. Every read
+    // `leave_gen::next_step` makes -- which racks are below target, which are
+    // out with an open claim, whether any claim for the generation is still in
+    // flight -- is invisible to a concurrent claim transaction until that one
+    // commits. Unserialized, a claim still being issued was not counted as in
+    // flight, so the generation it belonged to could be closed while its task
+    // went out, and that task's work landed in a generation whose KLV was
+    // already built; and two claims could both find the generation complete and
+    // both start its transition. The lock is transaction-scoped -- released at
+    // commit or rollback, or with a dropped connection -- and is not held across
+    // the transition itself, which would hold a transaction open across an S3
+    // upload: what stops a second transition is the
+    // `leave_generation_transitions` row this lock makes safe to test and write
+    // (`leave_gen::claim_transition`).
     if !super::try_lock_job_dispatch(&mut *conn, job.id).await? {
         return Ok(Acquired::Busy);
     }
@@ -80,7 +95,7 @@ pub async fn acquire(
     // is replayed rather than skipped, since nothing else would ever revisit
     // those seeds.
     //
-    // Leave generation does this itself, under its claim lock and only for the
+    // Leave generation does this itself, under this same lock and only for the
     // current generation (see `generate_leave_gen`).
     if !matches!(job.job_type, JobType::LeaveGeneration) {
         if let Some(task_id) = next_available(conn, job.id, identity, None).await? {
@@ -129,13 +144,10 @@ async fn generate_opening_rack(
 /// An available task this worker may take, locked with `FOR UPDATE SKIP LOCKED`
 /// so concurrent claimers never serialize on one row.
 ///
-/// Excludes tasks this identity already holds a slot on, live or completed:
-/// the per-identity unique index would refuse a second, and without this
-/// filter the oldest such task would be selected again on every attempt, the
-/// insert would fail every time, and the worker would get nothing at all.
-///
-/// And, except in leave generation, tasks this identity declined in the last
-/// hour. A declined task goes
+/// An available task has no live or completed claim -- that would make it
+/// `claimed` or `completed` -- so there is no slot of this worker's own to
+/// exclude. What is excluded, except in leave generation, is a task this
+/// identity declined in the last hour. A declined task goes
 /// back to `available` and, the oldest, was handed straight back to whoever
 /// claimed next -- the worker that had just failed it included -- ahead of any
 /// new work: one task that fails everywhere was every claim of its job, and
@@ -160,15 +172,13 @@ async fn next_available(
     Ok(sqlx::query_scalar::<_, Uuid>(
         "SELECT t.id FROM tasks t
          WHERE t.job_id = $1 AND t.state = 'available'
-           AND NOT EXISTS (
+           AND ($4::int IS NOT NULL OR NOT EXISTS (
                SELECT 1 FROM task_claims c
                WHERE c.task_id = t.id
-                 AND (c.state NOT IN ('abandoned', 'declined')
-                      OR (c.state = 'declined' AND $4::int IS NULL
-                          AND COALESCE(c.last_heartbeat_at, c.claimed_at)
-                              > now() - interval '1 hour'))
+                 AND c.state = 'declined'
+                 AND COALESCE(c.last_heartbeat_at, c.claimed_at) > now() - interval '1 hour'
                  AND (c.claimed_by_user_id = $2 OR c.claimed_by_anon_uuid = $3)
-           )
+           ))
            AND ($4::int IS NULL OR EXISTS (
                SELECT 1 FROM leave_requests r
                WHERE r.task_id = t.id AND r.generation = $4
@@ -459,7 +469,8 @@ pub enum DecodedResult {
 ///
 /// Nothing here reads the database: the record is a function of the payload
 /// and the job's type, and the checks of the job's settings -- batch size,
-/// occurrence totals -- are the template's. Done inside the transaction, as it
+/// occurrence totals, what its players could have analysed -- are the
+/// template's. Done inside the transaction, as it
 /// was, the claim and task rows stayed locked and a pool connection held for
 /// the decode -- tens of milliseconds for an ordinary result, a second at the
 /// 64 MiB ceiling. What needs the task's own row (an opening-rack batch's
@@ -499,10 +510,18 @@ pub async fn decode_result(
     }
 
     match &template.kind {
-        JobKind::OpeningRack { .. } => Ok(DecodedResult::OpeningRack(
-            normalize::<opening_rack::OpeningRackHandler>(payload).await?,
-        )),
-        JobKind::Games { config, .. } => {
+        JobKind::OpeningRack { player, .. } => {
+            let record = normalize::<opening_rack::OpeningRackHandler>(payload).await?;
+            // A simulation from a static player is not an analysis this job
+            // asked for (`plausibility::check_analyses_against_players`).
+            super::plausibility::check_analyses_against_players(
+                &record.positions,
+                &[player],
+                "opening rack",
+            )?;
+            Ok(DecodedResult::OpeningRack(record))
+        }
+        JobKind::Games { config, player1, player2 } => {
             let record = normalize::<game::GameHandler>(payload).await?;
             // The batch size was fixed when the task was handed out -- it is
             // the job's, denormalized onto every request -- so a result of any
@@ -512,9 +531,14 @@ pub async fn decode_result(
                 super::plausibility::games_dispatched(config.games_per_batch, false),
             )?;
             refuse_uncaptured_positions(config.capture_positions, &record.positions, record.all_games.games)?;
+            super::plausibility::check_analyses_against_players(
+                &record.positions,
+                &[player1, player2],
+                "captured position",
+            )?;
             Ok(DecodedResult::Games(record))
         }
-        JobKind::GamePairs { config, .. } => {
+        JobKind::GamePairs { config, player1, player2 } => {
             let record = normalize::<game_pair::GamePairHandler>(payload).await?;
             // A pairs request counts pairs; each is two games.
             super::plausibility::check_batch_size(
@@ -529,6 +553,11 @@ pub async fn decode_result(
             } else {
                 refuse_uncaptured_positions(config.capture_positions, &record.positions, record.all_games.games)?;
             }
+            super::plausibility::check_analyses_against_players(
+                &record.positions,
+                &[player1, player2],
+                "captured position",
+            )?;
             Ok(DecodedResult::GamePairs(record))
         }
         JobKind::LeaveGeneration { config, .. } => {

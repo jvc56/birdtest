@@ -1,9 +1,9 @@
 # The derived-file builder: a scheduled ECS task that drains `derived_data`.
 #
-# See README.md's "MAGPIE on the server". A wordmap and a rack info table are
-# built on every contributor's own machine and are far too large to ship, so birdtest checks
-# them by building its own reference copy with a pinned MAGPIE and publishing
-# the hash. This is where those builds run.
+# See README.md's "MAGPIE on the server". A wordmap, a rack info table and a
+# word info table are built on every contributor's own machine and are far too
+# large to ship, so birdtest checks them by building its own reference copy
+# with a pinned MAGPIE and publishing the hash. This is where those builds run.
 #
 # Not in the web task. A rack info table build peaks at about 2.4 GB of memory,
 # writes a 1.9 GB file, and takes one to three minutes; the web task has 1 vCPU
@@ -35,6 +35,19 @@ variable "derived_builder_image" {
   validation {
     condition     = length(trimspace(var.derived_builder_image)) > 0
     error_message = "derived_builder_image is the backend image built with --target derived-builder, at the same tag as backend_image."
+  }
+
+  # One tag per release (README.md, "Deploying"): a release that moved one
+  # image and not the other left rows keyed to the web task's builder that
+  # nothing built (KL-62). A missing tag is `latest`, as Docker reads it. An
+  # image named by digest carries no tag to compare, and is let through.
+  validation {
+    condition = (
+      strcontains(var.derived_builder_image, "@") || strcontains(var.backend_image, "@") ||
+      try(regex(":([^:/]+)$", var.derived_builder_image)[0], "latest") ==
+      try(regex(":([^:/]+)$", var.backend_image)[0], "latest")
+    )
+    error_message = "derived_builder_image must be at the same tag as backend_image: the builder must carry the backend's MAGPIE."
   }
 }
 
@@ -255,7 +268,7 @@ resource "aws_iam_role_policy" "derived_builder_scheduler" {
 
 resource "aws_scheduler_schedule" "derived_builder" {
   name                         = "${local.name}-derived-builder"
-  description                  = "Drain the wordmap and rack info table build queue"
+  description                  = "Drain the wordmap, rack info table and word info table build queue"
   schedule_expression          = var.derived_builder_schedule
   schedule_expression_timezone = "UTC"
   state                        = var.scheduled_tasks_enabled ? "ENABLED" : "DISABLED"

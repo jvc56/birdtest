@@ -349,7 +349,15 @@ async fn idle_means_work_exists_and_no_work_exists_means_none_is_offered() {
     );
 
     exec(&db, "UPDATE jobs SET status = 'active' WHERE id = $1", job).await;
-    exec(&db, "UPDATE job_game_config SET max_games = 2 WHERE job_id = $1", job).await;
+    // A cap of one batch, and no test: the floor of a million it had would
+    // be past the cap, which the schema refuses.
+    exec(
+        &db,
+        "UPDATE job_game_config SET max_games = 2, test_enabled = FALSE, min_games = 0
+         WHERE job_id = $1",
+        job,
+    )
+    .await;
     claim_task(&state, &worker, &caps("1.0.0", &[])).await;
     assert_eq!(
         outcome_kind(&claim(&state, &anon(&db).await, &caps("1.0.0", &[])).await),
@@ -666,29 +674,25 @@ async fn a_taken_task_is_not_handed_to_another_worker() {
     }
 }
 
-/// I-SCHED-15: the per-identity unique indexes are partial on
-/// `state NOT IN ('abandoned', 'declined')`. A worker that declined a task --
-/// it was missing a file -- and then fixed its data claims that same task
-/// again an hour on, by anonymous UUID and by account alike. With `'declined'` dropped
-/// from either index, the second claim collides with the first and the worker
-/// is barred from that task for good.
+/// I-SCHED-15: the one-slot index is partial on
+/// `state IN ('claimed', 'completed')`. A worker that declined a task -- it
+/// was missing a file -- and then fixed its data claims that same task again
+/// an hour on, by anonymous UUID and by account alike. With `'declined'` in
+/// the index, the declined claim holds the task's one slot and nobody can
+/// claim it again.
 #[tokio::test]
 async fn a_worker_that_declined_a_task_can_claim_the_same_task_again() {
     let db = TestDb::new().await;
 
-    let defs: Vec<(String, String)> = sqlx::query_as(
-        "SELECT indexname::text, indexdef FROM pg_indexes
-         WHERE indexname IN ('task_claims_user_unique_idx', 'task_claims_anon_unique_idx')
-         ORDER BY indexname",
+    let def: String = sqlx::query_scalar(
+        "SELECT indexdef FROM pg_indexes WHERE indexname = 'task_claims_one_slot_idx'",
     )
-    .fetch_all(&db.pool)
+    .fetch_one(&db.pool)
     .await
     .unwrap();
-    assert_eq!(defs.len(), 2, "{defs:?}");
-    for (name, def) in &defs {
-        assert!(def.contains("UNIQUE"), "{name}: {def}");
-        assert!(def.contains("'abandoned'") && def.contains("'declined'"), "{name}: {def}");
-    }
+    assert!(def.contains("UNIQUE") && def.contains("(task_id)"), "{def}");
+    assert!(def.contains("'claimed'") && def.contains("'completed'"), "{def}");
+    assert!(!def.contains("'declined'") && !def.contains("'abandoned'"), "{def}");
 
     let state = db.state().await;
     for worker in [anon(&db).await, registered(&db).await] {
@@ -743,16 +747,13 @@ async fn a_worker_that_declined_a_task_can_claim_the_same_task_again() {
 
 /// I-SCHED-16: one worker never holds two live claims on one task, by account
 /// or by anonymous UUID. Claiming again hands the worker the next task, and
-/// the unique index refuses a second live row even written directly.
+/// the one-slot index refuses a second live row even written directly.
 #[tokio::test]
 async fn one_worker_never_holds_two_live_claims_on_one_task() {
     let db = TestDb::new().await;
     let state = db.state().await;
 
-    for (worker, index) in [
-        (registered(&db).await, "task_claims_user_unique_idx"),
-        (anon(&db).await, "task_claims_anon_unique_idx"),
-    ] {
+    for worker in [registered(&db).await, anon(&db).await] {
         let job = db.games_job(2).await;
         let others = every_job_but(&db, job).await;
         let first = claim_task(&state, &worker, &caps("1.0.0", &others)).await;
@@ -773,7 +774,69 @@ async fn one_worker_never_holds_two_live_claims_on_one_task() {
         .expect_err("a second live claim on one task");
         let db_err = err.as_database_error().expect("a database error");
         assert_eq!(db_err.code().as_deref(), Some("23505"), "{db_err}");
-        assert_eq!(db_err.constraint(), Some(index), "{db_err}");
+        assert_eq!(db_err.constraint(), Some("task_claims_one_slot_idx"), "{db_err}");
+    }
+}
+
+/// I-SCHED-22: a task never has two claims holding or having completed its
+/// one slot, by any two identities, and its counters never leave 0..1. The
+/// claim path keeps both so; the schema makes a breach fail at the statement
+/// rather than surface days later as a counter gone wrong. Lapsed and
+/// declined claims are outside the slot: a task has any number of those.
+#[tokio::test]
+async fn a_task_never_has_two_claims_on_its_one_slot() {
+    let db = TestDb::new().await;
+    let state = db.state().await;
+    let job = db.games_job(2).await;
+    let only_this = caps("1.0.0", &every_job_but(&db, job).await);
+
+    async fn insert_claim(db: &TestDb, task: Uuid, claim_state: &str) -> Result<(), String> {
+        let holder = anon(db).await;
+        sqlx::query(
+            "INSERT INTO task_claims (task_id, job_id, claim_token, state, claimed_by_anon_uuid)
+             VALUES ($1, (SELECT job_id FROM tasks WHERE id = $1), $2, $3::claim_state, $4)",
+        )
+        .bind(task)
+        .bind(Uuid::new_v4())
+        .bind(claim_state)
+        .bind(holder.anon_uuid())
+        .execute(&db.pool)
+        .await
+        .map(drop)
+        .map_err(|err| {
+            let db_err = err.as_database_error().expect("a database error");
+            format!("{} {}", db_err.code().unwrap_or_default(), db_err.constraint().unwrap_or(""))
+        })
+    }
+    let refused = "23505 task_claims_one_slot_idx".to_string();
+
+    // A claimed task: another identity's claim, live or completed, is refused;
+    // a lapsed or declined one is not.
+    let first = claim_task(&state, &anon(&db).await, &only_this).await;
+    let task = task_of(&db, first.claim_token).await;
+    assert_eq!(insert_claim(&db, task, "claimed").await, Err(refused.clone()));
+    assert_eq!(insert_claim(&db, task, "completed").await, Err(refused.clone()));
+    assert_eq!(insert_claim(&db, task, "abandoned").await, Ok(()));
+    assert_eq!(insert_claim(&db, task, "declined").await, Ok(()));
+
+    // Completed by its claim: still one slot, and taken.
+    sqlx::query("UPDATE task_claims SET state = 'completed' WHERE claim_token = $1")
+        .bind(first.claim_token)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(insert_claim(&db, task, "claimed").await, Err(refused));
+
+    // The counters: a second claim or a second accepted result counted on one
+    // task is refused.
+    for column in ["active_claim_count", "accepted_count"] {
+        let err = sqlx::query(&format!("UPDATE tasks SET {column} = 2 WHERE id = $1"))
+            .bind(task)
+            .execute(&db.pool)
+            .await
+            .expect_err("a counter past one");
+        let db_err = err.as_database_error().expect("a database error");
+        assert_eq!(db_err.code().as_deref(), Some("23514"), "{column}: {db_err}");
     }
 }
 

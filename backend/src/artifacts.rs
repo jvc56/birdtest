@@ -63,6 +63,10 @@ pub struct ArtifactStore {
     /// presigned URL's signature covers its host, so one signed for
     /// `minio:9000` cannot be rewritten to `localhost` afterwards.
     presigner: aws_sdk_s3::Client,
+    /// Where the clients' credentials come from, asked again for each link
+    /// ([`Self::presigned_get`]). The S3 config's own accessor for it always
+    /// answers `None`.
+    credentials: Option<aws_sdk_s3::config::SharedCredentialsProvider>,
 }
 
 impl ArtifactStore {
@@ -81,7 +85,7 @@ impl ArtifactStore {
             Some(public) => client_for(Some(public)),
             None => client.clone(),
         };
-        Self { cfg, client, presigner }
+        Self { cfg, client, presigner, credentials: aws.credentials_provider() }
     }
 
     pub async fn put(&self, key: &str, body: Vec<u8>) -> AppResult<String> {
@@ -155,18 +159,41 @@ impl ArtifactStore {
     /// presigned URL is the only way out of it, and it is minted for an admin
     /// who has just asked for it. Signed for `S3_PUBLIC_ENDPOINT` when that is
     /// set, since the browser, not this process, follows it.
+    ///
+    /// A presigned URL stops working when the credentials that signed it
+    /// expire, whatever its own expiry says. On ECS those are the task role's
+    /// temporary ones, which the SDK's cache keeps until moments before they
+    /// expire, so a link minted late in their life died minutes, or seconds,
+    /// after it was handed out (S3 answers `ExpiredToken`). It is signed with
+    /// credentials asked for now instead -- the newest the task has -- and
+    /// for no longer than they last ([`presign_ttl`]). Static keys (MinIO, an
+    /// environment's) carry no expiry and are signed for all of `expires_in`.
     pub async fn presigned_get(
         &self,
         key: &str,
         expires_in: std::time::Duration,
     ) -> AppResult<String> {
+        use aws_sdk_s3::config::ProvideCredentials;
+        let mut request =
+            self.presigner.get_object().bucket(&self.cfg.s3_bucket).key(key).customize();
+        let mut expires_in = expires_in;
+        if let Some(provider) = &self.credentials {
+            let credentials = provider.provide_credentials().await.map_err(|e| {
+                AppError::internal(format!("S3 presign {key}: no credentials: {}", chain(&e)))
+            })?;
+            let now = std::time::SystemTime::now();
+            expires_in = presign_ttl(expires_in, credentials.expiry(), now);
+            // Not through the client's cache: these are used once, and a
+            // provider of their own would be a cache partition each call.
+            request = request.config_override(
+                aws_sdk_s3::config::Builder::default()
+                    .credentials_provider(credentials)
+                    .identity_cache(aws_sdk_s3::config::IdentityCache::no_cache()),
+            );
+        }
         let config = aws_sdk_s3::presigning::PresigningConfig::expires_in(expires_in)
             .map_err(|e| AppError::internal(format!("invalid presigning config: {e}")))?;
-        let request = self
-            .presigner
-            .get_object()
-            .bucket(&self.cfg.s3_bucket)
-            .key(key)
+        let request = request
             .presigned(config)
             .await
             .map_err(|e| AppError::internal(format!("S3 presign {key} failed: {}", sdk(&e))))?;
@@ -329,5 +356,95 @@ fn unavailable(message: String) -> AppError {
     AppError {
         retry_after: Some(30),
         ..AppError::new(axum::http::StatusCode::SERVICE_UNAVAILABLE, "unavailable", message)
+    }
+}
+
+/// How long a link signed with credentials expiring at `expiry` may say it
+/// lasts: `wanted`, or less by what they have left, short of a minute for the
+/// clocks of this process and S3 to disagree by. At least a second, which is
+/// the least a presigning config takes; credentials that close to expiring
+/// are not what ECS hands out.
+fn presign_ttl(
+    wanted: std::time::Duration,
+    expiry: Option<std::time::SystemTime>,
+    now: std::time::SystemTime,
+) -> std::time::Duration {
+    const CLOCK_SLACK: std::time::Duration = std::time::Duration::from_secs(60);
+    match expiry {
+        None => wanted,
+        Some(expiry) => {
+            let left = expiry.duration_since(now).unwrap_or_default().saturating_sub(CLOCK_SLACK);
+            wanted.min(left).max(std::time::Duration::from_secs(1))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+
+    const HOUR: Duration = Duration::from_secs(3600);
+
+    /// A store whose presigner signs with `credentials`, offline: presigning
+    /// makes no request.
+    fn store(credentials: aws_sdk_s3::config::Credentials) -> ArtifactStore {
+        let provider = aws_sdk_s3::config::SharedCredentialsProvider::new(credentials);
+        let lookup = |key: &str| match key {
+            "DATABASE_URL" => Some("postgres://a:b@c/d".to_string()),
+            "SESSION_SIGNING_KEY" => Some("00".repeat(32)),
+            _ => None,
+        };
+        let cfg = Arc::new(Config::from_lookup(&lookup).unwrap());
+        let conf = aws_sdk_s3::Config::builder()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .credentials_provider(provider.clone())
+            .build();
+        let client = aws_sdk_s3::Client::from_conf(conf);
+        ArtifactStore { cfg, presigner: client.clone(), client, credentials: Some(provider) }
+    }
+
+    fn expires(url: &str) -> u64 {
+        let (_, rest) = url.split_once("X-Amz-Expires=").unwrap_or_else(|| panic!("{url}"));
+        rest.split('&').next().unwrap().parse().unwrap()
+    }
+
+    /// U-ART-1: a download link says no longer than the credentials that sign
+    /// it last. Signed with the task role's temporary credentials, a link
+    /// minted late in their life said an hour and stopped working with them,
+    /// minutes or seconds later (`ExpiredToken`).
+    #[tokio::test]
+    async fn a_link_lasts_no_longer_than_its_credentials() {
+        let soon = SystemTime::now() + Duration::from_secs(20 * 60);
+        let temporary = aws_sdk_s3::config::Credentials::new(
+            "ASIAEXAMPLE",
+            "secret",
+            Some("token".to_string()),
+            Some(soon),
+            "test",
+        );
+        let url = store(temporary).presigned_get("exports/x.ndjson.gz", HOUR).await.unwrap();
+        let said = expires(&url);
+        assert!((19 * 60 - 5..=19 * 60).contains(&said), "{said}: {url}");
+        assert!(url.contains("X-Amz-Security-Token=token"), "{url}");
+
+        // Static keys have no expiry: the whole hour.
+        let fixed =
+            aws_sdk_s3::config::Credentials::new("AKIAEXAMPLE", "secret", None, None, "test");
+        let url = store(fixed).presigned_get("exports/x.ndjson.gz", HOUR).await.unwrap();
+        assert_eq!(expires(&url), 3600, "{url}");
+    }
+
+    /// U-ART-1: the arithmetic at its edges.
+    #[test]
+    fn presign_ttl_is_the_shorter_less_a_minute_and_never_zero() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        assert_eq!(presign_ttl(HOUR, None, now), HOUR);
+        assert_eq!(presign_ttl(HOUR, Some(now + 6 * HOUR), now), HOUR);
+        assert_eq!(presign_ttl(HOUR, Some(now + HOUR), now), HOUR - Duration::from_secs(60));
+        let second = Duration::from_secs(1);
+        assert_eq!(presign_ttl(HOUR, Some(now + Duration::from_secs(30)), now), second);
+        assert_eq!(presign_ttl(HOUR, Some(now - HOUR), now), second);
     }
 }

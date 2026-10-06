@@ -94,7 +94,9 @@ resource "aws_lb" "main" {
   # uploading a large batch, an admin's results stream and an artifact rebuild
   # (about 13 seconds per generation, inline) still outlast a minute on a small
   # instance. MAGPIE's own request timeout is 120s. SSE streams are unaffected:
-  # they send keep-alives.
+  # they send keep-alives. Nginx's `keepalive_timeout`
+  # (frontend/docker/default.conf.template) stays above this, or a pooled
+  # connection it closes first answers a page request 502 (F-NGINX-2).
   idle_timeout    = 300
   security_groups = [aws_security_group.alb.id]
   subnets         = aws_subnet.public[*].id
@@ -454,11 +456,14 @@ resource "aws_ecs_service" "main" {
   #
   # birdtest is a single instance by construction and several things depend on
   # it: a starting process marks any input-data import or job export left
-  # `running` as failed, on the assumption that the process that owned it is
-  # gone. Under the default the new task does that to the old task's live work.
-  # Rate limits are per process and SSE subscribers only hear submissions made
-  # to their own instance, so an overlap is wrong for those too -- see
-  # `desired_count`'s description in variables.tf.
+  # `running` as failed, and releases any open leave-generation transition, on
+  # the assumption that the process that owned it is gone. Under the default
+  # the new task does that to the old task's live work. The dispatch holds
+  # that keep claims off a job being purged or deleted, and the purge count the
+  # finish check compares, are in-process, so neither instance would see the
+  # other's purge; rate limits are per process and SSE subscribers only hear
+  # submissions made to their own instance, so an overlap is wrong for those
+  # too -- see `desired_count`'s description in variables.tf.
   #
   # The cost is a gap with no instance serving during a deployment: the old
   # task's draining (30 s, set on the target groups above), its shutdown, the
@@ -470,6 +475,22 @@ resource "aws_ecs_service" "main" {
   # silently does not hold exactly when the code changes.
   deployment_minimum_healthy_percent = 0
   deployment_maximum_percent         = 100
+
+  # A release whose task cannot start -- a refused configuration, its own
+  # MAGPIE below `min_magpie_version`, a missing SSM parameter, a migration
+  # that fails -- was retried forever with nothing serving, since the old task
+  # is already gone (above). After three failed launches (ECS's least, for one
+  # task) the deployment fails and ECS goes back to the last task definition
+  # that reached a steady state; the previous image starts on the migrated
+  # schema because migrations after release are additive. Terraform's state
+  # still names the new revision, so the next apply redeploys it until
+  # prod.tfvars is changed: RUNBOOK.md, "Rolling back a deploy". It does not
+  # help when what fails is shared by both revisions -- an SSM value, the
+  # database -- and a first deployment has nothing to go back to.
+  deployment_circuit_breaker {
+    enable   = true
+    rollback = true
+  }
 
   # The backend migrates before it binds, and the load balancer's checks
   # (3 x 10 s) fail until it does. Without a grace period ECS replaced a task
@@ -497,4 +518,48 @@ resource "aws_ecs_service" "main" {
 
   depends_on = [aws_lb_listener.https]
   tags       = local.tags
+}
+
+# The circuit breaker's rollback, said out loud. Three failed launches usually
+# finish inside the `-down` alarms' ten minutes and the old revision is healthy
+# again, and `apply` has already returned, so without this nothing says the
+# release is not live -- while Terraform's state still names it (the next apply
+# of any kind redeploys it), the derived-data builder's schedule runs it (the
+# family's latest revision, derived.tf), and the nightly dumps' manifests name
+# its image. ECS sends SERVICE_DEPLOYMENT_FAILED when the breaker trips, with
+# the service's ARN (`id`) as the event's resource. A local, not inline, so
+# that S-TF-3 can read the pattern at plan time: the ARN is not known until
+# apply, and an encoded pattern holding it is unknown as a whole.
+locals {
+  deploy_failed_pattern = {
+    source      = ["aws.ecs"]
+    detail-type = ["ECS Deployment State Change"]
+    resources   = [aws_ecs_service.main.id]
+    detail = {
+      eventName = ["SERVICE_DEPLOYMENT_FAILED"]
+    }
+  }
+}
+
+resource "aws_cloudwatch_event_rule" "deploy_failed" {
+  name        = "${local.name}-deploy-failed"
+  description = "A deployment of the web service failed and ECS rolled it back (circuit breaker)"
+
+  event_pattern = jsonencode(local.deploy_failed_pattern)
+
+  tags = local.tags
+}
+
+resource "aws_cloudwatch_event_target" "deploy_failed" {
+  rule      = aws_cloudwatch_event_rule.deploy_failed.name
+  target_id = "sns"
+  arn       = aws_sns_topic.alerts.arn
+
+  input_transformer {
+    input_paths = {
+      reason     = "$.detail.reason"
+      deployment = "$.detail.deploymentId"
+    }
+    input_template = "\"birdtest deploy FAILED and ECS rolled the service back to the previous release: <reason> (<deployment>). Terraform's state still names the failed release, so the next apply deploys it again, and until then the derived-data builder runs it: follow RUNBOOK.md, Rolling back a deploy, from step 2, before any other apply. The stopped tasks and the CloudWatch log group ${aws_cloudwatch_log_group.main.name} say what failed.\""
+  }
 }

@@ -97,6 +97,18 @@ const patch = <T>(path: string, body: unknown) => request<T>('PATCH', path, body
 const put = <T>(path: string, body: unknown) => request<T>('PUT', path, body);
 const del = <T>(path: string) => request<T>('DELETE', path);
 
+/**
+ * A query string from parameters, leaving out any that are `undefined`: a
+ * first page has no cursor, and `String(undefined)` sent `cursor=undefined`,
+ * which the server read as "from the start" only because it ignores a cursor
+ * it cannot decode.
+ */
+export function query(params: Record<string, string | number | undefined>): string {
+  return new URLSearchParams(
+    Object.entries(params).flatMap(([k, v]) => (v === undefined ? [] : [[k, String(v)]]))
+  ).toString();
+}
+
 // --- Shared shapes ---------------------------------------------------------
 
 export type JobType = 'opening_rack' | 'games' | 'game_pairs' | 'leave_generation';
@@ -109,12 +121,6 @@ export interface Page<T> {
   per_page: number;
 }
 
-/**
- * A job's results page by cursor rather than by offset: the corpus runs to
- * millions of rows, where `OFFSET` produces every row before the page asked
- * for. Pass `next_cursor` back as `cursor` for the next page; its absence is
- * the end. This is the only endpoint that pages this way.
- */
 /** A position a games or pairs job captured, with its ranked moves. */
 export interface SavedPosition {
   task_id: string;
@@ -205,7 +211,6 @@ export interface RackLookupRow {
 /** Static equity, a simulation, a pre-endgame solve or an endgame solve. */
 export type PositionAnalysis = 'static' | 'sim' | 'peg' | 'endgame';
 
-/** A layout square, by what it multiplies (`#` in MAGPIE's layout is a brick). */
 /** What the contributor list can be ranked by; the server's default is compute time. */
 export type ContributorSort = 'compute' | 'games' | 'racks' | 'tasks';
 
@@ -226,6 +231,7 @@ export interface Contributor {
   last_seen_at: string | null;
 }
 
+/** A layout square, by what it multiplies (`#` in MAGPIE's layout is a brick). */
 export type BoardSquare =
   | 'normal'
   | 'double_letter'
@@ -246,9 +252,19 @@ export interface BoardData {
   letters: { letter: string; blank: string; score: number }[];
 }
 
+/**
+ * A page by cursor rather than by offset, for a job's results and its captured
+ * positions: the corpus runs to millions of rows, where `OFFSET` produces every
+ * row before the page asked for. Pass `next_cursor` back as `cursor` for the
+ * next page; its absence is the end. These two are the only endpoints that page
+ * this way.
+ */
 export interface CursorPage<T> {
   items: T[];
-  /** Always -1: an exact count costs more than it is worth to the caller. */
+  /**
+   * -1 for a results or positions page (an exact count costs more than it is
+   * worth to the caller); a rack lookup's count of the moves it returns.
+   */
   total: number;
   per_page: number;
   next_cursor?: string;
@@ -340,9 +356,6 @@ export interface GameStats {
   };
   min_units: number;
   max_units: number;
-  win_pct: number;
-  loss_pct: number;
-  draw_pct: number;
   /**
    * The significance test over every accepted result, recomputed on each read; null
    * for a job that runs none, which plays `max_units` and stops.
@@ -361,7 +374,7 @@ export interface GameStats {
  * `reason` is the server's: the significance test's verdict (`player1_better`,
  * `player2_better`, `inconclusive`), `reached_target` for a games or pairs job without a
  * test, `last generation built`, or none for an opening-rack job whose racks
- * were all analysed.
+ * were all settled.
  */
 export interface Completion {
   at: string;
@@ -388,7 +401,6 @@ export interface JobStats {
   tasks_completed: number;
   tasks_available: number;
   tasks_claimed: number;
-  results_accepted: number;
   games?: GameStats;
   opening_racks?: {
     racks_analyzed: number;
@@ -639,7 +651,9 @@ export interface JobExport {
   positions_row_count: number | null;
   /**
    * True for a completed job's final corpus; false for a snapshot read while
-   * the job was still taking results (and for an export not yet built).
+   * the job was still taking results, for a completed job's export whose
+   * consensus settings were changed after it was built, and for an export not
+   * yet built.
    */
   is_final: boolean;
   /** When the snapshot it was read in was taken; null until built. */
@@ -728,23 +742,22 @@ export const api = {
   jobs: (page = 0, status?: JobStatus) =>
     get<Page<JobListItem>>(`/api/jobs?page=${page}${status ? `&status=${status}` : ''}`),
   job: (id: string) => get<JobStats>(`/api/jobs/${id}`),
-  /** Cursor-paginated; see {@link CursorPage}. `?rack=` returns one rack's whole list. */
-  jobResults: (id: string, params: Record<string, string | number> = {}) =>
+  /** Cursor-paginated; see {@link CursorPage}. `?rack=` is `rackLookup`'s one page. */
+  jobResults: (id: string, params: Record<string, string | number | undefined> = {}) =>
     get<CursorPage<Record<string, unknown>>>(
-      `/api/jobs/${id}/results?${new URLSearchParams(
-        Object.entries(params).map(([k, v]) => [k, String(v)])
-      )}`
+      `/api/jobs/${id}/results?${query(params)}`
     ),
-  /** One rack's ranked moves in an opening-rack job, every analysis of it, in one page. */
+  /**
+   * One rack's ranked moves in an opening-rack job, in one page: every analysis
+   * of it, each with its best moves -- the whole list when there are few
+   * analyses, and fewer per analysis the more there are (32,767 moves in all).
+   */
   rackLookup: (id: string, rack: string) =>
     get<CursorPage<RackLookupRow>>(`/api/jobs/${id}/results?${new URLSearchParams({ rack })}`),
   /** Signed-in users only: a games or pairs job's captured positions with one rack, newest first. */
   jobPositions: (id: string, rack: string, params: { per_page?: number; cursor?: string } = {}) =>
     get<CursorPage<SavedPosition>>(
-      `/api/jobs/${id}/positions?${new URLSearchParams({
-        rack,
-        ...Object.fromEntries(Object.entries(params).map(([k, v]) => [k, String(v)]))
-      })}`
+      `/api/jobs/${id}/positions?${query({ rack, ...params })}`
     ),
   /** Signed-in users only: one captured position at random, or `null` before any. */
   randomPosition: (id: string) => get<SavedPosition | null>(`/api/jobs/${id}/positions/random`),
@@ -777,8 +790,12 @@ export const api = {
     anchor_player_config_id: string;
     anchor_rating?: number;
   }) => post<{ id: string }>('/api/admin/rating-pools', body),
+  /** `run_id` is null when the config is already a member: nothing is
+   *  logged or refitted. */
   addRatingPoolMember: (poolId: string, player_config_id: string) =>
-    post<{ run_id: string }>(`/api/admin/rating-pools/${poolId}/members`, { player_config_id }),
+    post<{ run_id: string | null }>(`/api/admin/rating-pools/${poolId}/members`, {
+      player_config_id
+    }),
   removeRatingPoolMember: (poolId: string, configId: string) =>
     del<{ run_id: string }>(`/api/admin/rating-pools/${poolId}/members/${configId}`),
   recomputeRatingPool: (poolId: string) =>
@@ -812,7 +829,10 @@ export const api = {
       klv_id: row.klv_id,
       letterdist_id: row.letterdist_id
     }),
-  /** `409` unless the job is completed and its last claims have landed. */
+  /**
+   * A snapshot while the job is not completed; `409` for a completed job with
+   * claims still in flight, or while an export of the job is already running.
+   */
   startExport: (id: string) =>
     post<{ id: string; state: string }>(`/api/admin/jobs/${id}/export`),
   /** The newest export; `404` when the job has never been exported. */
@@ -863,11 +883,9 @@ export const api = {
     post<{ id: string }>('/api/admin/workers/ban', body),
   unbanWorker: (id: string) => del<void>(`/api/admin/workers/ban/${id}`),
   workerBans: () => get<WorkerBan[]>('/api/admin/workers/bans'),
-  auditLog: (params: Record<string, string | number> = {}) =>
+  auditLog: (params: Record<string, string | number | undefined> = {}) =>
     get<Page<Record<string, unknown>>>(
-      `/api/admin/audit-log?${new URLSearchParams(
-        Object.entries(params).map(([k, v]) => [k, String(v)])
-      )}`
+      `/api/admin/audit-log?${query(params)}`
     )
 };
 
@@ -922,6 +940,12 @@ export interface RatingRun {
   jobs_used: number;
 }
 
+/** A config in a rating pool now, whether or not a fit has rated it yet. */
+export interface RatingPoolMember {
+  player_config_id: string;
+  name: string;
+}
+
 export interface RatingPoolDetail {
   id: string;
   name: string;
@@ -930,6 +954,12 @@ export interface RatingPoolDetail {
   layout: string;
   anchor_player_config_id: string;
   anchor_rating: number;
+  /**
+   * The pool's members now, by name, the anchor among them. Not the set
+   * `ratings` covers, which is the latest fit's: a config added since (or
+   * whose refit failed) has no rating yet, and one removed since still has.
+   */
+  members: RatingPoolMember[];
   run: RatingRun | null;
   ratings: RatingRow[];
   residuals: RatingResidual[];

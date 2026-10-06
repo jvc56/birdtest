@@ -70,7 +70,7 @@ pub struct Job {
     pub test_decided_lower: Option<f64>,
     pub test_decided_upper: Option<f64>,
     pub test_decided_units: Option<i64>,
-    /// Games recorded by the first accepted result of each task; the dashboard's
+    /// Games recorded by the job's accepted results (one per task); the dashboard's
     /// progress numerator, maintained in the submit transaction rather than
     /// summed on read. A pairs job's unit count is half of it.
     pub games_completed: i64,
@@ -86,7 +86,6 @@ pub struct Job {
     /// an hour from it (`scheduler::JOIN_SETTLE`); the ETA's rate is measured
     /// from it.
     pub activated_at: Option<DateTime<Utc>>,
-    pub deactivated_at: Option<DateTime<Utc>>,
 }
 
 impl Job {

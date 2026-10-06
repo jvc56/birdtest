@@ -14,10 +14,11 @@ pub struct AppError {
     /// Seconds to put in a `Retry-After` header. Only rate-limit rejections set it.
     pub retry_after: Option<u64>,
     /// The Postgres SQLSTATE, when this error came from the database. Callers
-    /// that treat a particular violation as an ordinary outcome -- the
-    /// scheduler losing a race on a unique index -- match on this rather than
-    /// on the message text, which is localised by the server's `lc_messages`
-    /// and is not an interface.
+    /// that treat a particular error as an ordinary outcome -- an export
+    /// finding one already running, a lock not to be had, a leave task's
+    /// random seed already taken -- match on this rather than on the message
+    /// text, which is localised by the server's `lc_messages` and is not an
+    /// interface.
     pub db_code: Option<Box<str>>,
     /// The constraint a database violation names, for a handler that maps
     /// one foreign key to what the caller got wrong (and leaves the rest
@@ -34,6 +35,10 @@ pub const LOCK_NOT_AVAILABLE: &str = "55P03";
 /// SQLSTATE for a statement Postgres cancelled, which here means the display
 /// pool's `statement_timeout` (`db::connect_read`): nothing else sets one.
 pub const QUERY_CANCELED: &str = "57014";
+/// SQLSTATE for a text value holding a NUL, which no Postgres text can.
+pub const CHARACTER_NOT_IN_REPERTOIRE: &str = "22021";
+/// SQLSTATE for a `\u0000` in JSON that Postgres is asked to read as text.
+pub const UNTRANSLATABLE_CHARACTER: &str = "22P05";
 
 #[derive(Serialize)]
 struct ErrorBody {
@@ -184,6 +189,16 @@ impl From<sqlx::Error> for AppError {
                             "that claim is busy; try again shortly",
                         )
                     },
+                    // A NUL in something the caller sent -- a query
+                    // parameter, a login name, a key's label -- bound as
+                    // text. Every text the server binds that could hold one
+                    // is the caller's (results and declines refuse it before
+                    // the database), so this is a malformed request, not a
+                    // fault: answered as one rather than a 500 and an error
+                    // line any caller could write at will.
+                    Some(CHARACTER_NOT_IN_REPERTOIRE | UNTRANSLATABLE_CHARACTER) => {
+                        AppError::bad_request("the request holds a character that cannot be stored (a NUL)")
+                    }
                     _ => AppError::internal(format!("database error: {db}")),
                 };
                 // The database's own words go to the log, never to the
@@ -365,8 +380,8 @@ mod tests {
         }
     }
 
-    /// The two violations callers treat as ordinary outcomes keep their
-    /// SQLSTATE, and neither says more than that something conflicted.
+    /// U-ERR-7: the two violations callers treat as ordinary outcomes keep
+    /// their SQLSTATE, and neither says more than that something conflicted.
     #[tokio::test]
     async fn constraint_violations_are_conflicts_without_the_constraint_text() {
         let unique: AppError =
@@ -400,6 +415,22 @@ mod tests {
         }
     }
 
+    /// U-ERR-8: a NUL the database cannot store is the caller's 400, without
+    /// the database's words: a `?worker=%00` or a NUL in a login name was a
+    /// 500 and an error line.
+    #[tokio::test]
+    async fn a_nul_the_database_cannot_store_is_a_bad_request() {
+        for code in [CHARACTER_NOT_IN_REPERTOIRE, UNTRANSLATABLE_CHARACTER] {
+            let err: AppError =
+                db_error(code, "invalid byte sequence for encoding \"UTF8\": 0x00").into();
+            let (status, _, body) = rendered(err).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{code}");
+            assert_eq!(body["code"], "bad_request", "{body}");
+            assert!(!body.to_string().contains("UTF8"), "{body}");
+        }
+    }
+
+    /// U-ERR-7: a pool timeout is a 503 with `Retry-After`.
     #[test]
     fn a_pool_timeout_is_a_503_with_retry_after() {
         let err: AppError = sqlx::Error::PoolTimedOut.into();

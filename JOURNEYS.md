@@ -8,7 +8,7 @@ should see, including what the site must refuse.
 
 [README.md](README.md) is how to run the site, [PLAN.md](PLAN.md) its design,
 and [TESTING.md](TESTING.md) the automated tests, whose end-to-end suite covers
-a handful of these journeys (`E-1`..`E-15`). This document is the whole
+a handful of these journeys (`E-1`..`E-18`). This document is the whole
 surface, by hand.
 
 ## How to use this document

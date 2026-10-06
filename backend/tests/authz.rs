@@ -269,7 +269,12 @@ const ROUTES: &[(&str, &str, Access, &str)] = &[
     ("POST", "/api/auth/reset-password/confirm", PreSession, ""),
     // --- Worker API ---------------------------------------------------------
     ("GET", "/api/worker/client-version", WorkerOpen, ""),
-    ("POST", "/api/worker/task", Worker, r#"{"magpie_version":"1.0.0","unsupported_jobs":[]}"#),
+    (
+        "POST",
+        "/api/worker/task",
+        Worker,
+        r#"{"magpie_version":"1.0.0","board_dim":15,"rack_size":7,"unsupported_jobs":[]}"#,
+    ),
     (
         "POST",
         "/api/worker/decline",
