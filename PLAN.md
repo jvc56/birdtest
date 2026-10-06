@@ -5878,8 +5878,7 @@ birdtest/
 ├── TESTING.md                       # the seven test tiers and every test id
 ├── RUNBOOK.md                       # operating production: restores, rotations, incidents
 ├── JOURNEYS.md                      # the manual pre-launch checklist
-├── FEATURE_BATCH*_PLAN.md, ENDGAME_PEG_PLAN.md, SETTINGS_COMPARISON.md
-│                                    # earlier design records, superseded by this document
+├── SETTINGS_COMPARISON.md           # an earlier design record, superseded by this document
 ├── contract-fixtures/               # one committed example of each worker API message, parsed
 │                                    # by both sides' tests (mirrored in MAGPIE)
 ├── fixtures/                        # tier 5's GitHub stand-in: MAGPIE-DATA tarballs, served by
@@ -8014,8 +8013,12 @@ twenty-fourth's `AUDIT_FINDINGS_20.md`, the twenty-fifth's
 `AUDIT_FINDINGS_21.md`, the twenty-sixth's `AUDIT_FINDINGS_22.md`, the
 twenty-seventh's `AUDIT_FINDINGS_23.md`, the twenty-eighth's
 `AUDIT_FINDINGS_24.md`, the twenty-ninth's `AUDIT_FINDINGS_25.md`, the
-thirtieth's `AUDIT_FINDINGS_26.md`, the thirty-first's `AUDIT_FINDINGS_27.md`
-and the thirty-second's `AUDIT_FINDINGS_28.md`.
+thirtieth's `AUDIT_FINDINGS_26.md`, the thirty-first's `AUDIT_FINDINGS_27.md`,
+the thirty-second's `AUDIT_FINDINGS_28.md` and the thirty-third's
+`AUDIT_FINDINGS_29.md` to `AUDIT_FINDINGS_32.md` (one per pass). The feature
+batches' and the endgame/pre-endgame plans (`FEATURE_BATCH*_PLAN.md`,
+`ENDGAME_PEG_PLAN.md`), all implemented, were deleted with the thirty-third's
+records; they too are in the git history.
 Everything they *changed* is described where it lives, above. This section is
 what they *left*: limits that were accepted on purpose, options that were
 considered and not built, and small things noted rather than fixed.

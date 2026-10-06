@@ -18,7 +18,7 @@ answers three questions:
 **Count.** `arg_token_t` has exactly **175 tokens**, not counting
 `NUMBER_OF_ARG_TOKENS`. 45 are registered as commands (`cmd(...)`) and 130 as
 options (`arg(...)`). 160 of them predate endgame and pre-endgame play in
-games jobs ([ENDGAME_PEG_PLAN.md](ENDGAME_PEG_PLAN.md)), which added 15: the
+games jobs (`ENDGAME_PEG_PLAN.md`, since deleted; see PLAN.md), which added 15: the
 per-player `eplies1`/`eplies2`, `pegbag1`/`pegbag2`, `pegtopk1`/`pegtopk2`,
 `pegstride1`/`pegstride2`, `pegpess1`/`pegpess2` and `pegnested1`/`pegnested2`,
 and the nested-lookahead options `pegncaps`, `pegndepth` and `pegnstrides`.
