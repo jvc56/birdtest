@@ -4,7 +4,7 @@
 
 ### Overview
 
-birdtest is a crowdsourced word game analysis platform, modeled after Fishnet (which crowdsources chess game analysis for Lichess). Users contribute compute by running tasks locally and submitting results back to the site. Admins define jobs and allocate work; the site aggregates results and presents them on a polished dashboard.
+birdtest is a crowdsourced crossword game research platform, modeled after Fishnet (which crowdsources chess game analysis for Lichess). It runs MAGPIE, a crossword board game engine, on volunteers' computers to play test matches between versions, tune its settings and study openings. Users contribute compute by running tasks locally and submitting results back to the site. Admins define jobs and allocate work; the site aggregates results and presents them on a polished dashboard.
 
 ---
 
@@ -1072,20 +1072,28 @@ it is a display figure that only ever moves forward. Account deletion subtracts
 nothing: it anonymizes in place and keeps the claims, so no donated compute is
 lost.
 
-Beside `tasks_completed` each identity carries **`compute_ms`, `games_played`
-and `racks_analyzed`**, and `/api/workers` ranks by compute time unless asked
-otherwise (`?sort=compute|games|racks|tasks`). MAGPIE reports no CPU time or
-thread count, so compute is the time each accepted claim was held, claim to
-submission, in whole milliseconds (`CLAIM_COMPUTE_MS`, one expression for the
-submission that adds it, the purge that gives it back and RUNBOOK §2.3b's
-recount). Each claim records its own games and racks
-(`task_claims.games_played`, `racks_analyzed`: a games or pairs batch's games,
-an opening-rack batch's racks, a leave task's `num_iterations` games and the
-distinct racks it reported), which is what lets a purge give back exactly what
-the submissions added by summing the claims it is about to delete, without
-reading the results. Each order is its own pair of partial indexes, one per kind
-of identity, so every order is two index scans merged, as the list always was;
-the cost is three more index entries on the identity's row per submission.
+Beside `tasks_completed` each identity carries **`compute_ms` and
+`movegens`**, and `/api/workers` ranks by movegens unless asked otherwise
+(`?sort=movegens|compute|tasks`). MAGPIE reports no CPU time or thread count,
+so compute is the time each accepted claim was held, claim to submission, in
+whole milliseconds (`CLAIM_COMPUTE_MS`, one expression for the submission that
+adds it, the purge that gives it back and RUNBOOK §2.3b's recount). Movegens
+are MAGPIE's own count of the work: every call to its move generator during
+the task, on every thread -- sims, endgame and pre-endgame searches and
+autoplay alike -- reported beside the result as the submission's `movegens`.
+They are the default ranking because they measure work done whatever the
+machine: tasks undercount a machine that plays slow, deep games, and compute
+time overcounts a slow one. Each claim records its own (`task_claims.movegens`),
+which is what lets a purge give back exactly what the submissions added by
+summing the claims it is about to delete, without reading the results. Movegens
+are the one measure the server cannot check, so a claim reporting more than a
+million per millisecond held is refused (`MAX_MOVEGENS_PER_MS`): that stops
+nonsense, not a determined liar, which is what bans are for. (Until 2026-10 the
+counters were games played and racks analysed, derived from each result; they
+said little about the work, and a games batch of deep sims counted the same as
+one of static play.) Each order is its own pair of partial indexes, one per
+kind of identity, so every order is two index scans merged, as the list always
+was.
 
 With the two opening-rack aggregates removed, `opening_racks` is now those two
 counters and nothing else: two single-row reads, constant time at any job size.
@@ -3942,7 +3950,10 @@ history and in `ps` output, and contribution settings have no business mixed int
 `settings.txt` alongside board layouts and simulation parameters.
 
 `contribute.txt` sits in the current working directory, one setting per line as
-`key value`. Blank lines and lines beginning with `#` are ignored — but a run
+`key value`. **The file is optional, and so is every setting in it**: a missing
+file means every setting takes its default, and a file that sets only some (an
+`apikey` alone, say) takes the defaults for the rest. An existing file that
+cannot be read is still an error. Blank lines and lines beginning with `#` are ignored — but a run
 with no `apikey` set names a comment that holds `apikey` then a key, since
 appending the setting to a last comment line with no newline puts it there
 (thirty-second audit, pass 18). Setting names are lowercase (one in the wrong
@@ -3962,7 +3973,7 @@ uuid      6f3d7198-178a-47c8-9ccc-6aa6995a5a9c
 
 | Key | Required | Default | Meaning |
 |---|---|---|---|
-| `server` | **yes** | — | birdtest base URL |
+| `server` | no | `https://birdtest.org` | birdtest base URL (MAGPIE's `CONTRIBUTE_DEFAULT_SERVER`) |
 | `apikey` | no | absent | Attributes work to an account. Without it the worker is anonymous, identified by `uuid`. |
 | `threads` | no | cores − 1 | Threads given to MAGPIE while working |
 | `maxtasks` | no | `0` | Tasks to complete before stopping; `0` runs until stopped |
@@ -3970,12 +3981,16 @@ uuid      6f3d7198-178a-47c8-9ccc-6aa6995a5a9c
 | `uuid` | no | assigned by the server | The anonymous worker identity |
 
 An unknown key is an error rather than a silent ignore — a typo'd `apikey` should
-not quietly downgrade someone to anonymous. If `server` is missing, `contribute`
-fails with a message naming the file and the missing key, not a usage string,
-since the fix is editing a file.
+not quietly downgrade someone to anonymous. Only a missing setting defaults; a
+malformed one is still refused. `contribute` prints the settings it is using at
+start, marking each defaulted one (`server https://birdtest.org (default)`) and
+saying only whether an API key is set, never the key.
 
 The file is **user-authored and MAGPIE does not rewrite it**, with exactly one
-exception: once the server assigns a `uuid`, MAGPIE **appends a single line**.
+exception: once the server assigns a `uuid`, MAGPIE **appends a single line**,
+creating the file (with a one-line header comment) if there is none. It never
+writes a defaulted setting into it, so a later change of default reaches every
+contributor whose file does not override it.
 Appending rather than rewriting means comments, ordering and formatting the
 contributor put there survive untouched.
 
@@ -4002,10 +4017,13 @@ worker's first task and nothing after that, and means `contribute` needs no
 cryptographically secure random source at all.
 
 Because the file is resolved relative to the working directory, a contributor who
-runs MAGPIE from a different directory has no `contribute.txt` there and
-`contribute` stops rather than silently becoming a new anonymous worker and
-losing their contribution history. (Without `./data` it stops even earlier, on
-loading its default board layout, and exits 0 either way.)
+runs MAGPIE from a different directory has no `contribute.txt` there. That used
+to stop `contribute`; since the file became optional it starts as a new
+anonymous worker on the defaults instead, losing the link to the earlier
+identity's history. The trade was made deliberately (2026-10): a first-time
+contributor needs no file at all, and the settings printed at start --
+`(default)` beside the server, no `uuid` -- show the mistake at once. (Without
+`./data` it still stops, on loading its default board layout, and exits 0.)
 
 **The API key needs no special file handling.** `contribute.txt` holds a bearer
 credential when `apikey` is set, but nothing about that requires MAGPIE-side
@@ -4024,6 +4042,11 @@ only an optional path to the settings file, defaulting to `contribute.txt`:
 magpie> contribute                      # reads ./contribute.txt
 magpie> contribute /path/to/other.txt   # a path is not a secret
 ```
+
+Only the default `contribute.txt` may be missing. A path given explicitly must
+exist (it may be empty, or set only some settings): a typo in a named file
+would otherwise start a new anonymous identity against the default server
+without a word.
 
 Implemented as `impl_contribute(Config *config, const char *settings_path,
 ErrorStack *error_stack)` in `src/impl/config.c`, following the other `impl_*`
@@ -4801,10 +4824,14 @@ declined leave task is reissued as it stands.
 
 #### `POST /api/worker/result`
 
-`{ "claim_token": "...", "result": { } }` → `200` with `{"accepted": true}`, or
-`{"accepted": false}` when the claim had already lapsed or the result was already
-accepted — which is **not an error**: the work was reassigned or is done. `400`
-when the result does not satisfy its shape; `413` over 64 MiB.
+`{ "claim_token": "...", "movegens": 123456, "result": { } }` → `200` with
+`{"accepted": true}`, or `{"accepted": false}` when the claim had already lapsed
+or the result was already accepted — which is **not an error**: the work was
+reassigned or is done. `400` when the result does not satisfy its shape, or
+`movegens` is missing, not a whole number from 0 to `i64::MAX`, or more than a
+million per millisecond the claim was held; `413` over 64 MiB. `movegens` is
+the move generations MAGPIE performed for the task, on every thread, which its
+contributor is credited with (see "The stats payload").
 
 ```json
 { "racks": [ { "rack": "ABDEELT", "num_moves": 412,
@@ -5748,7 +5775,7 @@ do not exist.
 | `GET` | `/api/jobs/:id/board` | What a position is drawn on, public: the job's layout parsed (`start` as `[row, column]`, `squares` row by row — `normal`, `double_letter` … `quadruple_word`, `brick`) and every letter of its distribution in machine-letter order with its blank's spelling and its score. Read from the bytes the job pins, by the same parsers job creation checks them with. |
 | `GET` | `/api/jobs/:id/stream` | SSE stream of live stat updates for a job. Pushes an event after accepted results, coalesced to at most one per `JOB_STATS_CACHE_SECONDS` (an admin's change, a completion or a generation closing at once). |
 | `GET` | `/api/users` | List all registered user accounts with contribution stats. Paginated. |
-| `GET` | `/api/workers` | Contributor stats for all workers (anonymous and authenticated) — compute time, games, racks, tasks and the last result — paginated, ranked by compute time or by `?sort=compute\|games\|racks\|tasks`. |
+| `GET` | `/api/workers` | Contributor stats for all workers (anonymous and authenticated) — movegens, compute time, tasks and the last result — paginated, ranked by movegens or by `?sort=movegens\|compute\|tasks`. |
 | `GET` | `/api/rating-pools` | Rating pools with their conditions, member counts and last fit time. |
 | `GET` | `/api/rating-pools/:id` | One pool: its members now (`members`: config id and name, the anchor among them) and its latest fit, with run provenance, each rated config's rating with uncertainty, and the residuals. The two sets can differ: a member added since the fit (or whose refit failed) has no rating yet, and one removed since is still rated. |
 | `GET` | `/api/rating-pools/:id/history` | Stored runs' ratings, oldest first, thinned to at most 500 runs evenly spaced over the pool's history, for the six current members rated highest in the newest run. No page draws it now. |
@@ -5777,7 +5804,7 @@ SvelteKit uses file-based routing under `frontend/src/routes/`. Each directory w
 | `/jobs` | Job list — all jobs with type, status, allocation, and completion counter. Loaded on visit rather than live: there is no job-list stream, only a per-job one. |
 | `/jobs/[id]` | Job detail — four headline cards (status, allocation, tasks completed, estimated time left; the admin page has the same), job-type-specific stats and per-worker contribution table. Live-updated via SSE. The status card says nothing beside an active job's badge; an inactive job's says "Paused: …" (and where its significance test stands), a completed job's "Finished …: …" and why. Beside the lexicon and variant, how each player searches ("4-ply sim, 1,000 iterations vs static, by equity"); a Job settings card — the job's settings and its type's, every row, with no toggle, the significance test one row ("no" or "yes (95%)") — then a Player settings card, the players side by side (`PlayerSettingsTable`: one column per player, those they differ in bold, each name linking to its config), showing their key rows (Lexicon, Leaves, Sorted By, Move Recorder, Moves Generated, Plies, Uses Inference, Uses Preendgame, Uses Endgame, for every player) with an "All settings" toggle for the rest, and a JSON download (`GET /api/jobs/:id/config`). Which player rows are key is `jobSettings.ts`'s (`PLAYER_ROWS`, `keySettings`). The admin job page has the same cards. |
 | `/users` | Registered user list — all user accounts with contribution stats. |
-| `/workers` | Contributor leaderboard — all workers (anonymous and authenticated) ranked by compute time, or by games, racks or tasks at a click on the column; on a phone only the ranked column is shown beside the name, and a "Rank by" row above the list chooses it. |
+| `/workers` | Contributor leaderboard — all workers (anonymous and authenticated) ranked by movegens (shown as "1.2M"; the exact count on hover), or by compute time or tasks at a click on the column; on a phone only the ranked column is shown beside the name, and a "Rank by" row above the list chooses it. |
 | `/ratings` | Rating pool list — each pool's conditions, member count and last fit. |
 | `/player-configs` | Every player config, newest first: its name, how it searches, its lexicon and leaves. Public, like the job pages that already show players' settings. |
 | `/player-configs/[id]` | One config: a table of its key settings (its files, how moves are sorted, recorded and generated, plies, and whether it infers and solves the pre-endgame and endgame) that "All settings" grows to every setting — the job page's `PlayerSettingsTable` with one column — a JSON download, and the config it was cloned from. The job page's Settings card links each player here. |
@@ -6180,18 +6207,19 @@ CREATE TABLE users (
     -- The rest of the contribution, kept the same way and given back the same
     -- way: the time each accepted claim was held, claim to submission, in
     -- milliseconds (MAGPIE reports no CPU or thread counts, so this is the
-    -- measure of compute there is, and what the contributor list ranks by);
-    -- the games those claims played; and the racks they analysed -- an
-    -- opening-rack batch's racks, the distinct racks a leave task drew. Summed
-    -- from each claim's own figures (`task_claims.games_played`,
-    -- `racks_analyzed`), every claim counted: unlike a job's progress, which
-    -- counts an opening rack once however often consensus has it analysed
-    -- again, a contributor did the work of each claim.
+    -- only measure of time there is); and the move generations those claims
+    -- performed, as MAGPIE counts and reports them with each result -- every
+    -- call to its move generator, in sims, endgame and pre-endgame searches
+    -- and autoplay alike, on every thread. Movegens are the measure of work
+    -- done, independent of how fast a machine is or how long it held a
+    -- claim, and what the contributor list ranks by. Summed from each claim's
+    -- own figure (`task_claims.movegens`), every claim counted: unlike a job's
+    -- progress, which counts an opening rack once however often consensus has
+    -- it analysed again, a contributor did the work of each claim.
     -- Integer milliseconds rather than fractional seconds so that what a purge
     -- takes back is exactly what the submissions added.
     compute_ms           BIGINT NOT NULL DEFAULT 0 CHECK (compute_ms >= 0),
-    games_played         BIGINT NOT NULL DEFAULT 0 CHECK (games_played >= 0),
-    racks_analyzed       BIGINT NOT NULL DEFAULT 0 CHECK (racks_analyzed >= 0),
+    movegens             BIGINT NOT NULL DEFAULT 0 CHECK (movegens >= 0),
     last_completed_at    TIMESTAMPTZ,
     created_at           TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -6202,7 +6230,7 @@ CREATE INDEX users_contribution_idx ON users (tasks_completed DESC, created_at A
     WHERE deleted_at IS NULL;
 
 -- Serve the account half of /api/workers, one per order that list offers --
--- compute time (its default), games, racks and tasks -- with the list's own
+-- movegens (its default), compute time and tasks -- with the list's own
 -- predicate, so whichever it is sorted by it is the same contributors (see
 -- anonymous_workers_contribution_idx). A deleted account keeps its place
 -- there: its work was done, and it is listed under its anonymized name.
@@ -6210,9 +6238,7 @@ CREATE INDEX users_worker_rank_idx ON users (tasks_completed DESC, id)
     WHERE tasks_completed > 0;
 CREATE INDEX users_worker_compute_idx ON users (compute_ms DESC, id)
     WHERE tasks_completed > 0;
-CREATE INDEX users_worker_games_idx ON users (games_played DESC, id)
-    WHERE tasks_completed > 0;
-CREATE INDEX users_worker_racks_idx ON users (racks_analyzed DESC, id)
+CREATE INDEX users_worker_movegens_idx ON users (movegens DESC, id)
     WHERE tasks_completed > 0;
 
 CREATE TABLE email_confirmations (
@@ -6271,15 +6297,14 @@ CREATE TABLE anonymous_workers (
     -- answers "is this worker still around".
     last_seen_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     -- The contribution counters, mirroring users.tasks_completed, compute_ms,
-    -- games_played, racks_analyzed and last_completed_at; see there for what
+    -- movegens and last_completed_at; see there for what
     -- each counts, why they are counters and who decrements them.
     -- `last_completed_at` is distinct from `last_seen_at` above: one is the
     -- last task finished, the other is the last request of any kind, and the
     -- contributor list shows the first.
     tasks_completed   BIGINT NOT NULL DEFAULT 0 CHECK (tasks_completed >= 0),
     compute_ms        BIGINT NOT NULL DEFAULT 0 CHECK (compute_ms >= 0),
-    games_played      BIGINT NOT NULL DEFAULT 0 CHECK (games_played >= 0),
-    racks_analyzed    BIGINT NOT NULL DEFAULT 0 CHECK (racks_analyzed >= 0),
+    movegens          BIGINT NOT NULL DEFAULT 0 CHECK (movegens >= 0),
     last_completed_at TIMESTAMPTZ
 );
 
@@ -6291,10 +6316,8 @@ CREATE INDEX anonymous_workers_contribution_idx
     ON anonymous_workers (tasks_completed DESC, uuid) WHERE tasks_completed > 0;
 CREATE INDEX anonymous_workers_compute_idx
     ON anonymous_workers (compute_ms DESC, uuid) WHERE tasks_completed > 0;
-CREATE INDEX anonymous_workers_games_idx
-    ON anonymous_workers (games_played DESC, uuid) WHERE tasks_completed > 0;
-CREATE INDEX anonymous_workers_racks_idx
-    ON anonymous_workers (racks_analyzed DESC, uuid) WHERE tasks_completed > 0;
+CREATE INDEX anonymous_workers_movegens_idx
+    ON anonymous_workers (movegens DESC, uuid) WHERE tasks_completed > 0;
 
 CREATE TABLE worker_bans (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -7107,16 +7130,13 @@ CREATE TABLE task_claims (
     claimed_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_heartbeat_at    TIMESTAMPTZ,
     completed_at         TIMESTAMPTZ,
-    -- What this claim's accepted result played and analysed, written when it
-    -- completes (zero until then, and for a claim that never does): the games
-    -- of a games or pairs batch or of a leave task, the racks of an
-    -- opening-rack batch or the distinct racks a leave task drew. Its
-    -- contributor's running totals add these, so a purge can give back
-    -- exactly what they added by summing the claims it is about to delete,
-    -- without reading the results. Every claim's own, not the task's first
-    -- result's.
-    games_played         INT NOT NULL DEFAULT 0,
-    racks_analyzed       INT NOT NULL DEFAULT 0,
+    -- The move generations this claim's accepted result reported (the
+    -- submission's `movegens`), written when it completes (zero until then,
+    -- and for a claim that never does). Its contributor's running total adds
+    -- this, so a purge can give back exactly what it added by summing the
+    -- claims it is about to delete, without reading the results. Every
+    -- claim's own, not the task's first result's.
+    movegens             BIGINT NOT NULL DEFAULT 0 CHECK (movegens >= 0),
     -- As reported at claim time. What the fleet is actually running, which is
     -- the evidence for raising a job's floor.
     magpie_version       TEXT,
@@ -10142,9 +10162,9 @@ says so in its implemented option, rather than being removed.
   `/api/users`, tie-broken by `created_at`, and `users_worker_rank_idx` for
   `/api/workers`, by `id`), each written on every registered submission. One
   would do if `/api/users` broke ties by id — a visible ordering change, left
-  for a decision. *(Fifteenth audit.)* (The worker list's other three orders,
-  compute, games and racks, have an index each too, on both kinds of
-  identity: every submission writes them.)
+  for a decision. *(Fifteenth audit.)* (The worker list's other two orders,
+  movegens and compute, have an index each too, on both kinds of identity:
+  every submission writes them.)
 - **The job list's `stalled` flag reads `jobs.last_completed_at`** — done
   (nineteenth audit). Answered from the claims, "no result in a day" joined
   every task of the job to the day's completions (hundreds of milliseconds at a

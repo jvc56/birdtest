@@ -33,18 +33,19 @@ CREATE TABLE users (
     -- The rest of the contribution, kept the same way and given back the same
     -- way: the time each accepted claim was held, claim to submission, in
     -- milliseconds (MAGPIE reports no CPU or thread counts, so this is the
-    -- measure of compute there is, and what the contributor list ranks by);
-    -- the games those claims played; and the racks they analysed -- an
-    -- opening-rack batch's racks, the distinct racks a leave task drew. Summed
-    -- from each claim's own figures (`task_claims.games_played`,
-    -- `racks_analyzed`), every claim counted: unlike a job's progress, which
-    -- counts an opening rack once however often consensus has it analysed
-    -- again, a contributor did the work of each claim.
+    -- only measure of time there is); and the move generations those claims
+    -- performed, as MAGPIE counts and reports them with each result -- every
+    -- call to its move generator, in sims, endgame and pre-endgame searches
+    -- and autoplay alike, on every thread. Movegens are the measure of work
+    -- done, independent of how fast a machine is or how long it held a
+    -- claim, and what the contributor list ranks by. Summed from each claim's
+    -- own figure (`task_claims.movegens`), every claim counted: unlike a job's
+    -- progress, which counts an opening rack once however often consensus has
+    -- it analysed again, a contributor did the work of each claim.
     -- Integer milliseconds rather than fractional seconds so that what a purge
     -- takes back is exactly what the submissions added.
     compute_ms           BIGINT NOT NULL DEFAULT 0 CHECK (compute_ms >= 0),
-    games_played         BIGINT NOT NULL DEFAULT 0 CHECK (games_played >= 0),
-    racks_analyzed       BIGINT NOT NULL DEFAULT 0 CHECK (racks_analyzed >= 0),
+    movegens             BIGINT NOT NULL DEFAULT 0 CHECK (movegens >= 0),
     last_completed_at    TIMESTAMPTZ,
     created_at           TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -55,7 +56,7 @@ CREATE INDEX users_contribution_idx ON users (tasks_completed DESC, created_at A
     WHERE deleted_at IS NULL;
 
 -- Serve the account half of /api/workers, one per order that list offers --
--- compute time (its default), games, racks and tasks -- with the list's own
+-- movegens (its default), compute time and tasks -- with the list's own
 -- predicate, so whichever it is sorted by it is the same contributors (see
 -- anonymous_workers_contribution_idx). A deleted account keeps its place
 -- there: its work was done, and it is listed under its anonymized name.
@@ -63,9 +64,7 @@ CREATE INDEX users_worker_rank_idx ON users (tasks_completed DESC, id)
     WHERE tasks_completed > 0;
 CREATE INDEX users_worker_compute_idx ON users (compute_ms DESC, id)
     WHERE tasks_completed > 0;
-CREATE INDEX users_worker_games_idx ON users (games_played DESC, id)
-    WHERE tasks_completed > 0;
-CREATE INDEX users_worker_racks_idx ON users (racks_analyzed DESC, id)
+CREATE INDEX users_worker_movegens_idx ON users (movegens DESC, id)
     WHERE tasks_completed > 0;
 
 CREATE TABLE email_confirmations (
@@ -124,15 +123,14 @@ CREATE TABLE anonymous_workers (
     -- answers "is this worker still around".
     last_seen_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     -- The contribution counters, mirroring users.tasks_completed, compute_ms,
-    -- games_played, racks_analyzed and last_completed_at; see there for what
+    -- movegens and last_completed_at; see there for what
     -- each counts, why they are counters and who decrements them.
     -- `last_completed_at` is distinct from `last_seen_at` above: one is the
     -- last task finished, the other is the last request of any kind, and the
     -- contributor list shows the first.
     tasks_completed   BIGINT NOT NULL DEFAULT 0 CHECK (tasks_completed >= 0),
     compute_ms        BIGINT NOT NULL DEFAULT 0 CHECK (compute_ms >= 0),
-    games_played      BIGINT NOT NULL DEFAULT 0 CHECK (games_played >= 0),
-    racks_analyzed    BIGINT NOT NULL DEFAULT 0 CHECK (racks_analyzed >= 0),
+    movegens          BIGINT NOT NULL DEFAULT 0 CHECK (movegens >= 0),
     last_completed_at TIMESTAMPTZ
 );
 
@@ -144,10 +142,8 @@ CREATE INDEX anonymous_workers_contribution_idx
     ON anonymous_workers (tasks_completed DESC, uuid) WHERE tasks_completed > 0;
 CREATE INDEX anonymous_workers_compute_idx
     ON anonymous_workers (compute_ms DESC, uuid) WHERE tasks_completed > 0;
-CREATE INDEX anonymous_workers_games_idx
-    ON anonymous_workers (games_played DESC, uuid) WHERE tasks_completed > 0;
-CREATE INDEX anonymous_workers_racks_idx
-    ON anonymous_workers (racks_analyzed DESC, uuid) WHERE tasks_completed > 0;
+CREATE INDEX anonymous_workers_movegens_idx
+    ON anonymous_workers (movegens DESC, uuid) WHERE tasks_completed > 0;
 
 CREATE TABLE worker_bans (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -960,16 +956,13 @@ CREATE TABLE task_claims (
     claimed_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_heartbeat_at    TIMESTAMPTZ,
     completed_at         TIMESTAMPTZ,
-    -- What this claim's accepted result played and analysed, written when it
-    -- completes (zero until then, and for a claim that never does): the games
-    -- of a games or pairs batch or of a leave task, the racks of an
-    -- opening-rack batch or the distinct racks a leave task drew. Its
-    -- contributor's running totals add these, so a purge can give back
-    -- exactly what they added by summing the claims it is about to delete,
-    -- without reading the results. Every claim's own, not the task's first
-    -- result's.
-    games_played         INT NOT NULL DEFAULT 0,
-    racks_analyzed       INT NOT NULL DEFAULT 0,
+    -- The move generations this claim's accepted result reported (the
+    -- submission's `movegens`), written when it completes (zero until then,
+    -- and for a claim that never does). Its contributor's running total adds
+    -- this, so a purge can give back exactly what it added by summing the
+    -- claims it is about to delete, without reading the results. Every
+    -- claim's own, not the task's first result's.
+    movegens             BIGINT NOT NULL DEFAULT 0 CHECK (movegens >= 0),
     -- As reported at claim time. What the fleet is actually running, which is
     -- the evidence for raising a job's floor.
     magpie_version       TEXT,

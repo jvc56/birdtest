@@ -87,6 +87,6 @@
   </main>
 
   <footer class="border-t border-border px-6 py-4 text-center text-xs text-muted-foreground">
-    birdtest — crowdsourced crossword game analysis
+    birdtest — crowdsourced crossword game research
   </footer>
 </div>

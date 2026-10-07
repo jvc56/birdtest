@@ -655,6 +655,19 @@ def _submission(assignment: dict, mode: str, rng: random.Random,
     return token, result
 
 
+def _movegens(result: dict) -> int:
+    """The `movegens` a submission of `result` reports beside it.
+
+    MAGPIE counts every call to its move generator; the fake generates no
+    moves, so it reports a stand-in in proportion to the work its result
+    describes -- thirty per game played, fifty per rack -- which is always
+    positive and far under what the server refuses as implausible.
+    """
+    games = result.get("all_games", {}).get("games", 0)
+    racks = len(result.get("racks", []))
+    return max(1, 30 * games + 50 * racks)
+
+
 def emit_fixture(args: argparse.Namespace) -> None:
     """Print, without contacting a server, what one worker in `--mode` would
     submit for the assignment in the file `--emit-fixture` names.
@@ -670,7 +683,7 @@ def emit_fixture(args: argparse.Namespace) -> None:
 
     What is printed depends on the mode:
       normal     the result, as posted under `result`
-      stale      the whole body, `{"claim_token": ..., "result": ...}`
+      stale      the whole body, `{"claim_token": ..., "movegens": ..., "result": ...}`
       malformed  `{variant: result}` for every entry of CORRUPTIONS, rather
                  than the one a run draws at random
       abandon    null: the mode submits nothing
@@ -694,7 +707,11 @@ def emit_fixture(args: argparse.Namespace) -> None:
         if submission is None:
             output = None
         elif args.mode == "stale":
-            output = {"claim_token": submission[0], "result": submission[1]}
+            output = {
+                "claim_token": submission[0],
+                "movegens": _movegens(submission[1]),
+                "result": submission[1],
+            }
         else:
             output = submission[1]
     else:
@@ -798,7 +815,7 @@ class FakeWorker:
             response = self.session.post(
                 self._url("/api/worker/result"),
                 headers=self.headers,
-                json={"claim_token": claim_token, "result": result},
+                json={"claim_token": claim_token, "movegens": _movegens(result), "result": result},
                 timeout=60,
             )
             if response.status_code == 429:

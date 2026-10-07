@@ -901,7 +901,7 @@ async fn games_history(app: &Router) -> String {
         post_json(
             "/api/worker/result",
             &[("x-worker-uuid", &uuid)],
-            json!({ "claim_token": assignment["claim_token"], "result": result }),
+            json!({ "claim_token": assignment["claim_token"], "movegens": 1000, "result": result }),
         ),
     )
     .await;
@@ -959,7 +959,7 @@ async fn leave_history(app: &Router) {
         post_json(
             "/api/worker/result",
             &[("x-worker-uuid", body["worker_uuid"].as_str().unwrap())],
-            json!({ "claim_token": body["claim_token"], "result": { "racks": racks } }),
+            json!({ "claim_token": body["claim_token"], "movegens": 1000, "result": { "racks": racks } }),
         ),
     )
     .await;

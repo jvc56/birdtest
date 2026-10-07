@@ -48,6 +48,29 @@ export function computeTime(seconds: number | null): string {
   return d % 365 ? `${y.toLocaleString()}y ${d % 365}d` : `${y.toLocaleString()}y`;
 }
 
+/**
+ * A large count in three significant figures or fewer: "950", "12.3K",
+ * "4.56M" reads as "4.5M", "1.2B". Rounded down, so a count never shows as
+ * more than it is -- or reaches the next unit early ("1000K"). Movegens run
+ * to billions per contributor, where every digit side by side is noise.
+ */
+export function bigCount(n: number | null): string {
+  if (n === null || !isFinite(n) || n < 0) return '—';
+  const units: [number, string][] = [
+    [1e12, 'T'],
+    [1e9, 'B'],
+    [1e6, 'M'],
+    [1e3, 'K']
+  ];
+  for (const [size, suffix] of units) {
+    if (n >= size) {
+      const v = n / size;
+      return `${v >= 100 ? Math.floor(v) : Math.floor(v * 10) / 10}${suffix}`;
+    }
+  }
+  return String(Math.floor(n));
+}
+
 export function datetime(value: string | null): string {
   if (!value) return '—';
   return new Date(value).toLocaleString();

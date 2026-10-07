@@ -390,15 +390,16 @@ async fn insert_on_demand_task(
 /// position come from: both are job settings the request rows denormalize, so
 /// reading them from the template costs no round trip inside the task's lock.
 ///
-/// Returns what the result adds to the job's totals and what this claim did,
-/// which its contributor is credited with.
+/// Returns what the result adds to the job's totals. What the claim did for
+/// its contributor is not read from the result: MAGPIE reports it beside the
+/// result, as the submission's `movegens` (`routes::worker::submit_result`).
 pub async fn store_result(
     conn: &mut PgConnection,
     template: &JobTemplate,
     task_id: Uuid,
     claim_id: Uuid,
     decoded: DecodedResult,
-) -> AppResult<(ProgressDelta, ClaimUnits)> {
+) -> AppResult<ProgressDelta> {
     match decoded {
         DecodedResult::OpeningRack(record) => {
             let racks: Vec<String> =
@@ -406,28 +407,20 @@ pub async fn store_result(
             opening_rack::check_batch_against_task(conn, template, task_id, &racks).await?;
             opening_rack::OpeningRackHandler::insert_record(conn, template, task_id, claim_id, &record)
                 .await?;
-            // One row per rack, and the unique index on (task_claim_id, rack)
-            // means the insert above would have failed on a duplicate, so the
-            // submission's length is its distinct-rack count -- what its
-            // contributor is credited with. What the job's totals gain depends
-            // on whether its racks were analysed before, which a consensus job
-            // reissues them to be.
+            // What the job's totals gain depends on whether its racks were
+            // analysed before, which a consensus job reissues them to be.
             let tally = opening_rack::record_consensus(conn, template.job_id, &racks).await?;
-            let racks = record.positions.len() as i64;
-            Ok((
-                ProgressDelta {
-                    racks_analyzed: tally.analysed,
-                    racks_settled: tally.settled,
-                    racks_without_consensus: tally.without_consensus,
-                    ..ProgressDelta::default()
-                },
-                ClaimUnits { games: 0, racks },
-            ))
+            Ok(ProgressDelta {
+                racks_analyzed: tally.analysed,
+                racks_settled: tally.settled,
+                racks_without_consensus: tally.without_consensus,
+                ..ProgressDelta::default()
+            })
         }
         DecodedResult::Games(record) => {
             game::GameHandler::insert_record(conn, template, task_id, claim_id, &record).await?;
             let games = record.all_games.games as i64;
-            Ok((ProgressDelta { games_completed: games, ..ProgressDelta::default() }, ClaimUnits { games, racks: 0 }))
+            Ok(ProgressDelta { games_completed: games, ..ProgressDelta::default() })
         }
         DecodedResult::GamePairs(record) => {
             game_pair::GamePairHandler::insert_record(conn, template, task_id, claim_id, &record)
@@ -435,23 +428,15 @@ pub async fn store_result(
             // Games, not pairs, for both job types: the pairs count is half of
             // it and is derived where it is displayed.
             let games = record.all_games.games as i64;
-            Ok((ProgressDelta { games_completed: games, ..ProgressDelta::default() }, ClaimUnits { games, racks: 0 }))
+            Ok(ProgressDelta { games_completed: games, ..ProgressDelta::default() })
         }
         DecodedResult::LeaveGeneration(record) => {
-            let JobKind::LeaveGeneration { config, .. } = &template.kind else {
+            if !matches!(template.kind, JobKind::LeaveGeneration { .. }) {
                 return Err(template.mismatch("leave_generation"));
-            };
+            }
             leave_gen::LeaveGenHandler::insert_record(conn, template, task_id, claim_id, &record)
                 .await?;
-            // A leave task plays the job's `num_iterations` games and stops
-            // (its request's `num_games`, written from the same setting), and
-            // reports every rack its games drew: the racks it analysed, as the
-            // claim's `leave_records.rack_count` says.
-            let units = ClaimUnits {
-                games: i64::from(config.num_iterations),
-                racks: record.racks.len() as i64,
-            };
-            Ok((ProgressDelta::default(), units))
+            Ok(ProgressDelta::default())
         }
     }
 }
@@ -658,15 +643,6 @@ pub struct ProgressDelta {
     pub racks_analyzed: i64,
     pub racks_settled: i64,
     pub racks_without_consensus: i64,
-}
-
-/// What one accepted claim did, which its contributor's running totals add
-/// (`users` / `anonymous_workers`, and the claim's own row, from which a purge
-/// gives them back): games played, racks analysed.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct ClaimUnits {
-    pub games: i64,
-    pub racks: i64,
 }
 
 /// The part of job initialization that cannot run inside the creating

@@ -30,15 +30,23 @@ async fn submit_as(
     token: &str,
     result: serde_json::Value,
 ) -> (StatusCode, serde_json::Value) {
-    send(
-        app,
-        post_json(
-            "/api/worker/result",
-            &[("x-worker-uuid", uuid)],
-            json!({ "claim_token": token, "result": result }),
-        ),
-    )
-    .await
+    submit_with_movegens(app, uuid, token, result, json!(1000)).await
+}
+
+/// A submission reporting `movegens` as given (a number, or anything else a
+/// client might send); `Value::Null` leaves the field out.
+async fn submit_with_movegens(
+    app: &axum::Router,
+    uuid: &str,
+    token: &str,
+    result: serde_json::Value,
+    movegens: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let mut body = json!({ "claim_token": token, "result": result });
+    if !movegens.is_null() {
+        body["movegens"] = movegens;
+    }
+    send(app, post_json("/api/worker/result", &[("x-worker-uuid", uuid)], body)).await
 }
 
 async fn anonymous_worker_count(db: &TestDb) -> i64 {
@@ -304,16 +312,19 @@ async fn analysed_racks_are_counted_as_they_arrive() {
     let racks = stats.opening_racks.expect("an opening-rack job reports rack stats");
     assert_eq!(racks.racks_analyzed, 4, "four racks were analysed, two by each worker");
 
-    // Each worker is credited with its own claim's racks.
+    // Each worker is credited with its own claim's movegens, which the claim
+    // keeps for a purge to give back.
     for uuid in [&uuid_a, &uuid_b] {
         let credited: (i64, i64) = sqlx::query_as(
-            "SELECT games_played, racks_analyzed FROM anonymous_workers WHERE uuid = $1::uuid",
+            "SELECT w.movegens, c.movegens FROM anonymous_workers w
+             JOIN task_claims c ON c.claimed_by_anon_uuid = w.uuid
+             WHERE w.uuid = $1::uuid",
         )
         .bind(uuid)
         .fetch_one(&db.pool)
         .await
         .unwrap();
-        assert_eq!(credited, (0, 2), "{uuid}");
+        assert_eq!(credited, (1000, 1000), "{uuid}");
     }
 }
 
@@ -1826,10 +1837,11 @@ async fn contributions_are_counted_as_they_arrive() {
 }
 
 /// A contributor is credited with what each of its claims did: the time the
-/// claim was held, claim to submission, and the games it played. Two workers,
-/// a task each, are each credited its games; the job counts them all.
+/// claim was held, claim to submission, and the move generations it reported.
+/// Two workers, a task each, are each credited their own; the job counts both
+/// tasks' games.
 #[tokio::test]
-async fn each_accepted_claim_credits_its_time_and_games_to_its_contributor() {
+async fn each_accepted_claim_credits_its_time_and_movegens_to_its_contributor() {
     let db = TestDb::new().await;
     let job = db.games_job(2).await;
     let app = birdtest::app(db.state().await);
@@ -1837,8 +1849,8 @@ async fn each_accepted_claim_credits_its_time_and_games_to_its_contributor() {
     let counters = |uuid: String| {
         let pool = db.pool.clone();
         async move {
-            sqlx::query_as::<_, (i64, i64, i64, i64)>(
-                "SELECT tasks_completed, compute_ms, games_played, racks_analyzed
+            sqlx::query_as::<_, (i64, i64, i64)>(
+                "SELECT tasks_completed, compute_ms, movegens
                  FROM anonymous_workers WHERE uuid = $1::uuid",
             )
             .bind(uuid)
@@ -1851,7 +1863,7 @@ async fn each_accepted_claim_credits_its_time_and_games_to_its_contributor() {
     let (first, a) = first_claim(&app).await;
     let (second, b) = first_claim(&app).await;
     assert_ne!(first["task_request"]["seed"], second["task_request"]["seed"], "a task each");
-    assert_eq!(counters(a.clone()).await, (0, 0, 0, 0), "a claim is not a contribution");
+    assert_eq!(counters(a.clone()).await, (0, 0, 0), "a claim is not a contribution");
     // The first claim was held a minute and a half; the second not at all.
     sqlx::query(
         "UPDATE task_claims SET claimed_at = now() - interval '90 seconds' WHERE claim_token = $1::uuid",
@@ -1861,17 +1873,18 @@ async fn each_accepted_claim_credits_its_time_and_games_to_its_contributor() {
     .await
     .unwrap();
 
-    for (assignment, uuid) in [(&first, &a), (&second, &b)] {
+    for (assignment, uuid, movegens) in [(&first, &a, 70_000), (&second, &b, 300)] {
         let token = assignment["claim_token"].as_str().unwrap();
-        let (_, body) = submit_as(&app, uuid, token, games_result(2, 1)).await;
+        let (_, body) =
+            submit_with_movegens(&app, uuid, token, games_result(2, 1), json!(movegens)).await;
         assert_eq!(body["accepted"], true, "{body}");
     }
 
-    let (tasks, compute_ms, games, racks) = counters(a.clone()).await;
-    assert_eq!((tasks, games, racks), (1, 2, 0));
+    let (tasks, compute_ms, movegens) = counters(a.clone()).await;
+    assert_eq!((tasks, movegens), (1, 70_000));
     assert!((90_000..100_000).contains(&compute_ms), "held 90 s: {compute_ms} ms");
-    let (tasks, compute_ms, games, racks) = counters(b.clone()).await;
-    assert_eq!((tasks, games, racks), (1, 2, 0), "the second worker is credited its own games");
+    let (tasks, compute_ms, movegens) = counters(b.clone()).await;
+    assert_eq!((tasks, movegens), (1, 300), "the second worker is credited its own movegens");
     assert!(compute_ms < 10_000, "{compute_ms} ms");
     let games_completed: i64 = sqlx::query_scalar("SELECT games_completed FROM jobs WHERE id = $1")
         .bind(job)
@@ -1880,19 +1893,68 @@ async fn each_accepted_claim_credits_its_time_and_games_to_its_contributor() {
         .unwrap();
     assert_eq!(games_completed, 4, "the job counts both tasks' games");
 
-    // The claims keep what they did, and the list shows it.
-    let per_claim: Vec<(i32, i32)> = sqlx::query_as(
-        "SELECT games_played, racks_analyzed FROM task_claims WHERE job_id = $1 ORDER BY claimed_at",
-    )
-    .bind(job)
-    .fetch_all(&db.pool)
-    .await
-    .unwrap();
-    assert_eq!(per_claim, [(2, 0), (2, 0)]);
+    // The claims keep what they did, and the list shows it, most work first.
+    let per_claim: Vec<i64> =
+        sqlx::query_scalar("SELECT movegens FROM task_claims WHERE job_id = $1 ORDER BY claimed_at")
+            .bind(job)
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(per_claim, [70_000, 300]);
     let (_, body) = send(&app, get_request("/api/workers", &[])).await;
     assert_eq!(body["items"][0]["anon_id"], birdtest::auth::public_anon_id(a.parse().unwrap()));
     assert!(body["items"][0]["compute_seconds"].as_f64().unwrap() >= 90.0, "{body}");
-    assert_eq!(body["items"][0]["games_played"], 2);
+    assert_eq!(body["items"][0]["movegens"], 70_000);
+    assert_eq!(body["items"][1]["movegens"], 300);
+    assert!(body["items"][0].get("games_played").is_none(), "{body}");
+}
+
+/// A submission must say how many move generations it did, as a whole number
+/// no machine could exceed for the time the claim was held. Refused, it stores
+/// nothing: the claim stays open, the task unfinished, the contributor
+/// uncredited -- and a corrected submission is still accepted.
+#[tokio::test]
+async fn a_result_without_plausible_movegens_is_refused_and_stores_nothing() {
+    let db = TestDb::new().await;
+    let job = db.games_job(2).await;
+    let app = birdtest::app(db.state().await);
+    let (assignment, uuid) = first_claim(&app).await;
+    let token = assignment["claim_token"].as_str().unwrap();
+
+    // Left out, negative, fractional, and more per millisecond held than any
+    // machine generates (the claim was held well under a second). Four, and
+    // the accepted one: a worker's burst of work-in-hand requests is five.
+    for movegens in [
+        serde_json::Value::Null,
+        json!(-1),
+        json!(1.5),
+        json!(10_000_000_000_000_i64),
+    ] {
+        let (status, body) =
+            submit_with_movegens(&app, &uuid, token, games_result(2, 1), movegens.clone()).await;
+        assert!(status.is_client_error(), "{movegens}: {status} {body}");
+        assert!(body.to_string().contains("movegens"), "refused for its movegens: {movegens}: {body}");
+        let (claim_state, task_state, completed): (String, String, i64) = sqlx::query_as(
+            "SELECT c.state::text, t.state::text,
+                    (SELECT tasks_completed FROM anonymous_workers WHERE uuid = $2::uuid)
+             FROM task_claims c JOIN tasks t ON t.id = c.task_id WHERE c.claim_token = $1::uuid",
+        )
+        .bind(token)
+        .bind(&uuid)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!((claim_state.as_str(), task_state.as_str(), completed), ("claimed", "claimed", 0), "{movegens}");
+    }
+    let games: i64 = sqlx::query_scalar("SELECT games_completed FROM jobs WHERE id = $1")
+        .bind(job)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(games, 0, "nothing refused reached the job");
+
+    let (status, body) = submit_with_movegens(&app, &uuid, token, games_result(2, 1), json!(0)).await;
+    assert_eq!((status, &body["accepted"]), (StatusCode::OK, &json!(true)), "{body}");
 }
 
 /// The results feed pages by cursor, because a job's corpus is millions of rows
@@ -2831,7 +2893,7 @@ async fn the_results_feed_filters_by_who_a_name_is() {
             post_json(
                 "/api/worker/result",
                 &[("authorization", &bearer)],
-                json!({ "claim_token": claim["claim_token"], "result": games_result(2, 2) }),
+                json!({ "claim_token": claim["claim_token"], "movegens": 1000, "result": games_result(2, 2) }),
             ),
         )
         .await;
@@ -3086,7 +3148,7 @@ async fn positions_from_a_job_that_does_not_capture_them_are_refused() {
         post_json(
             "/api/worker/result",
             &[("x-worker-uuid", uuid)],
-            json!({ "claim_token": assignment["claim_token"], "result": result }),
+            json!({ "claim_token": assignment["claim_token"], "movegens": 1000, "result": result }),
         ),
     )
     .await;

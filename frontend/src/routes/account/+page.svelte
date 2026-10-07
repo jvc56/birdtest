@@ -108,7 +108,8 @@
       <p class="text-sm text-muted-foreground">
         Add one to the <code class="rounded bg-muted px-1">contribute.txt</code> you run MAGPIE with, as a
         line <code class="rounded bg-muted px-1">apikey &lt;key&gt;</code>, to credit your work to this
-        account. Use one key per machine: machines sharing a key share its rate limit. Up to 100
+        account. Create the file in the directory you run MAGPIE from if you don't have one: that
+        line alone is enough. Use one key per machine: machines sharing a key share its rate limit. Up to 100
         keys; deactivate one to suspend it without losing it.
       </p>
     </div>

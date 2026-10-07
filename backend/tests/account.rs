@@ -347,8 +347,8 @@ async fn a_scrubbed_dump_keeps_no_worker_credential() {
     let job = db.games_job(10).await;
     let worker = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO anonymous_workers (uuid, tasks_completed, compute_ms, games_played, racks_analyzed)
-         VALUES ($1, 7, 8000, 9, 10)",
+        "INSERT INTO anonymous_workers (uuid, tasks_completed, compute_ms, movegens)
+         VALUES ($1, 7, 8000, 9)",
     )
         .bind(worker)
         .execute(&db.pool)
@@ -392,14 +392,14 @@ async fn a_scrubbed_dump_keeps_no_worker_credential() {
         scrub(&db).await;
     }
 
-    let (uuid, tasks_completed, compute_ms, games, racks): (Uuid, i64, i64, i64, i64) = sqlx::query_as(
-        "SELECT uuid, tasks_completed, compute_ms, games_played, racks_analyzed FROM anonymous_workers",
+    let (uuid, tasks_completed, compute_ms, movegens): (Uuid, i64, i64, i64) = sqlx::query_as(
+        "SELECT uuid, tasks_completed, compute_ms, movegens FROM anonymous_workers",
     )
     .fetch_one(&db.pool)
     .await
     .unwrap();
     assert_ne!(uuid, worker, "the credential is gone");
-    assert_eq!((tasks_completed, compute_ms, games, racks), (7, 8000, 9, 10), "what it did is kept");
+    assert_eq!((tasks_completed, compute_ms, movegens), (7, 8000, 9), "what it did is kept");
     let (claimed_by, claim_token): (Uuid, Uuid) =
         sqlx::query_as("SELECT claimed_by_anon_uuid, claim_token FROM task_claims").fetch_one(&db.pool).await.unwrap();
     assert_eq!(claimed_by, uuid, "its claim follows it");
@@ -434,7 +434,7 @@ async fn a_scrubbed_dump_keeps_no_worker_credential() {
         columns,
         [
             "uuid", "first_seen_at", "last_seen_at", "tasks_completed", "compute_ms",
-            "games_played", "racks_analyzed", "last_completed_at",
+            "movegens", "last_completed_at",
         ]
     );
 }

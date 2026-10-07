@@ -98,7 +98,7 @@ Use a signed-out window for the V journeys unless one says otherwise.
 
 - [ ] **Expect** a header with **birdtest**, **Jobs**, **Ratings**, **Players**,
   **Contributors** and **Users**, and on the right **Sign in** and **Register**;
-  a footer "birdtest — crowdsourced word game analysis".
+  a footer "birdtest — crowdsourced crossword game research".
 - [ ] **Do** click each nav link. **Expect** the current one highlighted, and
   no page erroring.
 - [ ] **Do** narrow the window to phone width. **Expect** the nav to wrap and no
@@ -107,15 +107,18 @@ Use a signed-out window for the V journeys unless one says otherwise.
 
 ### V-2 The home page
 
-- [ ] **Expect** "Crowdsourced Crossword Game Analysis" and the buttons **Browse
+- [ ] **Expect** "Crowdsourced Crossword Game Research" and the buttons **Browse
   jobs** and **Create an account**.
 - [ ] **Expect** next "Active Jobs" listing the seeded jobs still running as
   cards: name, status badge, "25% allocation". Clicking one opens its job page.
 - [ ] **Expect** after it a "Contribute" section (not a card, like "Active
   Jobs") of four numbered steps: **Install MAGPIE** (linking MAGPIE's
-  getting-started section), **Create a contribute.txt file** (a sample whose
-  `server` line is this site's own address, and a table of its settings --
-  `server` required; `apikey`, `threads`, `maxtasks`, `idlewait` optional),
+  getting-started section), **Create a contribute.txt file** (a table of its
+  settings and each one's default -- `server` https://birdtest.org, `apikey`
+  none, `threads` every core but one, `maxtasks` 0, `idlewait` 5 -- and a
+  sample. Here, off birdtest.org, the step is not optional and the sample is a
+  `server` line with this site's own address; on birdtest.org the heading
+  starts "(Optional)" and the sample sets `threads`),
   **(Optional) Create an account** (to contribute under a username, else
   anonymously) and **Run the contribute command** (`./bin/magpie contribute`).
 - [ ] (With every job deactivated, A-8) **expect** the Active Jobs section gone
@@ -386,12 +389,13 @@ Open "dev game pairs (first divergences saved)".
   **admin** tag and the two contributor accounts, with tasks completed and when
   they joined — and no email addresses anywhere.
 - [ ] **Do** open **Contributors**. **Expect** all four workers ranked by
-  compute time, most first, the column marked ↓: the two accounts by name, the
+  movegens, most first, the column marked ↓: the two accounts by name, the
   two anonymous ones as "Anonymous · <16 characters>", never as their UUID;
-  each with its compute time read as "5h 20m" or "3d 4h" (the exact hours on
-  hover), games, racks, tasks and last result.
-- [ ] **Do** click **Games**, then **Racks**, then **Tasks**. **Expect** the
-  list re-ranked by each, most first, the arrow moving with it; still all four.
+  each with its movegens read as "12.3K" or "4.5M" (the exact count on hover),
+  its compute time read as "5h 20m" or "3d 4h" (the exact hours on hover),
+  tasks and last result.
+- [ ] **Do** click **Compute time**, then **Tasks**. **Expect** the list
+  re-ranked by each, most first, the arrow moving with it; still all four.
 - [ ] At phone width, **expect** a "Rank by" row of the four columns above the
   list and only the ranked column beside the name. **Do** choose **Games**.
   **Expect** the games column in its place, and no sideways scroll.

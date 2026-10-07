@@ -16,7 +16,7 @@ test('E-1: an anonymous visitor browses the landing page, jobs, a job and the le
   await waitForResults(request, job.id);
 
   await page.goto('/');
-  await expect(page.getByRole('heading', { name: 'Crowdsourced Crossword Game Analysis' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Crowdsourced Crossword Game Research' })).toBeVisible();
   // Signed out: the header offers an account, and no admin link.
   await expect(page.getByRole('link', { name: 'Sign in' })).toBeVisible();
   await expect(page.getByRole('link', { name: 'Admin', exact: true })).toHaveCount(0);
@@ -56,8 +56,8 @@ test('E-1: an anonymous visitor browses the landing page, jobs, a job and the le
   await expect(page.getByRole('heading', { name: 'Contributors' })).toBeVisible();
   const leaders = page.locator('tbody tr');
   await expect(leaders.first()).toContainText(/Anonymous · [0-9a-f]{16}/);
-  // Ranked by compute time unless another column is chosen.
-  await expect(page.getByRole('columnheader', { name: 'Compute time' })).toHaveAttribute(
+  // Ranked by movegens unless another column is chosen.
+  await expect(page.getByRole('columnheader', { name: 'Movegens' })).toHaveAttribute(
     'aria-sort',
     'descending'
   );

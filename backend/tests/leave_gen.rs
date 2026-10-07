@@ -164,7 +164,7 @@ async fn a_result_folds_into_the_generation_and_creates_no_rows() {
         post_json(
             "/api/worker/result",
             &[("x-worker-uuid", uuid)],
-            json!({ "claim_token": token, "result": result }),
+            json!({ "claim_token": token, "movegens": 1000, "result": result }),
         ),
     )
     .await;
@@ -253,7 +253,7 @@ async fn a_leave_result_of_partial_racks_is_rejected() {
         post_json(
             "/api/worker/result",
             &[("x-worker-uuid", uuid)],
-            json!({ "claim_token": token, "result": { "racks": [
+            json!({ "claim_token": token, "movegens": 1000, "result": { "racks": [
                 { "rack": "AB", "count": 3, "mean": 10.0 }
             ]}}),
         ),
@@ -286,7 +286,7 @@ async fn a_count_no_game_could_produce_is_refused_before_it_can_wedge_the_merge(
         post_json(
             "/api/worker/result",
             &[("x-worker-uuid", uuid)],
-            json!({ "claim_token": token, "result": { "racks": [
+            json!({ "claim_token": token, "movegens": 1000, "result": { "racks": [
                 { "rack": racks[0], "count": i64::MAX, "mean": 1.0 },
                 { "rack": racks[1], "count": i64::MAX, "mean": 1.0 }
             ]}}),
@@ -306,7 +306,7 @@ async fn a_count_no_game_could_produce_is_refused_before_it_can_wedge_the_merge(
         post_json(
             "/api/worker/result",
             &[("x-worker-uuid", uuid)],
-            json!({ "claim_token": token, "result": { "racks": [
+            json!({ "claim_token": token, "movegens": 1000, "result": { "racks": [
                 { "rack": racks[0], "count": 40, "mean": 1.0 },
                 { "rack": racks[1], "count": 35, "mean": 1.0 }
             ]}}),
@@ -439,7 +439,7 @@ async fn a_result_for_a_closed_generation_is_credited_but_not_folded() {
         post_json(
             "/api/worker/result",
             &[("x-worker-uuid", uuid.as_str())],
-            json!({ "claim_token": token, "result": { "racks": [
+            json!({ "claim_token": token, "movegens": 1000, "result": { "racks": [
                 { "rack": racks[0], "count": 3, "mean": 10.0 }
             ]}}),
         ),
@@ -1067,7 +1067,7 @@ async fn play_one_task(app: &axum::Router, count: i64) -> Vec<String> {
         post_json(
             "/api/worker/result",
             &[("x-worker-uuid", body["worker_uuid"].as_str().unwrap())],
-            json!({ "claim_token": body["claim_token"], "result": result }),
+            json!({ "claim_token": body["claim_token"], "movegens": 1000, "result": result }),
         ),
     )
     .await;
@@ -1126,7 +1126,7 @@ async fn a_generation_does_not_close_with_results_still_staged() {
             post_json(
                 "/api/worker/result",
                 &[("x-worker-uuid", body["worker_uuid"].as_str().unwrap())],
-                json!({ "claim_token": body["claim_token"], "result": { "racks": [
+                json!({ "claim_token": body["claim_token"], "movegens": 1000, "result": { "racks": [
                     { "rack": racks[0], "count": 1000, "mean": 1.0 },
                     { "rack": racks[1], "count": 10, "mean": 1.0 },
                 ]}}),
@@ -1484,7 +1484,7 @@ async fn submit(app: &axum::Router, assignment: &serde_json::Value, racks: &[(&s
         post_json(
             "/api/worker/result",
             &[("x-worker-uuid", assignment["worker_uuid"].as_str().unwrap())],
-            json!({ "claim_token": assignment["claim_token"], "result": result }),
+            json!({ "claim_token": assignment["claim_token"], "movegens": 1000, "result": result }),
         ),
     )
     .await;
@@ -1536,7 +1536,7 @@ async fn a_rack_counts_however_the_worker_spells_it() {
         post_json(
             "/api/worker/result",
             &[("x-worker-uuid", task["worker_uuid"].as_str().unwrap())],
-            json!({ "claim_token": task["claim_token"], "result": result }),
+            json!({ "claim_token": task["claim_token"], "movegens": 1000, "result": result }),
         ),
     )
     .await;

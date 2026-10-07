@@ -138,7 +138,7 @@ async fn submit(app: &axum::Router, assignment: &serde_json::Value, racks: &[(&s
         post_json(
             "/api/worker/result",
             &[("x-worker-uuid", assignment["worker_uuid"].as_str().unwrap())],
-            json!({ "claim_token": assignment["claim_token"], "result": result }),
+            json!({ "claim_token": assignment["claim_token"], "movegens": 1000, "result": result }),
         ),
     )
     .await;
@@ -384,17 +384,15 @@ async fn nothing_is_handed_out_once_every_rack_is_at_target() {
     // Its result brings the rack to target. Staged, it is not yet in the
     // counts, so the claim asks for a merge rather than closing the generation.
     submit(&app, &out, &[(short, 1)]).await;
-    // Its worker is credited with the task's games -- the job's 100 -- and the
-    // one rack it reported.
-    let credited: (i64, i64, i64) = sqlx::query_as(
-        "SELECT tasks_completed, games_played, racks_analyzed FROM anonymous_workers
-         WHERE uuid = $1::uuid",
+    // Its worker is credited with the task and the movegens it reported.
+    let credited: (i64, i64) = sqlx::query_as(
+        "SELECT tasks_completed, movegens FROM anonymous_workers WHERE uuid = $1::uuid",
     )
     .bind(out["worker_uuid"].as_str().unwrap())
     .fetch_one(&db.pool)
     .await
     .unwrap();
-    assert_eq!(credited, (1, 100, 1));
+    assert_eq!(credited, (1, 1000));
     assert_eq!(next_step(&db, job).await, Step::NeedsMerge(1));
     leave_gen::merge_staged(&db.pool, job, 1, true)
         .await

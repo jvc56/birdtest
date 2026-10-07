@@ -69,9 +69,9 @@ TRUNCATE backups;
 CREATE TEMP TABLE scrub_anon_remap ON COMMIT DROP AS
     SELECT uuid AS old_uuid, gen_random_uuid() AS new_uuid FROM anonymous_workers;
 INSERT INTO anonymous_workers (uuid, first_seen_at, last_seen_at, tasks_completed, compute_ms,
-                               games_played, racks_analyzed, last_completed_at)
+                               movegens, last_completed_at)
     SELECT m.new_uuid, a.first_seen_at, a.last_seen_at, a.tasks_completed, a.compute_ms,
-           a.games_played, a.racks_analyzed, a.last_completed_at
+           a.movegens, a.last_completed_at
     FROM anonymous_workers a JOIN scrub_anon_remap m ON m.old_uuid = a.uuid;
 UPDATE task_claims c SET claimed_by_anon_uuid = m.new_uuid
     FROM scrub_anon_remap m WHERE c.claimed_by_anon_uuid = m.old_uuid;

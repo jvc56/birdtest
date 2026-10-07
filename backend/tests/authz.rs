@@ -507,7 +507,7 @@ async fn worker_writes_need_no_csrf_token_even_alongside_session_cookies() {
             "/api/worker/task" => (status, first.clone()),
             "/api/worker/heartbeat" => send(&app, post(path, json!({ "claim_token": token }))).await,
             "/api/worker/result" => {
-                send(&app, post(path, json!({ "claim_token": token, "result": games_result(2, 1) })))
+                send(&app, post(path, json!({ "claim_token": token, "movegens": 1000, "result": games_result(2, 1) })))
                     .await
             }
             "/api/worker/decline" => {

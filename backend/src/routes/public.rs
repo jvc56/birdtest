@@ -1808,8 +1808,9 @@ pub(super) struct WorkerListItem {
     /// Every claim this contributor completed, held from claim to submission:
     /// MAGPIE reports no CPU time, so this is the compute it is credited with.
     compute_seconds: f64,
-    games_played: i64,
-    racks_analyzed: i64,
+    /// Every move generation MAGPIE reported doing for this contributor's
+    /// completed claims: the measure of work done, whatever the machine.
+    movegens: i64,
     tasks_completed: i64,
     last_seen_at: Option<chrono::DateTime<chrono::Utc>>,
 }
@@ -1820,12 +1821,12 @@ pub(super) struct WorkerListItem {
 #[derive(Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(super) enum WorkerSort {
-    /// The default: the fairest single measure of what a contributor gave, as
-    /// a machine that plays slow, deep games finishes few tasks in many hours.
+    /// The default: the work a contributor's machine actually did, as MAGPIE
+    /// counts it. Tasks undercount a machine that plays slow, deep games, and
+    /// compute time -- a claim's time held -- overcounts a slow machine.
     #[default]
+    Movegens,
     Compute,
-    Games,
-    Racks,
     Tasks,
 }
 
@@ -1834,9 +1835,8 @@ impl WorkerSort {
     /// it is spliced into the statement.
     fn column(self) -> &'static str {
         match self {
+            WorkerSort::Movegens => "movegens",
             WorkerSort::Compute => "compute_ms",
-            WorkerSort::Games => "games_played",
-            WorkerSort::Racks => "racks_analyzed",
             WorkerSort::Tasks => "tasks_completed",
         }
     }
@@ -1919,19 +1919,19 @@ async fn worker_page(
                     CASE WHEN c.anon_uuid IS NOT NULL
                          THEN left(encode(sha256(convert_to(c.anon_uuid::text, 'UTF8')), 'hex'), 16)
                     END AS anon_id,
-                    c.username, c.compute_ms, c.games_played, c.racks_analyzed,
+                    c.username, c.compute_ms, c.movegens,
                     c.tasks_completed, c.last_seen_at
              FROM (
                  SELECT * FROM (
                      (SELECT u.id AS user_id, NULL::uuid AS anon_uuid, u.username,
-                             u.compute_ms, u.games_played, u.racks_analyzed, u.tasks_completed,
+                             u.compute_ms, u.movegens, u.tasks_completed,
                              u.last_completed_at AS last_seen_at
                       FROM users u WHERE u.tasks_completed > 0
                       ORDER BY u.{rank} DESC, u.id
                       LIMIT $3)
                      UNION ALL
                      (SELECT NULL::uuid, w.uuid, NULL::text,
-                             w.compute_ms, w.games_played, w.racks_analyzed, w.tasks_completed,
+                             w.compute_ms, w.movegens, w.tasks_completed,
                              w.last_completed_at
                       FROM anonymous_workers w WHERE w.tasks_completed > 0
                       ORDER BY w.{rank} DESC, w.uuid
@@ -1958,8 +1958,7 @@ async fn worker_page(
                 anon_uuid: if with_credentials { r.get("anon_uuid") } else { None },
                 username: r.get("username"),
                 compute_seconds: r.get::<i64, _>("compute_ms") as f64 / 1000.0,
-                games_played: r.get("games_played"),
-                racks_analyzed: r.get("racks_analyzed"),
+                movegens: r.get("movegens"),
                 tasks_completed: r.get("tasks_completed"),
                 last_seen_at: r.get("last_seen_at"),
             })

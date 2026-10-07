@@ -3114,26 +3114,24 @@ struct Contributions {
 }
 
 /// One kind of identity's share of a job, as parallel arrays in id order:
-/// claims completed, the milliseconds they were held, the games they played
-/// and the racks they analysed -- every counter the submit path adds to.
+/// claims completed, the milliseconds they were held and the move generations
+/// they reported -- every counter the submit path adds to.
 #[derive(Default)]
 struct Earned {
     ids: Vec<Uuid>,
     tasks: Vec<i64>,
     compute_ms: Vec<i64>,
-    games: Vec<i64>,
-    racks: Vec<i64>,
+    movegens: Vec<i64>,
 }
 
 impl Earned {
     /// Each identity of `column`'s kind with a completed claim of the job, and
     /// what those claims added, summed as the submit path added it.
     async fn count(conn: &mut sqlx::PgConnection, job_id: Uuid, column: &str) -> AppResult<Self> {
-        let rows = sqlx::query_as::<_, (Uuid, i64, i64, i64, i64)>(&format!(
+        let rows = sqlx::query_as::<_, (Uuid, i64, i64, i64)>(&format!(
             "SELECT c.{column}, COUNT(*)::bigint,
                     COALESCE(SUM({compute}), 0)::bigint,
-                    COALESCE(SUM(c.games_played), 0)::bigint,
-                    COALESCE(SUM(c.racks_analyzed), 0)::bigint
+                    COALESCE(SUM(c.movegens), 0)::bigint
              FROM task_claims c JOIN tasks t ON t.id = c.task_id
              WHERE t.job_id = $1 AND c.state = 'completed' AND c.{column} IS NOT NULL
              GROUP BY 1 ORDER BY 1",
@@ -3143,12 +3141,11 @@ impl Earned {
         .fetch_all(&mut *conn)
         .await?;
         let mut earned = Earned::default();
-        for (id, tasks, compute_ms, games, racks) in rows {
+        for (id, tasks, compute_ms, movegens) in rows {
             earned.ids.push(id);
             earned.tasks.push(tasks);
             earned.compute_ms.push(compute_ms);
-            earned.games.push(games);
-            earned.racks.push(racks);
+            earned.movegens.push(movegens);
         }
         Ok(earned)
     }
@@ -3172,17 +3169,15 @@ impl Earned {
             "UPDATE {table} x
              SET tasks_completed = GREATEST(x.tasks_completed - d.tasks, 0),
                  compute_ms = GREATEST(x.compute_ms - d.compute_ms, 0),
-                 games_played = GREATEST(x.games_played - d.games, 0),
-                 racks_analyzed = GREATEST(x.racks_analyzed - d.racks, 0)
-             FROM UNNEST($1::uuid[], $2::bigint[], $3::bigint[], $4::bigint[], $5::bigint[])
-                  AS d(id, tasks, compute_ms, games, racks)
+                 movegens = GREATEST(x.movegens - d.movegens, 0)
+             FROM UNNEST($1::uuid[], $2::bigint[], $3::bigint[], $4::bigint[])
+                  AS d(id, tasks, compute_ms, movegens)
              WHERE x.{key} = d.id"
         ))
         .bind(&self.ids)
         .bind(&self.tasks)
         .bind(&self.compute_ms)
-        .bind(&self.games)
-        .bind(&self.racks)
+        .bind(&self.movegens)
         .execute(&mut *conn)
         .await?;
         Ok(())

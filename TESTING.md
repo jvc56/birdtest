@@ -949,6 +949,10 @@ Each entry's tests are the `describe` block named for its id.
 - `F-FMT-18` `targetsText` lists a leave job's targets in generation order
   joined by arrows ("100 → 200 → 1,000"), since a comma list cannot be read
   when the numbers carry thousands separators. *(Covered: `format.test.ts`.)*
+- `F-FMT-19` `bigCount` reads a contributor's movegens in its largest unit to
+  three figures ("12.3K", "4.5M", "1.2B"), rounded down so a count never reads
+  as more than it is or reaches the next unit early, and a dash for anything
+  that is not a count. *(Covered: `format.test.ts`.)*
 
 ### `F-CONS-*` — `lib/consensus.ts`
 
@@ -2218,16 +2222,24 @@ permanent.
   `worker_api::contributions_are_counted_as_they_arrive`.)*
 - `I-STATS-7b` **A contributor is credited with each claim it completed**: the
   time the claim was held, claim to submission, in whole milliseconds, and the
-  games and racks it did. Two workers, a task each, are each credited their
-  two games (and the job four); a claim held 90 s is credited 90 s; each of
-  two opening-rack claims is credited its batch's racks; a leave task is
-  credited the job's `num_iterations` games and the racks it reported; each
-  claim keeps its own games and racks. *(Covered:
-  `worker_api::each_accepted_claim_credits_its_time_and_games_to_its_contributor`,
+  movegens its submission reported. Two workers, a task each, are each credited
+  their own movegens (and the job both tasks' games); a claim held 90 s is
+  credited 90 s; each of two opening-rack claims, and a leave task, is credited
+  what it reported; each claim keeps its own movegens. *(Covered:
+  `worker_api::each_accepted_claim_credits_its_time_and_movegens_to_its_contributor`,
   `worker_api::analysed_racks_are_counted_as_they_arrive`,
   `leave_generation::nothing_is_handed_out_once_every_rack_is_at_target`.)*
+- `I-STATS-7d` **A submission must report plausible movegens**: left out,
+  negative, fractional, past `i64` or more than a million per millisecond the
+  claim was held, it is a `400` naming `movegens`, and stores nothing -- the
+  claim stays open, the task unfinished, the contributor uncredited -- and a
+  corrected submission is then accepted. *(Covered:
+  `worker_api::a_result_without_plausible_movegens_is_refused_and_stores_nothing`,
+  `routes::worker::movegens_tests::movegens_is_a_whole_number_in_i64_and_every_refusal_names_it`;
+  every contract fixture's result reports a positive count, checked in
+  `routes::worker::contract_fixtures`.)*
 - `I-STATS-7c` **A purge or a delete gives back every contributor counter** the
-  job's claims added -- tasks, compute time, games and racks -- to the
+  job's claims added -- tasks, compute time and movegens -- to the
   millisecond, summed from the claims it is about to delete with the
   submission's own expression (`CLAIM_COMPUTE_MS`), including a submission that
   landed mid-purge. *(Covered:
@@ -3409,9 +3421,10 @@ below.
   key hashes — nor an anonymous worker's UUID, its only credential, which
   public endpoints replace with a derived pseudonym; contributors that tie are
   each listed exactly once, in every order. The worker list carries compute
-  seconds, games, racks and tasks, is ranked by compute time by default and by
-  `?sort=games|racks|tasks` on request (each order its own, the same
-  contributors in each), and refuses any other `sort`. *(Covered:
+  seconds, movegens and tasks, is ranked by movegens by default and by
+  `?sort=compute|tasks` on request (each order its own, the same contributors
+  in each), and refuses any other `sort` -- the retired `games` and `racks`
+  among them. *(Covered:
   `public_api::contributor_lists_paginate_and_leak_no_credentials`,
   `public_api::tied_contributors_are_each_listed_exactly_once`,
   `public_api::tied_jobs_and_users_are_each_listed_exactly_once`,
@@ -3741,8 +3754,8 @@ admin in once and the admin journeys reuse its storage state.
   the job page again with a 32-character creator and contributor, and both
   lists with a 32-character username and a tombstone (and the contributors'
   list a pseudonym), which the seed does not register; the contributors'
-  list shows only its ranked column beside the name — compute time, then
-  games once ranked by games through its "Rank by" row, since the other
+  list shows only its ranked column beside the name — movegens, then compute
+  time once ranked by it through its "Rank by" row, since the other
   columns' headers are not on a phone's screen.)* The screen is the device's width:
   compared with `innerWidth`, as it was, the check could not fail, because a
   phone's browser widens its layout viewport to fit what overflows — and the

@@ -50,7 +50,7 @@ test('E-10: a visitor on a phone reads the job list, a job page and the rankings
   expect(page.viewportSize()!.width).toBeLessThan(400);
 
   await page.goto('/');
-  await expect(page.getByRole('heading', { name: 'Crowdsourced Crossword Game Analysis' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Crowdsourced Crossword Game Research' })).toBeVisible();
   await expectNoSidewaysScroll(page);
 
   await page.getByRole('link', { name: 'Browse jobs' }).tap();
@@ -115,11 +115,11 @@ test('E-10: a visitor on a phone reads the job list, a job page and the rankings
   // screen: a pseudonym's sixteen characters pushed it out (thirty-second audit).
   // With a row in it: an empty table fits on any page.
   await page.getByRole('banner').getByRole('link', { name: 'Contributors', exact: true }).tap();
-  await expect(page.getByRole('columnheader', { name: 'Compute time' })).toBeVisible();
+  await expect(page.getByRole('columnheader', { name: 'Movegens' })).toBeVisible();
   await expect(page.getByRole('cell', { name: /^Anonymous · [0-9a-f]{16}$/ }).first()).toBeVisible();
   await expectNoSidewaysScroll(page);
   await expectTableFits(page);
-  await expect(page.getByRole('columnheader', { name: 'Compute time' })).toBeInViewport();
+  await expect(page.getByRole('columnheader', { name: 'Movegens' })).toBeInViewport();
 
   // And with the widest names either ranking can hold, which the seed has not
   // registered: both lists answered as the server would with them.
@@ -128,14 +128,13 @@ test('E-10: a visitor on a phone reads the job list, a job page and the rankings
     route.fulfill({
       json: {
         items: [
-          // Longer than any fleet will run: the compute column at its widest.
+          // Longer than any fleet will run: every column at its widest.
           { user_id: null, username: LONGEST, anon_id: null, compute_seconds: 9.9e10,
-            games_played: 123456789012, racks_analyzed: 123456789012,
-            tasks_completed: 123456789012, last_seen_at: now },
+            movegens: 9.2e18, tasks_completed: 123456789012, last_seen_at: now },
           { user_id: null, username: TOMBSTONE, anon_id: null, compute_seconds: 1,
-            games_played: 1, racks_analyzed: 1, tasks_completed: 1, last_seen_at: now },
+            movegens: 1, tasks_completed: 1, last_seen_at: now },
           { user_id: null, username: null, anon_id: 'f'.repeat(16), compute_seconds: 1,
-            games_played: 1, racks_analyzed: 1, tasks_completed: 1, last_seen_at: now }
+            movegens: 1, tasks_completed: 1, last_seen_at: now }
         ],
         total: 3,
         page: 0,
@@ -160,14 +159,14 @@ test('E-10: a visitor on a phone reads the job list, a job page and the rankings
   await expect(page.getByRole('cell', { name: LONGEST })).toBeVisible();
   await expectNoSidewaysScroll(page);
   await expectTableFits(page);
-  await expect(page.getByRole('columnheader', { name: 'Compute time' })).toBeInViewport();
+  await expect(page.getByRole('columnheader', { name: 'Movegens' })).toBeInViewport();
   // Ranked by another column, that column is the one shown beside the name.
-  await page.getByRole('button', { name: 'Games' }).tap();
-  await expect(page.getByRole('columnheader', { name: 'Games' })).toHaveAttribute('aria-sort', 'descending');
-  await expect(page.getByRole('columnheader', { name: 'Compute time' })).toBeHidden();
+  await page.getByRole('button', { name: 'Compute time' }).tap();
+  await expect(page.getByRole('columnheader', { name: 'Compute time' })).toHaveAttribute('aria-sort', 'descending');
+  await expect(page.getByRole('columnheader', { name: 'Movegens' })).toBeHidden();
   await expectNoSidewaysScroll(page);
   await expectTableFits(page);
-  await expect(page.getByRole('columnheader', { name: 'Games' })).toBeInViewport();
+  await expect(page.getByRole('columnheader', { name: 'Compute time' })).toBeInViewport();
 
   await page.getByRole('banner').getByRole('link', { name: 'Users', exact: true }).tap();
   await expect(page.getByRole('cell', { name: new RegExp(`^${LONGEST}`) })).toBeVisible();

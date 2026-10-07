@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  bigCount,
   blankFields,
   computeTime,
   unchosenText,
@@ -439,6 +440,25 @@ describe('F-FMT-16 computeTime', () => {
     expect(computeTime(null)).toBe('—');
     expect(computeTime(Number.NaN)).toBe('—');
     expect(computeTime(-1)).toBe('—');
+  });
+});
+
+describe('F-FMT-19 bigCount', () => {
+  it('reads a count in its largest unit, rounded down', () => {
+    expect(bigCount(0)).toBe('0');
+    expect(bigCount(999)).toBe('999');
+    expect(bigCount(1000)).toBe('1K');
+    expect(bigCount(12_345)).toBe('12.3K');
+    expect(bigCount(999_999)).toBe('999K');
+    expect(bigCount(4_567_890)).toBe('4.5M');
+    expect(bigCount(1_200_000_000)).toBe('1.2B');
+    expect(bigCount(3e12)).toBe('3T');
+  });
+
+  it('shows nothing it cannot read as a count', () => {
+    expect(bigCount(null)).toBe('—');
+    expect(bigCount(Number.NaN)).toBe('—');
+    expect(bigCount(-1)).toBe('—');
   });
 });
 

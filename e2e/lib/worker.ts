@@ -79,7 +79,13 @@ export async function firstClaim(api: APIRequestContext, jobId: string): Promise
 export async function submit(api: APIRequestContext, uuid: string, assignment: Assignment) {
   return api.post('/api/worker/result', {
     headers: { 'X-Worker-UUID': uuid },
-    data: { claim_token: assignment.claim_token, result: syntheticResult(assignment.task_request) }
+    // A real MAGPIE reports the move generations it performed; any positive
+    // count the server finds plausible will do here.
+    data: {
+      claim_token: assignment.claim_token,
+      movegens: 1000,
+      result: syntheticResult(assignment.task_request)
+    }
   });
 }
 

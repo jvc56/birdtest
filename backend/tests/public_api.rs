@@ -36,7 +36,7 @@ async fn submit(
         post_json(
             "/api/worker/result",
             &[("x-worker-uuid", uuid)],
-            json!({ "claim_token": assignment["claim_token"], "result": result }),
+            json!({ "claim_token": assignment["claim_token"], "movegens": 1000, "result": result }),
         ),
     )
     .await;
@@ -318,7 +318,7 @@ async fn the_job_list_flags_a_stalled_job() {
         post_json(
             "/api/worker/result",
             &[("x-worker-uuid", other.as_str())],
-            json!({ "claim_token": claim["claim_token"], "result": games_result(2, 1) }),
+            json!({ "claim_token": claim["claim_token"], "movegens": 1000, "result": games_result(2, 1) }),
         ),
     )
     .await;
@@ -588,7 +588,7 @@ async fn the_filtered_feed_pages_through_a_contributors_claims() {
                 post_json(
                     "/api/worker/result",
                     &headers,
-                    json!({ "claim_token": assignment["claim_token"], "result": result }),
+                    json!({ "claim_token": assignment["claim_token"], "movegens": 1000, "result": result }),
                 ),
             )
             .await;
@@ -823,7 +823,7 @@ async fn a_simulated_position_shows_its_plies_and_its_inference() {
                 post_json(
                     "/api/worker/result",
                     &[("x-worker-uuid", uuid.as_str())],
-                    json!({ "claim_token": assignment["claim_token"], "result": result }),
+                    json!({ "claim_token": assignment["claim_token"], "movegens": 1000, "result": result }),
                 ),
             )
             .await
@@ -1238,8 +1238,9 @@ async fn contributor_lists_paginate_and_leak_no_credentials() {
         async move {
             let mut names = Vec::new();
             for page in 0..count {
+                let sep = if path.contains('?') { '&' } else { '?' };
                 let (status, body) =
-                    send(&app, get_request(&format!("{path}?page={page}&per_page=2"), &[])).await;
+                    send(&app, get_request(&format!("{path}{sep}page={page}&per_page=2"), &[])).await;
                 assert_eq!(status, StatusCode::OK, "{body}");
                 let text = body.to_string();
                 for secret in &secrets {
@@ -1274,7 +1275,7 @@ async fn contributor_lists_paginate_and_leak_no_credentials() {
     let (busy_id, light_id) =
         (birdtest::auth::public_anon_id(busy), birdtest::auth::public_anon_id(light));
     assert_eq!(
-        pages("/api/workers", 3).await,
+        pages("/api/workers?sort=tasks", 3).await,
         [
             vec!["deleted-dave".to_string(), "alice".into()],
             vec!["6".into()],
@@ -1286,25 +1287,21 @@ async fn contributor_lists_paginate_and_leak_no_credentials() {
         "both kinds of contributor in one ranking, the idle worker left out"
     );
 
-    // Ranked by compute time unless asked otherwise: each order its own, and
-    // the same contributors in each. Games and racks run against tasks here,
-    // so each order is visibly its own.
-    for (name, games, racks) in
-        [("alice", 10, 600), ("bob", 20, 500), ("carol", 100, 400), ("deleted-dave", 30, 300)]
-    {
-        sqlx::query("UPDATE users SET games_played = $2, racks_analyzed = $3 WHERE username = $1")
+    // Ranked by movegens unless asked otherwise: each order its own, and the
+    // same contributors in each. Movegens run against tasks here, so the
+    // default is visibly its own order.
+    for (name, movegens) in [("alice", 600), ("bob", 500), ("carol", 400), ("deleted-dave", 300)] {
+        sqlx::query("UPDATE users SET movegens = $2 WHERE username = $1")
             .bind(name)
-            .bind(games as i64)
-            .bind(racks as i64)
+            .bind(movegens as i64)
             .execute(&db.pool)
             .await
             .unwrap();
     }
-    for (uuid, games, racks) in [(busy, 40, 200), (light, 50, 100), (idle, 0, 0)] {
-        sqlx::query("UPDATE anonymous_workers SET games_played = $2, racks_analyzed = $3 WHERE uuid = $1")
+    for (uuid, movegens) in [(busy, 200), (light, 100), (idle, 0)] {
+        sqlx::query("UPDATE anonymous_workers SET movegens = $2 WHERE uuid = $1")
             .bind(uuid)
-            .bind(games as i64)
-            .bind(racks as i64)
+            .bind(movegens as i64)
             .execute(&db.pool)
             .await
             .unwrap();
@@ -1326,28 +1323,25 @@ async fn contributor_lists_paginate_and_leak_no_credentials() {
     let (busy_id, light_id) =
         (birdtest::auth::public_anon_id(busy), birdtest::auth::public_anon_id(light));
     let by_tasks = ["deleted-dave", "alice", &busy_id, "bob", &light_id, "carol"];
-    assert_eq!(ranked("").await, by_tasks, "compute time, by default");
+    let by_movegens = ["alice", "bob", "carol", "deleted-dave", &busy_id, &light_id];
+    assert_eq!(ranked("").await, by_movegens, "movegens, by default");
+    assert_eq!(ranked("?sort=movegens").await, by_movegens);
     assert_eq!(ranked("?sort=compute").await, by_tasks);
     assert_eq!(ranked("?sort=tasks").await, by_tasks);
-    assert_eq!(
-        ranked("?sort=games").await,
-        ["carol", &light_id, &busy_id, "deleted-dave", "bob", "alice"]
-    );
-    assert_eq!(
-        ranked("?sort=racks").await,
-        ["alice", "bob", "carol", "deleted-dave", &busy_id, &light_id]
-    );
-    let (_, body) = send(&app, get_request("/api/workers?per_page=1", &[])).await;
+    let (_, body) = send(&app, get_request("/api/workers?per_page=1&sort=tasks", &[])).await;
     assert_eq!(
         body["items"][0],
         json!({
             "user_id": users[3], "anon_id": null, "username": "deleted-dave",
-            "compute_seconds": 9.0, "games_played": 30, "racks_analyzed": 300,
+            "compute_seconds": 9.0, "movegens": 300,
             "tasks_completed": 9, "last_seen_at": body["items"][0]["last_seen_at"],
         })
     );
-    let (status, body) = send(&app, get_request("/api/workers?sort=username", &[])).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "only a counter ranks: {body}");
+    // Games and racks were counters once; neither ranks now.
+    for sort in ["username", "games", "racks"] {
+        let (status, body) = send(&app, get_request(&format!("/api/workers?sort={sort}"), &[])).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "only a counter ranks ({sort}): {body}");
+    }
 
     for path in ["/api/users", "/api/workers"] {
         let (_, body) = send(&app, get_request(&format!("{path}?per_page=100000"), &[])).await;
@@ -1377,8 +1371,8 @@ async fn tied_contributors_are_each_listed_exactly_once() {
     }
     expected.sort();
 
-    // Every order ties here -- one task each, a second each, no games or racks.
-    for (per_page, sort) in [(2, ""), (3, "compute"), (4, "games"), (5, "racks"), (7, "tasks")] {
+    // Every order ties here -- one task each, a second each, no movegens.
+    for (per_page, sort) in [(2, ""), (3, "compute"), (5, "movegens"), (7, "tasks")] {
         let mut seen = Vec::new();
         for page in 0..=(18 / per_page) {
             let sort = if sort.is_empty() { String::new() } else { format!("&sort={sort}") };
@@ -1637,7 +1631,7 @@ async fn a_pairs_job_keeps_first_divergences_and_shows_each_with_its_partner() {
             post_json(
                 "/api/worker/result",
                 &[("x-worker-uuid", uuid.as_str())],
-                json!({ "claim_token": assignment["claim_token"], "result": pairs_result(positions) }),
+                json!({ "claim_token": assignment["claim_token"], "movegens": 1000, "result": pairs_result(positions) }),
             ),
         )
         .await;

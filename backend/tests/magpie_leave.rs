@@ -768,7 +768,7 @@ async fn a_two_generation_job_runs_to_completion_on_real_klvs() {
         post_json(
             "/api/worker/result",
             &[("x-worker-uuid", task["worker_uuid"].as_str().unwrap())],
-            json!({ "claim_token": task["claim_token"], "result": result }),
+            json!({ "claim_token": task["claim_token"], "movegens": 1000, "result": result }),
         ),
     )
     .await;
