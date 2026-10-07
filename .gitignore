@@ -30,3 +30,9 @@ __pycache__/
 
 # A contribute.txt left at the root by a local `magpie contribute` run.
 /contribute.txt
+
+# A personal launch checklist, not part of the repository.
+/LAUNCH_PLAN.md
+
+# The Terraform backend: names this account's state bucket (LAUNCH_PLAN.md, Step 5).
+/infra/backend.tf
