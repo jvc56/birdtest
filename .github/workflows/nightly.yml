@@ -166,6 +166,14 @@ jobs:
       # undoes, its two blocks as written, through their refusals and re-runs.
       - name: Security actions re-applied after a full restore
         run: timeout 300 ./scripts/reapply-check.sh
+      # The operator scripts' SQL against the schema: confirm-user.sh's, the
+      # pre-launch reset's, and scripts/ops-sql run as prod-psql.sh runs them.
+      # (CI's scripts job runs the rest of the check, without Postgres.)
+      - name: The operator scripts' SQL
+        env:
+          PG_EXEC: docker compose exec -T postgres
+          PGUSER_: birdtest
+        run: timeout 300 ./scripts/ops-scripts-check.sh
       - if: always()
         run: docker compose down -v
 

@@ -328,6 +328,11 @@ jobs:
       # sends.
       - name: the fake-worker fixtures are what the fake worker emits
         run: ./scripts/fake-worker-fixtures.sh --check
+      # deploy.sh, rollback.sh, set-setting.sh, confirm-user.sh, prod-psql.sh
+      # and pitr-restore.sh against stand-ins for aws, terraform, gh and
+      # docker: nothing reaches AWS.
+      - name: the operator scripts, against stand-ins for AWS
+        run: timeout 300 ./scripts/ops-scripts-check.sh
 
   # MAGPIE's half of the contract. Each repository
   # tests against its own copy of the fixtures, so a fixture changed here and
