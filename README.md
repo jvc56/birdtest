@@ -383,6 +383,10 @@ docker compose exec postgres \
 docker compose restart backend
 ```
 
+Production is the same: `scripts/deploy.sh` refuses a commit that changed an
+applied migration, and `scripts/deploy.sh --reset-db` empties the production
+database as part of the deploy (below, "Operator scripts").
+
 After release, a schema change is a new numbered migration, never an edit, and
 it is **additive**: new tables, new nullable or defaulted columns, new
 indexes. A drop or a rename waits for a later release, once no image that
@@ -759,8 +763,9 @@ A first deployment, in order (each step is described below):
    scheduled tasks on). This apply creates the `-down` alarms before the
    task is healthy, so expect an ALARM mail for each and an OK a few minutes
    later.
-7. Point DNS at the load balancer, run the alert-path checks, and make the
-   first admin. Until production access is granted SES sends only to verified
+7. Point DNS at the load balancer, run the alert-path checks
+   (`scripts/check-alerts.sh`), and make the first admin
+   (`scripts/confirm-user.sh --admin <name>` once they have registered). Until production access is granted SES sends only to verified
    identities, so the first admin's confirmation mail arrives only if their
    address is in `ses_domain` or verified on its own (below, "SES starts in the
    sandbox").
@@ -792,15 +797,37 @@ started before they exist, the service's tasks cannot start, the
 derived-data builder fails every five minutes, and a 03:00 backup fails
 without starting, which only the 36-hour staleness alarm reports.
 
-**Terraform's state is local** — `infra/terraform.tfstate`, ignored by git, on
-the machine that applied. RUNBOOK.md's recovery steps and both ops scripts read
-it (`terraform output`), so keep it somewhere that survives that machine and
-the stack's region: copy it off after every apply, or configure a remote
-backend (an S3 bucket in another region, versioned, with locking) before the
-first one. The repository does not choose one for you. Keep `infra/prod.tfvars`
-(and RUNBOOK §5's `infra/dr.tfvars`, when there is one) with it: the state
-records no input variables, and every later apply and the region-loss rebuild
-read them. Neither holds a secret. (A stack applied before the thirty-second
+**Keep Terraform's state off the machine that applies.** The repository
+chooses no backend, so unless you add one the state is local --
+`infra/terraform.tfstate`, ignored by git. RUNBOOK.md's recovery steps, the
+ops scripts and the operator scripts below read it (`terraform output`), so
+keep it somewhere that survives that machine and the stack's region: an S3
+backend in another region, versioned, with S3's lock file, before the first
+apply. The backend is a file of your own, `infra/backend.tf` (ignored by
+git), naming a bucket you create (versioning on, public access blocked) --
+production's is `birdtest-tfstate-<account>` in us-east-2:
+
+```bash
+cat > infra/backend.tf <<EOF
+terraform {
+  backend "s3" {
+    bucket       = "$STATE_BUCKET"
+    key          = "birdtest/terraform.tfstate"
+    region       = "$STATE_REGION"
+    use_lockfile = true
+  }
+}
+EOF
+terraform -chdir=infra init
+```
+
+Every script works with whatever backend `terraform -chdir=infra` is
+initialized with, local state included. Keep `infra/prod.tfvars` (and RUNBOOK
+§5's `infra/dr.tfvars`, when there is one) with the state: it records no input
+variables, and every later apply and the region-loss rebuild read them. The
+operator scripts keep `prod.tfvars` beside the state, at
+`s3://$STATE_BUCKET/birdtest/prod.tfvars`, fetching it before and uploading
+it after each change. Neither holds a secret. (A stack applied before the thirty-second
 audit's pass 17 managed the two SSM parameters as resources, and every refresh
 wrote their decrypted values into the state: its next apply drops them from
 the state without deleting them (an apply does; a `destroy` run first would
@@ -836,9 +863,8 @@ aws ssm put-parameter --name /birdtest/SESSION_SIGNING_KEY --type SecureString -
   --value "$(openssl rand -hex 32)"
 ```
 
-To rotate the password later, run the same `modify-db-instance` and
-`put-parameter` pair, then force a new ECS deployment so tasks re-read SSM
-(RUNBOOK.md, "Rotating the database password").
+To rotate the password later, run `scripts/rotate-db-password.sh` (RUNBOOK.md,
+"Rotating the database password", says what it does and how by hand).
 
 The GitHub token for input-data imports is optional and goes in a third
 parameter, made the same way; a fine-grained token with read-only access to
@@ -846,7 +872,8 @@ public repositories is enough. Keep the default `aws/ssm` key (no `--key-id`):
 the tasks' execution role has no `kms:Decrypt`, so under a key of your own
 every task fails to start. `github_token_parameter_arn` takes the parameter's
 ARN, not its name, in the stack's region (the plan refuses anything else; KL-62):
-add it to `infra/prod.tfvars` and apply.
+add it to `infra/prod.tfvars` and apply. `scripts/set-github-token.sh` does
+all of that, the token read without echoing it; by hand:
 
 ```bash
 export AWS_PAGER=""
@@ -907,7 +934,8 @@ by looking.
 
 **Check that the alarms reach you** after the first apply (once the SNS
 subscription is confirmed), and after any change to the alerts topic: nothing
-else will say an alert was dropped. With `REGION` set as above:
+else will say an alert was dropped. `scripts/check-alerts.sh` runs the checks
+below and says which mails to look for; by hand, with `REGION` set as above:
 
 ```bash
 export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
@@ -998,6 +1026,11 @@ endpoint for it, by design:
 scripts/prod-sql.sh "UPDATE users SET is_admin = true WHERE lower(username) = lower('alice') RETURNING username"
 ```
 
+While SES is in the sandbox the confirmation mail cannot arrive, so
+`scripts/confirm-user.sh --admin alice` confirms the address by hand (as the
+site's confirm-email route does, with an audit row saying so) and makes the
+account an admin in one step.
+
 `alert_email` has no default: `terraform apply` refuses to run without
 somewhere to send alarms (every one the stack raises, backup failures among
 them), because an unmonitored backup is the failure mode the whole design
@@ -1017,6 +1050,45 @@ Wordmap, rack info table and word info table builds run in a separate scheduled 
 and writes a 1.9 GB file — neither of which fits the web task's 1 vCPU and
 2 GB. A job whose derived files are not built yet is not dispatched; the admin
 page at `/admin/derived-data` is where that wait is visible.
+
+### Operator scripts
+
+The procedures that repeat run as scripts on an operator's machine, with
+their AWS login, instead of pasted blocks. Each reads `~/.birdtest-env`
+(`BIRDTEST_ENV`): `AWS_PROFILE`, `SITE` (the domain), `STATE_BUCKET` and
+`STATE_REGION` (the Terraform state bucket, which also keeps `prod.tfvars`),
+and for deploys `REGISTRY` (ECR) -- `scripts/onboard-deployer.sh` writes it.
+They take the stack's region and names from Terraform's outputs, print the
+workspace and refuse any but `default` unless `BIRDTEST_WORKSPACE` names it,
+say to run `aws sso login` when the login has expired, and ask on the
+terminal before changing anything. Every apply goes through one plan gate:
+the plan is shown and applied only once you say so, and one that destroys,
+replaces or forgets the database, a bucket, the network or a KMS key is
+refused outright (`BIRDTEST_ALLOW_DESTRUCTIVE_PLAN=yes` and a typed word let
+one through). Releases, rollbacks, settings and resets are logged in
+`~/birdtest-releases.log` (`BIRDTEST_RELEASE_LOG`). They need `aws` (with the
+Session Manager plugin for ECS Exec), `terraform`, `jq`, `git`, `gh`,
+`docker`, `python3`, `openssl` and `curl`, each script checking for its own.
+
+| Script | Does |
+| --- | --- |
+| `deploy.sh [--reset-db] [--set KEY=VALUE]` | Deploys the checked-out commit of main: a clean tree, CI green for it (`gh`), the MAGPIE pin pushed to `birdtest-contribute` (`MAGPIE_DIR`, default `~/MAGPIE`); builds and pushes the images ECR lacks (`linux/amd64`, `CARGO_BUILD_JOBS=2`, `MAKE_JOBS=3`), retags `prod.tfvars`, plans, applies, uploads, waits for both target groups. Refuses a commit that changed a migration the live release applied (until launch `0001_initial.sql`, edited in place) unless `--reset-db`. |
+| `reset-prod-db.sh [--no-start]` | Empties the production database (the hostname typed): the service stopped, the schema dropped and made again, the service started so the backend applies `0001`. Then: register, `confirm-user.sh --admin`, import the input data. `deploy.sh --reset-db` does the same once its plan is approved and before the new task starts. |
+| `rollback.sh [--to TAG] [--reset-db]` | RUNBOOK "Rolling back a deploy": the previous release from the log, or the one a circuit breaker went back to. |
+| `set-setting.sh KEY=VALUE...` | Changes `prod.tfvars` values (e.g. `mail_max_per_second=14`) and applies them. |
+| `check-alerts.sh` | The alert-path checks above. |
+| `confirm-user.sh [--admin] NAME` | Confirms an address by hand while SES is in the sandbox, as the confirm-email route does; `--admin` promotes too. |
+| `rotate-db-password.sh [--signing-key] [--resume]` | RUNBOOK "Rotating the database password", never leaving the password only in a shell. |
+| `set-github-token.sh` | The optional GitHub token, then `github_token_parameter_arn`. |
+| `onboard-deployer.sh` | A new deployer's machine: settings, `infra/backend.tf`, `init`, `prod.tfvars`, and a plan that must show no changes. |
+| `assess-damage.sh` | RUNBOOK §0. Reads only. |
+| `restore-artifact.sh JOB GENERATION` | RUNBOOK §3: an older version of a KLV, chosen from a list. |
+| `prod-psql.sh [-v NAME=VALUE] FILE.sql...` | SQL files in the ops task, with psql variables and their own transactions (`scripts/ops-sql/`: RUNBOOK §2.0, §2.3, §2.6, §4); `--keep`, `--task` and `--follow` for work that spans steps or outlasts the terminal. |
+| `pitr-restore.sh STAGE` | RUNBOOK §1's mechanical stages, one at a time. |
+
+`scripts/ops-scripts-check.sh` runs them against stand-ins for `aws`,
+`terraform`, `gh` and `docker` (CI's scripts job), and with `PG_EXEC` their
+SQL against a real Postgres (nightly).
 
 ## Backups
 

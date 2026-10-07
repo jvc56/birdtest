@@ -31,14 +31,32 @@ service's security group, so no `psql` on an operator's machine can reach it.
 Every `psql "$DATABASE_URL" ...` below runs inside the VPC, in the ops task
 (`infra/ops.tf`: the postgres image, `DATABASE_URL` already set, read access to
 the backups bucket): `scripts/prod-sql.sh "<SQL>"` for one batch of statements,
-or `scripts/prod-shell.sh` for an interactive shell (it needs the AWS CLI's
+`scripts/prod-psql.sh` for the SQL files in `scripts/ops-sql/` (psql variables
+such as `-v job=<id>`, and each file's own transactions), or
+`scripts/prod-shell.sh` for an interactive shell (it needs the AWS CLI's
 Session Manager plugin) — which is where §2's scratch restore and row copy run,
 with the scratch database a Postgres started inside that shell the way
 `scripts/restore-drill.sh` starts one.
 
+**Scripts.** Several procedures here are also scripts that run from your
+machine with your AWS login (README.md, "Operator scripts"): §0
+(`scripts/assess-damage.sh`), §1's mechanical stages (`scripts/pitr-restore.sh`),
+§3 (`scripts/restore-artifact.sh`), rolling back (`scripts/rollback.sh`) and
+rotating the password (`scripts/rotate-db-password.sh`). Each section says
+which; the blocks stay for doing it by hand, and for reading what the script
+does.
+
 ---
 
 ## 0. Before anything: what is the damage?
+
+Both halves below at once, from your machine (it only reads):
+
+```bash
+scripts/assess-damage.sh
+```
+
+By hand, the first half in the ops task:
 
 ```bash
 # What the admin actions did, and how big the thing they destroyed was.
@@ -96,6 +114,28 @@ The same information is on `/admin/backups` if the site is up.
 
 Loses at most ~5 minutes. Takes under an hour.
 
+`scripts/pitr-restore.sh` runs this section's mechanical stages from your
+machine, one at a time, each confirmed and each refusing to run out of turn
+(the incident's stamp and restore time are kept in `~/.birdtest-pitr/state`
+between them). Run them one by one, reading this section as you go; the
+judgement stays yours: the restore time, the re-apply review in an ops shell,
+and retiring the damaged instance only once §4 passes. The blocks below are
+what each stage does, for doing it by hand or finishing one the script
+stopped.
+
+```text
+scripts/pitr-restore.sh stop                 # step 1; prints the restorable window
+scripts/pitr-restore.sh restore --time <T>   # steps 2-3, and the backup settings
+scripts/pitr-restore.sh count                # contributors the restore stops, before the swap
+scripts/pitr-restore.sh swap                 # the renames, then state rm and import
+scripts/pitr-restore.sh damaged-host         # DAMAGED_HOST for the re-apply blocks (ops shell)
+scripts/pitr-restore.sh repoint              # DATABASE_URL, a new signing key, the service on
+scripts/pitr-restore.sh finish               # after §4 and Check artifacts: the closing apply
+scripts/pitr-restore.sh retire               # once §4 passes: the damaged instance goes
+```
+
+By hand (`pitr-restore.sh stop`):
+
 ```bash
 # No pager: one would swallow the rest of a paste (above).
 export AWS_PAGER=""
@@ -110,7 +150,8 @@ aws rds describe-db-instances --db-instance-identifier birdtest --region "$REGIO
   --query 'DBInstances[0].LatestRestorableTime'
 ```
 
-Choose the instant, then go on. Each command that needs it refuses to run
+Choose the instant, then go on (`pitr-restore.sh restore --time <T>` does
+this block and the next). Each command that needs it refuses to run
 until it is set, rather than a check here that would close the shell it was
 pasted into:
 
@@ -175,7 +216,7 @@ aws rds modify-db-instance --region "$REGION" \
 ```
 
 Before the swap, while `birdtest` is still the damaged instance, count the
-contributors the restore will stop — in a block of its own, so that a refusal
+contributors the restore will stop (`pitr-restore.sh count`) — in a block of its own, so that a refusal
 (`RESTORE_TIME` unset in a fresh shell) stops here rather than before a rename
 that makes the count impossible:
 
@@ -191,7 +232,10 @@ scripts/prod-sql.sh "
   UNION ALL SELECT 'users', count(*) FROM users WHERE created_at > '${RESTORE_TIME:?}'"
 ```
 
-Swap the names, and hand the restored instance to Terraform. The rename moves
+Swap the names, and hand the restored instance to Terraform
+(`pitr-restore.sh swap`, which works out from the instances and the state
+which of these steps are still to do, so it is run again after a stop
+part-way). The rename moves
 the endpoint with it, which is why it comes before repointing. A rename returns
 before it takes effect, and `wait db-instance-available` on a name that does not
 exist yet fails at once rather than waiting, so each wait is preceded by a poll
@@ -282,7 +326,8 @@ time was refused only if it lacked a `Z`.
 
 In an ops shell (`scripts/prod-shell.sh`), where `DATABASE_URL` now reaches
 the restored instance — the rename moved the endpoint — with the damaged
-instance's endpoint (`aws rds describe-db-instances --region "$REGION"
+instance's endpoint (`scripts/pitr-restore.sh damaged-host` prints it, or
+`aws rds describe-db-instances --region "$REGION"
 --db-instance-identifier "birdtest-damaged-$STAMP" --query
 'DBInstances[0].Endpoint.Address' --output text`, from where the blocks above
 ran; the ops shell has none of their variables). The export and the review
@@ -591,7 +636,7 @@ be redone by hand from what people remember and report.
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c 'UPDATE password_reset_tokens SET used_at = now() WHERE used_at IS NULL'
 ```
 
-Repoint the application. The master password is set by hand and lives only in
+Repoint the application (`pitr-restore.sh repoint`, which runs once). The master password is set by hand and lives only in
 the `DATABASE_URL` parameter, so keep it and swap the host. A PITR copy keeps
 the password the source had at the restore point; if it was rotated after that
 point, set it on the new instance first (see "Rotating the database password"):
@@ -631,9 +676,10 @@ itself Terraform leaves alone — autoscaling owns it.)
 Then run §4 (verification), **Check artifacts** on every leave-generation job
 (§3: the database now describes the objects as they were at the restore point,
 and the button makes what workers are sent match what the bucket holds), and
-`terraform apply -var-file=prod.tfvars`: the restore set none of
+`terraform apply -var-file=prod.tfvars` (`pitr-restore.sh finish`, which
+offers the `db_allocated_storage` raise above when the ceiling needs it): the restore set none of
 Multi-AZ, the backup window or tag copying, and the apply puts them back. Only
-once §4 passes, retire `birdtest-damaged-$STAMP` — never before, and with a
+once §4 passes, retire `birdtest-damaged-$STAMP` (`pitr-restore.sh retire`) — never before, and with a
 final snapshot (`aws rds delete-db-instance --region "$REGION"
 --db-instance-identifier "birdtest-damaged-$STAMP" --final-db-snapshot-identifier
 "birdtest-damaged-$STAMP-final"`, after `modify-db-instance
@@ -695,37 +741,22 @@ results then fail their foreign keys, and the restore reports success with the
 contributors' work still gone. So first, from the admin page or the API,
 **deactivate the job** (a purged completed job is already inactive). Then
 delete what it has generated since the purge — nothing of it predates the
-mistake — in one transaction, in the ops shell. The SQL here and in §2.3 reads
-the job's id as `:'job'`, so start psql with it set:
+mistake — in one transaction: `scripts/ops-sql/clear-job.sql`, which reads
+the job's id as `:'job'`. It puts a purged job that completed again since
+(a small job, or a force-complete) back to inactive with no verdict, deletes
+its exports made since (once §2.3 completes the job again one would be
+served as the restored job's corpus), and deletes its claims, tasks and
+progress, staging, cursor, artifact and transition rows. It prints the job
+first and refuses an active one. Read it, check the id, then from your
+machine:
 
 ```bash
-psql "$DATABASE_URL" -v job=00000000-0000-0000-0000-000000000000
+scripts/prod-psql.sh -v job=00000000-0000-0000-0000-000000000000 scripts/ops-sql/clear-job.sql
 ```
 
-```sql
-BEGIN;
--- A purged job that completed again since -- a small job, or a force-complete --
--- cannot be deactivated from the admin page, and its verdict is from the
--- results about to be deleted: back to inactive, with no verdict.
-UPDATE jobs SET status = 'inactive', test_decided_status = NULL,
-                test_decided_lower = NULL, test_decided_upper = NULL,
-                test_decided_units = NULL
- WHERE id = :'job' AND status = 'completed';
--- And an export of those results: once §2.3 completes the job again it would be
--- served as the restored job's corpus. (A purge deletes exports for this
--- reason; the objects go with the bucket's lifecycle rule.)
-DELETE FROM job_exports WHERE job_id = :'job';
-DELETE FROM task_claims c USING tasks t WHERE c.task_id = t.id AND t.job_id = :'job';
-DELETE FROM tasks WHERE job_id = :'job';
-DELETE FROM opening_rack_progress       WHERE job_id = :'job';
-DELETE FROM leave_rack_progress         WHERE job_id = :'job';
-DELETE FROM leave_rack_staging          WHERE job_id = :'job';
-DELETE FROM leave_generation_progress   WHERE job_id = :'job';
-DELETE FROM leave_selection_cursors     WHERE job_id = :'job';
-DELETE FROM leave_generation_artifacts  WHERE job_id = :'job';
-DELETE FROM leave_generation_transitions WHERE job_id = :'job';
-COMMIT;
-```
+(In an ops shell instead, the same file:
+`psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -v job=<id> -f clear-job.sql`, with the
+file's text written there first.)
 
 (A deleted job has nothing to clear, and needs nothing re-inserted by hand:
 §2.2's script, finding no `jobs` row in production, restores it first.) After
@@ -944,100 +975,18 @@ collided).
 
 This is the step a naive row copy gets wrong, and the one that makes the
 scheduler dispatch work that is already done. Run it against production after
-the copy, in one transaction:
+the copy, in one transaction: `scripts/ops-sql/repair-job-counters.sql`. It
+recomputes each of the job's tasks' `accepted_count` and `active_claim_count`
+from its claims (only the rows that are wrong), then each task's `state` and
+`completed_at` from those exactly as the submit path does, then the job's own
+counters -- `claims_issued` and `last_completed_at` from the claims, the
+dashboard's progress totals as the reads they replaced computed them -- and
+last puts `claims_baseline` level with the jobs being served, as activation
+and purge do (`scheduler::join_at_parity`), so the job neither owes nor is
+owed a backlog. The file's comments say why each statement is as it is.
 
-```sql
-BEGIN;
-
-UPDATE tasks t
-   SET accepted_count     = actual.accepted,
-       active_claim_count = actual.active
-  FROM (
-    SELECT t2.id,
-           count(*) FILTER (WHERE c.state = 'completed')::int AS accepted,
-           count(*) FILTER (WHERE c.state = 'claimed')::int   AS active
-      FROM tasks t2
-      LEFT JOIN task_claims c ON c.task_id = t2.id
-     WHERE t2.job_id = :'job'
-     GROUP BY t2.id
-  ) actual
- WHERE t.id = actual.id
-   -- Only rows that are wrong: every task of a large job rewritten was
-   -- seconds of writes and as many dead tuples, for rows already right.
-   AND (t.accepted_count, t.active_claim_count) IS DISTINCT FROM (actual.accepted, actual.active);
-
--- State and completed_at follow from the counters, exactly as the submit
--- path computes them: a task has one slot, so an accepted result completes
--- it and a live claim holds it.
-UPDATE tasks t
-   SET state = CASE
-         WHEN t.accepted_count > 0 THEN 'completed'::task_state
-         WHEN t.active_claim_count > 0 THEN 'claimed'::task_state
-         ELSE 'available'::task_state
-       END,
-       completed_at = CASE WHEN t.accepted_count > 0
-                           THEN COALESCE(t.completed_at, now()) ELSE NULL END
- WHERE t.job_id = :'job'
-   AND t.state IS DISTINCT FROM CASE
-         WHEN t.accepted_count > 0 THEN 'completed'::task_state
-         WHEN t.active_claim_count > 0 THEN 'claimed'::task_state
-         ELSE 'available'::task_state
-       END;
-
--- The job's own counters. claims_issued is the scheduler's deficit numerator,
--- measured from claims_baseline; the statement after this one puts the
--- restored job level with the jobs beside it, as activation and purge do
--- (scheduler::join_at_parity), so it neither owes nor is owed a backlog. The
--- rest are the dashboard's progress totals; they
--- are maintained one task at a time in the claim and submit paths, so a row
--- copy leaves them describing the results the job had before. Each is
--- recomputed here exactly as the read it replaced computed it.
--- The claims are read once, for both of their columns: a second subquery for
--- last_completed_at was a second pass over them.
-UPDATE jobs j
-   SET claims_issued = cl.issued,
-       last_completed_at = cl.last,
-       tasks_total = (SELECT count(*) FROM tasks t WHERE t.job_id = j.id),
-       tasks_completed = (SELECT count(*) FROM tasks t
-                           WHERE t.job_id = j.id AND t.state = 'completed'),
-       games_completed = (SELECT COALESCE(sum(r.games), 0)
-                            FROM game_results r WHERE r.job_id = j.id),
-       racks_analyzed = (SELECT count(DISTINCT p.rack)
-                           FROM position_analysis_records p
-                          WHERE p.job_id = j.id AND p.game_index IS NULL),
-       -- An opening-rack job's settled racks are its settled progress rows:
-       -- every opening-rack job keeps one per rack, and one wanting a single
-       -- analysis per rack settles each at its first.
-       racks_settled = (SELECT count(*) FROM opening_rack_progress p
-                         WHERE p.job_id = j.id AND p.settled),
-       racks_without_consensus = (SELECT count(*) FROM opening_rack_progress p
-                                   WHERE p.job_id = j.id AND p.without_consensus)
-  FROM (SELECT count(*) AS issued,
-               max(c.completed_at) FILTER (WHERE c.state = 'completed') AS last
-          FROM task_claims c JOIN tasks t ON t.id = c.task_id
-         WHERE t.job_id = :'job') cl
- WHERE j.id = :'job';
-
--- Level with the lowest of the jobs being *served* -- those that issued a
--- claim within the heartbeat timeout (300 s unless HEARTBEAT_TIMEOUT_SECONDS
--- says otherwise) of the latest claim of any of them -- or, when none ever
--- has, the highest on offer: scheduler::join_at_parity's rule.
-WITH others AS (
-  SELECT (o.claims_issued - o.claims_baseline)::float8 / o.allocation AS ratio,
-         o.last_claimed_at,
-         MAX(o.last_claimed_at) OVER () AS latest
-    FROM jobs o
-   WHERE o.status = 'active' AND o.allocation > 0 AND o.id <> :'job'
-)
-UPDATE jobs j
-   SET claims_baseline = j.claims_issued - floor(
-         COALESCE((SELECT MIN(ratio) FROM others
-                    WHERE last_claimed_at > latest - interval '300 seconds'),
-                  (SELECT MAX(ratio) FROM others), 0)
-         * COALESCE(j.allocation, 0))::bigint
- WHERE j.id = :'job';
-
-COMMIT;
+```bash
+scripts/prod-psql.sh -v job=00000000-0000-0000-0000-000000000000 scripts/ops-sql/repair-job-counters.sql
 ```
 
 `racks_analyzed`, `racks_settled` and `racks_without_consensus` are meaningful
@@ -1046,7 +995,7 @@ only for an opening-rack job and
 each at 0 for the job types that do not use it, which is what they hold anyway.
 
 The job's `tasks_total`/`tasks_completed` come after both `UPDATE tasks`
-statements above, and must stay after them if the block is run in pieces:
+statements in the file, and must stay after them if it is run in pieces:
 `tasks_completed` counts tasks whose `state` is `completed`, which the second
 of those — the state repair — recomputes.
 
@@ -1055,21 +1004,21 @@ purge returns a completed job to inactive and clears the match-test verdict it w
 completed on, and neither is a row the copy brings back. **A deleted job that
 had completed** comes back inactive too: §2.2 restores its `jobs` row with its
 verdict but made `inactive`. Put the status (and, for a purged job, the
-verdict) back from the scratch copy's `jobs` row:
+verdict) back from the scratch copy's `jobs` row. Read it in the §2.1 shell
+(`source /tmp/restore.env` first):
 
-```sql
--- Set each variable from the scratch copy's row
---   SELECT status, test_decided_status, test_decided_lower, test_decided_upper,
---          test_decided_units
---   FROM jobs WHERE id = :'job';
--- and to the empty string where it is NULL (a job an admin completed has no
--- verdict): :'var' always quotes, so NULLIF is what turns empty back into NULL.
-UPDATE jobs SET status = :'old_status',
-               test_decided_status = NULLIF(:'old_verdict', ''),
-               test_decided_lower  = NULLIF(:'old_lower', '')::float8,
-               test_decided_upper  = NULLIF(:'old_upper', '')::float8,
-               test_decided_units  = NULLIF(:'old_units', '')::bigint
- WHERE id = :'job';
+```bash
+psql "$SCRATCH_URL" -c "SELECT status, test_decided_status, test_decided_lower, test_decided_upper, test_decided_units FROM jobs WHERE id = '00000000-0000-0000-0000-000000000000'"
+```
+
+then pass each value -- the empty string where it is NULL (a job an admin
+completed has no verdict): `:'var'` always quotes, and the file's `NULLIF`
+turns empty back into NULL -- to `scripts/ops-sql/restore-job-status.sql`:
+
+```bash
+scripts/prod-psql.sh -v job=00000000-0000-0000-0000-000000000000 \
+  -v old_status=completed -v old_verdict='' -v old_lower='' -v old_upper='' -v old_units='' \
+  scripts/ops-sql/restore-job-status.sql
 ```
 
 Activating it instead would dispatch more work on a job that had finished.
@@ -1298,6 +1247,17 @@ history endpoint's points — are not restored.
    its own two rows. Skip this copy; if the pool is still wanted, make it again
    (same name, variant, anchor and members) on the rows the jobs now use.
 
+   `scripts/ops-sql/restore-rating-pool.sql` does it, in the task of the §2.1
+   shell, whose `/tmp/restore.env` names the scratch copy; the shell printed
+   its task's ARN when it started. From your machine (over ECS Exec):
+
+```bash
+scripts/prod-psql.sh --task '<the section 2.1 shell task ARN>' -v pool=00000000-0000-0000-0000-000000000000 \
+  scripts/ops-sql/restore-rating-pool.sql
+```
+
+   Or by hand, inside that shell:
+
 ```bash
 # Inside scripts/prod-shell.sh, after §2.1 (source /tmp/restore.env first).
 POOL=''   # the deleted pool's id
@@ -1351,7 +1311,8 @@ KLVs are derivable from `leave_rack_progress`, so they need no backup:
   evidence of anything.
 - **Corrupted object with a known-good older version.** The bucket is
   versioned; restore that specific object version rather than rolling the
-  bucket back:
+  bucket back. `scripts/restore-artifact.sh <job id> <generation>` lists the
+  versions and copies back the one you choose; by hand:
 
 ```bash
 export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
@@ -1409,6 +1370,15 @@ SELECT relname AS table_name, want.n AS manifest, got.n AS restored
  WHERE want.n IS DISTINCT FROM got.n
  ORDER BY 1;
 SQL
+```
+
+Checks 2 and 3 below run from your machine as they are written here
+(`scripts/ops-sql/check-restore.sql`, which `scripts/ops-scripts-check.sh`
+keeps the same as this section); 3b, in the same block, through
+`scripts/prod-shell.sh`:
+
+```bash
+scripts/prod-psql.sh scripts/ops-sql/check-restore.sql
 ```
 
 ```sql
@@ -1922,6 +1892,20 @@ service keeps no healthy task through a deploy, so the site is down from the
 moment the bad task stops until the old one is healthy, and the `-down`
 alarms may fire and clear. Keep each release's three image tags (in its
 release notes, say): `prod.tfvars` holds only the current ones.
+`scripts/deploy.sh` writes them to `~/birdtest-releases.log`, and
+
+```bash
+scripts/rollback.sh
+```
+
+does the steps below: it tells a circuit-breaker rollback from what ECS runs
+and offers the image it went back to (otherwise the previous release in the
+log), asks step 1's question and whether to put `min_magpie_version` back,
+refuses a target whose migrations differ from the live release's unless
+`--reset-db` (until launch `0001_initial.sql` is edited in place, so a
+rollback across a change to it needs a database reset), then plans, applies,
+uploads `prod.tfvars` and waits for both target groups. `--to <tag>` names the
+release outright.
 
 **ECS may have rolled back already.** The service has a deployment circuit
 breaker (`infra/ecs.tf`): a release whose task fails to start three times --
@@ -2000,26 +1984,36 @@ loses every write since.
 
 The master password is set by hand (`infra/rds.tf` sets a placeholder
 `password`, so RDS does not manage it) and lives only inside
-`/birdtest/DATABASE_URL`. Rotation is
-this, in order; the service fails new connections between the first and last
-step, so do it in a quiet moment:
+`/birdtest/DATABASE_URL`. The service fails new connections from the moment
+the instance takes the new password until it restarts, so do it in a quiet
+moment:
+
+```bash
+scripts/rotate-db-password.sh   # --signing-key to rotate SESSION_SIGNING_KEY too
+```
+
+It writes the new URL to SSM *first* and then sets the instance's password
+from what SSM holds, so the new password is never only in a shell: a run that
+stops part-way (an expired login, a laptop asleep) is finished with
+`scripts/rotate-db-password.sh --resume`, which makes no new password. By
+hand, in the same order:
 
 ```bash
 export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
 DB_PASSWORD=$(openssl rand -hex 24)
-aws rds modify-db-instance --region "$REGION" --db-instance-identifier birdtest \
-  --master-user-password "$DB_PASSWORD" --apply-immediately
-aws rds wait db-instance-available --region "$REGION" --db-instance-identifier birdtest
-
 OLD_URL=$(aws ssm get-parameter --region "$REGION" --name /birdtest/DATABASE_URL \
   --with-decryption --query Parameter.Value --output text)
 NEW_URL=$(python3 -c 'import sys, urllib.parse as u
 p = u.urlsplit(sys.argv[1])
 print(p._replace(netloc="birdtest:" + sys.argv[2] + "@" + p.netloc.rsplit("@", 1)[1]).geturl())' \
   "$OLD_URL" "$DB_PASSWORD")
+# The URL first: if anything stops after this, the password is in SSM, and
+# the modify below can be run again from it.
 aws ssm put-parameter --region "$REGION" --name /birdtest/DATABASE_URL --type SecureString --overwrite \
-  --value "$NEW_URL"
-
+  --value "$NEW_URL" &&
+aws rds modify-db-instance --region "$REGION" --db-instance-identifier birdtest \
+  --master-user-password "$DB_PASSWORD" --apply-immediately &&
+aws rds wait db-instance-available --region "$REGION" --db-instance-identifier birdtest &&
 # Tasks read SSM at start; the backup task reads it per run.
 aws ecs update-service --region "$REGION" --cluster "$CLUSTER" --service birdtest --force-new-deployment
 ```
