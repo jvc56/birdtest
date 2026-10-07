@@ -34,7 +34,9 @@
 # scratch copy lives (its /tmp/restore.env is read first, so the SQL sees
 # SCRATCH_URL through \getenv). The files go over ECS Exec in pieces (it
 # needs the Session Manager plugin), are checked against their SHA-256, and
-# run detached in the task, their output joining the task's log.
+# run detached in the task, writing /tmp/ops/<run>.log there, which is copied
+# to the task's log for this to follow. A run that never shows up in the log
+# within three minutes is not waited for: the file in the task says why.
 #
 # A file containing the line `-- prod-psql: writes` is confirmed before it
 # runs; one containing `-- prod-psql: needs NAME...` is refused without those
@@ -46,7 +48,7 @@ source "$(dirname "$0")/lib/ops.sh"
 
 usage() { sed -n '9,12p' "$0" >&2; exit 2; }
 
-vars=() files=() keep="" task="" follow="" follow_run=""
+vars=() files=() keep="" task="" follow="" follow_run="" exec_mode=""
 while (($#)); do
   case $1 in
     -v) [[ $# -ge 2 && "$2" == *=* ]] || usage; vars+=("$2"); shift ;;
@@ -91,10 +93,18 @@ log_group=$(tf -raw log_group_name)
 # its start and exit markers (RUN empty: every line), until the exit marker
 # or the task stops. Returns psql's exit status.
 follow_run() {
-  local arn=$1 run=$2 stream token="" next page line rc="" started=0 status stopped=0 unseen=0
+  local arn=$1 run=$2 patience=${3:-0} stream token="" next page line rc="" started=0 status stopped=0 unseen=0 polls=0
   stream="ops/ops/${arn##*/}"
   [[ -n "$run" ]] || started=1
   while :; do
+    # In a running task (--task), a run whose start never reaches the log is
+    # not waited for forever: its output is in the task's /tmp/ops.
+    polls=$((polls + 1))
+    if ((patience && !started && polls > patience)); then
+      ops_say "no output from $run in the task's log after $((patience * 10)) seconds: look in the task --"
+      ops_say "  scripts/prod-shell.sh --attach $arn, then  cat /tmp/ops/$run.log"
+      return 1
+    fi
     page=$(aws logs get-log-events --log-group-name "$log_group" --log-stream-name "$stream" \
       --start-from-head ${token:+--next-token "$token"} --output json 2>/dev/null) || page=""
     next=$token
@@ -215,6 +225,7 @@ if [[ -z "$task" ]]; then
 else
   # An existing task, over ECS Exec: the payload in pieces, then a starter
   # that checks it whole and runs it detached, into the task's own log.
+  exec_mode=1
   ops_say "task $task (ECS Exec)"
   exec_in() {
     aws ecs execute-command --cluster "$OPS_CLUSTER" --task "$task" --container ops \
@@ -228,6 +239,9 @@ else
     exec_in "/bin/bash -c 'printf %s ${rest:0:4000} >> /tmp/ops/$run.b64'"
     rest=${rest:4000}
   done
+  # The run writes /tmp/ops/<run>.log in the task, and a tail copies it to
+  # the task's own output (/proc/1/fd/1, as root like the task's command),
+  # which is what CloudWatch keeps and --follow reads.
   starter="trap '' HUP
 cd /tmp/ops || exit 1
 if [ \"\$(base64 -d $run.b64 | sha256sum | cut -c1-64)\" != $sum ]; then
@@ -236,12 +250,17 @@ fi
 if ! { mkdir $run && base64 -d $run.b64 | tar -xzf - -C $run; }; then
   echo '__birdtest_run $run exit unpacking' > /proc/1/fd/1; exit 1
 fi
-setsid nohup bash $run/run.sh > /proc/1/fd/1 2>&1 < /dev/null &
+setsid nohup bash $run/run.sh > /tmp/ops/$run.log 2>&1 < /dev/null &
+setsid nohup tail -n +1 -F --pid=\$! /tmp/ops/$run.log > /proc/1/fd/1 2> /dev/null < /dev/null &
 sleep 1"
   exec_in "/bin/bash -c 'printf %s $(printf '%s' "$starter" | base64 | tr -d '\n') | base64 -d | bash'"
 fi
 
 if [[ -n "$payload" ]]; then
   ops_say "following $run (Ctrl-C stops only this; the SQL runs on. Again: scripts/prod-psql.sh --follow $task $run)"
-  follow_run "$task" "$run"
+  if [[ -n "$exec_mode" ]]; then
+    follow_run "$task" "$run" 18
+  else
+    follow_run "$task" "$run"
+  fi
 fi

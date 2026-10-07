@@ -219,7 +219,8 @@ def ecs(op, opt, q):
             out(json.dumps({"tasks": [{"taskArn": arn}], "failures": []}))
     elif op == "describe-tasks":
         if "lastStatus" in q:
-            out("STOPPED")
+            # A shell's task (prod-psql.sh --task) runs on; a one-off stops.
+            out("RUNNING" if "shelltask" in opt.get("--tasks", "") else "STOPPED")
         elif "exitCode" in q and "stoppedReason" not in q:
             out("0")
         else:

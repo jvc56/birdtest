@@ -27,7 +27,8 @@
 #     the SQL except as hex, which decodes back to it, and the SQL that
 #     reaches the ops task is that SQL;
 #   - prod-psql.sh's payload: the files in order, each variable's value
-#     byte for byte, a missing variable refused, a write confirmed;
+#     byte for byte, a missing variable refused, a write confirmed; and
+#     --task's, in pieces over ECS Exec that make it whole again;
 #   - pitr-restore.sh: a restore time not in UTC refused, `swap` in order
 #     (rename, rename, state rm, import), resumed from half-way, and `count`
 #     refused once the swap has begun;
@@ -37,7 +38,8 @@
 # scripts/reapply-check.sh takes it) the SQL also runs against a real
 # Postgres with the schema: confirm-user.sh's for a hostile name, the reset,
 # and each scripts/ops-sql file -- prod-psql.sh's run.sh unpacked and run as
-# the ops task runs it.
+# the ops task runs it, its one-off task's command as sent, and its --task
+# ECS Exec commands replayed in the container, down to the detached run.
 set -Eeuo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -338,6 +340,21 @@ grep -q -- "--single-transaction" "$WORK/payload/run.sh" && fail "run.sh forces 
 grep -q "ON_ERROR_STOP=1" "$WORK/payload/run.sh" || fail "run.sh does not stop on errors"
 pass "prod-psql.sh: the files and variables reach the task intact, writes confirmed, needs enforced"
 
+# --task: the payload over ECS Exec in pieces, put back together whole. The
+# stand-in's log never shows the run, so it gives up and says where to look.
+TASK_ARN=arn:aws:ecs:us-east-1:123456789012:task/birdtest/shelltask
+{ echo "CREATE TABLE ops_task_ran (n int);"; head -c 9000 /dev/urandom | base64 | sed 's/^/-- /'; } > "$WORK/big.sql"
+fresh "$B"
+if run prod-psql.sh --task "$TASK_ARN" -v job=x "$WORK/big.sql"; then fail "a run never seen in the log counted as done"; fi
+grep -q "cat /tmp/ops/run-" "$WORK/out" || fail "the give-up does not say where the output is"
+grep "aws ecs execute-command" "$FAKE_DIR/calls.log" | sed -n 's/.* --command //p' > "$WORK/exec-commands"
+chunks=$(grep -c "printf %s [A-Za-z0-9+/=]* >> /tmp/ops/run-" "$WORK/exec-commands" || true)
+((chunks >= 3)) || fail "a large payload went in $chunks pieces"
+sed -n "s#^/bin/bash -c 'printf %s \([A-Za-z0-9+/=]*\) >> /tmp/ops/run-.*#\1#p" "$WORK/exec-commands" | tr -d '\n' \
+  | base64 -d | tar -tzf - > "$WORK/listing" || fail "the pieces do not make the payload"
+{ grep -q "run.sh" "$WORK/listing" && grep -q "big.sql" "$WORK/listing"; } || fail "the payload lacks its files"
+pass "prod-psql.sh --task: the payload in pieces over ECS Exec, whole again, and a run never seen is not waited on forever"
+
 # ---------------------------------------------------------------------------
 # pitr-restore.sh
 # ---------------------------------------------------------------------------
@@ -439,13 +456,41 @@ if [[ -n "${PG_EXEC:-}" ]]; then
     fail "restore-rating-pool.sql copied a pool the scratch copy does not have"
   fi
   grep -q "has no such pool" "$WORK/out" || fail "restore-rating-pool.sql did not refuse for the right reason"
+  # The whole one-shot task as prod-psql.sh starts it: its command and its
+  # environment, in the postgres image, as the ops task's `bash -c`.
+  fresh "$B"
+  run prod-psql.sh "$R/scripts/ops-sql/check-restore.sql" || fail "prod-psql.sh failed"
+  command=$(jq -r '.containerOverrides[0].command[0]' "$FAKE_DIR/runtask/1.json")
+  payload=$(jq -r '.containerOverrides[0].environment[0].value' "$FAKE_DIR/runtask/1.json")
+  pgx env BIRDTEST_PAYLOAD="$payload" DATABASE_URL="postgresql:///ops_check?user=$PGU" bash -c "$command" \
+    > "$WORK/out" 2>&1 || fail "the task's command failed"
+  { grep -q "__birdtest_run run-.* exit 0" "$WORK/out" && grep -q "counter_disagreements" "$WORK/out"; } \
+    || fail "the task's command did not run the file"
+  # And --task's ECS Exec commands, as recorded above, replayed in the
+  # container: the pieces, the checksum, the unpacking and the detached run.
+  # (Its copy to /proc/1/fd/1 is denied here, where PID 1 is the server's
+  # user rather than root as in the ops task; the run does not depend on it.)
+  pgx bash -c "rm -rf /tmp/ops" > /dev/null
+  while IFS= read -r cmd; do
+    pgx env DATABASE_URL="postgresql:///ops_check?user=$PGU" bash -c "$cmd" < /dev/null > /dev/null 2>&1 \
+      || fail "an ECS Exec command failed in the container: ${cmd:0:80}"
+  done < "$WORK/exec-commands"
+  ran=""
+  for _ in $(seq 30); do
+    ran=$(pgx psql -U "$PGU" -X -tA -d ops_check -c "SELECT to_regclass('ops_task_ran') IS NOT NULL")
+    [[ "$ran" == t ]] && break
+    PATH="$REAL_PATH" sleep 1
+  done
+  [[ "$ran" == t ]] || fail "the detached run never ran the file"
+  pgx bash -c "cat /tmp/ops/run-*.log" | grep -q "__birdtest_run run-.* exit 0" \
+    || fail "the detached run's log does not end with its exit"
   pg -d ops_check -c "$(sed -n '/^OPS_RESET_SQL="/,/^"$/p' "$ROOT/scripts/lib/ops.sh" | sed '1d;$d')" > "$WORK/out" 2>&1 \
     || fail "the reset SQL failed"
   [[ "$(pgx psql -U "$PGU" -X -tA -d ops_check -c "SELECT count(*) FROM pg_tables WHERE schemaname = 'public'")" == 0 ]] \
     || fail "the reset left tables"
   pg -d ops_check < "$ROOT/backend/migrations/0001_initial.sql" > /dev/null || fail "0001 does not apply after the reset"
   pg -d postgres -c "DROP DATABASE ops_check" >/dev/null
-  pass "the ops-sql files run through run.sh, and the reset empties a schema 0001 applies to again"
+  pass "the ops-sql files run through run.sh, the one-off and --task paths in the postgres image, and the reset empties a schema 0001 applies to again"
 fi
 
 echo "ops scripts check passed"
