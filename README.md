@@ -318,7 +318,8 @@ then run `./bin/magpie contribute` there. Given an anonymous identity, MAGPIE
 appends a `uuid` line to `contribute.txt`, creating the file if there is none;
 it never writes a defaulted setting into it. A second process in the same
 directory needs a file of its own — a copy of the one above, without the
-`uuid` line MAGPIE appends on a first run, named on the command line
+`uuid` line MAGPIE appends on a first run, named on the command line (a named
+file must exist, unlike the default `contribute.txt`; an empty one will do)
 (`./bin/magpie contribute second.txt`): MAGPIE appends the identity it is issued
 to that file. (A directory of its own does not work unless it also holds
 MAGPIE's `data/`, or a link to it: MAGPIE loads its default board from

@@ -4043,6 +4043,11 @@ magpie> contribute                      # reads ./contribute.txt
 magpie> contribute /path/to/other.txt   # a path is not a secret
 ```
 
+Only the default `contribute.txt` may be missing. A path given explicitly must
+exist (it may be empty, or set only some settings): a typo in a named file
+would otherwise start a new anonymous identity against the default server
+without a word.
+
 Implemented as `impl_contribute(Config *config, const char *settings_path,
 ErrorStack *error_stack)` in `src/impl/config.c`, following the other `impl_*`
 entry points, which owns the loop; `src/impl/contribute.c` holds the protocol
