@@ -3942,7 +3942,10 @@ history and in `ps` output, and contribution settings have no business mixed int
 `settings.txt` alongside board layouts and simulation parameters.
 
 `contribute.txt` sits in the current working directory, one setting per line as
-`key value`. Blank lines and lines beginning with `#` are ignored — but a run
+`key value`. **The file is optional, and so is every setting in it**: a missing
+file means every setting takes its default, and a file that sets only some (an
+`apikey` alone, say) takes the defaults for the rest. An existing file that
+cannot be read is still an error. Blank lines and lines beginning with `#` are ignored — but a run
 with no `apikey` set names a comment that holds `apikey` then a key, since
 appending the setting to a last comment line with no newline puts it there
 (thirty-second audit, pass 18). Setting names are lowercase (one in the wrong
@@ -3962,7 +3965,7 @@ uuid      6f3d7198-178a-47c8-9ccc-6aa6995a5a9c
 
 | Key | Required | Default | Meaning |
 |---|---|---|---|
-| `server` | **yes** | — | birdtest base URL |
+| `server` | no | `https://birdtest.org` | birdtest base URL (MAGPIE's `CONTRIBUTE_DEFAULT_SERVER`) |
 | `apikey` | no | absent | Attributes work to an account. Without it the worker is anonymous, identified by `uuid`. |
 | `threads` | no | cores − 1 | Threads given to MAGPIE while working |
 | `maxtasks` | no | `0` | Tasks to complete before stopping; `0` runs until stopped |
@@ -3970,12 +3973,16 @@ uuid      6f3d7198-178a-47c8-9ccc-6aa6995a5a9c
 | `uuid` | no | assigned by the server | The anonymous worker identity |
 
 An unknown key is an error rather than a silent ignore — a typo'd `apikey` should
-not quietly downgrade someone to anonymous. If `server` is missing, `contribute`
-fails with a message naming the file and the missing key, not a usage string,
-since the fix is editing a file.
+not quietly downgrade someone to anonymous. Only a missing setting defaults; a
+malformed one is still refused. `contribute` prints the settings it is using at
+start, marking each defaulted one (`server https://birdtest.org (default)`) and
+saying only whether an API key is set, never the key.
 
 The file is **user-authored and MAGPIE does not rewrite it**, with exactly one
-exception: once the server assigns a `uuid`, MAGPIE **appends a single line**.
+exception: once the server assigns a `uuid`, MAGPIE **appends a single line**,
+creating the file (with a one-line header comment) if there is none. It never
+writes a defaulted setting into it, so a later change of default reaches every
+contributor whose file does not override it.
 Appending rather than rewriting means comments, ordering and formatting the
 contributor put there survive untouched.
 
@@ -4002,10 +4009,13 @@ worker's first task and nothing after that, and means `contribute` needs no
 cryptographically secure random source at all.
 
 Because the file is resolved relative to the working directory, a contributor who
-runs MAGPIE from a different directory has no `contribute.txt` there and
-`contribute` stops rather than silently becoming a new anonymous worker and
-losing their contribution history. (Without `./data` it stops even earlier, on
-loading its default board layout, and exits 0 either way.)
+runs MAGPIE from a different directory has no `contribute.txt` there. That used
+to stop `contribute`; since the file became optional it starts as a new
+anonymous worker on the defaults instead, losing the link to the earlier
+identity's history. The trade was made deliberately (2026-10): a first-time
+contributor needs no file at all, and the settings printed at start --
+`(default)` beside the server, no `uuid` -- show the mistake at once. (Without
+`./data` it still stops, on loading its default board layout, and exits 0.)
 
 **The API key needs no special file handling.** `contribute.txt` holds a bearer
 credential when `apikey` is set, but nothing about that requires MAGPIE-side

@@ -299,8 +299,14 @@ admin page.
 ### Contributing with MAGPIE
 
 A contributor needs only MAGPIE — no Python, no Docker, nothing else to
-install. Put a `contribute.txt` in the directory you run it from, the one
-holding its `data/` (MAGPIE reads both from its working directory):
+install. `./bin/magpie contribute`, run from the directory holding MAGPIE's
+`data/`, contributes to https://birdtest.org anonymously on every core but one.
+Settings go in a `contribute.txt` in that directory (MAGPIE reads both from its
+working directory); the file is optional, and any setting it leaves out takes
+its default: `server` https://birdtest.org, `apikey` none (anonymous),
+`threads` every core but one, `maxtasks` 0 (no limit), `idlewait` 5 seconds.
+MAGPIE prints the settings it is using at start, marking the defaulted ones.
+A local stack is not the default server, so name it:
 
 ```text
 server   http://localhost:5173
@@ -308,7 +314,9 @@ threads  7
 maxtasks 0
 ```
 
-then run `./bin/magpie contribute` there. A second process in the same
+then run `./bin/magpie contribute` there. Given an anonymous identity, MAGPIE
+appends a `uuid` line to `contribute.txt`, creating the file if there is none;
+it never writes a defaulted setting into it. A second process in the same
 directory needs a file of its own — a copy of the one above, without the
 `uuid` line MAGPIE appends on a first run, named on the command line
 (`./bin/magpie contribute second.txt`): MAGPIE appends the identity it is issued

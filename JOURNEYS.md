@@ -113,9 +113,12 @@ Use a signed-out window for the V journeys unless one says otherwise.
   cards: name, status badge, "25% allocation". Clicking one opens its job page.
 - [ ] **Expect** after it a "Contribute" section (not a card, like "Active
   Jobs") of four numbered steps: **Install MAGPIE** (linking MAGPIE's
-  getting-started section), **Create a contribute.txt file** (a sample whose
-  `server` line is this site's own address, and a table of its settings --
-  `server` required; `apikey`, `threads`, `maxtasks`, `idlewait` optional),
+  getting-started section), **Create a contribute.txt file** (a table of its
+  settings and each one's default -- `server` https://birdtest.org, `apikey`
+  none, `threads` every core but one, `maxtasks` 0, `idlewait` 5 -- and a
+  sample. Here, off birdtest.org, the step is not optional and the sample is a
+  `server` line with this site's own address; on birdtest.org the heading
+  starts "(Optional)" and the sample sets `threads`),
   **(Optional) Create an account** (to contribute under a username, else
   anonymously) and **Run the contribute command** (`./bin/magpie contribute`).
 - [ ] (With every job deactivated, A-8) **expect** the Active Jobs section gone

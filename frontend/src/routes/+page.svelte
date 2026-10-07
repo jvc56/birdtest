@@ -6,6 +6,13 @@
 
   let active: JobListItem[] = [];
 
+  // The server `magpie contribute` uses when contribute.txt sets none
+  // (MAGPIE's CONTRIBUTE_DEFAULT_SERVER). Any other server -- a local or test
+  // stack -- has to be named in the file.
+  const DEFAULT_SERVER = 'https://birdtest.org';
+  const origin = typeof window !== 'undefined' ? window.location.origin : DEFAULT_SERVER;
+  const isDefaultServer = origin === DEFAULT_SERVER;
+
   // The job list is a side panel here; a failed load leaves it empty rather
   // than the whole page broken, and is not an unhandled rejection.
   onMount(async () => {
@@ -65,48 +72,55 @@
         </p>
       </li>
       <li class="space-y-2">
-        <h3 class="font-medium">Create a contribute.txt file</h3>
+        <h3 class="font-medium">{isDefaultServer ? '(Optional) ' : ''}Create a contribute.txt file</h3>
         <p class="text-muted-foreground">
-          Put a <code class="rounded bg-muted px-1">contribute.txt</code> in the directory you run
-          MAGPIE from, the one holding its <code class="rounded bg-muted px-1">data/</code>. Each
-          line is a setting's name and its value:
+          {#if isDefaultServer}
+            MAGPIE works without one: it contributes to this site anonymously, on every core but one.
+            To change that, put a
+          {:else}
+            This site is not MAGPIE's default server, so tell it where to contribute: put a
+          {/if}
+          <code class="rounded bg-muted px-1">contribute.txt</code> in the directory you run MAGPIE
+          from, the one holding its <code class="rounded bg-muted px-1">data/</code>. Each line is a
+          setting's name and its value, and any setting left out takes its default:
         </p>
         <div class="overflow-x-auto">
           <table class="table text-xs">
             <thead>
-              <tr><th>Setting</th><th>Required</th><th>What it is</th></tr>
+              <tr><th>Setting</th><th>Default</th><th>What it is</th></tr>
             </thead>
             <tbody>
               <tr>
-                <td class="font-mono">server</td><td>yes</td>
-                <td>This site's address, as above.</td>
+                <td class="font-mono">server</td><td class="font-mono">{DEFAULT_SERVER}</td>
+                <td>The birdtest site to contribute to.</td>
               </tr>
               <tr>
-                <td class="font-mono">apikey</td><td>no</td>
-                <td>An API key from your account, to contribute under your username (step 3).</td>
+                <td class="font-mono">apikey</td><td>none</td>
+                <td>An API key from your account, to contribute under your username (step 3). Without one you contribute anonymously.</td>
               </tr>
               <tr>
-                <td class="font-mono">threads</td><td>no</td>
-                <td>How many threads to run tasks on. Leave it out to use every core but one.</td>
+                <td class="font-mono">threads</td><td>every core but one</td>
+                <td>How many threads to run tasks on.</td>
               </tr>
               <tr>
-                <td class="font-mono">maxtasks</td><td>no</td>
-                <td>How many tasks to run before stopping. 0, or left out, runs until you stop it.</td>
+                <td class="font-mono">maxtasks</td><td>0</td>
+                <td>How many tasks to run before stopping. 0 runs until you stop it.</td>
               </tr>
               <tr>
-                <td class="font-mono">idlewait</td><td>no</td>
-                <td>Seconds to wait before asking again when there is no work. 5 if left out.</td>
+                <td class="font-mono">idlewait</td><td>5</td>
+                <td>Seconds to wait before asking again when there is no work.</td>
               </tr>
             </tbody>
           </table>
         </div>
         <p class="text-muted-foreground">
-          Don't add a <code class="rounded bg-muted px-1">uuid</code> line yourself: MAGPIE adds one
-          when it is given an anonymous identity, and uses it from then on. Here's an example contribute.txt
-          that you can copy into the MAGPIE directory to get started:
+          Don't add a <code class="rounded bg-muted px-1">uuid</code> line yourself: when MAGPIE is
+          given an anonymous identity it adds one, creating contribute.txt if there isn't one, and
+          uses it from then on. Here's an example contribute.txt
+          {isDefaultServer ? 'that runs on 4 threads:' : 'for this site:'}
         </p>
         <pre class="overflow-x-auto rounded-md bg-muted p-4 text-xs"><code
-            >server   {typeof window !== 'undefined' ? window.location.origin : ''}</code
+            >{isDefaultServer ? 'threads  4' : `server   ${origin}`}</code
           ></pre>
       </li>
       <li class="space-y-2">
@@ -114,8 +128,8 @@
         <p class="text-muted-foreground">
           To contribute under a username, <a href="/register">create an account</a>, make an API
           key on your account page, and add its <code class="rounded bg-muted px-1">apikey</code>
-          line to your contribute.txt. Otherwise you contribute anonymously, with nothing to sign up
-          for.
+          line to your contribute.txt (create the file if you don't have one; that line alone is
+          enough). Otherwise you contribute anonymously, with nothing to sign up for.
         </p>
       </li>
       <li class="space-y-2">
