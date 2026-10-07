@@ -115,11 +115,11 @@ test('E-10: a visitor on a phone reads the job list, a job page and the rankings
   // screen: a pseudonym's sixteen characters pushed it out (thirty-second audit).
   // With a row in it: an empty table fits on any page.
   await page.getByRole('banner').getByRole('link', { name: 'Contributors', exact: true }).tap();
-  await expect(page.getByRole('columnheader', { name: 'Compute time' })).toBeVisible();
+  await expect(page.getByRole('columnheader', { name: 'Movegens' })).toBeVisible();
   await expect(page.getByRole('cell', { name: /^Anonymous · [0-9a-f]{16}$/ }).first()).toBeVisible();
   await expectNoSidewaysScroll(page);
   await expectTableFits(page);
-  await expect(page.getByRole('columnheader', { name: 'Compute time' })).toBeInViewport();
+  await expect(page.getByRole('columnheader', { name: 'Movegens' })).toBeInViewport();
 
   // And with the widest names either ranking can hold, which the seed has not
   // registered: both lists answered as the server would with them.
