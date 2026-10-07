@@ -98,7 +98,7 @@ Use a signed-out window for the V journeys unless one says otherwise.
 
 - [ ] **Expect** a header with **birdtest**, **Jobs**, **Ratings**, **Players**,
   **Contributors** and **Users**, and on the right **Sign in** and **Register**;
-  a footer "birdtest — crowdsourced word game analysis".
+  a footer "birdtest — crowdsourced crossword game research".
 - [ ] **Do** click each nav link. **Expect** the current one highlighted, and
   no page erroring.
 - [ ] **Do** narrow the window to phone width. **Expect** the nav to wrap and no
@@ -107,7 +107,7 @@ Use a signed-out window for the V journeys unless one says otherwise.
 
 ### V-2 The home page
 
-- [ ] **Expect** "Crowdsourced Crossword Game Analysis" and the buttons **Browse
+- [ ] **Expect** "Crowdsourced Crossword Game Research" and the buttons **Browse
   jobs** and **Create an account**.
 - [ ] **Expect** next "Active Jobs" listing the seeded jobs still running as
   cards: name, status badge, "25% allocation". Clicking one opens its job page.

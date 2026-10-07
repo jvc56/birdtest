@@ -16,7 +16,7 @@ test('E-1: an anonymous visitor browses the landing page, jobs, a job and the le
   await waitForResults(request, job.id);
 
   await page.goto('/');
-  await expect(page.getByRole('heading', { name: 'Crowdsourced Crossword Game Analysis' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Crowdsourced Crossword Game Research' })).toBeVisible();
   // Signed out: the header offers an account, and no admin link.
   await expect(page.getByRole('link', { name: 'Sign in' })).toBeVisible();
   await expect(page.getByRole('link', { name: 'Admin', exact: true })).toHaveCount(0);

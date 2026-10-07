@@ -50,7 +50,7 @@ test('E-10: a visitor on a phone reads the job list, a job page and the rankings
   expect(page.viewportSize()!.width).toBeLessThan(400);
 
   await page.goto('/');
-  await expect(page.getByRole('heading', { name: 'Crowdsourced Crossword Game Analysis' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Crowdsourced Crossword Game Research' })).toBeVisible();
   await expectNoSidewaysScroll(page);
 
   await page.getByRole('link', { name: 'Browse jobs' }).tap();

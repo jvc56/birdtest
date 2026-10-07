@@ -4,7 +4,7 @@
 
 ### Overview
 
-birdtest is a crowdsourced word game analysis platform, modeled after Fishnet (which crowdsources chess game analysis for Lichess). Users contribute compute by running tasks locally and submitting results back to the site. Admins define jobs and allocate work; the site aggregates results and presents them on a polished dashboard.
+birdtest is a crowdsourced crossword game research platform, modeled after Fishnet (which crowdsources chess game analysis for Lichess). It runs MAGPIE, a crossword board game engine, on volunteers' computers to play test matches between versions, tune its settings and study openings. Users contribute compute by running tasks locally and submitting results back to the site. Admins define jobs and allocate work; the site aggregates results and presents them on a polished dashboard.
 
 ---
 

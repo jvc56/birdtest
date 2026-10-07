@@ -28,7 +28,7 @@ test('E-6: a non-admin is sent away from /admin, and an anonymous visitor from /
   for (const path of ['/admin', '/admin/jobs/new', '/admin/input-data']) {
     await page.goto(path);
     await expect(page).toHaveURL(/\/$/);
-    await expect(page.getByRole('heading', { name: 'Crowdsourced Crossword Game Analysis' })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Crowdsourced Crossword Game Research' })).toBeVisible();
   }
   // The admin API says no as well; the redirect is not the only thing between
   // a contributor and the admin endpoints.

@@ -21,9 +21,10 @@
 
 <section class="space-y-8">
   <div class="space-y-3">
-    <h1 class="text-3xl font-semibold">Crowdsourced Crossword Game Analysis</h1>
+    <h1 class="text-3xl font-semibold">Crowdsourced Crossword Game Research</h1>
     <p class="max-w-2xl text-muted-foreground">
-      birdtest is a distributed task queue for analyzing crossword games. Admins create jobs and
+      birdtest runs MAGPIE, a crossword board game engine, on volunteers' computers to play test
+      matches between versions, tune its settings and study openings. Admins create jobs and
       contributors' machines claim their tasks, run them locally with MAGPIE, and submit the
       results.
     </p>

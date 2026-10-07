@@ -1,7 +1,9 @@
 # birdtest
 
-Crowdsourced crossword game analysis, modelled after Fishnet. Admins define jobs;
-contributors run [MAGPIE](https://github.com/jvc56/MAGPIE) itself — `magpie
+Crowdsourced crossword game research, modelled after Fishnet. birdtest runs
+[MAGPIE](https://github.com/jvc56/MAGPIE), a crossword board game engine, on
+volunteers' computers to play test matches between versions, tune its settings
+and study openings. Admins define jobs; contributors run MAGPIE itself — `magpie
 contribute` claims tasks, executes them locally, and submits results. The site
 aggregates everything onto a live dashboard.
 
