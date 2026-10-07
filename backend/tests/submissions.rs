@@ -25,7 +25,7 @@ async fn submit(app: &Router, assignment: &Value, uuid: &str, result: Value) -> 
         post_json(
             "/api/worker/result",
             &[("x-worker-uuid", uuid)],
-            json!({ "claim_token": assignment["claim_token"], "result": result }),
+            json!({ "claim_token": assignment["claim_token"], "movegens": 1000, "result": result }),
         ),
     )
     .await

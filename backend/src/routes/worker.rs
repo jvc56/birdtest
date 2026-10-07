@@ -681,7 +681,40 @@ struct ResultBody {
     claim_token: Uuid,
     /// Kept as text until the job type is known: see `registry::store_result`.
     result: Box<serde_json::value::RawValue>,
+    /// The move generations MAGPIE performed for this task, on every thread:
+    /// what its contributor is credited with. Beside the result rather than in
+    /// it, since every job type reports it alike. Required -- no build that
+    /// leaves it out is supported -- and read by [`movegens_of`], so that a
+    /// refusal names the field rather than quoting serde.
+    #[serde(default)]
+    movegens: Option<serde_json::Value>,
 }
+
+/// A submission's `movegens`: a whole number from 0 to `i64::MAX`.
+fn movegens_of(value: Option<&serde_json::Value>) -> AppResult<i64> {
+    let refuse = |why: &str| {
+        Err(AppError::bad_request(format!("movegens {why}")).with_field("movegens", why.to_string()))
+    };
+    match value {
+        None | Some(serde_json::Value::Null) => {
+            refuse("is required: this MAGPIE build does not report its move generations")
+        }
+        Some(serde_json::Value::Number(n)) => match n.as_i64() {
+            Some(m) if m >= 0 => Ok(m),
+            _ => refuse("must be a whole number from 0 to 9223372036854775807"),
+        },
+        Some(_) => refuse("must be a whole number"),
+    }
+}
+
+/// The most move generations a claim may report per millisecond it was held.
+/// Movegens are the one contribution measure the server cannot check -- the
+/// others are its own clock or derived from the result -- so a figure no
+/// machine could reach is refused rather than credited: a thousand times what
+/// a many-core machine generates. It stops nonsense (a broken client, a typo'd
+/// test harness) from owning the contributor list, not a determined liar,
+/// which is what bans are for.
+const MAX_MOVEGENS_PER_MS: i64 = 1_000_000;
 
 #[derive(Serialize)]
 struct ResultAck {
@@ -737,6 +770,9 @@ async fn submit_result(
     if state.dispatch_holds.claims_held(job.id) {
         return Err(claims_held_error());
     }
+    // Checked once the claim is known to be live, as a stale one is answered
+    // `accepted: false` whatever it carries.
+    let movegens = movegens_of(body.movegens.as_ref())?;
     // Held until the handler returns, after the commit.
     let turn = crate::jobs::registry::large_result_turn(body.result.get().len()).await?;
     // The job's immutable half: its batch size, its players' reporting caps,
@@ -807,7 +843,7 @@ async fn submit_result(
         return Err(AppError::internal("a claim's task changed job"));
     }
 
-    let (progress, units) = crate::jobs::registry::store_result(
+    let progress = crate::jobs::registry::store_result(
         &mut tx,
         &template,
         task_id,
@@ -823,15 +859,22 @@ async fn submit_result(
     // which follows the claim's).
     let compute_ms: i64 = sqlx::query_scalar(&format!(
         "UPDATE task_claims c
-         SET state = 'completed', completed_at = now(), games_played = $2, racks_analyzed = $3
+         SET state = 'completed', completed_at = now(), movegens = $2
          WHERE c.id = $1
          RETURNING {CLAIM_COMPUTE_MS}"
     ))
     .bind(claim_id)
-    .bind(i32::try_from(units.games).map_err(|_| AppError::internal("a claim's games overflow"))?)
-    .bind(i32::try_from(units.racks).map_err(|_| AppError::internal("a claim's racks overflow"))?)
+    .bind(movegens)
     .fetch_one(&mut *tx)
     .await?;
+    // Checked against the time held, which only the update above measures; a
+    // refusal rolls back everything this submission stored.
+    if movegens > compute_ms.max(1).saturating_mul(MAX_MOVEGENS_PER_MS) {
+        return Err(AppError::bad_request(format!(
+            "movegens ({movegens}) is more than any machine generates in the {compute_ms} ms the claim was held"
+        ))
+        .with_field("movegens", "implausible for the time the claim was held"));
+    }
 
     // A task has one slot, so its one accepted result completes it.
     // `RETURNING` whether this was that result is what tells the job's
@@ -857,9 +900,9 @@ async fn submit_result(
 
     // The contributor's own running totals, which are what the leaderboards
     // read instead of summing this identity's claims: this claim, the time it
-    // was held, and the games and racks it played -- this claim's own
-    // (`units`), not what it added to the job's progress (`progress`, which
-    // counts an opening rack analysed again for consensus once). One
+    // was held, and the move generations it reported -- this claim's own, not
+    // what it added to the job's progress (`progress`, which counts an
+    // opening rack analysed again for consensus once). One
     // statement, on the row the identity already owns. Deliberately not rolled
     // back by account deletion: the account is anonymized in place and keeps
     // its claims, so no donated compute is lost. `purge_job` and `delete_job`
@@ -873,15 +916,13 @@ async fn submit_result(
     sqlx::query(&format!(
         "UPDATE {table} SET tasks_completed = tasks_completed + 1,
                             compute_ms = compute_ms + $2,
-                            games_played = games_played + $3,
-                            racks_analyzed = racks_analyzed + $4,
+                            movegens = movegens + $3,
                             last_completed_at = now()
          WHERE {key} = $1"
     ))
     .bind(id)
     .bind(compute_ms)
-    .bind(units.games)
-    .bind(units.racks)
+    .bind(movegens)
     .execute(&mut *tx)
     .await?;
 
@@ -1256,6 +1297,24 @@ pub const OPENING_RACK_FINISHED: &str = "SELECT j.racks_settled >= c.total_racks
 /// change a fixture edit, but a *renamed* or *dropped* field is exactly what
 /// this needs to catch.
 #[cfg(test)]
+mod movegens_tests {
+    use super::movegens_of;
+    use serde_json::json;
+
+    #[test]
+    fn movegens_is_a_whole_number_in_i64_and_every_refusal_names_it() {
+        assert_eq!(movegens_of(Some(&json!(0))).unwrap(), 0);
+        assert_eq!(movegens_of(Some(&json!(i64::MAX))).unwrap(), i64::MAX);
+        for bad in [None, Some(json!(null)), Some(json!(-1)), Some(json!(1.5)),
+                    Some(json!(u64::MAX)), Some(json!("12")), Some(json!([1]))] {
+            let err = movegens_of(bad.as_ref()).expect_err(&format!("{bad:?} is refused"));
+            assert!(err.message.starts_with("movegens "), "{bad:?}: {}", err.message);
+        }
+        assert!(movegens_of(None).unwrap_err().message.contains("MAGPIE build"));
+    }
+}
+
+#[cfg(test)]
 mod contract_fixtures {
     use super::*;
     use serde_json::{json, Value};
@@ -1512,6 +1571,11 @@ mod contract_fixtures {
     fn submitted<H: crate::jobs::handler::JobHandler>(fixture: &str, what: &str) -> (Uuid, H::Record) {
         let body: ResultBody = serde_json::from_str(fixture)
             .unwrap_or_else(|e| panic!("{what} no longer parses as ResultBody: {e}"));
+        // Every task generates moves; a submission reporting none is a client
+        // that stopped counting.
+        let movegens = movegens_of(body.movegens.as_ref())
+            .unwrap_or_else(|e| panic!("{what}'s movegens would be refused: {}", e.message));
+        assert!(movegens > 0, "{what} reports no movegens");
         let response: H::Response = serde_json::from_str(body.result.get())
             .unwrap_or_else(|e| panic!("{what}'s result is malformed: {e}"));
         let record = H::process_response(response)

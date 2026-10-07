@@ -653,7 +653,7 @@ async fn play_batch(app: &axum::Router, wins: i32) {
         post_json(
             "/api/worker/result",
             &[("x-worker-uuid", uuid)],
-            json!({ "claim_token": assignment["claim_token"], "result": games_result(100, wins) }),
+            json!({ "claim_token": assignment["claim_token"], "movegens": 1000, "result": games_result(100, wins) }),
         ),
     )
     .await;

@@ -29,7 +29,7 @@ async fn with_history(app: &axum::Router) {
         post_json(
             "/api/worker/result",
             &[("x-worker-uuid", uuid)],
-            json!({ "claim_token": assignment["claim_token"], "result": games_result(2, 1) }),
+            json!({ "claim_token": assignment["claim_token"], "movegens": 1000, "result": games_result(2, 1) }),
         ),
     )
     .await;
@@ -152,7 +152,7 @@ async fn purging_a_job_removes_its_captured_positions_through_the_record() {
         post_json(
             "/api/worker/result",
             &[("x-worker-uuid", uuid)],
-            json!({ "claim_token": assignment["claim_token"], "result": result }),
+            json!({ "claim_token": assignment["claim_token"], "movegens": 1000, "result": result }),
         ),
     )
     .await;
@@ -598,19 +598,18 @@ async fn purging_and_deleting_a_job_give_back_what_it_earned() {
         .await
         .unwrap();
         let contributed = || async {
-            sqlx::query_as::<_, (i64, i64, i64, i64)>(
+            sqlx::query_as::<_, (i64, i64, i64)>(
                 "SELECT COALESCE(SUM(tasks_completed), 0)::bigint,
                         COALESCE(SUM(compute_ms), 0)::bigint,
-                        COALESCE(SUM(games_played), 0)::bigint,
-                        COALESCE(SUM(racks_analyzed), 0)::bigint
+                        COALESCE(SUM(movegens), 0)::bigint
                  FROM anonymous_workers",
             )
             .fetch_one(&db.pool)
             .await
             .unwrap()
         };
-        let (tasks, compute_ms, games, racks) = contributed().await;
-        assert_eq!((tasks, games, racks), (1, 2, 0), "the worker's task is on its counters");
+        let (tasks, compute_ms, movegens) = contributed().await;
+        assert_eq!((tasks, movegens), (1, 1000), "the worker's task is on its counters");
         assert!(compute_ms >= 60_000, "and the minute it was held: {compute_ms} ms");
 
         let (status, body) = match destroy {
@@ -627,7 +626,7 @@ async fn purging_and_deleting_a_job_give_back_what_it_earned() {
         assert!(status.is_success(), "{destroy}: {body}");
         assert_eq!(
             contributed().await,
-            (0, 0, 0, 0),
+            (0, 0, 0),
             "{destroy}: the claims are gone, so every counter of the contribution must be too"
         );
     }
@@ -1930,7 +1929,7 @@ async fn a_purge_in_progress_neither_parks_submissions_nor_costs_its_claims() {
         post_json(
             "/api/worker/result",
             &[("x-worker-uuid", uuid.as_str())],
-            json!({ "claim_token": token, "result": games_result(2, 1) }),
+            json!({ "claim_token": token, "movegens": 1000, "result": games_result(2, 1) }),
         ),
     )
     .await;
@@ -1954,7 +1953,7 @@ async fn a_purge_in_progress_neither_parks_submissions_nor_costs_its_claims() {
         post_json(
             "/api/worker/result",
             &[("x-worker-uuid", uuid.as_str())],
-            json!({ "claim_token": token, "result": games_result(2, 1) }),
+            json!({ "claim_token": token, "movegens": 1000, "result": games_result(2, 1) }),
         ),
     )
     .await;
@@ -2029,7 +2028,7 @@ async fn a_purge_waiting_on_a_rating_fit_holds_up_no_submissions() {
         post_json(
             "/api/worker/result",
             &[("x-worker-uuid", uuid.as_str())],
-            json!({ "claim_token": claim["claim_token"], "result": games_result(2, 1) }),
+            json!({ "claim_token": claim["claim_token"], "movegens": 1000, "result": games_result(2, 1) }),
         ),
     )
     .await;
@@ -2094,7 +2093,7 @@ async fn a_purge_waiting_on_a_rating_fit_holds_up_no_submissions() {
         post_json(
             "/api/worker/result",
             &[("x-worker-uuid", uuid.as_str())],
-            json!({ "claim_token": other["claim_token"], "result": games_result(2, 1) }),
+            json!({ "claim_token": other["claim_token"], "movegens": 1000, "result": games_result(2, 1) }),
         ),
     )
     .await;

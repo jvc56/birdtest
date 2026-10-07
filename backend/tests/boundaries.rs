@@ -72,7 +72,7 @@ async fn submit_as(app: &Router, uuid: &str, token: &Value, result: Value) -> (S
         post_json(
             "/api/worker/result",
             &[("x-worker-uuid", uuid)],
-            json!({ "claim_token": token, "result": result }),
+            json!({ "claim_token": token, "movegens": 1000, "result": result }),
         ),
     )
     .await
@@ -545,7 +545,7 @@ async fn a_capture_result_of_several_megabytes_is_accepted() {
     };
     let mut result = games_result(2, 1);
     result["positions"] = json!([position(0), position(1)]);
-    let body = json!({ "claim_token": assignment["claim_token"], "result": result }).to_string();
+    let body = json!({ "claim_token": assignment["claim_token"], "movegens": 1000, "result": result }).to_string();
     assert!(
         body.len() > AXUM_DEFAULT_BODY_LIMIT && body.len() < MAX_RESULT_BYTES,
         "the body is {} bytes: between axum's default and this route's limit",

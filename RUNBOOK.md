@@ -1109,12 +1109,12 @@ SET temp_buffers = '64MB';
 --    the rest of the procedure (step 2 reads it); step 3 works through a copy.
 --    Compute is each claim's whole milliseconds held, claim to submission,
 --    exactly as the submit path adds it (`CLAIM_COMPUTE_MS` in
---    routes/worker.rs); games and racks are what each claim recorded.
+--    routes/worker.rs); movegens are what each claim recorded.
 CREATE TEMP TABLE recount AS
 SELECT 'u' AS kind, c.claimed_by_user_id AS id, count(*) AS n,
        sum(GREATEST((EXTRACT(EPOCH FROM c.completed_at - c.claimed_at) * 1000)::bigint, 0))::bigint
          AS ms,
-       sum(c.games_played)::bigint AS games, sum(c.racks_analyzed)::bigint AS racks,
+       sum(c.movegens)::bigint AS movegens,
        max(c.completed_at) AS last
   FROM task_claims c
  WHERE c.state = 'completed' AND c.claimed_by_user_id IS NOT NULL
@@ -1122,7 +1122,7 @@ SELECT 'u' AS kind, c.claimed_by_user_id AS id, count(*) AS n,
 UNION ALL
 SELECT 'a', c.claimed_by_anon_uuid, count(*),
        sum(GREATEST((EXTRACT(EPOCH FROM c.completed_at - c.claimed_at) * 1000)::bigint, 0))::bigint,
-       sum(c.games_played)::bigint, sum(c.racks_analyzed)::bigint, max(c.completed_at)
+       sum(c.movegens)::bigint, max(c.completed_at)
   FROM task_claims c
  WHERE c.state = 'completed' AND c.claimed_by_anon_uuid IS NOT NULL
  GROUP BY 2;
@@ -1146,8 +1146,8 @@ DECLARE zeroed int;
 BEGIN
   LOOP
     WITH z AS (
-      UPDATE users SET tasks_completed = 0, compute_ms = 0, games_played = 0,
-                       racks_analyzed = 0, last_completed_at = NULL
+      UPDATE users SET tasks_completed = 0, compute_ms = 0, movegens = 0,
+                       last_completed_at = NULL
        WHERE id IN (SELECT u.id FROM users u
                      WHERE u.tasks_completed > 0
                        AND NOT EXISTS (SELECT 1 FROM recount r
@@ -1155,8 +1155,8 @@ BEGIN
                      LIMIT 1000)
       RETURNING 1),
     za AS (
-      UPDATE anonymous_workers SET tasks_completed = 0, compute_ms = 0, games_played = 0,
-                                   racks_analyzed = 0, last_completed_at = NULL
+      UPDATE anonymous_workers SET tasks_completed = 0, compute_ms = 0, movegens = 0,
+                                   last_completed_at = NULL
        WHERE uuid IN (SELECT w.uuid FROM anonymous_workers w
                        WHERE w.tasks_completed > 0
                          AND NOT EXISTS (SELECT 1 FROM recount r
@@ -1176,25 +1176,22 @@ BEGIN
     WITH batch AS (
       DELETE FROM pending
        WHERE ctid IN (SELECT ctid FROM pending LIMIT 1000)
-      RETURNING kind, id, n, ms, games, racks, last),
+      RETURNING kind, id, n, ms, movegens, last),
     u AS (
-      UPDATE users u SET tasks_completed = b.n, compute_ms = b.ms, games_played = b.games,
-                         racks_analyzed = b.racks, last_completed_at = b.last
+      UPDATE users u SET tasks_completed = b.n, compute_ms = b.ms, movegens = b.movegens,
+                         last_completed_at = b.last
         FROM batch b
        WHERE b.kind = 'u' AND u.id = b.id
-         AND (u.tasks_completed, u.compute_ms, u.games_played, u.racks_analyzed,
-              u.last_completed_at)
-             IS DISTINCT FROM (b.n, b.ms, b.games, b.racks, b.last)
+         AND (u.tasks_completed, u.compute_ms, u.movegens, u.last_completed_at)
+             IS DISTINCT FROM (b.n, b.ms, b.movegens, b.last)
       RETURNING 1),
     a AS (
       UPDATE anonymous_workers w SET tasks_completed = b.n, compute_ms = b.ms,
-                                     games_played = b.games, racks_analyzed = b.racks,
-                                     last_completed_at = b.last
+                                     movegens = b.movegens, last_completed_at = b.last
         FROM batch b
        WHERE b.kind = 'a' AND w.uuid = b.id
-         AND (w.tasks_completed, w.compute_ms, w.games_played, w.racks_analyzed,
-              w.last_completed_at)
-             IS DISTINCT FROM (b.n, b.ms, b.games, b.racks, b.last)
+         AND (w.tasks_completed, w.compute_ms, w.movegens, w.last_completed_at)
+             IS DISTINCT FROM (b.n, b.ms, b.movegens, b.last)
       RETURNING 1)
     SELECT count(*) INTO taken FROM batch;
     EXIT WHEN taken = 0;
@@ -1439,29 +1436,29 @@ SELECT count(*) AS counter_disagreements
   ) actual ON actual.task_id = t.id
  WHERE t.accepted_count <> COALESCE(actual.accepted, 0)
     OR t.active_claim_count <> COALESCE(actual.active, 0);
--- 3b. Contributor counters (§2.3b's result): tasks, compute, games and
---     racks. Must be zero.
+-- 3b. Contributor counters (§2.3b's result): tasks, compute and movegens.
+--     Must be zero.
 SELECT
   (SELECT count(*) FROM users u
      LEFT JOIN (SELECT claimed_by_user_id AS id, count(*) AS n,
                        sum(GREATEST((EXTRACT(EPOCH FROM completed_at - claimed_at) * 1000)::bigint,
                                     0))::bigint AS ms,
-                       sum(games_played)::bigint AS games, sum(racks_analyzed)::bigint AS racks
+                       sum(movegens)::bigint AS movegens
                   FROM task_claims
                  WHERE state = 'completed' AND claimed_by_user_id IS NOT NULL
                  GROUP BY 1) c ON c.id = u.id
-    WHERE (u.tasks_completed, u.compute_ms, u.games_played, u.racks_analyzed)
-          <> (COALESCE(c.n, 0), COALESCE(c.ms, 0), COALESCE(c.games, 0), COALESCE(c.racks, 0)))
+    WHERE (u.tasks_completed, u.compute_ms, u.movegens)
+          <> (COALESCE(c.n, 0), COALESCE(c.ms, 0), COALESCE(c.movegens, 0)))
 + (SELECT count(*) FROM anonymous_workers w
      LEFT JOIN (SELECT claimed_by_anon_uuid AS id, count(*) AS n,
                        sum(GREATEST((EXTRACT(EPOCH FROM completed_at - claimed_at) * 1000)::bigint,
                                     0))::bigint AS ms,
-                       sum(games_played)::bigint AS games, sum(racks_analyzed)::bigint AS racks
+                       sum(movegens)::bigint AS movegens
                   FROM task_claims
                  WHERE state = 'completed' AND claimed_by_anon_uuid IS NOT NULL
                  GROUP BY 1) c ON c.id = w.uuid
-    WHERE (w.tasks_completed, w.compute_ms, w.games_played, w.racks_analyzed)
-          <> (COALESCE(c.n, 0), COALESCE(c.ms, 0), COALESCE(c.games, 0), COALESCE(c.racks, 0)))
+    WHERE (w.tasks_completed, w.compute_ms, w.movegens)
+          <> (COALESCE(c.n, 0), COALESCE(c.ms, 0), COALESCE(c.movegens, 0)))
   AS contributor_disagreements;
 ```
 

@@ -441,7 +441,7 @@ async fn each_lifecycle_action_answers_its_shape_and_a_read_agrees() {
         post_json(
             "/api/worker/result",
             &[("x-worker-uuid", assignment["worker_uuid"].as_str().unwrap())],
-            json!({ "claim_token": assignment["claim_token"], "result": games_result(2, 1) }),
+            json!({ "claim_token": assignment["claim_token"], "movegens": 1000, "result": games_result(2, 1) }),
         ),
     )
     .await;

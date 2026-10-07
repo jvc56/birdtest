@@ -211,8 +211,8 @@ export interface RackLookupRow {
 /** Static equity, a simulation, a pre-endgame solve or an endgame solve. */
 export type PositionAnalysis = 'static' | 'sim' | 'peg' | 'endgame';
 
-/** What the contributor list can be ranked by; the server's default is compute time. */
-export type ContributorSort = 'compute' | 'games' | 'racks' | 'tasks';
+/** What the contributor list can be ranked by; the server's default is movegens. */
+export type ContributorSort = 'movegens' | 'compute' | 'tasks';
 
 /** One row of the contributor list (`/api/workers`). */
 export interface Contributor {
@@ -224,8 +224,8 @@ export interface Contributor {
   username: string | null;
   /** Every accepted claim, held from claim to submission: the compute MAGPIE does not report. */
   compute_seconds: number;
-  games_played: number;
-  racks_analyzed: number;
+  /** Every move generation MAGPIE reported for its accepted claims: the work done. */
+  movegens: number;
   tasks_completed: number;
   /** The last task finished. */
   last_seen_at: string | null;
@@ -768,7 +768,7 @@ export const api = {
   ratingPool: (id: string) => get<RatingPoolDetail>(`/api/rating-pools/${id}`),
 
   users: (page = 0) => get<Page<Record<string, unknown>>>(`/api/users?page=${page}`),
-  workers: (page = 0, sort: ContributorSort = 'compute') =>
+  workers: (page = 0, sort: ContributorSort = 'movegens') =>
     get<Page<Contributor>>(`/api/workers?page=${page}&sort=${sort}`),
 
   clientVersion: () =>

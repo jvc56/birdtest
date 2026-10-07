@@ -51,7 +51,7 @@ async fn a_stale_mode_submission_is_not_accepted_and_changes_nothing() {
     .unwrap();
     assert_eq!((claim_state.as_str(), accepted, results), ("claimed", 0, 0));
 
-    let issued = json!({ "claim_token": assignment["claim_token"], "result": stale["result"] });
+    let issued = json!({ "claim_token": assignment["claim_token"], "movegens": 1000, "result": stale["result"] });
     let (status, body) =
         send(&app, post_json("/api/worker/result", &[("x-worker-uuid", &uuid)], issued)).await;
     assert_eq!(status, StatusCode::OK, "{body}");

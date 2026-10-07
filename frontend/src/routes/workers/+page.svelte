@@ -1,24 +1,23 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { api, type Contributor, type ContributorSort, type Page } from '$lib/api';
-  import { computeTime, datetime, workerLabel } from '$lib/format';
+  import { bigCount, computeTime, datetime, workerLabel } from '$lib/format';
   import Pagination from '$lib/components/Pagination.svelte';
 
   let result: Page<Contributor> | null = null;
   let loadError = '';
-  // Compute time by default: MAGPIE reports no CPU time, and the time a claim
-  // was held is the fairest measure there is of what a machine gave -- one
-  // that plays deep, slow games finishes few tasks in many hours.
-  let sort: ContributorSort = 'compute';
+  // Movegens by default: the work a machine actually did, as MAGPIE counts it.
+  // Tasks undercount one that plays deep, slow games, and compute time -- how
+  // long its claims were held -- overcounts a slow machine.
+  let sort: ContributorSort = 'movegens';
   // Each load is numbered, and only the newest one's answer is shown: a
   // header clicked while the previous order is still loading must not be
   // overwritten by it.
   let generation = 0;
 
   const columns: { sort: ContributorSort; label: string }[] = [
+    { sort: 'movegens', label: 'Movegens' },
     { sort: 'compute', label: 'Compute time' },
-    { sort: 'games', label: 'Games' },
-    { sort: 'racks', label: 'Racks' },
     { sort: 'tasks', label: 'Tasks' }
   ];
 
@@ -41,12 +40,10 @@
 
   function value(worker: Contributor, column: ContributorSort): string {
     switch (column) {
+      case 'movegens':
+        return bigCount(worker.movegens);
       case 'compute':
         return computeTime(worker.compute_seconds);
-      case 'games':
-        return worker.games_played.toLocaleString();
-      case 'racks':
-        return worker.racks_analyzed.toLocaleString();
       case 'tasks':
         return worker.tasks_completed.toLocaleString();
     }
@@ -62,9 +59,9 @@
 
 <h1 class="mb-2 text-2xl font-semibold">Contributors</h1>
 <p class="mb-6 text-sm text-muted-foreground">
-  Every worker that has completed a task, authenticated or anonymous. Compute time is how long its
-  claims were held, from claim to result, summed over every task it finished; choose a column to
-  rank by it instead.
+  Every worker that has completed a task, authenticated or anonymous, ranked by movegens: the move
+  generations MAGPIE performed for it, summed over every task it finished. Compute time is how long
+  its claims were held, from claim to result. Choose a column to rank by it instead.
 </p>
 
 {#if loadError}
@@ -120,7 +117,9 @@
                 data-column={column.sort}
                 title={column.sort === 'compute'
                   ? `${(worker.compute_seconds / 3600).toLocaleString(undefined, { maximumFractionDigits: 1 })} hours`
-                  : undefined}
+                  : column.sort === 'movegens'
+                    ? `${worker.movegens.toLocaleString()} move generations`
+                    : undefined}
               >
                 {value(worker, column.sort)}
               </td>
@@ -128,7 +127,7 @@
             <td class="hidden sm:table-cell">{datetime(worker.last_seen_at)}</td>
           </tr>
         {:else}
-          <tr><td colspan="7" class="text-muted-foreground">No contributions yet.</td></tr>
+          <tr><td colspan="6" class="text-muted-foreground">No contributions yet.</td></tr>
         {/each}
       </tbody>
     </table>

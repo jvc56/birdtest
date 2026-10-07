@@ -34,7 +34,7 @@ async fn submit(app: &axum::Router, uuid: &str, assignment: &Value, result: Valu
         post_json(
             "/api/worker/result",
             &[("x-worker-uuid", uuid)],
-            json!({ "claim_token": assignment["claim_token"], "result": result }),
+            json!({ "claim_token": assignment["claim_token"], "movegens": 1000, "result": result }),
         ),
     )
     .await;
