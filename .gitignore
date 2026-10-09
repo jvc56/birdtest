@@ -36,3 +36,5 @@ __pycache__/
 
 # The Terraform backend: names this account's state bucket (LAUNCH_PLAN.md, Step 5).
 /infra/backend.tf
+/infra/magpie/backend.tf
+/infra/magpie/*.plan

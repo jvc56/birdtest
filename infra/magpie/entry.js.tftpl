@@ -1,0 +1,21 @@
+function handler(event) {
+    var request = event.request;
+    var uri = request.uri;
+    if (uri === '/' || uri === '/index.html' || uri === '/wasmentry' || uri === '/wasmentry/') {
+        if (!'${release}') {
+            return { statusCode: 503, headers: { 'cache-control': { value: 'no-store' } }, body: 'MAGPIE preview is not published yet.' };
+        }
+        // A version in the browser URL keeps lazy data loads and worker imports
+        // on the same release even after a new version becomes the default.
+        return {
+            statusCode: 302,
+            headers: {
+                location: { value: '/releases/${release}/wasmentry/' },
+                'cache-control': { value: 'no-store' }
+            }
+        };
+    }
+    // S3's REST endpoint does not resolve directory indexes.
+    if (uri.endsWith('/')) request.uri += 'index.html';
+    return request;
+}
