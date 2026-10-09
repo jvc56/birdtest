@@ -20,7 +20,9 @@
 #     then a question before anything is applied;
 #   - prompts read from /dev/tty (OPS_TTY in the tests), so nothing piped
 #     into a script answers them;
-#   - the rollout wait: the service's deployment settled, running the image
+#   - the two services, the backend's and the frontend's, and what each runs;
+#     which of them a commit's changes reach (ops_changed_components);
+#   - the rollout wait: each service's deployment settled, running the image
 #     that was deployed (a circuit-breaker rollback is said out loud), then
 #     both target groups healthy, past the AWS waiter's ten minutes;
 #   - the release log, ~/birdtest-releases.log (BIRDTEST_RELEASE_LOG);
@@ -101,7 +103,8 @@ ops_login() {
 tf() { terraform -chdir="$OPS_INFRA" output "$@"; }
 
 # Sets OPS_WORKSPACE, OPS_REGION (exported as AWS_REGION/AWS_DEFAULT_REGION),
-# OPS_CLUSTER, OPS_SERVICE and OPS_VARFILES.
+# OPS_CLUSTER, OPS_SERVICE (the backend's), OPS_FRONTEND_SERVICE and
+# OPS_VARFILES.
 ops_stack() {
   OPS_WORKSPACE=$(terraform -chdir="$OPS_INFRA" workspace show) \
     || ops_die "terraform cannot read infra/: run  terraform -chdir=infra init  first"
@@ -118,8 +121,11 @@ ops_stack() {
   # during a region loss, is usually the region that was lost.
   export AWS_REGION=$OPS_REGION AWS_DEFAULT_REGION=$OPS_REGION
   OPS_CLUSTER=$(tf -raw cluster_name)
-  # The service, its cluster and its target groups share the stack's name.
+  # The backend's service, the cluster and the target groups share the stack's
+  # name (infra/ecs.tf): by name, not by an output, so that a stack applied
+  # before the frontend had a service of its own is named the same way.
   OPS_SERVICE=$OPS_CLUSTER
+  OPS_FRONTEND_SERVICE=$OPS_CLUSTER-frontend
   OPS_VARFILES=(-var-file=prod.tfvars)
   if [[ "$OPS_WORKSPACE" != default ]]; then
     [[ -e "$OPS_INFRA/$OPS_WORKSPACE.tfvars" ]] \
@@ -245,22 +251,50 @@ ops_hcl_value() {
   printf '"%s"' "$v"
 }
 
-# The three image variables and the MAGPIE floor, for the release log.
+# The three image variables and the MAGPIE floor, for the release log: as
+# they are now, and the two images as they were when prod.tfvars was fetched
+# (previous_*), so that the release a line replaced can be put back from that
+# line alone (ops_release_images) -- the backend and the frontend need not be
+# at one tag.
 ops_release_fields() {
   printf 'backend_image=%s derived_builder_image=%s frontend_image=%s min_magpie_version=%s' \
     "$(ops_tfvar backend_image)" "$(ops_tfvar derived_builder_image)" \
     "$(ops_tfvar frontend_image)" "$(ops_tfvar min_magpie_version)"
+  printf ' previous_backend_image=%s previous_frontend_image=%s' \
+    "$(ops_tfvar backend_image "$OPS_TFVARS_BASE")" "$(ops_tfvar frontend_image "$OPS_TFVARS_BASE")"
 }
 
-# Points the three images at TAG, in the repositories they already name.
+# The image variables each service runs: the derived-data builder goes with
+# the backend, at its tag (it is the backend image with another entrypoint,
+# and Terraform refuses the two at different tags).
+ops_service_images() {
+  case $1 in
+    backend) printf '%s\n' backend_image derived_builder_image ;;
+    frontend) printf '%s\n' frontend_image ;;
+    *) ops_die "not a service: $1" ;;
+  esac
+}
+
+# Points the images of each SERVICE named (backend, frontend; both if none is)
+# at TAG, in the repositories they already name.
 ops_retag() {
-  local tag=$1
+  local tag=$1 svc v repos=""
+  shift
+  (($#)) || set -- backend frontend
   [[ "$tag" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]] || ops_die "not an image tag: $tag"
-  sed -E "s#(birdtest-(backend|derived-builder|frontend)):[^\"]+\"#\\1:$tag\"#" "$OPS_TFVARS" > "$OPS_TFVARS.new"
+  for svc in "$@"; do
+    case $svc in
+      backend) repos+="${repos:+|}backend|derived-builder" ;;
+      frontend) repos+="${repos:+|}frontend" ;;
+      *) ops_die "not a service: $svc" ;;
+    esac
+  done
+  sed -E "s#(birdtest-($repos)):[^\"]+\"#\\1:$tag\"#" "$OPS_TFVARS" > "$OPS_TFVARS.new"
   mv "$OPS_TFVARS.new" "$OPS_TFVARS"
-  local v
-  for v in backend_image derived_builder_image frontend_image; do
-    [[ "$(ops_tfvar "$v")" == *":$tag" ]] || ops_die "$v in prod.tfvars did not take the tag $tag: check its line"
+  for svc in "$@"; do
+    for v in $(ops_service_images "$svc"); do
+      [[ "$(ops_tfvar "$v")" == *":$tag" ]] || ops_die "$v in prod.tfvars did not take the tag $tag: check its line"
+    done
   done
 }
 
@@ -334,10 +368,10 @@ ops_plan_gate() {
   ops_confirm "Apply this plan?" || ops_die "not applied: nothing changed"
 }
 
-# Whether the gated plan changes the web service or its task definition.
+# Whether the gated plan changes either service or its task definition.
 ops_plan_touches_service() {
   jq -e '[.resource_changes[]?
-          | select(.address == "aws_ecs_service.main" or .address == "aws_ecs_task_definition.main")
+          | select(.address | test("^aws_ecs_(service|task_definition)\\.(backend|frontend)$"))
           | select(.change.actions != ["no-op"])] | length > 0' "$OPS_PLAN_JSON" >/dev/null
 }
 
@@ -346,74 +380,103 @@ ops_apply_plan() {
 }
 
 # ---------------------------------------------------------------------------
-# The service
+# The services: the backend's (OPS_SERVICE) and the frontend's
 # ---------------------------------------------------------------------------
 
+# The backend's: the one a reset, a restore or a password rotation stops,
+# starts or restarts. The frontend's holds no state and keeps serving pages.
 ops_desired_count() {
   aws ecs describe-services --cluster "$OPS_CLUSTER" --services "$OPS_SERVICE" \
     --query 'services[0].desiredCount' --output text
 }
 
-# Stops the web task and waits until none runs. Terraform's state still says
-# one: the next apply would start it again (deploy.sh starts it itself, after
-# applying, since a saved plan made at one task does not set the count).
+# Stops the backend's task and waits until none runs. Terraform's state still
+# says one: the next apply would start it again (deploy.sh starts it itself,
+# after applying, since a saved plan made at one task does not set the count).
 ops_stop_service() {
-  ops_say "stopping the service (desired count 0); the -down alarms fire in ten minutes and clear once it is back"
+  ops_say "stopping the backend's service (desired count 0); pages still load, and the -backend-down alarm fires in ten minutes and clears once it is back"
   aws ecs update-service --cluster "$OPS_CLUSTER" --service "$OPS_SERVICE" --desired-count 0 \
     --query 'service.desiredCount' --output text >/dev/null
   local i running
   for i in $(seq 90); do
     running=$(aws ecs describe-services --cluster "$OPS_CLUSTER" --services "$OPS_SERVICE" \
       --query 'services[0].runningCount' --output text 2>/dev/null) || running=""
-    [[ "$running" == 0 ]] && { ops_say "no task running"; return 0; }
-    [[ $i == 1 ]] || ops_say "waiting for the task to stop ($running running)"
+    [[ "$running" == 0 ]] && { ops_say "no backend task running"; return 0; }
+    [[ $i == 1 ]] || ops_say "waiting for the backend's task to stop ($running running)"
     sleep 10
   done
-  ops_die "the service still runs a task after fifteen minutes: look at it before going on (the service stays at desired count 0)"
+  ops_die "the backend's service still runs a task after fifteen minutes: look at it before going on (it stays at desired count 0)"
 }
 
 ops_start_service() {
-  ops_say "starting the service (desired count 1)"
+  ops_say "starting the backend's service (desired count 1)"
   aws ecs update-service --cluster "$OPS_CLUSTER" --service "$OPS_SERVICE" --desired-count 1 \
     --query 'service.desiredCount' --output text >/dev/null
 }
 
-# The backend image the service's settled deployment runs.
-ops_running_backend_image() {
-  local td
-  td=$(aws ecs describe-services --cluster "$OPS_CLUSTER" --services "$OPS_SERVICE" \
+# The image of CONTAINER in SERVICE's primary deployment; fails when there is
+# no such service (the frontend's, on a stack applied before it had one).
+ops_running_image() {
+  local service=$1 container=$2 td
+  td=$(aws ecs describe-services --cluster "$OPS_CLUSTER" --services "$service" \
     --query "services[0].deployments[?status=='PRIMARY'].taskDefinition | [0]" --output text) || return 1
+  [[ -n "$td" && "$td" != None && "$td" != null ]] || return 1
   aws ecs describe-task-definition --task-definition "$td" \
-    --query "taskDefinition.containerDefinitions[?name=='backend'].image | [0]" --output text
+    --query "taskDefinition.containerDefinitions[?name=='$container'].image | [0]" --output text
 }
 
-# Waits for the deployment to settle -- a single deployment, COMPLETED --
-# then checks it runs EXPECTED (the backend image deployed), then waits for
-# both target groups. A circuit-breaker rollback settles too, on the old
-# image: said here, with what to do.
-ops_wait_release() {
-  local expected=$1 i out lines state running
-  ops_say "waiting for the deployment to settle (startup is allowed ten minutes; three failed starts roll it back)"
-  # ECS is eventually consistent: asked at once, it can still describe only
-  # the old deployment, settled, which would read as a rollback.
-  sleep 20
+ops_running_backend_image() { ops_running_image "$OPS_SERVICE" backend; }
+ops_running_frontend_image() { ops_running_image "$OPS_FRONTEND_SERVICE" frontend; }
+
+# Waits for SERVICE's deployment to settle: a single deployment, COMPLETED.
+# A circuit-breaker rollback settles too, on the old image.
+ops_wait_settled() {
+  local service=$1 i out lines state
   for i in $(seq 240); do
-    out=$(aws ecs describe-services --cluster "$OPS_CLUSTER" --services "$OPS_SERVICE" \
+    out=$(aws ecs describe-services --cluster "$OPS_CLUSTER" --services "$service" \
       --query 'services[0].deployments[].[status, rolloutState]' --output text 2>/dev/null) || out=""
+    # No such service (the frontend's, before the apply that makes it).
+    if [[ "$out" == None ]]; then
+      ops_say "no service $service: nothing to wait for"
+      return 0
+    fi
     lines=$(printf '%s\n' "$out" | grep -c . || true)
     state=$(printf '%s\n' "$out" | awk 'NR == 1 { print $2 }')
-    if [[ "$lines" == 1 && "$state" == COMPLETED ]]; then break; fi
+    if [[ "$lines" == 1 && "$state" == COMPLETED ]]; then return 0; fi
     if [[ $i == 240 ]]; then
-      ops_die "the deployment has not settled after an hour: see  aws ecs describe-services --cluster $OPS_CLUSTER --services $OPS_SERVICE"
+      ops_die "$service's deployment has not settled after an hour: see  aws ecs describe-services --cluster $OPS_CLUSTER --services $service"
     fi
     sleep 15
   done
-  running=$(ops_running_backend_image) || running=""
-  if [[ -n "$expected" && "$running" != "$expected" ]]; then
-    aws ecs describe-services --cluster "$OPS_CLUSTER" --services "$OPS_SERVICE" \
-      --query 'services[0].events[:8].[createdAt, message]' --output text >&2 || true
-    ops_die "ECS rolled the release back: the service runs $running, not $expected. Terraform still names the new release, so before any other apply run scripts/rollback.sh (RUNBOOK.md, \"Rolling back a deploy\")"
-  fi
+}
+
+# Waits for both services' deployments to settle, then checks each runs what
+# was deployed -- BACKEND and FRONTEND, the images prod.tfvars names; an
+# empty one is not checked -- then waits for both target groups. A
+# circuit-breaker rollback is said here, with what to do.
+ops_wait_release() {
+  local expected_backend=$1 expected_frontend=${2:-} service container expected running
+  ops_say "waiting for the deployments to settle (the backend's startup is allowed ten minutes; three failed starts roll a service back)"
+  # ECS is eventually consistent: asked at once, it can still describe only
+  # the old deployment, settled, which would read as a rollback.
+  sleep 20
+  for service in "$OPS_SERVICE" "$OPS_FRONTEND_SERVICE"; do
+    ops_wait_settled "$service"
+  done
+  for service in "$OPS_SERVICE" "$OPS_FRONTEND_SERVICE"; do
+    if [[ "$service" == "$OPS_SERVICE" ]]; then
+      container=backend expected=$expected_backend
+    else
+      container=frontend expected=$expected_frontend
+    fi
+    [[ -n "$expected" ]] || continue
+    running=$(ops_running_image "$service" "$container") || running=""
+    if [[ "$running" != "$expected" ]]; then
+      aws ecs describe-services --cluster "$OPS_CLUSTER" --services "$service" \
+        --query 'services[0].events[:8].[createdAt, message]' --output text >&2 || true
+      ops_die "ECS rolled the release back: $service runs $running, not $expected. Terraform still names the new release, so before any other apply run scripts/rollback.sh (RUNBOOK.md, \"Rolling back a deploy\")"
+    fi
+  done
   ops_wait_healthy
 }
 
@@ -479,6 +542,32 @@ ops_logged_floor() {
     | sed -n -E 's/.*min_magpie_version=([^ ]*).*/\1/p'
 }
 
+# The backend's and the frontend's tags of a logged release, as "BACKEND
+# FRONTEND": since a deploy rebuilds only what changed, release TAG may run
+# a backend from an older commit. From the last line that deployed or rolled
+# back to TAG (its image fields), else the last that replaced it
+# (previous=TAG, with its previous_* fields), else -- a line from before the
+# split, or none -- both at TAG.
+ops_release_images() {
+  local tag=$1 line b="" f=""
+  if [[ -r "$OPS_RELEASE_LOG" ]]; then
+    line=$({ grep -E "(^| )tag=$tag( |$)" "$OPS_RELEASE_LOG" || true; } \
+      | { grep -E ' backend_image=[^ ]*:' || true; } | tail -1)
+    if [[ -n "$line" ]]; then
+      b=$(sed -n -E 's/.* backend_image=[^ ]*:([^ :]+)( .*|$)/\1/p' <<<"$line")
+      f=$(sed -n -E 's/.* frontend_image=[^ ]*:([^ :]+)( .*|$)/\1/p' <<<"$line")
+    else
+      line=$({ grep -E "(^| )previous=$tag( |$)" "$OPS_RELEASE_LOG" || true; } \
+        | { grep -E ' previous_backend_image=[^ ]*:' || true; } | tail -1)
+      if [[ -n "$line" ]]; then
+        b=$(sed -n -E 's/.* previous_backend_image=[^ ]*:([^ :]+)( .*|$)/\1/p' <<<"$line")
+        f=$(sed -n -E 's/.* previous_frontend_image=[^ ]*:([^ :]+)( .*|$)/\1/p' <<<"$line")
+      fi
+    fi
+  fi
+  printf '%s %s' "${b:-$tag}" "${f:-$tag}"
+}
+
 # ---------------------------------------------------------------------------
 # Schema changes (UPDATES_PLAN "Decided: schema changes keep editing 0001")
 # ---------------------------------------------------------------------------
@@ -495,6 +584,51 @@ ops_migrations_changed() {
   changed=$(printf '%s\n' "$changed" | awk 'NF && $1 !~ /^A/ { print "  " $0 }')
   [[ -n "$changed" ]] || return 1
   printf '%s\n' "$changed"
+}
+
+# ---------------------------------------------------------------------------
+# What a commit's changes reach (deploy.sh)
+# ---------------------------------------------------------------------------
+
+# The parts of the stack the paths on stdin (repository-relative, one a line)
+# reach, each printed once: `backend` (its image, and with it the derived-data
+# builder's, which is the backend image with another entrypoint: backend/,
+# docker/ -- the Dockerfile and its MAGPIE pin -- the root .dockerignore, and
+# any Cargo file), `frontend` (frontend/, its own build context) and `infra`
+# (infra/, and the scripts Terraform reads into task definitions with
+# file()). Anything else -- docs, e2e/, worker/, the other scripts -- reaches
+# nothing that is deployed.
+ops_path_components() {
+  awk '
+    function hit(c) { if (!(c in seen)) { seen[c] = 1; print c } }
+    /^frontend\//                                        { hit("frontend"); next }
+    /^backend\// || /^docker\// || /^\.dockerignore$/    { hit("backend"); next }
+    /(^|\/)Cargo\.[^\/]*$/                               { hit("backend"); next }
+    /^infra\//                                           { hit("infra"); next }
+    /^scripts\/(backup|restore-drill|restore-job)\.sh$/  { hit("infra"); next }
+  '
+}
+
+# The parts of the stack (ops_path_components) that commit TO changes since
+# FROM. Returns 2 when FROM or TO is not a commit here.
+ops_changed_components() {
+  local from=$1 to=$2 paths
+  git -C "$OPS_ROOT" cat-file -e "$from^{commit}" 2>/dev/null || return 2
+  git -C "$OPS_ROOT" cat-file -e "$to^{commit}" 2>/dev/null || return 2
+  paths=$(git -C "$OPS_ROOT" diff --name-only --no-renames "$from" "$to") || return 2
+  printf '%s\n' "$paths" | ops_path_components
+}
+
+# Of two tags, the one whose commit descends from the other's: the release
+# the two together make up, for the release log's previous=. The first when
+# neither is a commit here, or neither descends from the other.
+ops_newer_tag() {
+  local a=$1 b=$2
+  if [[ "$a" != "$b" ]] && git -C "$OPS_ROOT" merge-base --is-ancestor "$a" "$b" 2>/dev/null; then
+    printf '%s' "$b"
+  else
+    printf '%s' "$a"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -653,10 +787,10 @@ EOF
 # database reset, once the plan is approved and before the new task starts;
 # the apply; the service started again after a reset (a plan saved while it
 # ran one task does not set the count back); the upload; the release log
-# line LOG_LINE; and the wait for the release to be healthy, running the
-# backend image prod.tfvars now names.
+# line LOG_LINE; and the wait for the release to be healthy, each service
+# running the image prod.tfvars now names.
 ops_ship() {
-  local log_line=$1 expected desired
+  local log_line=$1 desired
   ops_plan_gate
   if [[ "${OPS_RESET:-0}" == 1 ]]; then
     ops_reset_database
@@ -664,7 +798,7 @@ ops_ship() {
   if [[ -z "$OPS_PLAN_EMPTY" ]]; then
     if ! ops_apply_plan; then
       if [[ "${OPS_RESET:-0}" == 1 ]]; then
-        ops_say "the database has been reset and the service is stopped."
+        ops_say "the database has been reset and the backend's service is stopped."
       fi
       ops_die "terraform apply failed. prod.tfvars was not uploaded (infra/prod.tfvars has the change): fix the cause and run this again"
     fi
@@ -676,10 +810,9 @@ ops_ship() {
   ops_log_release "$log_line"
   desired=$(ops_desired_count) || desired=""
   if [[ "$desired" == 0 ]]; then
-    ops_say "the service is at desired count 0: nothing to wait for"
+    ops_say "the backend's service is at desired count 0: nothing to wait for"
   elif [[ "${OPS_RESET:-0}" == 1 ]] || { [[ -z "$OPS_PLAN_EMPTY" ]] && ops_plan_touches_service; }; then
-    expected=$(ops_tfvar backend_image)
-    ops_wait_release "$expected"
+    ops_wait_release "$(ops_tfvar backend_image)" "$(ops_tfvar frontend_image)"
     if command -v curl >/dev/null 2>&1; then
       local host
       host=$(ops_site_host)

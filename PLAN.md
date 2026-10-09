@@ -1612,7 +1612,7 @@ What the numbers settled:
 
 **Claim tokens**: Each claim issues a UUID token. Workers must submit this token with their results. Stale tokens (from timed-out claims) are silently rejected.
 
-**ECS with Fargate**: Two containers share a single ECS task definition — one running the Axum backend, one running an Nginx container serving the SvelteKit static build. The frontend will be split out to S3 + CloudFront in a later phase.
+**ECS with Fargate**: Two ECS services, each with its own task definition and image variable — the Axum backend, and an Nginx container serving the SvelteKit static build. The load balancer sends `/api/*` and `/health` to the backend's target group and everything else to the frontend's. The backend's service is a single instance that stops its task before starting the next (see `desired_count`); the frontend's is stateless and rolls (100%/200%), so a release that changes only the pages has no gap, and `scripts/deploy.sh` redeploys only the services whose sources a commit changed. (Until October 2026 the two containers shared one task, and every deploy, a page change included, stopped the backend.)
 
 **Database migrations**: `sqlx migrate run` executes at container startup before the server accepts connections. No separate migration runner needed.
 
@@ -1696,7 +1696,7 @@ what the workers are checked against.
 | API keys active/inactive toggle | Lets contributors rotate or temporarily suspend a key without losing it; only active keys accepted for auth |
 | Account deletion is app-layer, not CASCADE | The account is anonymized in place, its contributions kept, and its keys, codes and tokens deleted; a cascade would delete what the account did, and the census row it writes first must outlive it |
 | Match test evaluated inline on the submission path, debounced | No background sweep needed; a debounced check is late, never wrong (see Statistical Result Evaluation) |
-| Two containers per ECS task | Axum backend + Nginx for SvelteKit static files; cleaner than co-mingling in one process |
+| Two ECS services, backend and frontend | Axum backend + Nginx for SvelteKit static files, each with its own task definition and image: cleaner than co-mingling in one process, and the stateless frontend rolls without a gap while the single-instance backend is left alone |
 
 ---
 
@@ -6022,7 +6022,8 @@ birdtest/
 ├── frontend/                       # SvelteKit app
 │   ├── Dockerfile                  # static build served by Nginx — the same artifact ECS runs
 │   ├── docker/default.conf.template # SPA fallback + /api proxy (SSE needs proxy_buffering off); the
-│   │                               # backend's address filled in at start (BACKEND_UPSTREAM)
+│   │                               # backend's address filled in at start (BACKEND_UPSTREAM).
+│   │                               # The proxy is compose's: in production the ALB routes /api
 │   ├── package.json
 │   ├── svelte.config.js
 │   ├── vite.config.ts
@@ -10508,8 +10509,8 @@ and the ceiling reached (RDS-EVENT-0224, `failure`).
 It also carries the site being down (`infra/ecs.tf`): no healthy backend or
 frontend target behind the load balancer for ten minutes. Nothing else would
 report a crash-looping task, a health check that never passes, or a rollback
-onto a schema its image refuses. Ten minutes, not one, because the service
-keeps no healthy task through a deploy, and migrations run inside the health
+onto a schema its image refuses. Ten minutes, not one, because the backend's
+service keeps no healthy task through a deploy, and migrations run inside the health
 check's grace. The alarms exist only while `desired_count` is above 0, so a
 first apply or RUNBOOK §5's first step does not page. The apply that raises
 it does, once: it creates the alarms before the task is healthy, and with no
@@ -10517,7 +10518,7 @@ data yet they start in ALARM, then clear (README's first deploy says to expect
 it).
 
 It carries a deploy the circuit breaker rolled back, too (`infra/ecs.tf`,
-`-deploy-failed`: ECS's `SERVICE_DEPLOYMENT_FAILED` for the web service). The
+`-deploy-failed`: ECS's `SERVICE_DEPLOYMENT_FAILED` for either service). The
 `-down` alarms rarely see one, since three failed launches usually end inside
 their ten minutes with the old revision healthy again, and `apply` does not
 wait. Yet a rollback is not over when the site is back: Terraform's state still
@@ -10834,8 +10835,10 @@ only configuration that survives full account compromise.
    says so: ECS waits out the target group's deregistration delay before it
    even sends `SIGTERM`, and the defaults (300 s of draining, then three health
    checks thirty seconds apart for the new task) made it seven or eight
-   minutes — longer than the heartbeat timeout. `infra/ecs.tf` sets 30 s of
-   draining and two checks ten seconds apart. Three things are sized to ride
+   minutes — longer than the heartbeat timeout. `infra/ecs.tf` sets 10 s of
+   draining (30 s until October 2026; a cut upload is retried) and two checks
+   ten seconds apart. Only the backend's service works this way: the frontend
+   has its own service, which rolls. Three things are sized to ride
    out what is left: MAGPIE retries a refused or `5xx` request for about
    fifteen minutes, and a task claim for as long as it takes (see [HTTP](#http-srccompatchttp--srcutilhttp_client)), a
    restarted server reclaims no claim until it has been up for the heartbeat

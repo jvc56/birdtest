@@ -13,8 +13,9 @@
 #      -backup-failed rule turns into a mail -- the rule's TriggeredRules
 #      metric is checked here, and FailedInvocations must be 0;
 # and, without a mail, the -deploy-failed rule's pattern is tested against a
-# failed deployment of the live service (ECS's own events cannot be sent by
-# hand), and the database storage event subscription must be active.
+# failed deployment of each live service, the backend's and the frontend's
+# (ECS's own events cannot be sent by hand), and the database storage event
+# subscription must be active.
 #
 # Works on whatever stack infra/'s workspace is (BIRDTEST_WORKSPACE=dr for
 # RUNBOOK §5's copy, whose names carry its suffix). Needs aws, terraform, jq,
@@ -84,20 +85,22 @@ else
   fail "$name-backup-failed did not fire within ten minutes (TriggeredRules is 0)"
 fi
 
-# 3. The deploy-failed rule against a failed deployment of the live service.
-service=$(aws ecs describe-services --cluster "$OPS_CLUSTER" --services "$OPS_SERVICE" \
-  --query 'services[0].serviceArn' --output text)
-match=$(aws events test-event-pattern \
-  --event-pattern "$(aws events describe-rule --name "$name-deploy-failed" --query EventPattern --output text)" \
-  --event "$(jq -nc --arg s "$service" --arg r "$OPS_REGION" '{id: "1", account: "123456789012",
-     source: "aws.ecs", time: "2026-01-01T00:00:00Z", region: $r, resources: [$s],
-     "detail-type": "ECS Deployment State Change", detail: {eventName: "SERVICE_DEPLOYMENT_FAILED"}}')" \
-  --query Result --output text) || match=""
-if [[ "$match" == True || "$match" == true ]]; then
-  ops_say "$name-deploy-failed matches a failed deployment of $OPS_SERVICE"
-else
-  fail "$name-deploy-failed does not match a failed deployment of $OPS_SERVICE"
-fi
+# 3. The deploy-failed rule against a failed deployment of each live service.
+pattern=$(aws events describe-rule --name "$name-deploy-failed" --query EventPattern --output text)
+for svc in "$OPS_SERVICE" "$OPS_FRONTEND_SERVICE"; do
+  service=$(aws ecs describe-services --cluster "$OPS_CLUSTER" --services "$svc" \
+    --query 'services[0].serviceArn' --output text)
+  match=$(aws events test-event-pattern --event-pattern "$pattern" \
+    --event "$(jq -nc --arg s "$service" --arg r "$OPS_REGION" '{id: "1", account: "123456789012",
+       source: "aws.ecs", time: "2026-01-01T00:00:00Z", region: $r, resources: [$s],
+       "detail-type": "ECS Deployment State Change", detail: {eventName: "SERVICE_DEPLOYMENT_FAILED"}}')" \
+    --query Result --output text) || match=""
+  if [[ "$match" == True || "$match" == true ]]; then
+    ops_say "$name-deploy-failed matches a failed deployment of $svc"
+  else
+    fail "$name-deploy-failed does not match a failed deployment of $svc"
+  fi
+done
 
 if ((failed)); then
   ops_die "some checks failed (above)"
