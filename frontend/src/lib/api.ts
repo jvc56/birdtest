@@ -396,6 +396,13 @@ export interface JobStats {
     /** The lexicons in play. A games job comparing two reads "CSW21 vs NWL23". */
     lexicon: string | null;
     variant: string | null;
+    /** Tasks a worker stopped at the time limit and handed back. */
+    time_limit_declines: number;
+    /**
+     * Why the server switched the job off, while it is off: three of its tasks
+     * in a row hit the time limit. Null for a job an admin switched off.
+     */
+    set_aside_reason: string | null;
   };
   tasks_total: number;
   tasks_completed: number;
@@ -553,6 +560,19 @@ export interface FleetVersion {
   magpie_version: string | null;
   workers: number;
   claims: number;
+}
+
+/** The settings an admin changes at run time (`/admin/settings`). */
+export interface Settings {
+  /**
+   * The longest a task may run, in seconds (60 to 86,400). Every claim is
+   * given the limit as it stands then; a worker stops a task at it and hands
+   * it back.
+   */
+  max_task_seconds: number;
+  /** Who changed them last; null until anyone has. */
+  updated_by: string | null;
+  updated_at: string;
 }
 
 /** One run of scripts/backup.sh, as recorded in the `backups` table. */
@@ -817,6 +837,9 @@ export const api = {
     get<JobDerivedFile[]>(`/api/admin/jobs/${id}/derived-data`),
   fleet: () => get<FleetVersion[]>('/api/admin/fleet'),
   backups: () => get<BackupStatus>('/api/admin/backups'),
+  settings: () => get<Settings>('/api/admin/settings'),
+  /** Applies to the claims made from now on; one that changes nothing writes nothing. */
+  updateSettings: (body: { max_task_seconds: number }) => put<Settings>('/api/admin/settings', body),
   derivedData: () => get<DerivedData[]>('/api/admin/derived-data'),
   retryDerivedData: (row: DerivedData) =>
     post<void>('/api/admin/derived-data/retry', {

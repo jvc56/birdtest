@@ -80,6 +80,12 @@ pub struct JobSummary {
     pub created_by: Option<String>,
     pub lexicon: Option<String>,
     pub variant: Option<String>,
+    /// Tasks a worker stopped at the time limit and handed back: the page
+    /// says how many, since the cure is a smaller batch.
+    pub time_limit_declines: i64,
+    /// Why the server switched the job off, while it is off: its tasks kept
+    /// hitting the time limit. `None` for a job an admin switched off.
+    pub set_aside_reason: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -517,6 +523,10 @@ async fn compute_inner(conn: &mut PgConnection, job: &Job) -> AppResult<JobStats
             created_by,
             lexicon,
             variant,
+            time_limit_declines: job.time_limit_declines,
+            set_aside_reason: (job.status == crate::models::job::JobStatus::Inactive)
+                .then(|| job.set_aside_reason.clone())
+                .flatten(),
         },
         tasks_total,
         tasks_completed,

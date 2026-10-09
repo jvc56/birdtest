@@ -151,7 +151,9 @@ Open "dev game pairs (first divergences saved)".
   beside it -- the badge says it plainly, and its allocation has its own card.
   (Inactive: "Paused: no worker is offered its tasks until it is given an
   allocation." and "Its significance test is paused while the job is inactive (see the
-  Significance Test card).")
+  Significance Test card)." Set aside by the server, its reason instead, A-17;
+  and under it, once any of its tasks has hit the time limit, "N tasks hit the
+  time limit — lower the batch size.")
 - [ ] **Expect** under it three cards in a row: Allocation, Tasks completed and
   Estimated time left.
 - [ ] **Expect** a Progress card: a bar of "pairs completed", then **Tasks**
@@ -572,9 +574,9 @@ Do this last: it empties the database.
 
 ### A-2 The admin area
 
-- [ ] **Do** click **Admin**. **Expect** the tabs New job, Player configs, New
-  rating pool, Input data, Fleet, Users, Bans, Derived data, Backups and Audit
-  log. `/admin` itself goes to the jobs list.
+- [ ] **Do** click **Admin**. **Expect** the tabs New job, Allocation, Player
+  configs, New rating pool, Input data, Fleet, Users, Bans, Derived data,
+  Backups, Settings and Audit log. `/admin` itself goes to the jobs list.
 - [ ] Signed out, **expect** any `/admin` page to send you to sign in and back.
 
 ### A-3 Import data
@@ -934,9 +936,40 @@ closes in seconds rather than never.
   `input_data.import_staged`, `input_data.import_confirmed`,
   `input_data.import_nothing_new`,
   `rating_pool.created`, `rating_pool.member_added`, `user.deleted`,
-  `worker.banned`, `worker.unbanned` and more.
+  `worker.banned`, `worker.unbanned`, `settings.changed`, `job.set_aside` and
+  more.
 - [ ] **Do** filter by action `job.activated`, then by target type `job`.
   **Expect** only those, and paging to keep the filter.
+
+### A-17 Settings and the task time limit
+
+Needs a MAGPIE that stops a task at the assignment's `max_task_seconds` and
+declines it `time_limit` (from the pin after this change). An older one runs
+on, and the server takes the claim back a minute past its deadline instead,
+which counts toward nothing.
+
+- [ ] **Do** **Settings**. **Expect** Task Time Limit (Seconds) 3600, "1h",
+  "Never changed: these are the defaults.", and **Save** disabled until the
+  value changes.
+- [ ] **Do** type 59. **Expect** "A whole number of seconds from 60 to 86,400
+  (a minute to a day)." and **Save** disabled; sent anyway, the server
+  refuses it on the field.
+- [ ] **Do** set 120 and **Save**. **Expect** "Saved. Claims made from now on
+  are given the new limit." and "Last changed by dev, <now>". The audit log
+  has `settings.changed` ("max_task_seconds 3600 -> 120").
+- [ ] **Do** create a **Games** job of A-4's simmer against itself, with a
+  batch big enough that a task takes longer than two minutes, and give it an
+  allocation.
+  **Expect** each task MAGPIE claims to stop at two minutes, and the job's
+  page to say "1 task hit the time limit — lower the batch size." and then
+  more. **Expect**, after the third in a row, the job inactive at 0%, its
+  Status card reading "Set aside by the server: 3 tasks in a row hit the
+  2-minute time limit with none completed between: …", and `job.set_aside`
+  in the audit log ("N% -> 0%: …").
+- [ ] **Do** give it an allocation again. **Expect** it active, the reason gone
+  and the count of tasks that hit the limit still shown; three more in a row
+  set it aside again.
+- [ ] **Do** set the limit back to 3600.
 
 ---
 
@@ -1119,6 +1152,15 @@ curl -s -b "$JAR" "$SITE/api/admin/fleet"
 curl -s -b "$JAR" "$SITE/api/admin/derived-data" | jq '.[] | {role, name, state}'
 curl -s -b "$JAR" "$SITE/api/admin/backups"
 curl -s -b "$JAR" "$SITE/api/admin/audit-log?action=job.activated&per_page=5"
+```
+
+**The task time limit.** Read it, and set it: 60 to 86,400 seconds, or a
+`400` on `max_task_seconds`. Claims made after the change are given it.
+
+```bash
+curl -s -b "$JAR" "$SITE/api/admin/settings"
+curl -s -b "$JAR" -H "X-CSRF-Token: $CSRF" -H 'Content-Type: application/json' -X PUT \
+  -d '{"max_task_seconds":1800}' "$SITE/api/admin/settings"
 ```
 
 **Export a completed job.** Start it (`202`), poll until `state` is `ready`,

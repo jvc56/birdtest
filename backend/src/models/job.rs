@@ -12,6 +12,18 @@ pub enum JobType {
     LeaveGeneration,
 }
 
+impl JobType {
+    /// The wire name, as serde and Postgres spell it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OpeningRack => "opening_rack",
+            Self::Games => "games",
+            Self::GamePairs => "game_pairs",
+            Self::LeaveGeneration => "leave_generation",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
 #[sqlx(type_name = "job_status", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
@@ -72,6 +84,14 @@ pub struct Job {
     pub test_decided_lower: Option<f64>,
     pub test_decided_upper: Option<f64>,
     pub test_decided_units: Option<i64>,
+    /// Tasks a worker stopped at the time limit and handed back (`time_limit`
+    /// declines), and how many of those in a row with nothing completed
+    /// between: at [`crate::routes::worker::TIME_LIMIT_STREAK`] the job is set
+    /// aside, and `set_aside_reason` says why. The reason is read only while
+    /// the job is inactive; an allocation clears it.
+    pub time_limit_declines: i64,
+    pub time_limit_streak: i32,
+    pub set_aside_reason: Option<String>,
     /// Games recorded by the job's accepted results (one per task); the dashboard's
     /// progress numerator, maintained in the submit transaction rather than
     /// summed on read. A pairs job's unit count is half of it.
@@ -402,6 +422,7 @@ mod tests {
             let wire = serde_json::to_value(job_type).unwrap();
             assert_eq!(wire, serde_json::Value::String(label.clone()));
             assert_eq!(pg_text(job_type), *label);
+            assert_eq!(job_type.as_str(), label);
             let back: JobType = serde_json::from_value(wire).unwrap();
             assert_eq!(back, *job_type);
         }

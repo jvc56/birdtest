@@ -487,6 +487,21 @@ CREATE TABLE jobs (
     test_decided_lower  DOUBLE PRECISION,
     test_decided_upper  DOUBLE PRECISION,
     test_decided_units  BIGINT,
+    -- Tasks of this job a worker stopped at the time limit
+    -- (`settings.max_task_seconds`) and handed back, declining them
+    -- `time_limit`: the job page says how many, since the cure is a smaller
+    -- batch. And how many of those came in a row with no task of the job
+    -- completed between, which an accepted result zeroes: at three the job is
+    -- set aside -- inactive at 0%, with `set_aside_reason` saying why -- since
+    -- a job whose one unit always outlasts the limit would otherwise be
+    -- handed out, run for the limit and handed back for ever. Giving it an
+    -- allocation again starts the run afresh and clears the reason; a purge
+    -- zeroes all three.
+    time_limit_declines BIGINT NOT NULL DEFAULT 0 CHECK (time_limit_declines >= 0),
+    time_limit_streak   INT NOT NULL DEFAULT 0 CHECK (time_limit_streak >= 0),
+    -- Why the server switched the job off, when it did; read only while the
+    -- job is inactive.
+    set_aside_reason    TEXT,
     -- The invariant above, for every status: active exactly when above 0%,
     -- which holds an inactive or completed job at 0%.
     CONSTRAINT jobs_allocation_is_status CHECK ((status = 'active') = (allocation > 0)),
@@ -969,6 +984,15 @@ CREATE TABLE task_claims (
     claimed_by_user_id   UUID REFERENCES users(id),
     claimed_by_anon_uuid UUID REFERENCES anonymous_workers(uuid),
     claimed_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- When the task must be done by: `claimed_at` plus `settings.max_task_seconds`
+    -- as it stood when the claim was made, which the assignment told the
+    -- worker. Past it and a minute's grace the claim lapses whether or not its
+    -- worker still heartbeats, and a result for it is refused: a task whose
+    -- one unit outlasts the limit (a deep-sim game pair) would otherwise hold
+    -- its slot for as long as its worker lived. The claim path always sets
+    -- it; the default, the limit's own default, is for a row written any
+    -- other way (a script, a test's fixture).
+    deadline_at          TIMESTAMPTZ NOT NULL DEFAULT now() + interval '1 hour',
     last_heartbeat_at    TIMESTAMPTZ,
     completed_at         TIMESTAMPTZ,
     -- The move generations this claim's accepted result reported (the
@@ -1770,6 +1794,26 @@ CREATE TABLE backups (
 -- The admin page asks for the most recent runs, and the staleness figure asks
 -- for the most recent successful one.
 CREATE INDEX backups_finished_idx ON backups (finished_at DESC);
+
+-- Settings an admin changes at run time (`/admin/settings`), as one row. The
+-- deployment's own settings are environment variables, which take a deploy
+-- to change; these take effect at the next claim.
+CREATE TABLE settings (
+    -- Always TRUE: the primary key and its check are what make it one row.
+    id                BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (id),
+    -- The longest a task may run. Every claim is given it (the assignment's
+    -- `max_task_seconds`) and keeps its own deadline, claim time plus this as
+    -- it stood then, so a change applies to claims made after it. A claim
+    -- past its deadline and a minute's grace is reclaimed even while its
+    -- worker heartbeats, and its result refused (`task_claims.deadline_at`).
+    -- A minute at the least, a day at the most.
+    max_task_seconds  INT NOT NULL DEFAULT 3600 CHECK (max_task_seconds BETWEEN 60 AND 86400),
+    -- Who changed them last, and when; NULL until anyone has. SET NULL, like
+    -- jobs.created_by: the settings outlive the admin.
+    updated_by        UUID REFERENCES users(id) ON DELETE SET NULL,
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+INSERT INTO settings DEFAULT VALUES;
 
 -- Audit log
 

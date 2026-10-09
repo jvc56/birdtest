@@ -56,6 +56,18 @@ export function computeTime(seconds: number | null): string {
 }
 
 /**
+ * What a job page says of its tasks that hit the time limit: workers stop a
+ * task at the limit and hand it back, so a job whose batch is too big for it
+ * makes no progress, and the cure is the admin's -- a smaller batch. `null`
+ * while none has.
+ */
+export function timeLimitNotice(declines: number): string | null {
+  if (!(declines > 0)) return null;
+  const tasks = declines === 1 ? '1 task' : `${declines.toLocaleString()} tasks`;
+  return `${tasks} hit the time limit — lower the batch size`;
+}
+
+/**
  * A count to its last digit, grouped: "1,234,567,890". Movegens run to
  * billions per contributor; rounded to "1.2B" the list stood still between
  * refreshes while every contributor's count was rising.

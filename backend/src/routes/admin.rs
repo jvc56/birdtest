@@ -51,6 +51,91 @@ pub fn router() -> Router<AppState> {
         .route("/derived-data/retry", post(retry_derived_data))
         .route("/backups", get(backups))
         .route("/fleet", get(fleet))
+        .route("/settings", get(get_settings).put(put_settings))
+}
+
+// ---------------------------------------------------------------------------
+// Settings
+// ---------------------------------------------------------------------------
+
+/// The longest and shortest task time limit an admin may set: the column's
+/// CHECK. Under a minute no batch is worth a claim; over a day a lost claim
+/// held its task for that long.
+const MIN_TASK_SECONDS: i32 = 60;
+const MAX_TASK_SECONDS: i32 = 86_400;
+
+#[derive(Serialize, sqlx::FromRow)]
+struct SettingsView {
+    max_task_seconds: i32,
+    /// The admin who changed them last, by name; `None` until anyone has, or
+    /// once that account is gone.
+    updated_by: Option<String>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Deserialize)]
+struct SettingsBody {
+    max_task_seconds: i32,
+}
+
+async fn read_settings(conn: &mut sqlx::PgConnection) -> AppResult<SettingsView> {
+    Ok(sqlx::query_as::<_, SettingsView>(
+        "SELECT s.max_task_seconds, u.username AS updated_by, s.updated_at
+         FROM settings s LEFT JOIN users u ON u.id = s.updated_by",
+    )
+    .fetch_one(conn)
+    .await?)
+}
+
+/// The settings an admin changes at run time, as they stand.
+async fn get_settings(State(state): State<AppState>, _admin: AdminUser) -> AppResult<Json<SettingsView>> {
+    let mut conn = state.pool.acquire().await?;
+    Ok(Json(read_settings(&mut conn).await?))
+}
+
+/// Changes the settings. The time limit applies to claims made from now on:
+/// every claim keeps the deadline it was given (`task_claims.deadline_at`),
+/// which its worker was told. One `settings.changed` audit row, from what to
+/// what; a request that changes nothing is a `200` that writes nothing.
+async fn put_settings(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    method: Method,
+    headers: HeaderMap,
+    jar: CookieJar,
+    ApiJson(body): ApiJson<SettingsBody>,
+) -> AppResult<Json<SettingsView>> {
+    csrf::verify(&method, &headers, &jar)?;
+    if !(MIN_TASK_SECONDS..=MAX_TASK_SECONDS).contains(&body.max_task_seconds) {
+        return Err(AppError::bad_request("settings are invalid").with_field(
+            "max_task_seconds",
+            format!("must be between {MIN_TASK_SECONDS} and {MAX_TASK_SECONDS} (a minute to a day)"),
+        ));
+    }
+    let mut tx = state.pool.begin().await?;
+    let before: i32 = sqlx::query_scalar("SELECT max_task_seconds FROM settings FOR UPDATE")
+        .fetch_one(&mut *tx)
+        .await?;
+    if before != body.max_task_seconds {
+        sqlx::query("UPDATE settings SET max_task_seconds = $1, updated_by = $2, updated_at = now()")
+            .bind(body.max_task_seconds)
+            .bind(admin.0.id)
+            .execute(&mut *tx)
+            .await?;
+        audit::log_detail(
+            &mut tx,
+            "settings.changed",
+            admin.0.id,
+            "settings",
+            "max_task_seconds".to_string(),
+            None,
+            format!("max_task_seconds {before} -> {}", body.max_task_seconds),
+        )
+        .await?;
+    }
+    let view = read_settings(&mut tx).await?;
+    tx.commit().await?;
+    Ok(Json(view))
 }
 
 // ---------------------------------------------------------------------------
@@ -2625,8 +2710,16 @@ async fn set_allocations(
         }
         let moved = format!("{}% -> {}%", job.allocation, row.allocation);
         if row.allocation > 0 {
+            // A job set aside for its time-limit declines starts a new run of
+            // them, and is no longer set aside (`worker::record_time_limit`):
+            // the admin has decided it should run, and may have raised the
+            // limit since. An active job's new share keeps its run.
             sqlx::query(
-                "UPDATE jobs SET status = 'active', allocation = $1, activated_at = now() WHERE id = $2",
+                "UPDATE jobs SET status = 'active', allocation = $1, activated_at = now(),
+                                 time_limit_streak = CASE WHEN status = 'active'
+                                                          THEN time_limit_streak ELSE 0 END,
+                                 set_aside_reason = NULL
+                 WHERE id = $2",
             )
             .bind(row.allocation)
             .bind(row.job_id)
@@ -3412,6 +3505,7 @@ async fn purge_body(
                          tasks_total = 0, tasks_completed = 0, last_completed_at = NULL,
                          test_decided_status = NULL, test_decided_lower = NULL,
                          test_decided_upper = NULL, test_decided_units = NULL,
+                         time_limit_declines = 0, time_limit_streak = 0, set_aside_reason = NULL,
                          status = 'inactive', allocation = 0, claims_baseline = 0
          WHERE id = $1",
     )

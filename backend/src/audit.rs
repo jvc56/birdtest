@@ -83,6 +83,23 @@ pub async fn log_server_completion(
     Ok(())
 }
 
+/// A job the server switched off itself: its tasks kept hitting the time limit
+/// (`routes::worker::record_time_limit`). `job.set_aside`, from active to
+/// inactive, with the allocation it moved from and why in `reason`. No actor:
+/// the server.
+pub async fn log_server_set_aside(conn: &mut PgConnection, job_id: Uuid, reason: &str) -> AppResult<()> {
+    sqlx::query(
+        "INSERT INTO audit_log (action, target_type, target_id, job_id, old_status, new_status, reason)
+         VALUES ('job.set_aside', 'job', $1, $2, 'active', 'inactive', $3)",
+    )
+    .bind(job_id.to_string())
+    .bind(job_id)
+    .bind(reason)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
 /// Status transitions carry the old and new value so the log reads as a history,
 /// and an activation or deactivation the allocation it moved between in
 /// `reason` ("0% -> 40%"): the allocation is what switches a job on and off.

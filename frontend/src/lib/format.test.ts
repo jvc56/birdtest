@@ -3,6 +3,7 @@ import {
   blankFields,
   computeTime,
   exactCount,
+  timeLimitNotice,
   unchosenText,
   datetime,
   derivedKind,
@@ -469,5 +470,17 @@ describe('F-FMT-18 targetsText', () => {
   it('joins the targets in generation order with arrows, not commas', () => {
     expect(targetsText([100, 1000, 1000])).toBe(`100 → ${(1000).toLocaleString()} → ${(1000).toLocaleString()}`);
     expect(targetsText([500])).toBe('500');
+  });
+});
+
+describe('F-FMT-20 timeLimitNotice', () => {
+  it('counts the tasks that hit the limit and names the cure', () => {
+    expect(timeLimitNotice(1)).toBe('1 task hit the time limit — lower the batch size');
+    expect(timeLimitNotice(3)).toBe('3 tasks hit the time limit — lower the batch size');
+    expect(timeLimitNotice(1234)).toBe(`${(1234).toLocaleString()} tasks hit the time limit — lower the batch size`);
+  });
+
+  it('says nothing while none has', () => {
+    expect(timeLimitNotice(0)).toBeNull();
   });
 });

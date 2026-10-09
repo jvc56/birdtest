@@ -18,6 +18,7 @@ other then fails a test rather than a contributor's run.
 | `assignment-opening-rack.json` | server → client | A rack batch for a simming player: the one job type whose request carries `racks` and a single `player` |
 | `assignment-leave-generation.json` | server → client | Generation 1, reading the server-built zeroed KLV, and the static `player` the bot plays both seats as |
 | `decline-missing-data.json` | client → server | A decline naming a missing file and a mismatched one |
+| `decline-time-limit.json` | client → server | A task stopped at the assignment's `max_task_seconds`: the token and `"reason": "time_limit"`, no `missing` |
 | `shutdown-data-out-of-date.json` | server → client | Every job unreachable because the data is stale |
 | `shutdown-magpie-too-old.json` | server → client | Every job unreachable because the build is old |
 | `shutdown-both.json` | server → client | Both, leading with the MAGPIE version |
@@ -35,10 +36,40 @@ other then fails a test rather than a contributor's run.
 The digests here are the real ones from `data-20260925.tgz`, so a fixture that
 stops matching what an import produces is itself a signal.
 
+## What every assignment states
+
+Beside `claim_token`, `job_id`, `min_magpie_version`, `expected_data` and the
+`task_request`, every assignment carries:
+
+- `job_name` -- a string, never empty: the job's name, or for a job created
+  without one its type and the start of its id (`"games job 1d4a7f60"`). What
+  the worker calls the job when it says what it is running.
+- `max_task_seconds` -- a whole number, 60 to 86,400: how long the worker may
+  run this task. It is the server's setting (`/admin/settings`) as it stood
+  when the claim was made, and the claim's deadline is its claim time plus
+  this. A worker that reaches it stops the task, hands it back unfinished and
+  declines it with `"reason": "time_limit"` (`decline-time-limit.json`). A
+  minute past the deadline the server takes the claim back whether or not the
+  worker still heartbeats, and answers a result for it `{"accepted": false}`.
+
+A `games` or `game_pairs` request also states `threading_mode`, after
+`sim_cutoff`: `"igp"` (the default) gives all of a task's threads to one game's
+simulation at a time, which makes an iteration-bounded simulation
+reproducible, and `"pgp"` plays the batch's games in parallel. It is the job's
+setting, and matters only when a player simulates. Opening-rack and leave
+requests state none.
+
+A decline's `reason` is one of `missing_data`, `magpie_version`,
+`unknown_job_type`, `derived_mismatch`, `task_failed` and `time_limit`;
+anything else is a `400` listing them.
+
 ## Capturing
 
-The first nine, and `result-games-inference.json`, were written by hand. The
-rest were **captured from a real exchange**: `scripts/capture_contract.py` is a recording proxy that sits
+The first nine, `decline-time-limit.json` and `result-games-inference.json`
+were written by hand. The rest were **captured from a real exchange**, though
+`assignment-game-pairs.json` and `anon-uuid-assignment.json` were given
+`job_name`, `max_task_seconds` and `threading_mode` by hand when the server
+began sending them, until the next recapture: `scripts/capture_contract.py` is a recording proxy that sits
 between `magpie contribute` and the backend, forwards everything unchanged, and
 writes the first body of each message type here. Nothing is normalised --
 tokens, ids and timings are the ones that crossed the wire, so a recapture

@@ -972,6 +972,10 @@ Each entry's tests are the `describe` block named for its id.
 - `F-FMT-19` `exactCount` reads a contributor's movegens to the last digit,
   grouped ("1,234,567,890"), and a dash for anything that is not a count.
   *(Covered: `format.test.ts`.)*
+- `F-FMT-20` `timeLimitNotice` says how many of a job's tasks hit the time
+  limit and names the cure ("3 tasks hit the time limit — lower the batch
+  size"), "1 task" for one, and nothing while none has. *(Covered:
+  `format.test.ts`.)*
 
 ### `F-RR-*` — `lib/roundRobin.ts`
 
@@ -2973,10 +2977,11 @@ below.
   `use_wordmap` of its own, and pins the player's lexicon and wordmap but not
   its leaves. *(Covered:
   `worker_routes::a_leave_claim_carries_its_player_and_pins_only_its_lexicon`.)*
-- `A-WORKER-8` A decline with an unknown reason is rejected; the five known
-  reasons (`missing_data`, `magpie_version`, `unknown_job_type`,
-  `derived_mismatch`, `task_failed`) are accepted. *(Covered:
-  `worker_routes::only_the_five_known_decline_reasons_are_accepted`.)*
+- `A-WORKER-8` A decline with an unknown reason is rejected, the refusal
+  listing them; the six known reasons (`missing_data`, `magpie_version`,
+  `unknown_job_type`, `derived_mismatch`, `task_failed`, `time_limit`) are
+  accepted, release the claim and are recorded on its audit row. *(Covered:
+  `worker_routes::only_the_six_known_decline_reasons_are_accepted`.)*
 - `A-WORKER-9` Heartbeat extends the claim, and has no effect for a stale
   token — reclaimed, declined, another identity's, or never issued. It is
   still answered `204`, by design rather than as a gap: the heartbeat has one
@@ -3089,6 +3094,31 @@ below.
   the fixture by `contract_fixtures::every_shutdown_reason_matches_what_the_server_sends`;
   MAGPIE's claim body by `test_the_claim_body_matches_the_claim_fixture`.)*
   (Thirty-third audit, pass 1.)
+- `A-WORKER-23` Every assignment names its job (`job_name`: its name, or its
+  type and the start of its id, never empty) and states the time limit its
+  claim was given (`max_task_seconds`): the settings' at the claim, which the
+  claim's `deadline_at` is its claim time plus. A change to the setting moves
+  later claims' limits and not an earlier one's. *(Covered:
+  `worker_routes::an_assignment_names_its_job_and_states_the_limit_it_was_claimed_under`;
+  the field names by `C-11`.)*
+- `A-WORKER-24` A claim past its deadline and the minute's grace lapses at the
+  next reclamation **even while its worker heartbeats**, and its task goes
+  back out; inside the grace it stands, and a process in its startup grace
+  lapses nothing on a deadline either. *(Covered:
+  `worker_routes::a_claim_past_its_deadline_lapses_even_while_heartbeating`.)*
+- `A-WORKER-25` A result for a claim past its deadline and the grace is
+  answered `accepted: false` whether or not a reclamation got there first,
+  and the claim is released then, its task available and nothing stored;
+  inside the grace, or while the process is in its startup grace, the result
+  is accepted. *(Covered:
+  `worker_routes::a_result_past_its_claims_deadline_is_refused_and_frees_the_task`.)*
+- `A-WORKER-26` A `time_limit` decline is counted against its job, which the
+  job's page shows (`job.time_limit_declines`); three in a row with no task of
+  the job completed between set the job aside -- inactive at 0%, the reason
+  on the job and its page, a `job.set_aside` audit row from its share -- and
+  an accepted result between them starts the run again. An allocation puts it
+  back, its reason cleared and its run started afresh. *(Covered:
+  `worker_routes::three_time_limit_declines_in_a_row_set_the_job_aside`.)*
 - `A-WORKER-15` `client-version` reports the configured floor and a download
   URL. *(Covered:
   `worker_routes::client_version_reports_the_configured_floor_and_download_url`.)*
@@ -3290,6 +3320,18 @@ below.
   goes through while the purge waits. (A delete keeps the same order.)
   *(Covered: `admin_api::a_purge_waiting_on_a_rating_fit_holds_up_no_submissions`.)*
   (The test predates the entry, and cited `A-ADMIN-20`; thirty-third audit.)
+- `A-ADMIN-30` The task time limit is an admin setting (`GET`/`PUT
+  /api/admin/settings`): 3600 by default with nobody named as having changed
+  it, refused on its field below 60 or above 86,400, and each change audited
+  once (`settings.changed`, "max_task_seconds 3600 -> 1800", the admin as
+  actor) -- a change to what it already is writes nothing; the claims made
+  after a change are given it. *(Covered:
+  `admin_routes::the_task_time_limit_is_an_admin_setting_and_each_change_is_audited`;
+  that only an admin may, by `A-AUTHZ`.)*
+- `A-ADMIN-31` A games or pairs job's `threading_mode` is `igp` unless the
+  request says `pgp`, anything else a `400` on the field; its settings show
+  it, and its tasks' requests carry it, beside the job's name. *(Covered:
+  `admin_routes::a_games_jobs_threading_mode_is_on_its_settings_and_every_task`.)*
 
 ### `A-RATE-*` — `routes/ratings.rs`
 
@@ -3642,15 +3684,18 @@ request. Server→client fixtures are compared by **field structure, not bytes**
 so fields stay free to move before the first release while a renamed or dropped
 field still fails.
 
-Eighteen fixtures exist, and the set is complete: every message has one. The
+Nineteen fixtures exist, and the set is complete: every message has one. The
 first nine — an assignment of each original request shape (games, opening
 racks, leave generation), a claim, a decline, and each of the four shutdown
-reasons — were written by hand, and so was `result-games-inference.json`
+reasons — were written by hand, and so were `result-games-inference.json`
 (`C-3b`), in MAGPIE's key layout, MAGPIE's own test checking its output
-carries every key; `C-2`..`C-9` were **captured from a real exchange**.
-MAGPIE's `test/birdtest_contract/` carries a byte-identical copy of all
-eighteen, and CI's `magpie-contract` job runs MAGPIE's tests against this
-branch's copy.
+carries every key, and `decline-time-limit.json` (`C-12`); `C-2`..`C-9` were
+**captured from a real exchange** (the two captured assignments were given
+`job_name`, `max_task_seconds` and `threading_mode` by hand when the server
+began sending them, until the next recapture). MAGPIE's
+`test/birdtest_contract/` carries a copy, brought up to date with each MAGPIE
+pin, and CI's `magpie-contract` job runs MAGPIE's tests against this branch's
+copy.
 
 - `C-1` `assignment-opening-rack.json` — exists, and MAGPIE's
   `test/birdtest_contract/` carries a byte-identical copy. *(Covered:
@@ -3689,6 +3734,16 @@ branch's copy.
   `contract_fixtures::the_expected_data_block_matches_what_the_server_sends`.)*
 - `C-9` `anon-uuid-assignment.json`, a first claim that mints a UUID.
   *(Covered: `contract_fixtures::a_first_claim_is_assigned_a_worker_uuid`.)*
+- `C-11` Every assignment fixture names its job (`job_name`, never empty)
+  and states its time limit (`max_task_seconds`, 60 to 86,400), and a games
+  or pairs request its `threading_mode`, `igp` or `pgp` -- no other request
+  type one. *(Covered:
+  `contract_fixtures::every_assignment_names_its_job_its_time_limit_and_a_games_threading_mode`,
+  and each envelope's shape, the opening-rack and leave ones included, by
+  `the_assignment_envelope_matches_what_the_server_sends`.)*
+- `C-12` `decline-time-limit.json`, a task stopped at its time limit: the
+  token and `"reason": "time_limit"`, nothing missing. *(Covered:
+  `contract_fixtures::a_time_limit_decline_parses_as_a_decline_body`.)*
 - `C-10` `decline-missing-data.json`, a decline naming a file not found and one
   found with other bytes, parses as the body the server takes, with `actual`
   left out reading as its `null`; MAGPIE builds the same body key for key.

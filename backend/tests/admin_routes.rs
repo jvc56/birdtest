@@ -869,3 +869,101 @@ async fn the_audit_log_pages_and_filters_by_job() {
     let (_, body) = admin.get("/api/admin/audit-log").await;
     assert_eq!(body["total"], json!(8), "the unfiltered log counts every row: {body}");
 }
+
+// --- A-ADMIN-30, 31 ----------------------------------------------------------
+
+/// A-ADMIN-30: the task time limit is the admin's to set, from a minute to a
+/// day: read with who set it last, refused on its field outside that range,
+/// and each change audited once (`settings.changed`, from what to what) -- a
+/// change to what it already is writes nothing. The claims made after a
+/// change are given it.
+#[tokio::test]
+async fn the_task_time_limit_is_an_admin_setting_and_each_change_is_audited() {
+    let db = TestDb::new().await;
+    let admin = Admin::new(&db).await;
+    let changes = "SELECT COUNT(*) FROM audit_log WHERE action = 'settings.changed'";
+
+    let (status, settings) = admin.get("/api/admin/settings").await;
+    assert_eq!(status, StatusCode::OK, "{settings}");
+    assert_eq!(settings["max_task_seconds"], json!(3600), "{settings}");
+    assert!(settings["updated_by"].is_null(), "nobody has changed them: {settings}");
+
+    for refused in [0, 59, 86_401] {
+        let (status, body) = admin.put("/api/admin/settings", json!({ "max_task_seconds": refused })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}: {body}");
+        assert_eq!(body["fields"][0]["field"], "max_task_seconds", "{refused}: {body}");
+    }
+    assert_eq!(count(&db, changes).await, 0);
+
+    let (status, settings) = admin.put("/api/admin/settings", json!({ "max_task_seconds": 1800 })).await;
+    assert_eq!(status, StatusCode::OK, "{settings}");
+    assert_eq!((&settings["max_task_seconds"], &settings["updated_by"]), (&json!(1800), &json!("root")));
+    let (actor, reason): (Uuid, String) =
+        sqlx::query_as("SELECT actor_user_id, reason FROM audit_log WHERE action = 'settings.changed'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!((actor, reason.as_str()), (admin.id, "max_task_seconds 3600 -> 1800"));
+
+    let (status, _) = admin.put("/api/admin/settings", json!({ "max_task_seconds": 1800 })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(count(&db, changes).await, 1, "an unchanged setting is not a change");
+    let (_, settings) = admin.get("/api/admin/settings").await;
+    assert_eq!(settings["max_task_seconds"], json!(1800), "{settings}");
+
+    let files = files(&db).await;
+    let job = api_games_job(&admin, &files).await;
+    let (status, body) = admin.put("/api/admin/jobs/allocations", json!({ "allocations": [{ "job_id": job, "allocation": 50 }] })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, assignment) = claim(&admin.app, &[], "1.0.0", &[]).await;
+    assert_eq!(status, StatusCode::OK, "{assignment}");
+    assert_eq!(assignment["max_task_seconds"], json!(1800), "{assignment}");
+}
+
+/// A-ADMIN-31: a games or pairs job states how MAGPIE spends its threads,
+/// `igp` unless the request says `pgp`, and refuses anything else on the
+/// field. Its tasks carry it (`threading_mode` on the request), and its
+/// settings show it; the assignment names the job.
+#[tokio::test]
+async fn a_games_jobs_threading_mode_is_on_its_settings_and_every_task() {
+    let db = TestDb::new().await;
+    let admin = Admin::new(&db).await;
+    let files = files(&db).await;
+    let player = created_config(&admin, static_config("mirror", &files)).await;
+
+    let mut refused = games_job_body(&files, &player["id"], &player["id"]);
+    refused["threading_mode"] = json!("both");
+    let (status, body) = admin.post("/api/admin/jobs", refused).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["fields"][0]["field"], "threading_mode", "{body}");
+
+    let (status, games) = admin.post("/api/admin/jobs", games_job_body(&files, &player["id"], &player["id"])).await;
+    assert_eq!(status, StatusCode::CREATED, "{games}");
+    let games = games["jobs"][0]["id"].as_str().unwrap().to_string();
+    let (status, pairs) = admin
+        .post(
+            "/api/admin/jobs",
+            json!({
+                "name": "parallel mirror", "job_type": "game_pairs", "variant": "classic",
+                "letterdist_id": files.letterdist, "layout_id": files.layout,
+                "player_config_ids": [player["id"]], "max_pairs": 100, "threading_mode": "pgp",
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{pairs}");
+    let pairs = pairs["jobs"][0]["id"].as_str().unwrap().to_string();
+
+    for (job, mode) in [(&games, "igp"), (&pairs, "pgp")] {
+        let (status, config) = admin.get(&format!("/api/jobs/{job}/config")).await;
+        assert_eq!(status, StatusCode::OK, "{config}");
+        assert_eq!(config["games"]["threading_mode"], mode, "{config}");
+    }
+
+    let (status, body) = admin.put("/api/admin/jobs/allocations", json!({ "allocations": [{ "job_id": pairs, "allocation": 50 }] })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, assignment) = claim(&admin.app, &[], "1.0.0", &[]).await;
+    assert_eq!(status, StatusCode::OK, "{assignment}");
+    assert_eq!(assignment["job_id"], json!(pairs), "{assignment}");
+    assert_eq!(assignment["job_name"], "parallel mirror", "{assignment}");
+    assert_eq!(assignment["task_request"]["threading_mode"], "pgp", "{assignment}");
+}

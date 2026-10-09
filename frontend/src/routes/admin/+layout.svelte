@@ -14,6 +14,7 @@
     { href: '/admin/workers', label: 'Bans' },
     { href: '/admin/derived-data', label: 'Derived data' },
     { href: '/admin/backups', label: 'Backups' },
+    { href: '/admin/settings', label: 'Settings' },
     { href: '/admin/audit-log', label: 'Audit log' }
   ];
 

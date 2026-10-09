@@ -39,6 +39,32 @@ pub struct TaskClaim {
     /// The wordmap and rack info table hashes this job's tasks must reproduce.
     /// Empty for a job whose players ask for neither.
     pub derived_data: std::sync::Arc<Vec<crate::derived::ExpectedDerived>>,
+    /// What the worker calls the job when it says what it is running: its
+    /// name, or for a job created without one its type and the start of its
+    /// id. Never empty.
+    pub job_name: String,
+    /// How long the worker may run the task: `settings.max_task_seconds` as it
+    /// stood when this claim was made, from which the claim's deadline was
+    /// set. A worker that reaches it stops and declines `time_limit`.
+    pub max_task_seconds: i32,
+}
+
+/// How long past its deadline a claim still stands: what a worker that stopped
+/// at the limit has to say so in, or to land a result it finished just
+/// before it. Past it the claim lapses, heartbeats or not
+/// ([`reclaim_expired_for`]), and its result is refused
+/// (`routes::worker::submit_result`).
+pub const DEADLINE_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// [`TaskClaim::job_name`].
+fn job_name_for_worker(job: &Job) -> String {
+    let name = job.name.trim();
+    if name.is_empty() {
+        let id = job.id.simple().to_string();
+        format!("{} job {}", job.job_type.as_str(), &id[..8])
+    } else {
+        name.to_string()
+    }
 }
 
 /// The four answers a claim can get. One decision, not four checks: `204` and
@@ -430,6 +456,13 @@ async fn shutdown_or_idle(
 /// process. Each timed-out claim flips to `abandoned`, the task's
 /// `active_claim_count` drops, and the task returns to `available`.
 ///
+/// A claim has timed out when no heartbeat has come for `timeout_secs`, or
+/// when it is past its deadline (`task_claims.deadline_at`) and
+/// [`DEADLINE_GRACE`] -- however recently it heartbeat. A worker that honours
+/// the limit has declined such a claim by then; one that does not (an older
+/// build, a hung solve still heartbeating) would otherwise hold the task's
+/// one slot for as long as it ran.
+///
 /// Safe against a submission for the same claim racing it: the submit path
 /// holds the claim row locked from its lookup to its commit, and this
 /// statement skips a locked claim rather than waiting on it, so a claim is
@@ -469,7 +502,8 @@ pub async fn reclaim_expired_for(
              JOIN tasks t ON t.id = c.task_id
              WHERE t.job_id = ANY($1)
                AND c.state = 'claimed'
-               AND COALESCE(c.last_heartbeat_at, c.claimed_at) < now() - make_interval(secs => $2)
+               AND (COALESCE(c.last_heartbeat_at, c.claimed_at) < now() - make_interval(secs => $2)
+                    OR c.deadline_at < now() - make_interval(secs => $3))
              FOR UPDATE OF c SKIP LOCKED
          ),
          expired AS (
@@ -497,6 +531,7 @@ pub async fn reclaim_expired_for(
     )
     .bind(job_ids)
     .bind(timeout_secs)
+    .bind(DEADLINE_GRACE.as_secs_f64())
     .execute(pool)
     .await?;
 
@@ -523,6 +558,13 @@ pub async fn reclaim_expired_for(
 /// chance to speak as any other and is reclaimed as before. What this costs is
 /// that a claim whose worker really did die during the outage is handed out
 /// again up to one timeout later than it might have been.
+///
+/// Deadlines wait out the same grace, for the same reason: a worker that
+/// finished its task during the outage has been retrying the submission it
+/// could not land, and lapsing its claim at the first request after the
+/// restart refused a result computed inside the limit. The submission path
+/// asks [`deadlines_enforced`] before refusing one past its deadline, so a
+/// claim the sweep would spare is not refused there either.
 pub async fn reclaim_lapsed(state: &AppState, job_ids: &[Uuid]) -> AppResult<u64> {
     if std::time::Instant::now() < state.reclaim_from {
         return Ok(0);
@@ -535,6 +577,17 @@ pub async fn reclaim_lapsed(state: &AppState, job_ids: &[Uuid]) -> AppResult<u64
         return Ok(0);
     }
     reclaim_expired_for(&state.pool, &job_ids, state.cfg.heartbeat_timeout.as_secs_f64()).await
+}
+
+/// Whether a claim of `job_id` past its deadline and [`DEADLINE_GRACE`] is
+/// lapsed now: what [`reclaim_lapsed`] would decide, asked by a submission.
+/// Not while this process is in its startup grace, nor while the job's claims
+/// are in the grace after a hold let go of them -- each time the worker could
+/// not reach the claim (an outage, a purge's `503`s), and its result is as
+/// late as the server made it.
+pub fn deadlines_enforced(state: &AppState, job_id: Uuid) -> bool {
+    std::time::Instant::now() >= state.reclaim_from
+        && !state.dispatch_holds.reclaimable(&[job_id]).is_empty()
 }
 
 /// Walk the candidate jobs in deficit order and hand out the first available
@@ -1109,7 +1162,7 @@ async fn try_claim_from_job(
                     let _ = tx.rollback().await;
                     Ok(None)
                 }
-                Ok(Some(claim_token)) => {
+                Ok(Some((claim_token, max_task_seconds))) => {
                     tx.commit().await.map_err(|e| JobClaimError::Fatal(e.into()))?;
                     request_tail_merge(state, job, &template, &request, created);
                     Ok(Some(TaskClaim {
@@ -1122,6 +1175,8 @@ async fn try_claim_from_job(
                         // dispatch lock and the job's row lock on every claim.
                         expected_data: template.expected.clone(),
                         derived_data: derived,
+                        job_name: job_name_for_worker(job),
+                        max_task_seconds,
                     }))
                 }
                 // Including a unique violation. The task was selected while
@@ -1177,7 +1232,8 @@ fn request_tail_merge(
     });
 }
 
-/// Everything a claim writes, inside the claim transaction.
+/// Everything a claim writes, inside the claim transaction: the claim's token
+/// and the task's time limit in seconds.
 ///
 /// `None` when the job is no longer active by the time the claim reaches its
 /// row; the caller rolls everything back.
@@ -1189,7 +1245,7 @@ async fn issue_claim(
     task_id: Uuid,
     task_created: bool,
     standing: Standing,
-) -> AppResult<Option<Uuid>> {
+) -> AppResult<Option<(Uuid, i32)>> {
     // A worker that arrived with no identity becomes a real one only now,
     // when there is a task to attach it to and a response body to return its
     // UUID in.
@@ -1201,11 +1257,17 @@ async fn issue_claim(
     }
 
     let claim_token = Uuid::new_v4();
-    sqlx::query(
+    // The deadline is set from the limit as it stands now, in the statement
+    // that writes the claim, and the limit read back from it is the one the
+    // assignment states: the two cannot disagree, whatever an admin changes
+    // meanwhile. A change applies to the claims made after it.
+    let max_task_seconds: i32 = sqlx::query_scalar(
         "INSERT INTO task_claims
              (task_id, job_id, claim_token, claimed_by_user_id, claimed_by_anon_uuid,
-              magpie_version)
-         VALUES ($1, $6, $2, $3, $4, $5)",
+              magpie_version, deadline_at)
+         SELECT $1, $6, $2, $3, $4, $5, now() + make_interval(secs => s.max_task_seconds)
+         FROM settings s
+         RETURNING EXTRACT(EPOCH FROM deadline_at - claimed_at)::int",
     )
     .bind(task_id)
     .bind(claim_token)
@@ -1213,7 +1275,7 @@ async fn issue_claim(
     .bind(identity.anon_uuid())
     .bind(caps.magpie_version.to_string())
     .bind(job.id)
-    .execute(&mut **tx)
+    .fetch_one(&mut **tx)
     .await?;
 
     sqlx::query(
@@ -1293,7 +1355,7 @@ async fn issue_claim(
     .rows_affected()
         > 0;
 
-    Ok(still_active.then_some(claim_token))
+    Ok(still_active.then_some((claim_token, max_task_seconds)))
 }
 
 /// What a claim needs to keep its job's ratio level with the others: see
