@@ -29,6 +29,9 @@ pub struct JobStats {
     pub tasks_completed: i64,
     pub tasks_available: i64,
     pub tasks_claimed: i64,
+    /// The move generations the job's accepted claims reported: the work done
+    /// for it, whatever the machines (`jobs.movegens`).
+    pub movegens: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub games: Option<GameStats>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -532,6 +535,7 @@ async fn compute_inner(conn: &mut PgConnection, job: &Job) -> AppResult<JobStats
         tasks_completed,
         tasks_available: counts.get("available"),
         tasks_claimed: counts.get("claimed"),
+        movegens: job.movegens,
         games,
         opening_racks,
         leave_generation,

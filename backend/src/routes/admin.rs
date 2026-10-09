@@ -3201,11 +3201,13 @@ struct PurgeResult {
 /// What each identity earned on this job, to be given back when its claims
 /// are destroyed.
 ///
-/// The counters on `jobs` belong to the job, so a purge simply zeroes them. The
-/// ones on `users` and `anonymous_workers` do not: they span every job an
-/// identity ever worked on, so a job whose claims are about to disappear has to
-/// hand back exactly what it contributed, or the contributor lists read high
-/// for good and nothing says why. Must be read *before* the claims go, since it
+/// The counters on `jobs` belong to the job, so a purge simply zeroes them --
+/// its `movegens` with the rest, which is this same sum over every identity --
+/// and a delete takes them with the row. The ones on `users` and
+/// `anonymous_workers` do not: they span every job an identity ever worked on,
+/// so a job whose claims are about to disappear has to hand back exactly what
+/// it contributed, or the contributor lists read high for good and nothing
+/// says why. Must be read *before* the claims go, since it
 /// counts them; and it is exact up to the commit, because the caller holds the
 /// job's dispatch lock and every open claim (`lock_open_claims`), so no claim
 /// of the job can complete in between.
@@ -3502,7 +3504,8 @@ async fn purge_body(
     sqlx::query(
         "UPDATE jobs SET claims_issued = 0, games_completed = 0, racks_analyzed = 0,
                          racks_settled = 0, racks_without_consensus = 0,
-                         tasks_total = 0, tasks_completed = 0, last_completed_at = NULL,
+                         tasks_total = 0, tasks_completed = 0, movegens = 0,
+                         last_completed_at = NULL,
                          test_decided_status = NULL, test_decided_lower = NULL,
                          test_decided_upper = NULL, test_decided_units = NULL,
                          time_limit_declines = 0, time_limit_streak = 0, set_aside_reason = NULL,

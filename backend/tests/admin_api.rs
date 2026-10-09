@@ -612,6 +612,13 @@ async fn purging_and_deleting_a_job_give_back_what_it_earned() {
         let (tasks, compute_ms, movegens) = contributed().await;
         assert_eq!((tasks, movegens), (1, 1000), "the worker's task is on its counters");
         assert!(compute_ms >= 60_000, "and the minute it was held: {compute_ms} ms");
+        let jobs_movegens = || async {
+            sqlx::query_scalar::<_, i64>("SELECT COALESCE(SUM(movegens), 0)::bigint FROM jobs")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap()
+        };
+        assert_eq!(jobs_movegens().await, 1000, "and on the job's, credited beside them");
 
         let (status, body) = match destroy {
             "purge" => {
@@ -630,6 +637,7 @@ async fn purging_and_deleting_a_job_give_back_what_it_earned() {
             (0, 0, 0),
             "{destroy}: the claims are gone, so every counter of the contribution must be too"
         );
+        assert_eq!(jobs_movegens().await, 0, "{destroy}: the job's movegens with them");
     }
 }
 

@@ -44,7 +44,7 @@ test('E-1: an anonymous visitor browses the landing page, jobs, a job and the le
     await expect(page.getByTestId('job-status-context')).toContainText(/Paused|Finished/);
   }
   await expect(page.locator('.grid > .card > p:first-child')).toHaveText([
-    'Allocation', 'Tasks completed', 'Estimated time left'
+    'Allocation', 'Tasks completed', 'Movegens', 'Estimated time left'
   ]);
   // Anonymous workers are shown by pseudonym, never by the UUID that is
   // their credential.
@@ -56,13 +56,35 @@ test('E-1: an anonymous visitor browses the landing page, jobs, a job and the le
   await expect(page.getByRole('heading', { name: 'Contributors' })).toBeVisible();
   const leaders = page.locator('tbody tr');
   await expect(leaders.first()).toContainText(/Anonymous · [0-9a-f]{16}/);
+  // The site's movegens by job type above the list, every type listed.
+  const site = page.getByTestId('site-movegens');
+  await expect(site.locator('dt')).toHaveText([
+    'Opening Rack Analysis', 'Games', 'Game Pairs', 'Leave Generation'
+  ]);
+  // The seeded pairs job has results, so its type has movegens.
+  await expect(site.locator('dd').nth(2)).toHaveText(/^[1-9][\d,]*$/);
+  // A contributor's own, under their row when their name is chosen, and
+  // folded away again.
+  const first = leaders.first().getByRole('button');
+  await expect(first).toHaveAttribute('aria-expanded', 'false');
+  await first.click();
+  await expect(first).toHaveAttribute('aria-expanded', 'true');
+  const breakdown = page.getByTestId('contributor-movegens');
+  await expect(breakdown.locator('dt')).toHaveText([
+    'Opening Rack Analysis', 'Games', 'Game Pairs', 'Leave Generation'
+  ]);
+  // Whichever jobs it worked on, it did some work.
+  await expect(breakdown.locator('dd').filter({ hasText: /^[1-9][\d,]*$/ }).first()).toBeVisible();
+  await first.click();
+  await expect(breakdown).toHaveCount(0);
   // Ranked by movegens unless another column is chosen.
   await expect(page.getByRole('columnheader', { name: 'Movegens' })).toHaveAttribute(
     'aria-sort',
     'descending'
   );
   // Chosen: tasks completed, most first -- once the reordered page is in.
-  await page.getByRole('button', { name: 'Tasks' }).click();
+  // Exactly: a contributor's name is a button too.
+  await page.getByRole('button', { name: 'Tasks', exact: true }).click();
   await expect(page.getByRole('columnheader', { name: 'Tasks' })).toHaveAttribute('aria-sort', 'descending');
   const counts = async () =>
     (await leaders.locator('td[data-column="tasks"]').allInnerTexts()).map((text) =>

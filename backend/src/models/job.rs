@@ -102,6 +102,10 @@ pub struct Job {
     /// their most analyses without a consensus.
     pub racks_settled: i64,
     pub racks_without_consensus: i64,
+    /// The move generations the job's accepted claims reported, added in the
+    /// submit transaction beside its contributors' own totals: the job page's
+    /// figure, and summed by type, the Contributors page's.
+    pub movegens: i64,
     pub created_at: DateTime<Utc>,
     /// When the job last joined the jobs on offer: its activation, or its
     /// first claim after a spell unserved. The scheduler settles a job for

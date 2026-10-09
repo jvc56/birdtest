@@ -153,6 +153,7 @@ incidentally by higher tiers.
 | `lib/ratingPool.ts` | 1F | Covered (`F-RATE-*`) |
 | `lib/importWatch.ts`, `lib/poller.ts` | 1F | Covered (`F-IMPORT-*`, `F-POLL-*`) |
 | `lib/roundRobin.ts` | 1F | Covered (`F-RR-*`) |
+| `lib/movegens.ts` | 1F | Covered (`F-MOVEGENS-*`) |
 | Chart maths | 1F | Covered (`F-CHART-*`). The arithmetic moved out of the components into `lib/charts/*.ts` so it could be tested; the `.svelte` files that draw it are exercised only by tier 5 |
 | Every page under `routes/` | 5 | Partial — the eighteen journeys (E-10 visits `/users`). `/admin/backups`, `/admin/derived-data`, `/admin/fleet` and `/admin/users` are in none of them (`/admin/allocation` is E-4's); their endpoints are tier 3 |
 
@@ -976,6 +977,15 @@ Each entry's tests are the `describe` block named for its id.
   limit and names the cure ("3 tasks hit the time limit — lower the batch
   size"), "1 task" for one, and nothing while none has. *(Covered:
   `format.test.ts`.)*
+
+### `F-MOVEGENS-*` — `lib/movegens.ts`
+
+- `F-MOVEGENS-1` `movegensLines` lists a breakdown's four job types in one
+  order, labelled as the job list labels them, a type the answer leaves out
+  at 0. *(Covered: `movegens.test.ts`.)*
+- `F-MOVEGENS-2` `contributorKey` names an account by its id and an anonymous
+  worker by its pseudonym, escaped for the path, and nobody for a row with
+  neither. *(Covered: `movegens.test.ts`.)*
 
 ### `F-RR-*` — `lib/roundRobin.ts`
 
@@ -3561,6 +3571,19 @@ below.
   `public_api::tied_jobs_and_users_are_each_listed_exactly_once`,
   `worker_api::public_endpoints_name_anonymous_workers_by_pseudonym_only`; tied
   contributors were duplicated and skipped across pages.)*
+- `A-PUBLIC-7a` Movegens by job type: each accepted claim's movegens are
+  credited to its job (`jobs.movegens`, the job page's `movegens`) beside its
+  contributor; `GET /api/workers/movegens` is the jobs' totals by type, every
+  type present; a contributor's breakdown (`/api/workers/user/:id/movegens`,
+  `/api/workers/anon/:anon_id/movegens`) is their claims' by type; and both
+  add up to the contributor list's column, before and after a purge or a
+  delete takes a job's out of all three. Only a contributor the list shows is
+  answered -- an anonymous one by pseudonym, never by its UUID -- and anyone
+  else is a `404`. The breakdown is an index-only walk of the contributor's
+  own index. *(Covered: `public_api::movegens_are_broken_down_by_job_type`,
+  `public_api::a_contributors_breakdown_reads_only_their_index`,
+  `public::tests::movegens_are_summed_into_their_own_type`,
+  `admin_api::purging_and_deleting_a_job_give_back_what_it_earned`.)*
 - `A-PUBLIC-8` **A NUL in what a caller sends is a `400`.** Postgres stores no
   NUL in text and refuses the statement (SQLSTATE `22021`, or `22P05` from
   JSON), which was a `500` and an error line: `?worker=%00` on a job's public
@@ -3857,8 +3880,10 @@ admin in once and the admin journeys reuse its storage state.
 - `E-1` An anonymous visitor browses the landing page, job list, a job detail
   page — its status on a row of its own, with no description beside an
   active status and "Paused …" or "Finished …" beside any other, then its
-  three headline cards (Allocation, Tasks completed, Estimated time left) — and the contributor
-  leaderboard, ranked by compute time and re-ranked by tasks at a click.
+  four headline cards (Allocation, Tasks completed, Movegens, Estimated time
+  left) — and the contributor leaderboard, ranked by movegens and re-ranked by
+  tasks at a click, with the site's movegens by job type above it and a
+  contributor's own under their row when their name is clicked.
   *(Covered:
   `e1-anonymous-browsing.spec.ts`.)*
 - `E-2` Register → confirm the email → log in → generate an API key → see it
@@ -3912,7 +3937,9 @@ admin in once and the admin journeys reuse its storage state.
   list a pseudonym), which the seed does not register; the contributors'
   list shows only its ranked column beside the name — movegens, then compute
   time once ranked by it through its "Rank by" row, since the other
-  columns' headers are not on a phone's screen.)* The screen is the device's width:
+  columns' headers are not on a phone's screen. The site's movegens by job
+  type and a contributor's breakdown, unfolded, at a BIGINT's widest each,
+  stay inside the screen and the ranking's box.)* The screen is the device's width:
   compared with `innerWidth`, as it was, the check could not fail, because a
   phone's browser widens its layout viewport to fit what overflows — and the
   header's links ran to 533 pixels on a 393-pixel screen, "Sign in" and

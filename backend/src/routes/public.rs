@@ -35,6 +35,9 @@ pub fn router() -> Router<AppState> {
         .route("/player-configs/:id", get(player_config))
         .route("/users", get(list_users))
         .route("/workers", get(list_workers))
+        .route("/workers/movegens", get(site_movegens))
+        .route("/workers/user/:id/movegens", get(user_movegens))
+        .route("/workers/anon/:anon_id/movegens", get(anon_movegens))
 }
 
 #[derive(Deserialize)]
@@ -873,23 +876,29 @@ async fn resolve_worker(state: &AppState, name: &str) -> AppResult<Option<Worker
     .fetch_optional(&state.read_pool)
     .await?;
 
-    let looks_like_a_pseudonym =
-        name.len() == 16 && name.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
-    let anon_uuid = if looks_like_a_pseudonym {
-        sqlx::query_scalar::<_, Uuid>(
-            "SELECT uuid FROM anonymous_workers
-             WHERE tasks_completed > 0
-               AND left(encode(sha256(convert_to(uuid::text, 'UTF8')), 'hex'), 16) = $1
-             LIMIT 1",
-        )
-        .bind(name)
-        .fetch_optional(&state.read_pool)
-        .await?
-    } else {
-        None
-    };
+    let anon_uuid = resolve_pseudonym(state, name).await?;
 
     Ok((user_id.is_some() || anon_uuid.is_some()).then_some(WorkerFilter { user_id, anon_uuid }))
+}
+
+/// The contributing anonymous worker whose pseudonym `name` is, if any: see
+/// [`resolve_worker`] for why among contributors only. Anything that is not
+/// sixteen lowercase hex characters names nobody, without a query.
+async fn resolve_pseudonym(state: &AppState, name: &str) -> AppResult<Option<Uuid>> {
+    let looks_like_a_pseudonym =
+        name.len() == 16 && name.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if !looks_like_a_pseudonym {
+        return Ok(None);
+    }
+    Ok(sqlx::query_scalar::<_, Uuid>(
+        "SELECT uuid FROM anonymous_workers
+         WHERE tasks_completed > 0
+           AND left(encode(sha256(convert_to(uuid::text, 'UTF8')), 'hex'), 16) = $1
+         LIMIT 1",
+    )
+    .bind(name)
+    .fetch_optional(&state.read_pool)
+    .await?)
 }
 
 /// A named contributor's completed claims in the job (`$1`), from the cursor's
@@ -2082,6 +2091,120 @@ async fn worker_page(
     }))
 }
 
+/// Move generations by the type of job they were done for: the whole site's
+/// (`/api/workers/movegens`), or one contributor's
+/// (`/api/workers/user/:id/movegens`, `/api/workers/anon/:anon_id/movegens`).
+/// Every type is always present, at 0 when nothing was done for it, so a page
+/// lists the four whatever the data.
+#[derive(Debug, Default, PartialEq, Serialize)]
+pub struct MovegensByType {
+    pub opening_rack: i64,
+    pub games: i64,
+    pub game_pairs: i64,
+    pub leave_generation: i64,
+}
+
+impl MovegensByType {
+    fn from_rows(rows: impl IntoIterator<Item = (JobType, i64)>) -> Self {
+        let mut by_type = MovegensByType::default();
+        for (job_type, movegens) in rows {
+            *match job_type {
+                JobType::OpeningRack => &mut by_type.opening_rack,
+                JobType::Games => &mut by_type.games,
+                JobType::GamePairs => &mut by_type.game_pairs,
+                JobType::LeaveGeneration => &mut by_type.leave_generation,
+            } += movegens;
+        }
+        by_type
+    }
+}
+
+/// The site's movegens by job type, from the jobs' own running totals
+/// (`jobs.movegens`): one row per job, whatever the claims number. They are
+/// credited in the transaction that credits each claim's contributor, and a
+/// purge or delete takes them away with what it gives the contributors back,
+/// so these sum to the contributor list's column -- which summing the claims
+/// would too, at a read of every claim the site ever completed per view of a
+/// page that refreshes itself.
+async fn site_movegens(State(state): State<AppState>) -> AppResult<Json<MovegensByType>> {
+    let rows = sqlx::query_as::<_, (JobType, i64)>(
+        "SELECT job_type, COALESCE(SUM(movegens), 0)::bigint FROM jobs GROUP BY job_type",
+    )
+    .fetch_all(&state.read_pool)
+    .await?;
+    Ok(Json(MovegensByType::from_rows(rows)))
+}
+
+/// One identity's movegens by job type, the identity in `$1`: its claims summed
+/// per job, through its own index (`task_claims_user_idx` / `_anon_idx`, which
+/// are ordered by job within the identity and carry each claim's `movegens`,
+/// so the walk reads no heap page it can skip), then the jobs -- one row each
+/// -- grouped by type. Public for the plan test, which holds it to that index.
+///
+/// No `state = 'completed'`: only a completed claim has movegens (the submit
+/// path writes them as it completes it), so every other one adds 0, and
+/// naming the state invites the fleet-wide `task_claims_completed_idx` (see
+/// `filtered_claims`). A purged or deleted job's claims are gone with it, so
+/// what it gave back to the contributor's total is out of this too.
+pub fn contributor_movegens_query(anonymous: bool) -> &'static str {
+    if anonymous {
+        "SELECT j.job_type, SUM(c.movegens)::bigint
+         FROM (SELECT job_id, SUM(movegens) AS movegens FROM task_claims
+               WHERE claimed_by_anon_uuid = $1 GROUP BY job_id) c
+         JOIN jobs j ON j.id = c.job_id
+         GROUP BY j.job_type"
+    } else {
+        "SELECT j.job_type, SUM(c.movegens)::bigint
+         FROM (SELECT job_id, SUM(movegens) AS movegens FROM task_claims
+               WHERE claimed_by_user_id = $1 GROUP BY job_id) c
+         JOIN jobs j ON j.id = c.job_id
+         GROUP BY j.job_type"
+    }
+}
+
+async fn contributor_movegens(
+    state: &AppState,
+    identity: Uuid,
+    anonymous: bool,
+) -> AppResult<Json<MovegensByType>> {
+    let rows = sqlx::query_as::<_, (JobType, i64)>(contributor_movegens_query(anonymous))
+        .bind(identity)
+        .fetch_all(&state.read_pool)
+        .await?;
+    Ok(Json(MovegensByType::from_rows(rows)))
+}
+
+/// A contributing account's breakdown, by the `user_id` the contributor list
+/// gives it -- a deleted one's too, which the list shows under its tombstone.
+/// Anyone else is `404`: the list's rows are what this answers for.
+async fn user_movegens(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<MovegensByType>> {
+    let contributes: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users WHERE id = $1 AND tasks_completed > 0)")
+            .bind(id)
+            .fetch_one(&state.read_pool)
+            .await?;
+    if !contributes {
+        return Err(AppError::not_found("no such contributor"));
+    }
+    contributor_movegens(&state, id, false).await
+}
+
+/// A contributing anonymous worker's breakdown, by the pseudonym the
+/// contributor list shows (`anon_id`): never by its UUID, which is its
+/// credential and which no public route takes or gives.
+async fn anon_movegens(
+    State(state): State<AppState>,
+    Path(anon_id): Path<String>,
+) -> AppResult<Json<MovegensByType>> {
+    let Some(uuid) = resolve_pseudonym(&state, &anon_id).await? else {
+        return Err(AppError::not_found("no such contributor"));
+    };
+    contributor_movegens(&state, uuid, true).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2117,6 +2240,27 @@ mod tests {
         assert_eq!(merged.matches("LIMIT $6").count(), 1, "the merge's own; each page brings one");
         assert!(merged.contains(") UNION ALL ("), "{merged}");
         assert_eq!(merged_pages(std::iter::once("SELECT 1".to_string()), "x"), "(SELECT 1)");
+    }
+
+    /// A-PUBLIC-7a: every job type has its own figure, present at 0 when
+    /// nothing was done for it, and rows of one type add up.
+    #[test]
+    fn movegens_are_summed_into_their_own_type() {
+        assert_eq!(
+            serde_json::to_value(MovegensByType::from_rows([])).unwrap(),
+            serde_json::json!({ "opening_rack": 0, "games": 0, "game_pairs": 0, "leave_generation": 0 })
+        );
+        let rows = [
+            (JobType::GamePairs, 5),
+            (JobType::LeaveGeneration, 7),
+            (JobType::GamePairs, 11),
+            (JobType::OpeningRack, 13),
+            (JobType::Games, 17),
+        ];
+        assert_eq!(
+            MovegensByType::from_rows(rows),
+            MovegensByType { opening_rack: 13, games: 17, game_pairs: 16, leave_generation: 7 }
+        );
     }
 
     /// A-PUBLIC-6b: past the cap a stream is a 503 with `Retry-After`, and a

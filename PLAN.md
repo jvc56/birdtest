@@ -1113,6 +1113,7 @@ JobStats {
   job:               { id, name, job_type, status, allocation,
                        min_magpie_version, created_at, created_by, lexicon, variant }
   tasks_total, tasks_completed, tasks_available, tasks_claimed
+  movegens           // jobs.movegens: every accepted claim's, summed
   games?:            { unit: "game" | "pair", wins, losses, draws,
                        units_completed, pentanomial?, divergent_pairs?,
                        divergent?: { wins, losses, draws, p1_score_mean, p2_score_mean,
@@ -1194,6 +1195,24 @@ said little about the work, and a games batch of deep sims counted the same as
 one of static play.) Each order is its own pair of partial indexes, one per
 kind of identity, so every order is two index scans merged, as the list always
 was.
+
+**Movegens by job type.** The job keeps a running `jobs.movegens` too, added in
+the same `UPDATE jobs` every accepted submission already makes (last, after
+the claim, the task and the contributor's row -- so no new lock and no new
+lock order: the statement takes the job's row whatever it adds). It is the
+job page's fourth headline figure, and summed by `job_type` over the jobs --
+one row per job, whatever the claims number -- the Contributors page's
+"Movegens by job type" (`GET /api/workers/movegens`). A purge zeroes it with
+the other job counters and a delete takes the row, exactly as each gives the
+same claims' movegens back from the contributors, so the jobs' totals and the
+contributors' always add up to the same figure. One contributor's breakdown
+(`GET /api/workers/user/:id/movegens`, `/api/workers/anon/:anon_id/movegens`,
+fetched when their row is unfolded and with each refresh while it is) sums
+their claims per job and groups the jobs by type: an index-only walk of their
+range of `task_claims_user_idx` / `_anon_idx`, which `INCLUDE (movegens)` for
+it, costing their own claim count and nothing else's. Only an account or a
+pseudonym the list shows is answered (a `404` otherwise), and an anonymous
+worker by its pseudonym only, as everywhere public.
 
 With the two opening-rack aggregates removed, `opening_racks` is now those two
 counters and nothing else: two single-row reads, constant time at any job size.
@@ -5936,6 +5955,9 @@ do not exist.
 | `GET` | `/api/jobs/:id/stream` | SSE stream of live stat updates for a job. Pushes an event after accepted results, coalesced to at most one per `JOB_STATS_CACHE_SECONDS` (an admin's change, a completion or a generation closing at once). |
 | `GET` | `/api/users` | List all registered user accounts with contribution stats. Paginated. |
 | `GET` | `/api/workers` | Contributor stats for all workers (anonymous and authenticated) — movegens, compute time, tasks and the last result — paginated, ranked by movegens or by `?sort=movegens\|compute\|tasks`. |
+| `GET` | `/api/workers/movegens` | The site's movegens by job type, `{opening_rack, games, game_pairs, leave_generation}`, every type present: the jobs' running totals (`jobs.movegens`) summed, which add up to the contributor list's column. |
+| `GET` | `/api/workers/user/:id/movegens` | One contributing account's movegens by job type, same shape, from its claims; a deleted account under its tombstone too. `404` for an account that is not on the contributor list. |
+| `GET` | `/api/workers/anon/:anon_id/movegens` | The same for a contributing anonymous worker, by its pseudonym (never its UUID). `404` for a pseudonym of nobody on the list. |
 | `GET` | `/api/rating-pools` | Rating pools with their conditions, member counts and last fit time. |
 | `GET` | `/api/rating-pools/:id` | One pool: its members now (`members`: config id and name, the anchor among them) and its latest fit, with run provenance, each rated config's rating with uncertainty, and the cross table (`head_to_heads`: every head-to-head from both sides, each with its pairs, win score, standard error, average spread and the score the ratings predict). The two sets can differ: a member added since the fit (or whose refit failed) has no rating yet, and one removed since is still rated. |
 | `GET` | `/api/rating-pools/:id/history` | Stored runs' ratings, oldest first, thinned to at most 500 runs evenly spaced over the pool's history, for the six current members rated highest in the newest run. No page draws it now. |
@@ -6883,6 +6905,11 @@ CREATE TABLE jobs (
     -- partial restore recomputes them (RUNBOOK 2.3).
     tasks_total     BIGINT NOT NULL DEFAULT 0 CHECK (tasks_total >= 0),
     tasks_completed BIGINT NOT NULL DEFAULT 0 CHECK (tasks_completed >= 0),
+    -- The move generations the job's accepted claims reported, added in the
+    -- same submission and `UPDATE jobs` that credit the claim's contributor;
+    -- a purge zeroes it and a delete takes it, as each gives the contributors
+    -- theirs back. A partial restore recomputes it (RUNBOOK 2.3).
+    movegens        BIGINT NOT NULL DEFAULT 0 CHECK (movegens >= 0),
     -- When a result was last accepted for the job, to the minute (the
     -- submission that stores one sets it at most once a minute). The job
     -- list's `stalled` flag asks "none in a day"; answered from the claims, it
@@ -8209,10 +8236,12 @@ CREATE INDEX        task_claims_completed_idx ON task_claims (completed_at DESC)
 -- column. The completion time adds nothing to a claim's updates: completing
 -- one changes `state`, which the open-claims index's predicate reads, so that
 -- update was never a HOT one, and a heartbeat touches neither.
+-- Each carries the claim's `movegens`, so a contributor's work by job type is
+-- an index-only walk of their range (`GET /api/workers/*/:id/movegens`).
 CREATE INDEX        task_claims_user_idx      ON task_claims (claimed_by_user_id, job_id, completed_at)
-    WHERE claimed_by_user_id IS NOT NULL;
+    INCLUDE (movegens) WHERE claimed_by_user_id IS NOT NULL;
 CREATE INDEX        task_claims_anon_idx      ON task_claims (claimed_by_anon_uuid, job_id, completed_at)
-    WHERE claimed_by_anon_uuid IS NOT NULL;
+    INCLUDE (movegens) WHERE claimed_by_anon_uuid IS NOT NULL;
 -- There is no (job_id, state) index. The job-scoped reads of `tasks` -- the
 -- detail page's counts by state, the census -- are served by
 -- `tasks_seed_unique_idx (job_id, seed)` and the heap. The opening-rack finish

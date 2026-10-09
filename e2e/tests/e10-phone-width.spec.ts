@@ -79,10 +79,10 @@ test('E-10: a visitor on a phone reads the job list, a job page and the rankings
   await expect(page.getByRole('heading', { name: 'Significance Test' })).toBeVisible();
   await expectNoSidewaysScroll(page);
 
-  // The three headline figures stack in one column rather than squeezing
-  // three across: each is as wide as the one above it and sits below it.
+  // The four headline figures stack in one column rather than squeezing
+  // across: each is as wide as the one above it and sits below it.
   const cards = page.locator('.grid > .card');
-  await expect(cards).toHaveCount(3);
+  await expect(cards).toHaveCount(4);
   const boxes = await Promise.all((await cards.all()).map((card) => card.boundingBox()));
   for (let i = 1; i < boxes.length; i++) {
     expect(boxes[i]!.x).toBeCloseTo(boxes[0]!.x, 0);
@@ -145,8 +145,8 @@ test('E-10: a visitor on a phone reads the job list, a job page and the rankings
       json: {
         items: [
           // Longer than any fleet will run: every column at its widest.
-          { user_id: null, username: LONGEST, anon_id: null, compute_seconds: 9.9e10,
-            movegens: 9.2e18, tasks_completed: 123456789012, last_seen_at: now },
+          { user_id: '00000000-0000-4000-8000-000000000001', username: LONGEST, anon_id: null,
+            compute_seconds: 9.9e10, movegens: 9.2e18, tasks_completed: 123456789012, last_seen_at: now },
           { user_id: null, username: TOMBSTONE, anon_id: null, compute_seconds: 1,
             movegens: 1, tasks_completed: 1, last_seen_at: now },
           { user_id: null, username: null, anon_id: 'f'.repeat(16), compute_seconds: 1,
@@ -171,11 +171,26 @@ test('E-10: a visitor on a phone reads the job list, a job page and the rankings
       }
     })
   );
+  // Every type at a BIGINT's widest, the site's and the contributor's.
+  const widest = { opening_rack: 9.2e18, games: 9.2e18, game_pairs: 9.2e18, leave_generation: 9.2e18 };
+  await page.route(/\/api\/workers\/(user\/[^/]+\/)?movegens$/, (route) => route.fulfill({ json: widest }));
   await page.reload();
   await expect(page.getByRole('cell', { name: LONGEST })).toBeVisible();
+  await expect(page.getByTestId('site-movegens').locator('dd').first()).toHaveText('9,200,000,000,000,000,000');
   await expectNoSidewaysScroll(page);
   await expectTableFits(page);
   await expect(page.getByRole('columnheader', { name: 'Movegens' })).toBeInViewport();
+  // A contributor's movegens by job type open under their row, inside the
+  // ranking's box, and the page still does not scroll sideways.
+  await page.getByRole('button', { name: LONGEST }).tap();
+  const breakdown = page.getByTestId('contributor-movegens');
+  await expect(breakdown.locator('dd')).toHaveText(Array(4).fill('9,200,000,000,000,000,000'));
+  await expectNoSidewaysScroll(page);
+  await expectTableFits(page);
+  for (const line of await breakdown.locator('dd').all()) {
+    const box = (await line.boundingBox())!;
+    expect(box.x + box.width).toBeLessThanOrEqual(page.viewportSize()!.width);
+  }
   // Ranked by another column, that column is the one shown beside the name.
   await page.getByRole('button', { name: 'Compute time' }).tap();
   await expect(page.getByRole('columnheader', { name: 'Compute time' })).toHaveAttribute('aria-sort', 'descending');

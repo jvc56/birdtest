@@ -154,8 +154,9 @@ Open "dev game pairs (first divergences saved)".
   Significance Test card)." Set aside by the server, its reason instead, A-17;
   and under it, once any of its tasks has hit the time limit, "N tasks hit the
   time limit — lower the batch size.")
-- [ ] **Expect** under it three cards in a row: Allocation, Tasks completed and
-  Estimated time left.
+- [ ] **Expect** under it four cards, in a row on a wide screen and two by two
+  on a narrower one: Allocation, Tasks completed, Movegens (to the last digit,
+  "1,234,567") and Estimated time left. Movegens rise with Tasks completed.
 - [ ] **Expect** a Progress card: a bar of "pairs completed", then **Tasks**
   with Waiting to be reissued / In progress / Done counts and no explanation
   under them; then "Created by dev, <date>" and "requires MAGPIE ≥ …".
@@ -427,13 +428,24 @@ Open "dev game pairs (first divergences saved)".
   each with its movegens to the last digit ("1,234,567"), its compute time
   to the second in every unit it has ("2m 13s", "5h 20m 13s", "3d 4h 5m 6s";
   the hours on hover), tasks and last result.
-- [ ] **Do** leave the page open while the workers run. **Expect** the counts
-  to rise by themselves every 30 seconds, on the page and in the order chosen.
+- [ ] **Expect** above the list a "Movegens by job type" card: Opening Rack
+  Analysis, Games, Game Pairs and Leave Generation, each to the last digit, 0
+  for a type nothing has run for. Together they are the list's movegens
+  column summed.
+- [ ] **Do** click a contributor's name. **Expect** a ▸ that turns ▾ and,
+  under the row, their movegens for each of the four job types, adding up to
+  the row's movegens. **Do** click it again. **Expect** it folded away.
+- [ ] **Do** leave the page open, a contributor's row unfolded, while the
+  workers run. **Expect** the counts -- the job-type totals, the rows and the
+  unfolded breakdown -- to rise by themselves every 30 seconds, on the page and
+  in the order chosen, and the row to stay unfolded.
 - [ ] **Do** click **Compute time**, then **Tasks**. **Expect** the list
   re-ranked by each, most first, the arrow moving with it; still all four.
-- [ ] At phone width, **expect** a "Rank by" row of the four columns above the
-  list and only the ranked column beside the name. **Do** choose **Games**.
-  **Expect** the games column in its place, and no sideways scroll.
+- [ ] At phone width, **expect** the job-type totals one to a line, a "Rank by"
+  row of the three columns above the list and only the ranked column beside
+  the name. **Do** choose **Tasks**, and unfold a contributor. **Expect** the
+  tasks column in its place, the breakdown under the row, and no sideways
+  scroll.
 
 ### U-1 Register
 
