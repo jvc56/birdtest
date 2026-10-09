@@ -10026,8 +10026,6 @@ says so in its implemented option, rather than being removed.
     tree, so nothing ties a pushed image to a commit CI passed.
   - The dev compose file publishes Postgres, MinIO and the backend on every
     interface, with committed credentials.
-  - The pages are served uncompressed (nginx's gzip is off; the bundle is
-    about 524 KB).
   - The task roles' trust policies carry no `aws:SourceAccount` or
     `aws:SourceArn` condition, which AWS recommends for Scheduler and S3; the
     derived-file builder is given `SESSION_SIGNING_KEY` only because the

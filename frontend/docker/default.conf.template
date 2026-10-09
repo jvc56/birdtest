@@ -16,6 +16,20 @@ server {
     # reverse.
     keepalive_timeout 310s;
 
+    # The build's JavaScript, CSS, SVG and JSON go out compressed -- deployed
+    # this Nginx serves every page and asset, and the app's chunks are most of
+    # a first visit's bytes -- and so does the HTML, which gzip always takes.
+    # Not what is proxied: the API compresses its own JSON and NDJSON
+    # (backend/src/lib.rs), as it must where the ALB sends /api/ straight to
+    # it, and leaves its event stream alone, whose events gzip would hold back
+    # until its buffer filled. `gzip off` below says so for /api/.
+    gzip on;
+    gzip_types text/css application/javascript text/javascript image/svg+xml application/json
+               application/manifest+json;
+    # The ALB may add a Via header; compressed all the same.
+    gzip_proxied any;
+    gzip_vary on;
+
     # In production the ALB splits /api off to the backend target group. There
     # is no ALB in compose, so Nginx does the same routing itself — which also
     # keeps the app on a single origin, so the session cookie and the CSRF
@@ -53,16 +67,10 @@ server {
         # length and closed the connection, and a cut stream read as a
         # complete one (the audit's pass 21).
 
-        # The paginated results JSON and the results stream compress to a
-        # sixth or less: their long key names (`blended_utility`) are most of
-        # what gzip takes out. Only those two types -- never
-        # `text/event-stream`, whose events gzip would hold back until its
-        # buffer filled. A compressed stream is still chunked, so a cut one
-        # still shows. Any client, proxied or not.
-        gzip on;
-        gzip_types application/json application/x-ndjson;
-        gzip_proxied any;
-        gzip_vary on;
+        # The backend compresses what it answers here (its JSON and NDJSON,
+        # never its event stream), in compose as deployed; Nginx compressing
+        # too would be a second policy for the same bytes.
+        gzip off;
     }
 
     location /health {

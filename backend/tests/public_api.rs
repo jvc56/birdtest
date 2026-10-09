@@ -1919,3 +1919,47 @@ async fn a_cursor_older_than_postgres_can_hold_reads_as_the_first_page() {
         }
     }
 }
+
+/// A-PUBLIC-9: the API gzips its JSON for a client that asks -- deployed, the
+/// load balancer sends `/api/*` straight to the backend, past Nginx -- and
+/// sends it as it is to one that does not. Never the event stream, whose
+/// events gzip would hold back, and never an answer with no body.
+#[tokio::test]
+async fn the_api_compresses_its_json_and_never_its_event_stream() {
+    use std::io::Read;
+    let db = TestDb::new().await;
+    let job = db.games_job(2).await;
+    let app = birdtest::app(db.state().await);
+    let gzip = [("accept-encoding".to_string(), "gzip".to_string())];
+    let encoding = |response: &axum::response::Response| {
+        response.headers().get("content-encoding").map(|v| v.to_str().unwrap().to_string())
+    };
+
+    let response = app.clone().oneshot(get_request(&format!("/api/jobs/{job}"), &gzip)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(encoding(&response).as_deref(), Some("gzip"));
+    assert!(response.headers()["content-type"].to_str().unwrap().starts_with("application/json"));
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    let mut text = String::new();
+    flate2::read::GzDecoder::new(&bytes[..]).read_to_string(&mut text).unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(payload["job"]["id"], json!(job.to_string()), "{payload}");
+
+    let plain = app.clone().oneshot(get_request(&format!("/api/jobs/{job}"), &[])).await.unwrap();
+    assert_eq!(encoding(&plain), None, "not asked for");
+
+    let stream = app.clone().oneshot(get_request(&format!("/api/jobs/{job}/stream"), &gzip)).await.unwrap();
+    assert_eq!(stream.status(), StatusCode::OK);
+    assert_eq!(stream.headers()["content-type"], "text/event-stream");
+    assert_eq!(encoding(&stream), None, "the event stream is never compressed");
+
+    // An idle claim's `204`, with nothing to compress.
+    sqlx::query("UPDATE jobs SET status = 'inactive', allocation = 0").execute(&db.pool).await.unwrap();
+    let idle = app
+        .clone()
+        .oneshot(post_json("/api/worker/task", &[("accept-encoding", "gzip")], claim_body("1.0.0", &[])))
+        .await
+        .unwrap();
+    assert_eq!(idle.status(), StatusCode::NO_CONTENT);
+    assert_eq!(encoding(&idle), None);
+}

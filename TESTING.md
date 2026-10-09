@@ -1276,15 +1276,14 @@ server refuses. Each rule mirrors one in `routes/auth.rs`, with its wording.
   and a page request sent on one as it closed was answered 502. *(Covered:
   `nginxConfig.test.ts`; that it fails at 65 was checked by hand, and the
   template passes `nginx -t` in the image.)* (Thirty-third audit, pass 1.)
-- `F-NGINX-3` Nginx gzips what it proxies under `/api/` when it is
-  `application/json` or `application/x-ndjson` -- the paginated results and
-  the results stream, whose long key names gzip takes out -- and never
-  `text/event-stream`, whose events gzip would hold back; `gzip on` appears
-  once, in `location /api/`, so the pages are as they were. Deployed, the ALB
-  sends `/api/` straight to the backend, so this compresses the compose and
-  local stacks only. *(Covered: `nginxConfig.test.ts`; the template passes
-  `nginx -t` in the image, and a JSON and an NDJSON answer came back
-  `Content-Encoding: gzip` through it, an event stream not.)*
+- `F-NGINX-3` Nginx gzips what it serves -- the build's JavaScript, CSS, SVG
+  and JSON, and its HTML -- with `gzip on` once, for the whole server, and
+  never `text/event-stream` or every type; and `gzip off` once, in `location
+  /api/`, whose answers the backend compresses itself (`A-PUBLIC-9`): deployed,
+  the ALB sends `/api/` straight to the backend, so Nginx's compression of it
+  reached the local stacks only. *(Covered: `nginxConfig.test.ts`; the
+  template passes `nginx -t` in the image, and a script and the page came back
+  `Content-Encoding: gzip` through it.)*
 
 ## 2. Integration
 
@@ -3524,6 +3523,12 @@ below.
   results feed, a login name, a password-reset address. *(Covered:
   `public_api::a_nul_in_a_public_request_is_a_bad_request`; the mapping,
   `U-ERR-8`.)* (Thirty-third audit, pass 3.)
+- `A-PUBLIC-9` The API gzips its JSON for a client that sends
+  `Accept-Encoding: gzip` -- deployed, the ALB sends `/api/*` straight to the
+  backend, past Nginx -- and not for one that does not; never its event
+  stream (`text/event-stream`, whose events gzip would hold back), and never
+  an answer with no body (an idle claim's `204`, a redirect). *(Covered:
+  `public_api::the_api_compresses_its_json_and_never_its_event_stream`.)*
 
 ### `A-ACCOUNT-*` — `routes/account.rs`
 
