@@ -101,8 +101,9 @@ Use a signed-out window for the V journeys unless one says otherwise.
   a footer "birdtest — crowdsourced crossword game research".
 - [ ] **Do** click each nav link. **Expect** the current one highlighted, and
   no page erroring.
-- [ ] **Do** narrow the window to phone width. **Expect** the nav to wrap and no
-  page to scroll sideways.
+- [ ] **Do** narrow the window to phone width. **Expect** the header in two
+  rows -- **birdtest** with **Sign in** and **Register** on its right, then
+  the links -- and no page to scroll sideways.
 - [ ] **Expect** no **Admin** link unless signed in as an admin.
 
 ### V-2 The home page
@@ -113,14 +114,18 @@ Use a signed-out window for the V journeys unless one says otherwise.
   cards: name, status badge, "25% allocation". Clicking one opens its job page.
 - [ ] **Expect** after it a "Contribute" section (not a card, like "Active
   Jobs") of four numbered steps: **Install MAGPIE** (linking MAGPIE's
-  getting-started section), **Create a contribute.txt file** (a table of its
-  settings and each one's default -- `server` https://birdtest.org, `apikey`
-  none, `threads` every core but one, `maxtasks` 0, `idlewait` 5 -- and a
+  getting-started section), **(Optional) Create an account** (to contribute
+  under a username: make an API key and copy it for the next step; else
+  anonymously), **Create a contribute.txt file** (a table of its settings and
+  each one's default -- `server` https://birdtest.org, `apikey` none "(step
+  2)", `threads` every core but one, `maxtasks` 0, `idlewait` 5 -- and a
   sample. Here, off birdtest.org, the step is not optional and the sample is a
   `server` line with this site's own address; on birdtest.org the heading
-  starts "(Optional)" and the sample sets `threads`),
-  **(Optional) Create an account** (to contribute under a username, else
-  anonymously) and **Run the contribute command** (`./bin/magpie contribute`).
+  starts "(Optional)" and the sample sets `threads`) and **Run the contribute
+  command** (`./bin/magpie contribute`).
+- [ ] At phone width, **expect** the settings as a stacked list instead of a
+  table -- each name and its default on one line, what it is under them --
+  with nothing cut off at the screen's edge.
 - [ ] (With every job deactivated, A-8) **expect** the Active Jobs section gone
   rather than an error.
 

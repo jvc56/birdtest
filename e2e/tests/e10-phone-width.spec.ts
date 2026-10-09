@@ -28,7 +28,7 @@ async function expectNoSidewaysScroll(page: Page) {
 /**
  * A table's box is no wider than itself: the table wraps rather than scrolls,
  * so the column a list is ranked by stays in view. The page's first table
- * card unless given one.
+ * card unless given one -- or any box, a stacked list's.
  */
 async function expectTableFits(page: Page, box?: Locator) {
   const table = box ?? page.locator('.card', { has: page.locator('table') }).first();
@@ -52,6 +52,22 @@ test('E-10: a visitor on a phone reads the job list, a job page and the rankings
   await page.goto('/');
   await expect(page.getByRole('heading', { name: 'Crowdsourced Crossword Game Research' })).toBeVisible();
   await expectNoSidewaysScroll(page);
+  // The header is two rows: the sign-in links share the brand's, and the
+  // page's links have the second. A third row of its own pushed the heading
+  // half a screen down.
+  const banner = page.getByRole('banner');
+  const brand = (await banner.getByRole('link', { name: 'birdtest', exact: true }).boundingBox())!;
+  const signIn = (await banner.getByRole('link', { name: 'Sign in', exact: true }).boundingBox())!;
+  expect(Math.abs(signIn.y + signIn.height / 2 - (brand.y + brand.height / 2))).toBeLessThan(brand.height);
+  // contribute.txt's settings stack on a phone, every description on screen:
+  // as a table, the last column ran off the side.
+  const contributeSettings = page.getByTestId('contribute-settings');
+  await expect(contributeSettings.getByText('idlewait', { exact: true })).toBeVisible();
+  await expectTableFits(page, contributeSettings);
+  for (const description of await contributeSettings.locator('dd').all()) {
+    const box = (await description.boundingBox())!;
+    expect(box.x + box.width).toBeLessThanOrEqual(page.viewportSize()!.width);
+  }
 
   await page.getByRole('link', { name: 'Browse jobs' }).tap();
   await expect(page).toHaveURL(/\/jobs$/);
