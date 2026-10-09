@@ -407,9 +407,11 @@ Open "dev game pairs (first divergences saved)".
 - [ ] **Do** open **Contributors**. **Expect** all four workers ranked by
   movegens, most first, the column marked ↓: the two accounts by name, the
   two anonymous ones as "Anonymous · <16 characters>", never as their UUID;
-  each with its movegens read as "12.3K" or "4.5M" (the exact count on hover),
-  its compute time read as "5h 20m" or "3d 4h" (the exact hours on hover),
-  tasks and last result.
+  each with its movegens to the last digit ("1,234,567"), its compute time
+  to the second in every unit it has ("2m 13s", "5h 20m 13s", "3d 4h 5m 6s";
+  the hours on hover), tasks and last result.
+- [ ] **Do** leave the page open while the workers run. **Expect** the counts
+  to rise by themselves every 30 seconds, on the page and in the order chosen.
 - [ ] **Do** click **Compute time**, then **Tasks**. **Expect** the list
   re-ranked by each, most first, the arrow moving with it; still all four.
 - [ ] At phone width, **expect** a "Rank by" row of the four columns above the

@@ -904,6 +904,15 @@ Each entry's tests are the `describe` block named for its id.
   apart by it. A player's search in a few words leaves out what the job never reads
   (an opening-rack player's inference, the solving where the job never
   reaches the end of a game). *(Covered: `jobSettings.test.ts`.)*
+- `F-SET-2` The player settings table reads differences first
+  (`settingBlocks`, `PlayerSettingsTable.svelte`): every setting two players
+  differ in -- key or not -- in a block of its own at the top, "Differences
+  (N)", then the rows they share (the key rows, or every row with "All
+  settings"), folded behind "Show N shared settings" while there are
+  differences and open with "All settings"; one player, or two alike, has no
+  block and every row open; each of two players headed by its colour.
+  *(Covered: `jobSettings.test.ts`, and `PlayerSettingsTable.test.ts`, which
+  renders the component to HTML.)*
 - `F-FMT-12` `completionText` says how a job finished: a match test that
   decided, with the confidence, the units and player 1's interval ("its
   significance test found player 1 better at 95% confidence after 1,200
@@ -943,16 +952,16 @@ Each entry's tests are the `describe` block named for its id.
   job's player -- simulating, sorting on anything but equity, a rack info
   table, solving endgames -- before the submit, and accepts a static equity
   player. *(Covered: `format.test.ts`.)*
-- `F-FMT-16` `computeTime` reads a contributor's compute time in its two
-  largest units ("5h 20m", "3d 4h", "2y 17d"), and a dash for anything that is
-  not a time. *(Covered: `format.test.ts`.)*
+- `F-FMT-16` `computeTime` reads a contributor's compute time to the second
+  in every unit that is not zero ("2m 13s", "5h 20m 13s", "3d 4h 5m 6s", "2y
+  17d 1h", "0s"), and a dash for anything that is not a time. *(Covered:
+  `format.test.ts`.)*
 - `F-FMT-18` `targetsText` lists a leave job's targets in generation order
   joined by arrows ("100 → 200 → 1,000"), since a comma list cannot be read
   when the numbers carry thousands separators. *(Covered: `format.test.ts`.)*
-- `F-FMT-19` `bigCount` reads a contributor's movegens in its largest unit to
-  three figures ("12.3K", "4.5M", "1.2B"), rounded down so a count never reads
-  as more than it is or reaches the next unit early, and a dash for anything
-  that is not a count. *(Covered: `format.test.ts`.)*
+- `F-FMT-19` `exactCount` reads a contributor's movegens to the last digit,
+  grouped ("1,234,567,890"), and a dash for anything that is not a count.
+  *(Covered: `format.test.ts`.)*
 
 ### `F-CONS-*` — `lib/consensus.ts`
 
