@@ -99,7 +99,7 @@ resource_id() {
 case $stage in
 
 stop)
-  ops_say "RUNBOOK §1 step 1: stop writes. Workers submitting into a database about to be replaced have their results discarded; the -down alarms fire in ten minutes and clear when the service is back."
+  ops_say "RUNBOOK §1 step 1: stop writes. Workers submitting into a database about to be replaced have their results discarded; the backend's -down alarm fires in ten minutes and clears when it is back (pages still load)."
   ops_confirm "Stop the service $OPS_SERVICE?" || ops_die "nothing changed"
   ops_stop_service
   latest=$(aws rds describe-db-instances --db-instance-identifier "$db" \

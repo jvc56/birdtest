@@ -23,11 +23,12 @@ server {
     #
     # The backend's address is ${BACKEND_UPSTREAM}, filled in when the
     # container starts (the image's envsubst templates): `backend:8080` in
-    # compose, where each service is a host name, and `127.0.0.1:8080` in the
-    # ECS task, whose containers share one network namespace and are *not*
-    # names anything resolves. Written in literally, Nginx resolved `backend`
-    # while loading its configuration, found nothing on Fargate, and exited --
-    # and the frontend container is essential, so the task never started.
+    # compose, where each service is a host name. In production these two
+    # locations are never reached (the ALB routes /api and /health first) and
+    # the frontend's ECS task sets an address nothing listens on: a name, as
+    # `backend` written in literally was, Nginx resolves while loading its
+    # configuration, and finding nothing on Fargate it exited -- and the task
+    # never started.
     location /api/ {
         proxy_pass http://${BACKEND_UPSTREAM};
         # Nginx's default is 1 MB. A worker result with captured positions is

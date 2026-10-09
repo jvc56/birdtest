@@ -385,7 +385,8 @@ docker compose restart backend
 
 Production is the same: `scripts/deploy.sh` refuses a commit that changed an
 applied migration, and `scripts/deploy.sh --reset-db` empties the production
-database as part of the deploy (below, "Operator scripts").
+database as part of the deploy, deleting the nightly dumps with it (below,
+"Operator scripts"; RUNBOOK, "Resetting the production database").
 
 After release, a schema change is a new numbered migration, never an edit, and
 it is **additive**: new tables, new nullable or defaulted columns, new
@@ -759,8 +760,8 @@ A first deployment, in order (each step is described below):
    can take a day.
 6. Confirm the SNS subscription mail, set the database password and the two
    SSM parameters (below), then
-   `terraform -chdir=infra apply -var-file=prod.tfvars` (one task, and the
-   scheduled tasks on). This apply creates the `-down` alarms before the
+   `terraform -chdir=infra apply -var-file=prod.tfvars` (one task in each
+   service, the backend's and the frontend's, and the scheduled tasks on). This apply creates the `-down` alarms before the
    task is healthy, so expect an ALARM mail for each and an OK a few minutes
    later.
 7. Point DNS at the load balancer, run the alert-path checks
@@ -792,8 +793,8 @@ eight variables. Two SSM parameters must be created out of band right after
 the first `terraform apply` — Terraform only names them, and never reads or
 writes them, so their values stay out of its state — so make the first apply
 with `-var desired_count=0 -var scheduled_tasks_enabled=false`, create them as
-below, and apply again with the service at one task and the schedules on:
-started before they exist, the service's tasks cannot start, the
+below, and apply again with each service at one task and the schedules on:
+started before they exist, the backend's tasks cannot start, the
 derived-data builder fails every five minutes, and a 03:00 backup fails
 without starting, which only the 36-hour staleness alarm reports.
 
@@ -899,8 +900,8 @@ has no default — it is the backend image built with `--target derived-builder`
 and it must carry the same MAGPIE as `backend_image`, since the builder version
 recorded beside every hash comes from the binary that produced it.
 
-The three images are built from this repository and pushed, at one tag per
-release, to ECR in any region (Terraform creates no repository; the task
+The three images are built from this repository and pushed, each tagged with
+the commit it was built from, to ECR in any region (Terraform creates no repository; the task
 execution role's managed policy covers the pull, and a repository in another
 account must also admit this one in its own policy) or to a public registry. A
 private registry elsewhere — a private GHCR or Docker Hub repository — needs
@@ -914,6 +915,21 @@ docker build --pull --platform linux/amd64 frontend -t $REGISTRY/birdtest-fronte
 docker push ...   # all three, then apply with backend_image, derived_builder_image, frontend_image
 ```
 
+The backend and the frontend are two ECS services with a task definition
+each (`infra/ecs.tf`), and each image variable is its own: a release may move
+`frontend_image` alone, or `backend_image` and `derived_builder_image`
+together (Terraform refuses the builder at another tag than the backend: it is
+the backend image with another entrypoint). The frontend's service rolls --
+the new Nginx task serves before the old one drains, so a frontend release has
+no gap -- while the backend's stops its single task before starting the next
+(the single-instance rule, `desired_count`), a minute or two with the API
+answering 503 while the pages still load. `scripts/deploy.sh` rebuilds and
+moves only what the commit changed since each service's live image (below,
+"Operator scripts"). The load balancer sends `/api/*` and `/health` to the
+backend's target group and every other path to the frontend's, so in
+production Nginx never proxies to the backend; its `BACKEND_UPSTREAM` there is
+a placeholder.
+
 Build for `linux/amd64`, which is what the Fargate task definitions run, even on
 an arm64 machine: the backend's MAGPIE build targets `-march=nehalem`, and an
 arm64 frontend image fails on Fargate with "exec format error". Docker Desktop
@@ -924,7 +940,7 @@ the emulated release builds to be slow.
 The backend image fetches MAGPIE at `docker/Dockerfile`'s `MAGPIE_COMMIT`
 from GitHub, so that commit must be pushed to `birdtest-contribute` first.
 
-A release whose task fails to start three times is rolled back by ECS (the
+A release whose task fails to start three times is rolled back by ECS (each
 service's deployment circuit breaker) to the last task definition that ran
 steadily, and `apply` does not wait to see it: Terraform's state still names
 the new one, and the next apply deploys it again. RUNBOOK.md, "Rolling back a
@@ -968,20 +984,22 @@ its `FailedInvocations` 0. (RUNBOOK §5 runs the same checks with `SUFFIX=-dr`.)
 A deploy the circuit breaker rolls back mails the same topic, through the
 `birdtest$SUFFIX-deploy-failed` rule. ECS's deployment events cannot be sent by
 hand (`aws.ecs` is AWS's own source), so check instead that the rule's pattern
-matches a failed deployment of the live service; delivery is the backup
-mail's, through the same topic and policy:
+matches a failed deployment of each live service, the backend's and the
+frontend's; delivery is the backup mail's, through the same topic and policy:
 
 ```bash
 export AWS_PAGER=""
-SERVICE=$(aws ecs describe-services --region "$REGION" --cluster "$(tfout cluster_name)" \
-  --services "birdtest$SUFFIX" --query 'services[0].serviceArn' --output text)
-aws events test-event-pattern --region "$REGION" \
-  --event-pattern "$(aws events describe-rule --region "$REGION" --name "birdtest$SUFFIX-deploy-failed" \
-     --query EventPattern --output text)" \
-  --event "$(jq -nc --arg s "$SERVICE" --arg r "$REGION" '{id: "1", account: "123456789012",
-     source: "aws.ecs", time: "2026-01-01T00:00:00Z", region: $r, resources: [$s],
-     "detail-type": "ECS Deployment State Change", detail: {eventName: "SERVICE_DEPLOYMENT_FAILED"}}')"
-# "Result": true
+for NAME in "birdtest$SUFFIX" "birdtest$SUFFIX-frontend"; do
+  SERVICE=$(aws ecs describe-services --region "$REGION" --cluster "$(tfout cluster_name)" \
+    --services "$NAME" --query 'services[0].serviceArn' --output text)
+  aws events test-event-pattern --region "$REGION" \
+    --event-pattern "$(aws events describe-rule --region "$REGION" --name "birdtest$SUFFIX-deploy-failed" \
+       --query EventPattern --output text)" \
+    --event "$(jq -nc --arg s "$SERVICE" --arg r "$REGION" '{id: "1", account: "123456789012",
+       source: "aws.ecs", time: "2026-01-01T00:00:00Z", region: $r, resources: [$s],
+       "detail-type": "ECS Deployment State Change", detail: {eventName: "SERVICE_DEPLOYMENT_FAILED"}}')"
+done
+# "Result": true, twice
 ```
 
 **SES starts in the sandbox.** A new account's SES sends only to verified
@@ -1072,9 +1090,9 @@ Session Manager plugin for ECS Exec), `terraform`, `jq`, `git`, `gh`,
 
 | Script | Does |
 | --- | --- |
-| `deploy.sh [--reset-db] [--set KEY=VALUE]` | Deploys the checked-out commit of main: a clean tree, CI green for it (`gh`), the MAGPIE pin pushed to `birdtest-contribute` (`MAGPIE_DIR`, default `~/MAGPIE`); builds and pushes the images ECR lacks (`linux/amd64`, `CARGO_BUILD_JOBS=2`, `MAKE_JOBS=3`), retags `prod.tfvars`, plans, applies, uploads, waits for both target groups. Refuses a commit that changed a migration the live release applied (until launch `0001_initial.sql`, edited in place) unless `--reset-db`. |
-| `reset-prod-db.sh [--no-start]` | Empties the production database (the hostname typed): the service stopped, the schema dropped and made again, the service started so the backend applies `0001`. Then: register, `confirm-user.sh --admin`, import the input data. `deploy.sh --reset-db` does the same once its plan is approved and before the new task starts. |
-| `rollback.sh [--to TAG] [--reset-db]` | RUNBOOK "Rolling back a deploy": the previous release from the log, or the one a circuit breaker went back to. |
+| `deploy.sh [--all] [--reset-db] [--set KEY=VALUE]` | Deploys the checked-out commit of main, only what it changed: a clean tree, CI green for it (`gh`); then, from the image each service runs (its tag is a commit), `git diff` to HEAD by path -- `frontend/` deploys the frontend; `backend/`, `docker/` (the MAGPIE pin), `Cargo.*` and `.dockerignore` the backend and the derived-data builder with it; `infra/` (and the scripts its task definitions read) a plan; anything else nothing, and it says so. `--all` deploys both. For the backend, the MAGPIE pin pushed to `birdtest-contribute` (`MAGPIE_DIR`, default `~/MAGPIE`). Builds and pushes the images ECR lacks (`linux/amd64`, `CARGO_BUILD_JOBS=2`, `MAKE_JOBS=3`), retags those services in `prod.tfvars`, plans, applies, uploads, waits for both services and target groups. A frontend release never stops the backend. Refuses a backend whose migrations the live backend applied changed (until launch `0001_initial.sql`, edited in place) unless `--reset-db`, and a service ECS's circuit breaker rolled back until `rollback.sh` has run. |
+| `reset-prod-db.sh [--no-start]` | RUNBOOK "Resetting the production database": empties it (the hostname typed, in a prompt that names both backup buckets and their dump count): the backend's service stopped, the schema dropped and made again, every version under `pg/` in the backups bucket and its DR replica deleted, the backend started so it applies `0001`. RDS's automated backups are left to expire (30 days). Then: register, `confirm-user.sh --admin`, import the input data. `deploy.sh --reset-db` does the same once its plan is approved and before the new task starts. |
+| `rollback.sh [--to TAG] [--reset-db]` | RUNBOOK "Rolling back a deploy": the previous release from the log (its backend and frontend images, which may be at different tags), or what a circuit breaker went back to. |
 | `set-setting.sh KEY=VALUE...` | Changes `prod.tfvars` values (e.g. `mail_max_per_second=14`) and applies them. |
 | `check-alerts.sh` | The alert-path checks above. |
 | `confirm-user.sh [--admin] NAME` | Confirms an address by hand while SES is in the sandbox, as the confirm-email route does; `--admin` promotes too. |
@@ -1107,6 +1125,10 @@ exits non-zero, and no successful backup in 36 hours. A restore drill runs
 monthly, restoring the newest dump into a throwaway database and verifying it
 (`scripts/restore-drill.sh`) — the only check that catches a dump that has been
 silently producing unusable output.
+
+Until launch a production reset (`scripts/reset-prod-db.sh`, `deploy.sh
+--reset-db`) deletes the nightly dumps with the database, in both buckets;
+RDS's point-in-time backups are the one way back across it, for their 30 days.
 
 Recovering from anything is [RUNBOOK.md](RUNBOOK.md).
 

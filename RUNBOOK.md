@@ -41,7 +41,8 @@ with the scratch database a Postgres started inside that shell the way
 **Scripts.** Several procedures here are also scripts that run from your
 machine with your AWS login (README.md, "Operator scripts"): §0
 (`scripts/assess-damage.sh`), §1's mechanical stages (`scripts/pitr-restore.sh`),
-§3 (`scripts/restore-artifact.sh`), rolling back (`scripts/rollback.sh`) and
+§3 (`scripts/restore-artifact.sh`), rolling back (`scripts/rollback.sh`),
+resetting the database before launch (`scripts/reset-prod-db.sh`) and
 rotating the password (`scripts/rotate-db-password.sh`). Each section says
 which; the blocks stay for doing it by hand, and for reading what the script
 does.
@@ -141,8 +142,9 @@ By hand (`pitr-restore.sh stop`):
 export AWS_PAGER=""
 
 # 1. STOP WRITES. Workers submitting into a database about to be replaced have
-#    their results silently discarded. The -down alarms fire ten minutes
-#    later, and clear when the service is back: expected here.
+#    their results silently discarded. The backend's -down alarm fires ten
+#    minutes later, and clears when it is back: expected here. (The frontend's
+#    service runs on: pages load, the API answers 503.)
 aws ecs update-service --cluster "$CLUSTER" --service birdtest --desired-count 0 --region "$REGION"
 
 # 2. Pick the restore point: the latest possible instant before the damage.
@@ -1888,37 +1890,46 @@ A release that misbehaves goes back to the previous release's images. The
 backend starts against a schema a newer release migrated (it ignores
 migrations it does not know), and migrations after release are additive
 (README, "After a schema change"), so the previous image runs on it. The
-service keeps no healthy task through a deploy, so the site is down from the
-moment the bad task stops until the old one is healthy, and the `-down`
-alarms may fire and clear. Keep each release's three image tags (in its
-release notes, say): `prod.tfvars` holds only the current ones.
-`scripts/deploy.sh` writes them to `~/birdtest-releases.log`, and
+backend and the frontend are two services, each with its own image, and a
+release may have moved either or both (`scripts/deploy.sh` deploys only what
+the commit changed): a release is a backend tag and a frontend tag, which can
+differ. The backend's service keeps no healthy task through a deploy, so the
+API is down from the moment the bad task stops until the old one is healthy,
+and `-backend-down` may fire and clear; the frontend's rolls, so putting back
+the frontend alone has no gap. Keep each release's image tags (in its release
+notes, say): `prod.tfvars` holds only the current ones. `scripts/deploy.sh`
+writes them, before and after, to `~/birdtest-releases.log`, and
 
 ```bash
 scripts/rollback.sh
 ```
 
-does the steps below: it tells a circuit-breaker rollback from what ECS runs
-and offers the image it went back to (otherwise the previous release in the
-log), asks step 1's question and whether to put `min_magpie_version` back,
-refuses a target whose migrations differ from the live release's unless
-`--reset-db` (until launch `0001_initial.sql` is edited in place, so a
+does the steps below: it tells a circuit-breaker rollback from what each
+service runs and offers what ECS went back to (otherwise the previous release
+in the log, with the backend and frontend images it ran), asks step 1's
+question when the backend changes and whether to put `min_magpie_version`
+back, refuses a target backend whose migrations differ from the live one's
+unless `--reset-db` (until launch `0001_initial.sql` is edited in place, so a
 rollback across a change to it needs a database reset), then plans, applies,
-uploads `prod.tfvars` and waits for both target groups. `--to <tag>` names the
-release outright.
+uploads `prod.tfvars` and waits for both services and target groups. `--to
+<tag>` names the release outright.
 
-**ECS may have rolled back already.** The service has a deployment circuit
+**ECS may have rolled back already.** Each service has a deployment circuit
 breaker (`infra/ecs.tf`): a release whose task fails to start three times --
 a configuration the backend refuses, its MAGPIE below `min_magpie_version`, a
-failed migration -- is abandoned, and ECS starts the last task definition that
-ran steadily, after a gap of however long the three attempts took. The site
+failed migration, an Nginx that does not start -- is abandoned, and ECS
+starts the last task definition that ran steadily (for the backend, after a
+gap of however long the three attempts took; the frontend's old task never
+stopped). The site
 then runs the previous release, but Terraform's state still names the new
 task definition, so the next `apply` deploys the broken one again: do the
 steps below anyway, starting at step 2, before any other apply. The signal is
-the alerts topic's `-deploy-failed` mail (`infra/ecs.tf`), which quotes ECS's
-reason: three failed launches usually finish before the `-down` alarms' ten
-minutes, and `apply` has returned long before. Until step 3 two other things
-run the abandoned release: the derived-data builder's schedule starts the
+the alerts topic's `-deploy-failed` mail (`infra/ecs.tf`), which names the
+service and quotes ECS's reason: three failed launches usually finish before
+the `-down` alarms' ten minutes, and `apply` has returned long before.
+`scripts/deploy.sh` refuses to deploy over one until this is done. For a
+backend release, until step 3 two other things run the abandoned release:
+the derived-data builder's schedule starts the
 task family's latest revision, which is the new image (so with a MAGPIE pin
 that moved builder versions, the web task's rows wait for a builder that
 does not take them), and each nightly dump's manifest names the new
@@ -1928,17 +1939,20 @@ the release that actually ran is the previous one. To tell, by hand:
 ```bash
 export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
 NAME=birdtest   # birdtest-dr for §5's copy
-aws ecs describe-services --region "$REGION" --cluster "$NAME" --services "$NAME" \
-  --query 'services[0].deployments[].[status,rolloutState,taskDefinition]' --output text
-aws ecs describe-services --region "$REGION" --cluster "$NAME" --services "$NAME" \
-  --query 'services[0].events[:10].[createdAt,message]' --output text
+for SERVICE in "$NAME" "$NAME-frontend"; do
+  echo "== $SERVICE"
+  aws ecs describe-services --region "$REGION" --cluster "$NAME" --services "$SERVICE" \
+    --query 'services[0].deployments[].[status,rolloutState,taskDefinition]' --output text
+  aws ecs describe-services --region "$REGION" --cluster "$NAME" --services "$SERVICE" \
+    --query 'services[0].events[:10].[createdAt,message]' --output text
+done
 ```
 
 The `PRIMARY` deployment's task definition is the one running. A revision
 older than the release's, and events saying the deployment failed and is
 rolling back, are a rollback; the stopped tasks' `stoppedReason` (`aws ecs
 list-tasks --desired-status STOPPED`, then `describe-tasks`) and the backend's
-log say what failed. The breaker cannot help when what fails is
+log (or the frontend's) say what failed. The breaker cannot help when what fails is
 shared by both releases -- an SSM value, the database -- or on a stack's first
 deployment, which has nothing to go back to: those keep retrying until fixed.
 
@@ -1947,9 +1961,11 @@ deployment, which has nothing to go back to: those keep retrying until fixed.
    fails to read such a row, and one active job of an unknown type stops every
    claim. README's rule says to ship the reading of a new value a release
    before anything writes it, which makes this step empty.
-2. Put the previous tags back in `prod.tfvars`: `backend_image`,
-   `derived_builder_image` and `frontend_image` together (the builder must carry
-   the backend's MAGPIE). If the release raised `min_magpie_version`, put the
+2. Put the previous tags back in `prod.tfvars`: `backend_image` and
+   `derived_builder_image` together (the builder must carry the backend's
+   MAGPIE), and `frontend_image` -- each at the tag the previous release ran,
+   which for the two services may differ (the release log's lines say). If
+   the release raised `min_magpie_version`, put the
    previous value back too, since the backend refuses to start when its own
    MAGPIE is below the floor. That readmits the builds the raise kept out.
    The apply uses this checkout's `infra/`, so any change the release made to
@@ -1977,6 +1993,75 @@ If the release's migration was not additive (it dropped or renamed something
 the previous image reads), the previous image will fail on it: fix forward
 with a new release instead, or restore to before the deploy with §1, which
 loses every write since.
+
+---
+
+## Resetting the production database (until launch)
+
+Until launch a schema change edits `0001_initial.sql` in place, and a
+database migrated by the old file refuses the new backend. A release that
+changes it ships with a reset: `scripts/deploy.sh --reset-db` (once its plan
+is approved, before the new backend starts), `scripts/rollback.sh --reset-db`
+for a rollback across such a change, or `scripts/reset-prod-db.sh` for a reset
+on its own. Each one first counts the nightly dumps and prints, for the
+backups bucket and its DR replica, how many dumps, object versions and delete
+markers `pg/` holds; then asks for the site's hostname, in a prompt that names
+both buckets and the dump count. Then:
+
+1. The backend's service is stopped. The frontend's runs on: pages load and
+   the API answers 503, and `birdtest-backend-down` mails ten minutes in and
+   clears once the backend is back.
+2. The database role's other sessions are ended (a derived-data build, or the
+   03:00 backup, which then mails a failure) and the public schema is dropped
+   and made again, through the ops task. `audit_log` and the `backups` table go
+   with it.
+3. The nightly dumps are deleted: every object version and delete marker under
+   `pg/`, in the backups bucket and in its DR replica, each bucket in its own
+   region and by version (a plain delete would only add a delete marker, and a
+   delete by version is never replicated), bypassing the governance Object
+   Lock. A dump of the old schema restores only with the release that wrote it
+   (PLAN.md, "Restoring across a schema change"), and it holds every account's
+   address and password hash.
+4. The backend is started (by the deploy's apply, or by `reset-prod-db.sh`
+   unless `--no-start`), and applies `0001` to the empty schema.
+
+**What a reset leaves: RDS's automated backups.** A point-in-time restore (§1)
+to a moment before the reset stays possible until those expire,
+`db_backup_retention_days` (30) days after it. That is the only way back from
+a reset, and after those days there is none.
+
+The deletes need `s3:ListBucketVersions`, `s3:DeleteObjectVersion` and
+`s3:BypassGovernanceRetention` on both buckets, which the deployers'
+`AdministratorAccess` (LAUNCH_PLAN Part 2) holds; no KMS permission, since
+nothing is read. If S3 refuses one part-way, the script stops with the
+database reset and the backend stopped, and says which bucket: run the same
+command again, which resets the empty database again and deletes the rest. Or
+the dumps step by hand:
+
+```bash
+export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
+DR_BUCKET=$(terraform -chdir=infra output -raw backups_dr_bucket)
+for B in "$BUCKET" "$DR_BUCKET"; do
+  R=$(aws s3api get-bucket-location --bucket "$B" --query LocationConstraint --output text)
+  [ "$R" = None ] && R=us-east-1
+  # One listing page (at most 1000, as many as one delete takes) at a time,
+  # from the start again each time, until nothing is left.
+  while :; do
+    aws s3api list-object-versions --region "$R" --bucket "$B" --prefix pg/ --no-paginate --output json \
+      | jq '{Objects: [(.Versions // [])[], (.DeleteMarkers // [])[] | {Key, VersionId}], Quiet: true}' \
+      > /tmp/dump-page.json
+    [ "$(jq '.Objects | length' /tmp/dump-page.json)" -gt 0 ] || break
+    OUT=$(aws s3api delete-objects --region "$R" --bucket "$B" --bypass-governance-retention \
+      --delete file:///tmp/dump-page.json --output json)
+    if [ -n "$(printf '%s' "$OUT" | jq -r '(.Errors // [])[] | .Key')" ]; then
+      echo "$OUT"
+      break
+    fi
+  done
+  echo "$B: $(aws s3api list-object-versions --region "$R" --bucket "$B" --prefix pg/ \
+    --query 'length([Versions || `[]`, DeleteMarkers || `[]`][])' --output text) left under pg/"
+done
+```
 
 ---
 

@@ -439,10 +439,10 @@ run "a_sender_at_a_lookalike_domain_is_refused" {
 
 # --- S-TF-3: alerts -----------------------------------------------------------
 
-# A circuit-breaker rollback mails the alerts topic. The service's ARN in the
+# A circuit-breaker rollback mails the alerts topic. The services' ARNs in the
 # pattern and the delivery itself need a real account (TESTING.md); what plans
-# is that the rule exists, matches the failed deployment and only that, on one
-# resource, and has a target. That the target is the alerts topic is not
+# is that the rule exists, matches the failed deployment and only that, on the
+# two services, and has a target. That the target is the alerts topic is not
 # checked: a mock topic's ARN is unknown at plan on CI's Terraform.
 run "a_failed_deploy_is_alerted" {
   command = plan
@@ -455,11 +455,52 @@ run "a_failed_deploy_is_alerted" {
     error_message = "The deploy-failed rule must match only a failed deployment."
   }
   assert {
-    condition     = length(local.deploy_failed_pattern.resources) == 1
-    error_message = "The deploy-failed rule must name the one web service."
+    condition     = length(local.deploy_failed_pattern.resources) == 2
+    error_message = "The deploy-failed rule must name the backend's service and the frontend's."
   }
   assert {
     condition     = aws_cloudwatch_event_target.deploy_failed.rule == "birdtest-deploy-failed"
     error_message = "The deploy-failed rule must have a target."
+  }
+}
+
+# --- S-TF-4: the split services -----------------------------------------------
+
+# The backend's service stops its one task before starting the next (the
+# single-instance rule); the frontend's rolls, so a frontend release has no
+# gap. Each serves its own target group, and the backend no longer carries the
+# frontend's.
+run "the_backend_stops_first_and_the_frontend_rolls" {
+  command = plan
+  assert {
+    condition = (
+      aws_ecs_service.backend.deployment_minimum_healthy_percent == 0 &&
+      aws_ecs_service.backend.deployment_maximum_percent == 100
+    )
+    error_message = "The backend's service must stop its task before starting the next (0%/100%)."
+  }
+  assert {
+    condition = (
+      aws_ecs_service.frontend.deployment_minimum_healthy_percent == 100 &&
+      aws_ecs_service.frontend.deployment_maximum_percent == 200
+    )
+    error_message = "The frontend's service must roll (100%/200%)."
+  }
+  assert {
+    condition = (
+      length(aws_ecs_service.backend.load_balancer) == 1 &&
+      one(aws_ecs_service.backend.load_balancer).container_name == "backend" &&
+      length(aws_ecs_service.frontend.load_balancer) == 1 &&
+      one(aws_ecs_service.frontend.load_balancer).container_name == "frontend"
+    )
+    error_message = "Each service must serve its own container's target group, and only that."
+  }
+  assert {
+    condition     = [for c in jsondecode(aws_ecs_task_definition.backend.container_definitions) : c.name] == ["backend"]
+    error_message = "The backend's task definition must hold the backend alone."
+  }
+  assert {
+    condition     = [for c in jsondecode(aws_ecs_task_definition.frontend.container_definitions) : c.image] == [var.frontend_image]
+    error_message = "The frontend's task definition must run frontend_image, alone."
   }
 }

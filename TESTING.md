@@ -164,7 +164,7 @@ incidentally by higher tiers.
 | `scripts/dev.py` | Manual | Deliberate — see [Not tested](#what-is-deliberately-not-tested) |
 | `scripts/backup.sh`, `restore-drill.sh`, `restore-roundtrip.sh`, `restore-job.sh`, RUNBOOK §1's re-apply step | Nightly | Covered (`S-BACKUP-*`) |
 | `scripts/scrub.sql` | 3 | Covered (`S-SCRUB-1`, `-2`) |
-| `infra/` variable validations, the deploy-failed alert | CI (`terraform`) | Covered (`S-TF-1`, `-2`, `-3`: `terraform test` against mock providers) |
+| `infra/` variable validations, the deploy-failed alert, the split services' deployment settings | CI (`terraform`) | Covered (`S-TF-1`..`-4`: `terraform test` against mock providers) |
 | `scripts/dev-restore.sh` | CI (`scripts`) | Covered (`S-BACKUP-6`: its `SCRUB` rule against a stub `COMPOSE`, and that the scrub is the copy's) |
 | birdtest ↔ MAGPIE wire | 4 + 6 | Covered — `C-1`..`C-9` on both sides, and tier 6 |
 
@@ -4252,7 +4252,7 @@ run that breaks one variable expects only that one.
   the single-instance rule (KL-82). Broken on purpose, each side shows: with
   the count's bound at two, `two_tasks_are_refused` fails; with a certificate
   regex that no real ARN matches, the good plan fails. *(Covered:
-  `infra/tests/variables.tftest.hcl`, 57 runs with `S-TF-2`'s and `S-TF-3`'s.)*
+  `infra/tests/variables.tftest.hcl`, 58 runs with `S-TF-2`'s, `S-TF-3`'s and `S-TF-4`'s.)*
   (Thirty-third audit, pass 1: a validation was first evaluated by a real plan,
   since `terraform validate` evaluates none. Pass 2 added the MAGPIE floor, the
   one value the backend refuses at startup that the plan let through.)
@@ -4270,15 +4270,25 @@ run that breaks one variable expects only that one.
   task at start.)
 - `S-TF-3` A deployment the circuit breaker rolls back mails the alerts topic:
   the `-deploy-failed` rule matches `aws.ecs`'s "ECS Deployment State Change"
-  with `eventName` `SERVICE_DEPLOYMENT_FAILED` only, on one resource, and has
-  a target. That the target is the alerts topic (a mock's ARN is unknown at
-  plan on CI's Terraform 1.9.8), that the resource is the web service's ARN,
-  and that the mail arrives, are known only at apply (below; README's "Check
-  that the alarms reach you" checks the pattern against the live service).
+  with `eventName` `SERVICE_DEPLOYMENT_FAILED` only, on two resources (the
+  backend's service and the frontend's), and has a target. That the target is
+  the alerts topic (a mock's ARN is unknown at plan on CI's Terraform 1.9.8),
+  that the resources are the two services' ARNs, and that the mail arrives,
+  are known only at apply (below; README's "Check that the alarms reach you"
+  checks the pattern against each live service).
   *(Covered:
   `infra/tests/variables.tftest.hcl`, `a_failed_deploy_is_alerted`.)*
   (Thirty-third audit, pass 2: a rollback was silent, and the next apply
   redeployed the release it abandoned.)
+- `S-TF-4` The split services: the backend's stops its one task before
+  starting the next (minimum 0%, maximum 100%: the single-instance rule) and
+  the frontend's rolls (100%, 200%), each serves only its own container's
+  target group, and each task definition holds its own container alone, the
+  frontend's running `frontend_image`. *(Covered:
+  `infra/tests/variables.tftest.hcl`,
+  `the_backend_stops_first_and_the_frontend_rolls`.)* (October 2026: a page
+  change stopped the backend, because the two shared one task with minimum
+  0%.)
 
 ---
 
@@ -4303,7 +4313,8 @@ validate`, by the variable validations' plans ([Terraform](#terraform)), and by
 applying it. Asserting what the plan builds tests the plan, not the
 deployment, and the failure mode that matters — an apply that breaks
 production — is not reachable from a test suite. `S-TF-3` reads the one
-alert rule whose pattern the plan knows; that EventBridge delivers ECS's
+alert rule whose pattern the plan knows, and `S-TF-4` the two services'
+deployment settings, which decide whether a deploy has a gap; that EventBridge delivers ECS's
 deployment event to the topic, and the service ARN in its pattern, need a real
 account (a mock apply fails on the random ARNs the mocks make).
 Backup *restores* are covered by the monthly drill, which is the real check.

@@ -11,18 +11,33 @@
 #   - every script parses (bash -n);
 #   - deploy.sh refuses a commit that changed 0001_initial.sql without
 #     --reset-db, before building or planning anything; with it, the order is
-#     build and push, plan, the service stopped, the schema dropped, apply,
-#     the service started, prod.tfvars uploaded, and a release log line; a
-#     wrong hostname typed resets nothing; an image ECR already holds is not
-#     built again; red CI and a MAGPIE pin that is not pushed are refused;
+#     build and push, plan, the service stopped, the schema dropped, the
+#     dumps deleted, apply, the service started, prod.tfvars uploaded, and a
+#     release log line; a wrong hostname typed resets nothing; an image ECR
+#     already holds is not built again; red CI and a MAGPIE pin that is not
+#     pushed are refused;
+#   - a reset (reset-prod-db.sh, deploy.sh --reset-db) names both backup
+#     buckets and the dump count before it asks, says RDS's backups stay for
+#     db_backup_retention_days, and then deletes every version and delete
+#     marker under pg/ in both -- each in its own region, more than one page of
+#     each, at most 1000 to a delete, past the governance lock -- and nothing
+#     outside pg/; a delete refused leaves the backend stopped and says so;
+#   - deploy.sh deploys what changed since each service's live commit: the
+#     path -> service mapping (frontend/ the frontend; backend/, docker/,
+#     Cargo.*, .dockerignore the backend and its builder; infra/ and the
+#     scripts its task definitions read the plan), a frontend change that
+#     never touches the backend, a backend change measured from the backend's
+#     own commit, nothing for a docs-only commit, every image with --all, a
+#     plan and no image for an infra change; and a circuit-breaker rollback of
+#     either service refused up front or reported after the apply;
 #   - the plan gate refuses a plan that replaces the database (nothing
 #     applied), and lets it through only when asked, with a typed word;
 #   - set-setting.sh's edit of prod.tfvars and its upload, its refusals (an
 #     unknown variable, an image), and an upload refused when the bucket's copy
 #     changed during the apply;
 #   - rollback.sh takes the previous release from the release log, or the
-#     image a circuit breaker went back to, and refuses one across a 0001
-#     change without --reset-db;
+#     image a circuit breaker went back to, refuses one across a 0001 change
+#     without --reset-db, and puts back a split release's two images;
 #   - confirm-user.sh's SQL for hostile usernames: none of the name reaches
 #     the SQL except as hex, which decodes back to it, and the SQL that
 #     reaches the ops task is that SQL;
@@ -92,53 +107,93 @@ git -C "$WORK/magpie" fetch -q "$WORK/magpie-src" "$unpushed"
 R="$WORK/repo"
 git -c init.defaultBranch=main init -q --bare "$WORK/origin.git"
 git -c init.defaultBranch=main init -q "$R"
-mkdir -p "$R/scripts/lib" "$R/infra" "$R/docker" "$R/backend/migrations"
+mkdir -p "$R/scripts/lib" "$R/infra" "$R/docker" "$R/backend/migrations" "$R/frontend"
 cp "$ROOT"/scripts/lib/ops.sh "$R/scripts/lib/"
 cp "$ROOT"/scripts/*.sh "$R/scripts/"
 cp -r "$ROOT/scripts/ops-sql" "$R/scripts/"
 cp "$ROOT/infra/variables.tf" "$R/infra/"
 printf 'ARG MAGPIE_COMMIT=%s\n' "$pin" > "$R/docker/Dockerfile"
 printf 'CREATE TABLE users (id int);\n' > "$R/backend/migrations/0001_initial.sql"
+printf '<p>birdtest</p>\n' > "$R/frontend/index.html"
 printf '*.tfvars\n' > "$R/.gitignore"
 git -C "$R" add -A && git -C "$R" commit -q -m A
 A=$(git -C "$R" rev-parse --short=12 HEAD)
-echo change >> "$R/scripts/README-test" && git -C "$R" add -A && git -C "$R" commit -q -m B
+# The history the deploys are measured along: B changes the frontend alone, C
+# the backend's schema, D the docs alone and E the infrastructure alone.
+printf '<p>birdtest, again</p>\n' > "$R/frontend/index.html"
+git -C "$R" commit -q -am "B changes the frontend"
 B=$(git -C "$R" rev-parse --short=12 HEAD)
 printf 'CREATE TABLE users (id int, games bigint);\n' > "$R/backend/migrations/0001_initial.sql"
 git -C "$R" commit -q -am "C changes 0001"
 C=$(git -C "$R" rev-parse --short=12 HEAD)
+echo docs >> "$R/README-test.md" && git -C "$R" add -A && git -C "$R" commit -q -m "D changes the docs"
+D=$(git -C "$R" rev-parse --short=12 HEAD)
+echo '# more' >> "$R/infra/extra.tf" && git -C "$R" add -A && git -C "$R" commit -q -m "E changes infra"
+E=$(git -C "$R" rev-parse --short=12 HEAD)
 git -C "$R" remote add origin "$WORK/origin.git"
 git -C "$R" push -q origin HEAD:refs/heads/main
 
 PLAN_NORMAL='{"resource_changes": [
-  {"address": "aws_ecs_task_definition.main", "type": "aws_ecs_task_definition", "change": {"actions": ["delete", "create"]}},
-  {"address": "aws_ecs_service.main", "type": "aws_ecs_service", "change": {"actions": ["update"]}},
+  {"address": "aws_ecs_task_definition.backend", "type": "aws_ecs_task_definition", "change": {"actions": ["delete", "create"]}},
+  {"address": "aws_ecs_service.backend", "type": "aws_ecs_service", "change": {"actions": ["update"]}},
   {"address": "aws_db_instance.main", "type": "aws_db_instance", "change": {"actions": ["no-op"]}}]}'
 PLAN_DB_REPLACE='{"resource_changes": [
   {"address": "aws_db_instance.main", "type": "aws_db_instance", "change": {"actions": ["delete", "create"]}}]}'
 
-tfvars_with() {  # tag -> a prod.tfvars naming it
+tfvars_with() {  # backend tag [frontend tag] -> a prod.tfvars naming them
   cat <<EOF
 region                = "us-east-1"
 backend_image         = "$REGISTRY/birdtest-backend:$1"
 derived_builder_image = "$REGISTRY/birdtest-derived-builder:$1"
-frontend_image        = "$REGISTRY/birdtest-frontend:$1"
+frontend_image        = "$REGISTRY/birdtest-frontend:${2:-$1}"
 public_url            = "https://birdtest.test"
 min_magpie_version    = "0.1.1"
 EOF
 }
 S3_TFVARS="$FAKE_DIR/s3/state-bucket/birdtest/prod.tfvars"
-# A fresh world: the bucket naming LIVE, ECR holding the tags given, the
-# service at one task running LIVE, no local prod.tfvars, no calls yet.
+DUMPS="$FAKE_DIR/s3v/birdtest-backups-123.json" DUMPS_DR="$FAKE_DIR/s3v/birdtest-backups-dr-123.json"
+# The backups bucket: three dumps of 800 files each, every file in two
+# versions, a manifest overwritten once and three delete markers -- 4,807
+# versions and markers under pg/, five pages -- and one object outside pg/,
+# which a reset leaves. Its replica: two dumps, 1,202, two pages.
+dumps_world() {
+  mkdir -p "$FAKE_DIR/s3v"
+  python3 - "$DUMPS" "$DUMPS_DR" <<'EOF'
+import json, sys
+def world(stamps, files, versions):
+    e = []
+    for s in stamps:
+        for f in range(files):
+            for v in range(versions):
+                e.append({"Key": "pg/%s/toc.%d.dat" % (s, f), "VersionId": "%s-%d-%d" % (s, f, v)})
+        e.append({"Key": "pg/%s.manifest.json" % s, "VersionId": s + "-m"})
+    return e
+primary = world(["2026-10-01", "2026-10-02", "2026-10-03"], 800, 2)
+primary += [{"Key": "pg/2026-10-03.manifest.json", "VersionId": "again"}]
+primary += [{"Key": "pg/old/%d" % i, "VersionId": "dm%d" % i, "DeleteMarker": True} for i in range(3)]
+primary += [{"Key": "elsewhere/keep.txt", "VersionId": "keep"}]
+json.dump(primary, open(sys.argv[1], "w"))
+json.dump(world(["2026-10-01", "2026-10-02"], 600, 1), open(sys.argv[2], "w"))
+EOF
+}
+# How many versions and markers BUCKET-FILE holds under pg/.
+pg_left() { jq '[.[] | select(.Key | startswith("pg/"))] | length' "$1"; }
+# A fresh world: the bucket naming LIVE (a tag, or BACKEND/FRONTEND), ECR
+# holding the tags given, each service at one task running its LIVE, no local
+# prod.tfvars, no calls yet.
 fresh() {
-  local live=$1; shift
-  rm -rf "$FAKE_DIR"/{calls.log,ecr,runtask,rds,ssm,tfstate_db} "$R"/infra/prod.tfvars* "$WORK/answers"
+  local live=$1 lb lf; shift
+  lb=${live%%/*} lf=${live#*/}
+  rm -rf "$FAKE_DIR"/{calls.log,ecr,runtask,rds,ssm,tfstate_db,s3v,frontend_service_made} "$R"/infra/prod.tfvars* "$WORK/answers"
   mkdir -p "$FAKE_DIR/ecr" "$(dirname "$S3_TFVARS")"
-  tfvars_with "$live" > "$S3_TFVARS"
+  dumps_world
+  tfvars_with "$lb" "$lf" > "$S3_TFVARS"
   local t r
   for t in "$@"; do for r in backend derived-builder frontend; do : > "$FAKE_DIR/ecr/birdtest-$r:$t"; done; done
   echo 1 > "$FAKE_DIR/desired"
-  printf '%s' "$REGISTRY/birdtest-backend:$live" > "$FAKE_DIR/running_image"
+  echo 1 > "$FAKE_DIR/desired_frontend"
+  printf '%s' "$REGISTRY/birdtest-backend:$lb" > "$FAKE_DIR/running_image"
+  printf '%s' "$REGISTRY/birdtest-frontend:$lf" > "$FAKE_DIR/running_frontend_image"
   printf '%s' "$PLAN_NORMAL" > "$FAKE_DIR/plan.json"
   : > "$FAKE_DIR/calls.log"
   : > "$WORK/answers"
@@ -173,8 +228,9 @@ pass "deploy.sh refuses a changed 0001 without --reset-db, before building"
 fresh "$A"
 answers y nottherightname
 if run deploy.sh --reset-db; then fail "deploy.sh reset with the wrong hostname typed"; fi
-{ ! called "--desired-count 0" && ! called "ecs run-task" && ! called " apply "; } \
-  || fail "a wrong hostname still stopped, reset or applied something"
+{ ! called "--desired-count 0" && ! called "ecs run-task" && ! called "delete-objects" && ! called " apply "; } \
+  || fail "a wrong hostname still stopped, reset, deleted or applied something"
+[[ "$(pg_left "$DUMPS")" == 4807 && "$(pg_left "$DUMPS_DR")" == 1202 ]] || fail "a wrong hostname still deleted dumps"
 pass "deploy.sh --reset-db resets nothing when the hostname is mistyped"
 
 fresh "$A"
@@ -185,6 +241,8 @@ in_order "docker push $REGISTRY/birdtest-backend:$C" \
          "terraform -chdir=$R/infra plan" \
          "aws ecs update-service --cluster birdtest --service birdtest --desired-count 0" \
          "aws ecs run-task" \
+         "aws s3api delete-objects --bucket birdtest-backups-123 " \
+         "aws s3api delete-objects --bucket birdtest-backups-dr-123 " \
          "terraform -chdir=$R/infra apply" \
          "aws ecs update-service --cluster birdtest --service birdtest --desired-count 1" \
          "aws s3 cp $R/infra/prod.tfvars s3://state-bucket/birdtest/prod.tfvars" \
@@ -196,7 +254,43 @@ grep -q "reset-db host=birdtest.test" "$BIRDTEST_RELEASE_LOG" || fail "the reset
 grep -q "confirm-user.sh --admin" "$WORK/out" || fail "no post-reset checklist"
 { grep -q "CARGO_BUILD_JOBS=2" "$FAKE_DIR/calls.log" && grep -q -- "--platform linux/amd64" "$FAKE_DIR/calls.log"; } \
   || fail "the build is not capped, or not for linux/amd64"
-pass "deploy.sh --reset-db: build, push, plan, stop, reset, apply, start, upload, log, health"
+[[ "$(pg_left "$DUMPS")" == 0 && "$(pg_left "$DUMPS_DR")" == 0 ]] || fail "deploy.sh --reset-db left dumps"
+pass "deploy.sh --reset-db: build, push, plan, stop, reset, dumps deleted, apply, start, upload, log, health"
+
+# The reset on its own, and what it says before it asks.
+fresh "$B"
+answers birdtest.test
+run reset-prod-db.sh || fail "reset-prod-db.sh failed"
+for want in "birdtest-backups-123 (us-east-1): 3 dumps, 4804 object versions, 3 delete markers" \
+            "birdtest-backups-dr-123 (eu-west-1): 2 dumps, 1202 object versions, 0 delete markers" \
+            "delete the dumps in birdtest-backups-123 and birdtest-backups-dr-123 (5 in all)" \
+            "until they expire, 30 days from now"; do
+  grep -qF -- "$want" "$WORK/out" || fail "the reset's warning does not say: $want"
+done
+[[ "$(pg_left "$DUMPS")" == 0 && "$(pg_left "$DUMPS_DR")" == 0 ]] || fail "reset-prod-db.sh left dumps"
+jq -e 'map(select(.Key == "elsewhere/keep.txt")) | length == 1' "$DUMPS" > /dev/null \
+  || fail "the reset deleted an object outside pg/"
+[[ "$(grep -c "s3api delete-objects --bucket birdtest-backups-123 --region us-east-1 " "$FAKE_DIR/calls.log")" == 5 ]] \
+  || fail "the backups bucket was not deleted from in five pages"
+[[ "$(grep -c "s3api delete-objects --bucket birdtest-backups-dr-123 --region eu-west-1 " "$FAKE_DIR/calls.log")" == 2 ]] \
+  || fail "the DR bucket was not deleted from in two pages, in its own region"
+! grep "delete-objects" "$FAKE_DIR/calls.log" | grep -qv -- "--bypass-governance-retention" \
+  || fail "a delete did not bypass the governance lock"
+in_order "aws ecs update-service --cluster birdtest --service birdtest --desired-count 0" \
+         "aws ecs run-task" \
+         "aws s3api delete-objects --bucket birdtest-backups-123 " \
+         "aws s3api delete-objects --bucket birdtest-backups-dr-123 " \
+         "aws ecs update-service --cluster birdtest --service birdtest --desired-count 1"
+grep -q "reset-db host=birdtest.test dumps_deleted=5" "$BIRDTEST_RELEASE_LOG" || fail "the reset's log line does not count the dumps"
+pass "reset-prod-db.sh names both buckets and the dump count, then deletes every version under pg/ in each"
+
+fresh "$B"
+answers birdtest.test
+if FAKE_DUMP_DELETE_FAIL=1 run reset-prod-db.sh; then fail "a reset whose dumps were not deleted succeeded"; fi
+grep -q "dumps remain in birdtest-backups-123" "$WORK/out" || fail "the refused delete is not reported"
+grep -q "AccessDenied" "$WORK/out" || fail "S3's reason is not shown"
+! called "--desired-count 1" || fail "the backend was started with dumps left"
+pass "a delete S3 refuses stops the reset with the backend stopped, and says so"
 
 git -C "$R" checkout -q "$B"
 fresh "$A" "$B"
@@ -207,11 +301,124 @@ run deploy.sh || fail "deploy.sh failed for an unchanged schema"
 in_order "terraform -chdir=$R/infra plan" "terraform -chdir=$R/infra apply" "aws s3 cp $R/infra/prod.tfvars"
 pass "deploy.sh: no reset when 0001 is unchanged, no build when ECR has the images"
 
+# What a commit reaches, path by path, and along the test repository's history.
+mapping=$(printf '%s\n' frontend/src/routes/+page.svelte frontend/docker/default.conf.template \
+    backend/src/derived.rs backend/Cargo.lock backend/migrations/0001_initial.sql docker/Dockerfile \
+    Cargo.toml .dockerignore infra/ecs.tf scripts/backup.sh scripts/restore-drill.sh \
+    scripts/restore-job.sh scripts/deploy.sh scripts/lib/ops.sh README.md RUNBOOK.md e2e/run.sh \
+    worker/fake_worker.py frontend.md \
+  | while read -r p; do printf '%s [%s]\n' "$p" "$(printf '%s\n' "$p" | (source "$ROOT/scripts/lib/ops.sh"; ops_path_components))"; done)
+[[ "$mapping" == "frontend/src/routes/+page.svelte [frontend]
+frontend/docker/default.conf.template [frontend]
+backend/src/derived.rs [backend]
+backend/Cargo.lock [backend]
+backend/migrations/0001_initial.sql [backend]
+docker/Dockerfile [backend]
+Cargo.toml [backend]
+.dockerignore [backend]
+infra/ecs.tf [infra]
+scripts/backup.sh [infra]
+scripts/restore-drill.sh [infra]
+scripts/restore-job.sh [infra]
+scripts/deploy.sh []
+scripts/lib/ops.sh []
+README.md []
+RUNBOOK.md []
+e2e/run.sh []
+worker/fake_worker.py []
+frontend.md []" ]] || fail "a path reaches the wrong part of the stack:
+$mapping"
+components() { (cd "$R" && source scripts/lib/ops.sh && ops_changed_components "$1" "$2" | sort | paste -sd, -); }
+[[ "$(components "$A" "$B")" == frontend && "$(components "$B" "$C")" == backend \
+   && "$(components "$C" "$D")" == "" && "$(components "$D" "$E")" == infra \
+   && "$(components "$A" "$E")" == backend,frontend,infra ]] \
+  || fail "a commit's changes reach the wrong parts of the stack"
+rc=0; components 0123456789ab "$E" > /dev/null || rc=$?
+((rc == 2)) || fail "an unknown live commit is not told apart"
+pass "the path -> service mapping: frontend/ the frontend; backend/, docker/, Cargo.*, .dockerignore the backend; infra/ and its scripts Terraform"
+
+# A frontend change alone: the frontend's image built, pushed and retagged;
+# the backend's and the builder's left at the live tag, and never stopped.
+fresh "$A" "$A"
+answers y
+run deploy.sh || fail "deploy.sh failed for a frontend change"
+called "docker build --pull --platform linux/amd64 -t $REGISTRY/birdtest-frontend:$B frontend" \
+  || fail "the frontend's image was not built"
+{ ! called "birdtest-backend:$B" && ! called "birdtest-derived-builder:$B" && ! called "-f docker/Dockerfile"; } \
+  || fail "a frontend change built the backend"
+{ grep -q "birdtest-backend:$A\"" "$S3_TFVARS" && grep -q "birdtest-derived-builder:$A\"" "$S3_TFVARS" \
+  && grep -q "birdtest-frontend:$B\"" "$S3_TFVARS"; } || fail "prod.tfvars did not move the frontend alone"
+! called "--desired-count" || fail "a frontend deploy changed a service's count"
+grep -q "MAGPIE pin" "$WORK/out" && fail "a frontend deploy checked the MAGPIE pin"
+grep -q "deployed tag=$B previous=$A services=frontend .* previous_backend_image=$REGISTRY/birdtest-backend:$A previous_frontend_image=$REGISTRY/birdtest-frontend:$A" \
+  "$BIRDTEST_RELEASE_LOG" || fail "the release log line does not say what was deployed, and what was before"
+[[ "$(cat "$FAKE_DIR/running_image")" == "$REGISTRY/birdtest-backend:$A" ]] || fail "the backend was redeployed"
+pass "deploy.sh: a frontend change deploys the frontend alone"
+
+# Then the schema change on top of it: the backend is measured from its own
+# live commit (A), not the frontend's (B), and the builder goes with it.
+git -C "$R" checkout -q "$C"
+fresh "$A/$B" "$A"
+answers y birdtest.test
+run deploy.sh --reset-db || fail "deploy.sh --reset-db failed from a split release"
+{ called "--target backend -t $REGISTRY/birdtest-backend:$C" && called "--target derived-builder -t $REGISTRY/birdtest-derived-builder:$C"; } \
+  || fail "the backend and its builder were not built"
+! called "birdtest-frontend:$C" || fail "the frontend was rebuilt though C does not change it"
+{ grep -q "birdtest-backend:$C\"" "$S3_TFVARS" && grep -q "birdtest-derived-builder:$C\"" "$S3_TFVARS" \
+  && grep -q "birdtest-frontend:$B\"" "$S3_TFVARS"; } || fail "prod.tfvars did not move the backend and its builder alone"
+grep -q "deployed tag=$C previous=$B services=backend " "$BIRDTEST_RELEASE_LOG" || fail "no release log line for the backend"
+pass "deploy.sh: a backend change deploys the backend and the builder, measured from the backend's own commit"
+
+# A commit that changes nothing deployed; and --all, which deploys anyway.
+git -C "$R" checkout -q "$D"
+fresh "$C"
+run deploy.sh || fail "deploy.sh failed with nothing to deploy"
+grep -q "nothing this commit changed" "$WORK/out" || fail "a docs-only commit was not said to deploy nothing"
+{ ! called "docker" && ! called "terraform -chdir=$R/infra plan"; } || fail "a docs-only commit built or planned"
+fresh "$C"
+answers y
+run deploy.sh --all || fail "deploy.sh --all failed"
+for repo in backend derived-builder frontend; do
+  called "docker push $REGISTRY/birdtest-$repo:$D" || fail "--all did not push birdtest-$repo"
+done
+grep -q "birdtest-frontend:$D\"" "$S3_TFVARS" || fail "--all did not retag the frontend"
+pass "deploy.sh: nothing to deploy for a docs-only commit; --all deploys every image"
+
+# An infrastructure change alone: planned and applied, no image built or moved.
+git -C "$R" checkout -q "$E"
+fresh "$D"
+answers y
+run deploy.sh || fail "deploy.sh failed for an infra change"
+! called "docker" || fail "an infra change built an image"
+in_order "terraform -chdir=$R/infra plan" "terraform -chdir=$R/infra apply"
+cmp -s <(tfvars_with "$D") "$S3_TFVARS" || fail "an infra change moved an image"
+grep -q "deployed tag=$E previous=$D services=none " "$BIRDTEST_RELEASE_LOG" || fail "no release log line for the infra change"
+pass "deploy.sh: an infra change plans and applies, and moves no image"
+
+# A frontend the circuit breaker rolled back: refused before anything is built,
+# and, when it happens during the deploy, reported.
+git -C "$R" checkout -q "$B"
+fresh "$A"
+printf '%s' "$REGISTRY/birdtest-frontend:0123456789ab" > "$FAKE_DIR/running_frontend_image"
+if run deploy.sh; then fail "deploy.sh deployed over a circuit-breaker rollback"; fi
+grep -q "rollback.sh first" "$WORK/out" || fail "the refusal does not send to rollback.sh"
+! called "docker" || fail "deploy.sh built before refusing"
+fresh "$A" "$B"
+answers y
+if FAKE_ROLLBACK=frontend run deploy.sh; then fail "a frontend deploy ECS rolled back passed"; fi
+grep -q "birdtest-frontend runs $REGISTRY/birdtest-frontend:$A, not $REGISTRY/birdtest-frontend:$B" "$WORK/out" \
+  || fail "the frontend's rollback is not reported"
+# A stack from before the split, with no frontend service yet: nothing to compare.
+fresh "$A" "$B"
+answers y
+FAKE_NO_FRONTEND_SERVICE=1 run deploy.sh || fail "deploy.sh failed on a stack with no frontend service yet"
+pass "deploy.sh: a circuit-breaker rollback of either service is refused or reported; a stack without the frontend's service deploys"
+
 fresh "$A" "$B"
 answers y
 if FAKE_CI="completed failure https://ci/2" run deploy.sh; then fail "deploy.sh deployed with CI red"; fi
 grep -q "failure" "$WORK/out" || fail "the CI refusal does not say why"
-git -C "$R" checkout -q "$C"
+git -C "$R" checkout -q "$E"
 printf 'ARG MAGPIE_COMMIT=%s\n' "$unpushed" > "$R/docker/Dockerfile"
 git -C "$R" commit -q -am "an unpushed pin" && git -C "$R" push -q origin HEAD:refs/heads/main
 fresh "$A" "$B"
@@ -280,6 +487,8 @@ answers "" y y
 run rollback.sh || fail "rollback.sh failed after a circuit breaker"
 { grep -q "circuit breaker" "$WORK/out" && grep -q "Roll back to which tag? \[$A\]" "$WORK/out"; } \
   || fail "the circuit breaker's rollback was not taken as the target"
+{ grep -q "birdtest-backend:$A\"" "$S3_TFVARS" && grep -q "birdtest-frontend:$B\"" "$S3_TFVARS"; } \
+  || fail "prod.tfvars does not name what ECS runs: the backend it went back to, the frontend it kept"
 pass "rollback.sh follows a circuit-breaker rollback"
 
 fresh "$C" "$A" "$C"
@@ -289,6 +498,22 @@ if run rollback.sh; then fail "rollback.sh crossed a 0001 change without --reset
 grep -q -- "--reset-db" "$WORK/out" || fail "the refusal does not say --reset-db"
 ! called " apply " || fail "a refused rollback applied"
 pass "rollback.sh refuses to cross a 0001 change without --reset-db"
+
+# A split release (a frontend deploy, B, over the backend at A), logged by
+# another machine's deploy: the line that replaced A says what A ran
+# (previous_*), so the frontend alone goes back and the backend is not
+# touched, nor asked about.
+fresh "$A/$B" "$A" "$B"
+printf '%s\n' "2026-10-02T00:00:00Z deployed tag=$B previous=$A services=frontend backend_image=$REGISTRY/birdtest-backend:$A derived_builder_image=$REGISTRY/birdtest-derived-builder:$A frontend_image=$REGISTRY/birdtest-frontend:$B min_magpie_version=0.1.1 previous_backend_image=$REGISTRY/birdtest-backend:$A previous_frontend_image=$REGISTRY/birdtest-frontend:$A" \
+  > "$BIRDTEST_RELEASE_LOG"
+answers "" y
+run rollback.sh || fail "rollback.sh failed for a split release"
+grep -q "Roll back to which tag? \[$A\]" "$WORK/out" || fail "the default was not the release before B ($A)"
+! grep -q "enum value" "$WORK/out" || fail "a frontend rollback asked about the backend's enums"
+{ grep -q "birdtest-backend:$A\"" "$S3_TFVARS" && grep -q "birdtest-frontend:$A\"" "$S3_TFVARS"; } \
+  || fail "the rollback did not put the frontend back alone"
+grep -q "rolled-back tag=$A previous=$B " "$BIRDTEST_RELEASE_LOG" || fail "no release log line for the rollback"
+pass "rollback.sh puts back a split release's images, the frontend alone when only it changed"
 
 # ---------------------------------------------------------------------------
 # confirm-user.sh
