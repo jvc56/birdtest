@@ -161,6 +161,8 @@ export class AdminApi {
 
 export interface JobSummary {
   id: string;
+  /** A games or pairs job between two configs is named "A vs B" for them. */
+  name: string;
   job_type: string;
   status: string;
   created_at: string;

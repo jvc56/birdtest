@@ -40,6 +40,19 @@ async function expectTableFits(page: Page, box?: Locator) {
 }
 
 /**
+ * A column header is within the screen's width -- not pushed off its right
+ * edge -- wherever it is down the page: on a phone the movegens-by-type card
+ * stacks above the ranking and pushes it below the fold, which is not what
+ * this checks.
+ */
+async function expectAcrossScreen(page: Page, header: Locator) {
+  await expect(header).toBeVisible();
+  const box = (await header.boundingBox())!;
+  expect(box.x, 'the column starts off the screen').toBeGreaterThanOrEqual(0);
+  expect(box.x + box.width, 'the column runs off the screen').toBeLessThanOrEqual(page.viewportSize()!.width);
+}
+
+/**
  * E-10: the site at phone width. One journey rather than all of them: a
  * visitor on a phone opens the site, goes to the job list, reads a job's
  * page -- the densest public page -- and the two rankings, without anything
@@ -75,7 +88,7 @@ test('E-10: a visitor on a phone reads the job list, a job page and the rankings
   await expectNoSidewaysScroll(page);
 
   await page.locator(`a[href="/jobs/${job.id}"]`).tap();
-  await expect(page.getByRole('heading', { name: 'Game Pairs' })).toBeVisible();
+  await expect(page.getByRole('heading', { level: 1, name: job.name, exact: true })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Significance Test' })).toBeVisible();
   await expectNoSidewaysScroll(page);
 
@@ -135,7 +148,7 @@ test('E-10: a visitor on a phone reads the job list, a job page and the rankings
   await expect(page.getByRole('cell', { name: /^Anonymous · [0-9a-f]{16}$/ }).first()).toBeVisible();
   await expectNoSidewaysScroll(page);
   await expectTableFits(page);
-  await expect(page.getByRole('columnheader', { name: 'Movegens' })).toBeInViewport();
+  await expectAcrossScreen(page, page.getByRole('columnheader', { name: 'Movegens' }));
 
   // And with the widest names either ranking can hold, which the seed has not
   // registered: both lists answered as the server would with them.
@@ -179,7 +192,7 @@ test('E-10: a visitor on a phone reads the job list, a job page and the rankings
   await expect(page.getByTestId('site-movegens').locator('dd').first()).toHaveText('9,200,000,000,000,000,000');
   await expectNoSidewaysScroll(page);
   await expectTableFits(page);
-  await expect(page.getByRole('columnheader', { name: 'Movegens' })).toBeInViewport();
+  await expectAcrossScreen(page, page.getByRole('columnheader', { name: 'Movegens' }));
   // A contributor's movegens by job type open under their row, inside the
   // ranking's box, and the page still does not scroll sideways.
   await page.getByRole('button', { name: LONGEST }).tap();
@@ -197,13 +210,13 @@ test('E-10: a visitor on a phone reads the job list, a job page and the rankings
   await expect(page.getByRole('columnheader', { name: 'Movegens' })).toBeHidden();
   await expectNoSidewaysScroll(page);
   await expectTableFits(page);
-  await expect(page.getByRole('columnheader', { name: 'Compute time' })).toBeInViewport();
+  await expectAcrossScreen(page, page.getByRole('columnheader', { name: 'Compute time' }));
 
   await page.getByRole('banner').getByRole('link', { name: 'Users', exact: true }).tap();
   await expect(page.getByRole('cell', { name: new RegExp(`^${LONGEST}`) })).toBeVisible();
   await expectNoSidewaysScroll(page);
   await expectTableFits(page);
-  await expect(page.getByRole('columnheader', { name: 'Tasks completed' })).toBeInViewport();
+  await expectAcrossScreen(page, page.getByRole('columnheader', { name: 'Tasks completed' }));
 });
 
 /**

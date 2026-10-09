@@ -30,9 +30,11 @@ test('E-1: an anonymous visitor browses the landing page, jobs, a job and the le
   // fourteenth audit).
   await expect(row).toContainText(/\d[\d,]* \/ [\d,]+ pairs/);
 
-  await row.getByRole('link', { name: 'Game Pairs' }).click();
+  // Listed, and titled on its page, by its name: a pairs job between two
+  // configs is named for them ("static-equity vs static-score").
+  await row.getByRole('link', { name: job.name, exact: true }).click();
   await expect(page).toHaveURL(new RegExp(`/jobs/${job.id}$`));
-  await expect(page.getByRole('heading', { name: 'Game Pairs' })).toBeVisible();
+  await expect(page.getByRole('heading', { level: 1, name: job.name, exact: true })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Significance Test' })).toBeVisible();
   // The status on a row of its own, saying what it means for this job unless
   // it is active (the badge says that plainly), then the headline figures.
@@ -64,8 +66,10 @@ test('E-1: an anonymous visitor browses the landing page, jobs, a job and the le
   // The seeded pairs job has results, so its type has movegens.
   await expect(site.locator('dd').nth(2)).toHaveText(/^[1-9][\d,]*$/);
   // A contributor's own, under their row when their name is chosen, and
-  // folded away again.
-  const first = leaders.first().getByRole('button');
+  // folded away again. Held by name, not by place: the list reads itself
+  // again every 30 seconds, and the busy workers can swap places in between.
+  const label = (await leaders.first().getByRole('button').innerText()).replace(/^[▸▾]\s*/, '').trim();
+  const first = page.getByRole('button', { name: label, exact: true });
   await expect(first).toHaveAttribute('aria-expanded', 'false');
   await first.click();
   await expect(first).toHaveAttribute('aria-expanded', 'true');
