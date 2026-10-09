@@ -754,6 +754,12 @@ CREATE TABLE job_game_config (
     -- recorded. Off by default: at ~22.5 turns a game it roughly doubles the
     -- rows a job produces.
     capture_positions   BOOLEAN NOT NULL DEFAULT FALSE,
+    -- How MAGPIE spends its threads on a task (MULTI_THREADING_MODE): 'igp'
+    -- gives them all to one game at a time, inside its simulation, which makes
+    -- an iteration-bounded simulation reproducible; 'pgp' plays games in
+    -- parallel, a thread each. Matters only when a player simulates; a job of
+    -- static players runs alike in either. Stated on every request.
+    threading_mode      TEXT NOT NULL DEFAULT 'igp' CHECK (threading_mode IN ('igp', 'pgp')),
     -- What `validate_job_body` requires, held here too for a row written any
     -- other way (a script, a fixture, a restore). The stopping rule reads the
     -- counts as unsigned: a negative max_games was a cap no job reached, so it
@@ -788,6 +794,8 @@ CREATE TABLE job_game_pair_config (
     -- are the same game; after it they are two different ones, and the turn
     -- itself is where the players disagree.
     capture_first_divergence BOOLEAN NOT NULL DEFAULT FALSE,
+    -- As on job_game_config.
+    threading_mode      TEXT NOT NULL DEFAULT 'igp' CHECK (threading_mode IN ('igp', 'pgp')),
     CONSTRAINT job_game_pair_config_divergence_needs_capture
         CHECK (capture_positions OR NOT capture_first_divergence),
     -- As job_game_config_counts, in pairs.

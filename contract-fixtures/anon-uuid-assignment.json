@@ -12,6 +12,7 @@
     "capture_first_divergence": false,
     "bingo_bonus": 50,
     "sim_cutoff": 0.005,
+    "threading_mode": "igp",
     "player1": {
       "name": "e2e-solving",
       "recorder_type": "best",

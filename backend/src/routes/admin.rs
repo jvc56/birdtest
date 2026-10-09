@@ -1303,6 +1303,9 @@ enum JobTypeConfig {
         /// refused rather than ignored by this untagged body.
         #[serde(default)]
         capture_first_divergence: bool,
+        /// `igp` or `pgp`: see [`crate::jobs::handler::GameRequest::threading_mode`].
+        #[serde(default = "default_threading_mode")]
+        threading_mode: String,
     },
     GamePair {
         /// As for `Game`: one config is self-play, n ≥ 2 a round robin.
@@ -1323,6 +1326,9 @@ enum JobTypeConfig {
         /// Of the captured positions, keep only each pair's first divergence.
         #[serde(default)]
         capture_first_divergence: bool,
+        /// As for `Game`.
+        #[serde(default = "default_threading_mode")]
+        threading_mode: String,
     },
 }
 
@@ -1358,6 +1364,12 @@ impl TestRequest {
     }
 }
 
+/// IGP: all of a task's threads on one game's simulation at a time, which is
+/// what makes a simulation bounded by iterations reproducible. PGP, a game a
+/// thread, is the job's to ask for.
+fn default_threading_mode() -> String {
+    "igp".to_string()
+}
 fn default_consensus_pct() -> f64 {
     100.0
 }
@@ -1864,9 +1876,9 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
         }
         JobTypeConfig::Game {
             player_config_ids, games_per_batch, min_games, max_games, test, capture_positions,
-            capture_first_divergence,
+            capture_first_divergence, threading_mode,
         } => {
-            let err = round_robin_problems(err, player_config_ids);
+            let err = threading_mode_problem(round_robin_problems(err, player_config_ids), threading_mode);
             let mut err = match_test(err, "game", *games_per_batch, *min_games, *max_games, test);
             err = games_batch_field(err, "game", 1, *games_per_batch, *capture_positions);
             if *capture_first_divergence {
@@ -1892,9 +1904,9 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
         }
         JobTypeConfig::GamePair {
             player_config_ids, pairs_per_batch, min_pairs, max_pairs, test, capture_positions,
-            capture_first_divergence,
+            capture_first_divergence, threading_mode,
         } => {
-            let err = round_robin_problems(err, player_config_ids);
+            let err = threading_mode_problem(round_robin_problems(err, player_config_ids), threading_mode);
             let mut err = match_test(err, "pair", *pairs_per_batch, *min_pairs, *max_pairs, test);
             if *capture_first_divergence && !*capture_positions {
                 err = err.with_field(
@@ -1946,6 +1958,16 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
         Ok(())
     } else {
         Err(err)
+    }
+}
+
+/// A games or pairs job's threading mode, which MAGPIE takes as `igp` or `pgp`
+/// and nothing else (the column's CHECK).
+fn threading_mode_problem(err: AppError, threading_mode: &str) -> AppError {
+    if matches!(threading_mode, "igp" | "pgp") {
+        err
+    } else {
+        err.with_field("threading_mode", "must be 'igp' or 'pgp'")
     }
 }
 
@@ -2368,7 +2390,7 @@ async fn insert_job_config(
         (
             JobType::Games,
             JobTypeConfig::Game {
-                games_per_batch, min_games, max_games, test, capture_positions, ..
+                games_per_batch, min_games, max_games, test, capture_positions, threading_mode, ..
             },
         ) => {
             let (player1_config_id, player2_config_id) = pair.ok_or_else(mismatch)?;
@@ -2377,14 +2399,15 @@ async fn insert_job_config(
                 "INSERT INTO job_game_config
                      (job_id, player1_config_id,
                       player2_config_id, games_per_batch, test_enabled, min_games, max_games,
-                      confidence_pct, capture_positions)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+                      confidence_pct, capture_positions, threading_mode)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
             )
             .bind(job.id)
             .bind(player1_config_id).bind(player2_config_id)
             .bind(games_per_batch).bind(test.enabled).bind(test.min_units).bind(max_games)
             .bind(test.confidence_pct)
             .bind(capture_positions)
+            .bind(threading_mode)
             .execute(conn)
             .await?;
         }
@@ -2392,7 +2415,7 @@ async fn insert_job_config(
             JobType::GamePairs,
             JobTypeConfig::GamePair {
                 pairs_per_batch, min_pairs, max_pairs, test, capture_positions,
-                capture_first_divergence, ..
+                capture_first_divergence, threading_mode, ..
             },
         ) => {
             let (player1_config_id, player2_config_id) = pair.ok_or_else(mismatch)?;
@@ -2401,8 +2424,8 @@ async fn insert_job_config(
                 "INSERT INTO job_game_pair_config
                      (job_id, player1_config_id,
                       player2_config_id, pairs_per_batch, test_enabled, min_pairs, max_pairs,
-                      confidence_pct, capture_positions, capture_first_divergence)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+                      confidence_pct, capture_positions, capture_first_divergence, threading_mode)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
             )
             .bind(job.id)
             .bind(player1_config_id).bind(player2_config_id)
@@ -2410,6 +2433,7 @@ async fn insert_job_config(
             .bind(test.confidence_pct)
             .bind(capture_positions)
             .bind(capture_first_divergence)
+            .bind(threading_mode)
             .execute(conn)
             .await?;
         }

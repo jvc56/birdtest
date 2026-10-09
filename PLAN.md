@@ -4330,7 +4330,8 @@ a new MAGPIE setting has a table it visibly is not in.
 | Plies, candidate plays, iterations, minimum play iterations, stopping condition, time limit, threshold, sampling rule, inference and its margin, utility weights (`-pl*`, `-np*`, `-i*`, `-mi*`, `-sc*`, `-tl*`, `-th*`, `-sa*`, `-si*`, `-im*`, `-uwin*`, `-uspread*`, `-uspreadscale*`) | Yes | `num_plies` and `num_plays` required of every player, the rest of every simmer; all reset to MAGPIE's defaults first. An opening-rack task copies the player's into the run-wide settings `impl_move_gen` and `impl_sim` read, and forces inference off (there is no previous play, and `game_history` is whatever the contributor last loaded). A time limit must be 0 |
 | Bingo bonus (`-bb`), simulation cutoff (`-cutoff`) | Yes | Required at the top of every request (the cutoff where the job can simulate) |
 | Movegen margin (`-mmargin`) | Yes, for an opening-rack static analysis with an `equity` recorder; games, game pairs and leave generation never read it — autoplay generates with margin 0 | Required per player; reset before every task, and applied only by the opening-rack executor, from its one player |
-| Multi-threading mode (`-mtmode`), small plays (`-sp`), heat map | Yes / yes / no | No request field; reset before every task |
+| Multi-threading mode (`-mtmode`) | For a simmer: `igp` gives one game's simulation every thread, which makes an iteration-bounded simulation reproducible; `pgp` plays games in parallel | The job's `threading_mode` (`igp` by default, or `pgp`), stated on every games and pairs request. Opening-rack and leave requests state none |
+| Small plays (`-sp`), heat map | Yes / no | No request field; reset before every task |
 | Seed (`-seed`) | Yes | Required on every request: a games batch steps from it, rack `i` is analysed from `seed + i`, a leave task plays from it |
 | Game pairs (`-gp`) | Yes | From the request for games; a leave task does not reset it and does not need to — `autoplay_leave_gen` never creates a second game runner and forces the divergent report off |
 | PlayChooser (`-pc1`/`-pc2`) | Yes — a different move-selection algorithm | No request field; reset to off (`-1`) before every task |
@@ -4814,7 +4815,7 @@ the worker applies both rather than whatever its own settings last loaded.
   "variant": "classic", "letter_distribution": "english", "board_layout": "standard15",
   "seed": "1", "num_games": 10,
   "capture_positions": false, "capture_first_divergence": false,
-  "bingo_bonus": 50, "sim_cutoff": 0.005,
+  "bingo_bonus": 50, "sim_cutoff": 0.005, "threading_mode": "igp",
   "player1": { }, "player2": { } }
 
 { "job_type": "game_pairs", "...": "as games; num_games counts pairs",
@@ -4865,6 +4866,13 @@ them into its per-generation totals — so games played after the forced racks h
 filled still produce coverage the server uses. The target belongs to the server,
 which owns the running per-rack totals across every task in the generation and
 decides on its own when the generation closes.
+
+`threading_mode` is on every games and pairs request, and on no other: `igp`
+gives all of the task's threads to one game's simulation at a time, which makes
+a simulation bounded by iterations reproducible, and `pgp` plays the batch's
+games in parallel, a thread each. It is the job's (`threading_mode` on its
+config row, `igp` unless the job was created with `pgp`), and changes nothing
+for static players.
 
 `seed` is a **decimal string** on every request, because it is a `uint64` and
 JSON numbers are doubles. Every task states one: games and pairs play their
@@ -5955,7 +5963,7 @@ Protected by a layout guard (`/admin/+layout.svelte`) that requires `is_admin = 
 |---|---|
 | `/admin` | Admin overview — redirects to `/jobs`, the job list; a job's page links ("Manage") to its admin page, `/admin/jobs/:id`. There is no `/admin/jobs` list; `/admin/jobs/new` creates a job. |
 | `/admin/allocation` | Every active and inactive job with its allocation, set together and saved in one request (`PUT /api/admin/jobs/allocations`): a running total that turns red above 100% and holds the save, "Share equally", and only the jobs changed are sent. |
-| `/admin/jobs/new` | Create job form — job type selector, then type-specific config fields; a games or pairs job's players are a checklist — one ticked is a self-play job, several a [round robin](#admin-api-semantics) of a job per pairing, seated in the order ticked — with a live preview of the matchups ("4 configs → 6 jobs" and each job's name), and creating one goes to `/admin/allocation` with the new jobs marked, where they are started (any other job type goes to its own page); a games or pairs job can be set to save the positions it plays (`capture_positions`), which caps its batch at 1,000 games or 500 pairs, and a pairs job saving them to keep only where each pair first diverges (`capture_first_divergence`). The letter distribution and board layout start empty ("Choose…") and must be picked, here and on the rating-pool form: the first of each imported is no default worth having. A games or pairs job's **Significance Test** checkbox, ticked, shows its **Confidence %** (95) and minimum; an opening-rack job's consensus is three fields, Minimum and Maximum Analyses Per Rack and Consensus %. Every field is named as the settings tables name it, in Title Case. |
+| `/admin/jobs/new` | Create job form — job type selector, then type-specific config fields; a games or pairs job's players are a checklist — one ticked is a self-play job, several a [round robin](#admin-api-semantics) of a job per pairing, seated in the order ticked — with a live preview of the matchups ("4 configs → 6 jobs" and each job's name), and creating one goes to `/admin/allocation` with the new jobs marked, where they are started (any other job type goes to its own page); a games or pairs job can be set to save the positions it plays (`capture_positions`), which caps its batch at 1,000 games or 500 pairs, and a pairs job saving them to keep only where each pair first diverges (`capture_first_divergence`); a games or pairs job's **Threading** is IGP (the default: every thread on one game's simulation, which makes an iteration-bounded simulation reproducible) or PGP (games in parallel), which matters only when a player simulates. The letter distribution and board layout start empty ("Choose…") and must be picked, here and on the rating-pool form: the first of each imported is no default worth having. A games or pairs job's **Significance Test** checkbox, ticked, shows its **Confidence %** (95) and minimum; an opening-rack job's consensus is three fields, Minimum and Maximum Analyses Per Rack and Consensus %. Every field is named as the settings tables name it, in Title Case. |
 | `/admin/jobs/[id]` | Admin job view — the public page's four headline cards (status, allocation, tasks completed, ETA), the job's progress, its settings, match score and Significance Test cards as the public page has them, for an opening-rack job a Consensus card that changes its consensus settings (`PATCH .../consensus`), contributors and data gaps (what workers declined it for) plus the job's allocation, read-only with a link to `/admin/allocation` (the only place a job is switched on or off), and controls: force-complete, purge, delete (each asks first: none can be taken back), an artifact check and "merge progress now" for leave generation, and the export panel — a completed job's final export or a snapshot of a running one; start, poll, download. |
 | `/admin/player-configs` | Player config list — name, recorder type, sort strategy, sim parameters. |
 | `/admin/player-configs/new` | Create player config form, each field named as the settings tables name it with its MAGPIE argument beside it ("Move Recorder (-r)", "Sorted By (-s)"). No number box on either form has spinner arrows. |
@@ -7054,6 +7062,12 @@ CREATE TABLE job_game_config (
     -- recorded. Off by default: at ~22.5 turns a game it roughly doubles the
     -- rows a job produces.
     capture_positions   BOOLEAN NOT NULL DEFAULT FALSE,
+    -- How MAGPIE spends its threads on a task (MULTI_THREADING_MODE): 'igp'
+    -- gives them all to one game at a time, inside its simulation, which makes
+    -- an iteration-bounded simulation reproducible; 'pgp' plays games in
+    -- parallel, a thread each. Matters only when a player simulates; a job of
+    -- static players runs alike in either. Stated on every request.
+    threading_mode      TEXT NOT NULL DEFAULT 'igp' CHECK (threading_mode IN ('igp', 'pgp')),
     -- What `validate_job_body` requires, held here too for a row written any
     -- other way (a script, a fixture, a restore). The stopping rule reads the
     -- counts as unsigned: a negative max_games was a cap no job reached, so it
@@ -7088,6 +7102,8 @@ CREATE TABLE job_game_pair_config (
     -- are the same game; after it they are two different ones, and the turn
     -- itself is where the players disagree.
     capture_first_divergence BOOLEAN NOT NULL DEFAULT FALSE,
+    -- As on job_game_config.
+    threading_mode      TEXT NOT NULL DEFAULT 'igp' CHECK (threading_mode IN ('igp', 'pgp')),
     CONSTRAINT job_game_pair_config_divergence_needs_capture
         CHECK (capture_positions OR NOT capture_first_divergence),
     -- As job_game_config_counts, in pairs.

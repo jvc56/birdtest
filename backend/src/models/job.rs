@@ -243,6 +243,9 @@ pub struct GameConfig {
     /// Keep the position analyses produced while playing. Off by default: at
     /// ~22.5 turns a game it roughly doubles the rows a job produces.
     pub capture_positions: bool,
+    /// How MAGPIE spends its threads: `igp` or `pgp` (see
+    /// [`crate::jobs::handler::GameRequest::threading_mode`]).
+    pub threading_mode: String,
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
@@ -265,6 +268,8 @@ pub struct GamePairConfig {
     /// games' positions at the first turn they play different moves, and
     /// nothing from a pair played identically.
     pub capture_first_divergence: bool,
+    /// As on [`GameConfig::threading_mode`].
+    pub threading_mode: String,
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
@@ -432,6 +437,7 @@ mod tests {
             max_games: 5000,
             confidence_pct: 97.5,
             capture_positions: false,
+            threading_mode: "igp".into(),
         };
         let pairs = GamePairConfig {
             job_id,
@@ -444,6 +450,7 @@ mod tests {
             confidence_pct: 97.5,
             capture_positions: false,
             capture_first_divergence: false,
+            threading_mode: "igp".into(),
         };
 
         let fields = |p: TestParams| (p.enabled, p.min_units, p.max_units, p.confidence_pct);

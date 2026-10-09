@@ -883,8 +883,9 @@ Each entry's tests are the `describe` block named for its id.
   Position Recorder as yes, no or "yes (first divergences)"; an
   opening-rack job's minimum and maximum analyses per rack and its consensus
   share, "—" at a maximum of 1; a leave job's generations and each one's
-  target; then sim cutoff, the test's minimum, batch sizes, the oldest
-  MAGPIE); a job without a test shows none of the test's settings but its
+  target; then sim cutoff, a games or pairs job's Threading, "IGP (threads
+  within a game)" or "PGP (games in parallel)", the test's minimum, batch
+  sizes, the oldest MAGPIE); a job without a test shows none of the test's settings but its
   "no", and a leave job has no sim cutoff and no lexicon or wordmap row of
   its own. Every label is in Title Case, and every job type capitalised. A
   player's settings are one ordered list too, key rows first (Lexicon,
@@ -1720,7 +1721,8 @@ job creation touches needs one caller here.
 - `I-JOB-1` Creating each of the four job types inserts its config row with
   every column populated, and reads back identical; a games job created with
   only its target runs no match test, and stores the test's default
-  confidence (95%) and a floor of 0. *(Covered:
+  confidence (95%) and a floor of 0, and the default threading, `igp`.
+  *(Covered:
   `jobs::each_job_type_stores_every_setting_it_was_created_with`,
   `jobs::a_leave_generation_job_stores_every_setting_it_was_created_with`.)*
 - `I-JOB-1b` A `games` job's batch is even (default 2): MAGPIE gives player 1

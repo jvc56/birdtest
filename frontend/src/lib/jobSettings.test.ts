@@ -33,7 +33,7 @@ const config: JobConfig = {
   games: {
     unit: 'pair', per_batch: 1, test_enabled: true, min_units: 100, max_units: 5000,
     confidence_pct: 95, capture_positions: false,
-    capture_first_divergence: false
+    capture_first_divergence: false, threading_mode: 'igp'
   },
   players: [staticPlayer, simPlayer]
 };
@@ -85,8 +85,8 @@ describe('F-SET-1 job settings', () => {
     const rows = jobSettings(config);
     expect(labels(rows)).toEqual([
       'Type', 'Variant', 'Letter Distribution', 'Board', 'Bingo Bonus', 'Maximum Pairs',
-      'Significance Test', 'Position Recorder', 'Sim Cutoff', 'Minimum Pairs', 'Pairs Per Task',
-      'Oldest MAGPIE'
+      'Significance Test', 'Position Recorder', 'Sim Cutoff', 'Threading', 'Minimum Pairs',
+      'Pairs Per Task', 'Oldest MAGPIE'
     ]);
     expect(rows[0].value).toBe('Game Pairs');
     // The test and its confidence in one row.
@@ -111,6 +111,14 @@ describe('F-SET-1 job settings', () => {
     expect(value({})).toBe('no');
     expect(value({ capture_positions: true })).toBe('yes');
     expect(value({ capture_positions: true, capture_first_divergence: true })).toBe('yes (first divergences)');
+  });
+
+  it("names a games or pairs job's threading as the form does", () => {
+    const value = (threading_mode: 'igp' | 'pgp') =>
+      byLabel(jobSettings({ ...config, games: { ...config.games!, threading_mode } }), 'Threading').value;
+    expect(value('igp')).toBe('IGP (threads within a game)');
+    expect(value('pgp')).toBe('PGP (games in parallel)');
+    expect(labels(jobSettings(opening))).not.toContain('Threading');
   });
 
   it('shows a job without a test its target, and none of the test it does not run', () => {

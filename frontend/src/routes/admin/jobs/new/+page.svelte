@@ -66,6 +66,9 @@
   let capturePositions = false;
   // Game pairs, with positions saved: only each pair's first divergence.
   let captureFirstDivergence = false;
+  // How MAGPIE spends a task's threads, which matters only when a player
+  // simulates: IGP, all of them on one game's simulation, is the default.
+  let threadingMode: 'igp' | 'pgp' = 'igp';
   let numIterations = 10000;
   // One occurrence target per generation, as MAGPIE's `leavegen` takes them:
   // the list's length is how many generations the job runs.
@@ -167,7 +170,8 @@
           player_config_ids: players.map((config) => config.id),
           games_per_batch: batchSize, max_games: maxUnits, ...test,
           ...(testEnabled ? { min_games: minUnits } : {}),
-          capture_positions: capturePositions
+          capture_positions: capturePositions,
+          threading_mode: threadingMode
         };
       case 'game_pairs':
         return {
@@ -176,7 +180,8 @@
           pairs_per_batch: batchSize, max_pairs: maxUnits, ...test,
           ...(testEnabled ? { min_pairs: minUnits } : {}),
           capture_positions: capturePositions,
-          capture_first_divergence: capturePositions && captureFirstDivergence
+          capture_first_divergence: capturePositions && captureFirstDivergence,
+          threading_mode: threadingMode
         };
       case 'leave_generation':
         return {
@@ -562,6 +567,18 @@
           player's ranking. A pair played identically keeps nothing.
         </p>
       {/if}
+    </div>
+    <div>
+      <label class="label" for="threading">Threading</label>
+      <select id="threading" class="input" bind:value={threadingMode}>
+        <option value="igp">IGP: threads within a game</option>
+        <option value="pgp">PGP: games in parallel</option>
+      </select>
+      <p class="mt-1 text-xs text-muted-foreground">
+        IGP gives all of a task's threads to one game's simulation, which makes a simulation bounded
+        by iterations reproducible; PGP plays games in parallel, a thread each. It only matters when
+        a player simulates.
+      </p>
     </div>
   {:else}
     {#if leaveConflict}

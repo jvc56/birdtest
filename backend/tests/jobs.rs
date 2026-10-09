@@ -184,7 +184,7 @@ async fn each_job_type_stores_every_setting_it_was_created_with() {
             "player_config_ids": [p1, p2], "games_per_batch": 4,
             "test_enabled": true,
             "min_games": 100, "max_games": 2000, "confidence_pct": 97.5,
-            "capture_positions": true,
+            "capture_positions": true, "threading_mode": "pgp",
         }))
         .await;
     assert_eq!(status, StatusCode::CREATED, "{created}");
@@ -196,7 +196,7 @@ async fn each_job_type_stores_every_setting_it_was_created_with() {
         &json!({
             "job_id": games, "player1_config_id": p1, "player2_config_id": p2,
             "games_per_batch": 4, "test_enabled": true, "min_games": 100, "max_games": 2000,
-            "confidence_pct": 97.5, "capture_positions": true,
+            "confidence_pct": 97.5, "capture_positions": true, "threading_mode": "pgp",
         }),
     );
     let job = job_row(&db, games).await;
@@ -224,7 +224,7 @@ async fn each_job_type_stores_every_setting_it_was_created_with() {
             "test_enabled": true,
             "min_pairs": 10, "max_pairs": 500, "confidence_pct": 90.0,
             "capture_positions": true,
-            "capture_first_divergence": true,
+            "capture_first_divergence": true, "threading_mode": "pgp",
         }))
         .await;
     assert_eq!(status, StatusCode::CREATED, "{created}");
@@ -237,7 +237,7 @@ async fn each_job_type_stores_every_setting_it_was_created_with() {
             "job_id": pairs, "player1_config_id": p2, "player2_config_id": p1,
             "pairs_per_batch": 3, "test_enabled": true, "min_pairs": 10, "max_pairs": 500,
             "confidence_pct": 90.0, "capture_positions": true,
-            "capture_first_divergence": true,
+            "capture_first_divergence": true, "threading_mode": "pgp",
         }),
     );
     assert_eq!(job_row(&db, pairs).await["job_type"], "game_pairs");
@@ -255,7 +255,7 @@ async fn each_job_type_stores_every_setting_it_was_created_with() {
         &json!({
             "job_id": plain, "player1_config_id": p1, "player2_config_id": p2,
             "games_per_batch": 2, "test_enabled": false, "min_games": 0, "max_games": 10,
-            "confidence_pct": 95.0, "capture_positions": false,
+            "confidence_pct": 95.0, "capture_positions": false, "threading_mode": "igp",
         }),
     );
 

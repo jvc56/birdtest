@@ -256,6 +256,8 @@ struct GamesSettings {
     /// Game pairs: of the captured positions, only each pair's first
     /// divergence is kept. Always `false` for a games job.
     capture_first_divergence: bool,
+    /// `igp` or `pgp`: how MAGPIE spends its threads on a task.
+    threading_mode: String,
 }
 
 /// The lexicon and wordmap setting are the player's, and shown with it.
@@ -444,6 +446,7 @@ async fn job_config(
                 confidence_pct: c.confidence_pct,
                 capture_positions: c.capture_positions,
                 capture_first_divergence: false,
+                threading_mode: c.threading_mode,
             });
         }
         JobType::GamePairs => {
@@ -462,6 +465,7 @@ async fn job_config(
                 confidence_pct: c.confidence_pct,
                 capture_positions: c.capture_positions,
                 capture_first_divergence: c.capture_first_divergence,
+                threading_mode: c.threading_mode,
             });
         }
         JobType::OpeningRack => {

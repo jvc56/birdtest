@@ -161,8 +161,9 @@ Open "dev game pairs (first divergences saved)".
   settings** button, each label in Title Case: Type "Game Pairs", Variant,
   Letter Distribution, Board, Bingo Bonus 50, Maximum Pairs 100,000,
   Significance Test "yes (95%)" (one row, no separate Confidence %), Position
-  Recorder "yes (first divergences)", Sim Cutoff, Minimum Pairs (50,000),
-  Pairs Per Task and Oldest MAGPIE, and no download link.
+  Recorder "yes (first divergences)", Sim Cutoff, Threading "IGP (threads
+  within a game)", Minimum Pairs (50,000), Pairs Per Task and Oldest MAGPIE,
+  and no download link.
 - [ ] **Expect** after it a **Player settings** card: the players side by side,
   headed "Player 1" and "Player 2", each with its colour dot (green, purple:
   the colours their moves are drawn in under Saved positions) and its name
@@ -714,6 +715,13 @@ board start on "Choose…": pick `english` and `standard15` each time.
   pairing, and nothing created.
 - [ ] **Games**: **expect** the batch field to step by 2, and the browser to
   refuse an odd number.
+- [ ] **Games** or **Game Pairs**: **expect** a **Threading** select on "IGP:
+  threads within a game", saying IGP gives all threads to one game's
+  simulation and makes iteration-bounded simulations reproducible, PGP plays
+  games in parallel, and it only matters when a player simulates. **Do**
+  create "tester no test" with "PGP: games in parallel". **Expect** its Job
+  settings to say Threading "PGP (games in parallel)", and the others "IGP
+  (threads within a game)". No other job type has the field.
 - [ ] **Opening Rack Analysis** with `static-equity` (recorder best, 10 plays
   kept). **Expect** a warning that only one play per rack would be stored, and
   creation refused; with `tester-static-all` (A-4) it is accepted.
