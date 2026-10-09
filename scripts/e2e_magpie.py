@@ -47,6 +47,10 @@ Each case is selectable with `--cases` (default: every M case):
   two-letter data: it covers its eight racks, then reissues them -- as lists,
   from seeds past the end of the space -- until each is settled, and
   completes once all are; every rack has at least its fewest analyses.
+- `M-17` A worker at 24 threads runs a job whose players solve: each of its
+  24 concurrent games gives its solves one thread. Given every thread each,
+  as before, the solves needed 24 + 24 x 24 move generators of a pool of 512,
+  and magpie exited.
 
 And one case that is not a test: `capture` runs one job of each type through
 `scripts/capture_contract.py`'s recording proxy and writes the contract
@@ -380,8 +384,10 @@ class Worker:
     """
 
     def __init__(self, ctx: Context, name: str, *, small: bool = False,
-                 altered: Optional[Dict[str, bytes]] = None, shared_data: bool = False):
+                 altered: Optional[Dict[str, bytes]] = None, shared_data: bool = False,
+                 threads: Optional[int] = None):
         self.ctx = ctx
+        self.threads = threads or ctx.args.threads
         self.dir = ctx.args.workdir.resolve() / name
         shutil.rmtree(self.dir, ignore_errors=True)
         self.dir.mkdir(parents=True)
@@ -412,7 +418,7 @@ class Worker:
         kept = []
         if path.exists():
             kept = [line for line in path.read_text().splitlines() if line.startswith("uuid ")]
-        lines = [f"server {server or self.ctx.args.api}", f"threads {self.ctx.args.threads}",
+        lines = [f"server {server or self.ctx.args.api}", f"threads {self.threads}",
                  f"maxtasks {tasks}", "idlewait 2", *kept]
         path.write_text("\n".join(lines) + "\n")
 
@@ -1010,6 +1016,25 @@ def case_solvers(ctx: Context) -> None:
         worker.remove()
 
 
+def case_solvers_many_threads(ctx: Context) -> None:
+    """M-17: a solving job at 24 threads finishes, its solves sharing the
+    threads with the games rather than each taking all of them."""
+    deactivate_everything(ctx)
+    solver = solving_player(ctx)
+    players = {"player1_config_id": solver, "player2_config_id": solver}
+    # A game per thread, so all 24 run at once and each reaches its solves.
+    job_id = create_and_activate(ctx, ctx.data, games_body(players, 24))
+    worker = Worker(ctx, "m17", threads=24)
+    try:
+        output = worker.run(tasks=1)
+        expect(completed_claims(ctx, job_id) == 1,
+               f"the 24-thread solving task did not complete:\n{output[-3000:]}")
+        expect("finished task #1" in output, f"no finished line for the task:\n{output[-3000:]}")
+    finally:
+        delete_job(ctx, job_id)
+        worker.remove()
+
+
 def case_concurrent(ctx: Context) -> None:
     """M-9: two contributors at once, no duplicate seeds."""
     deactivate_everything(ctx)
@@ -1367,6 +1392,7 @@ CASES = {
     "M-14": case_first_divergences,
     "M-15": case_consensus,
     "M-16": case_inference,
+    "M-17": case_solvers_many_threads,
     "capture": case_capture,
 }
 DEFAULT_CASES = [name for name in CASES if name.startswith("M-")]

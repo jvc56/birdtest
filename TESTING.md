@@ -74,7 +74,7 @@ at tier 5 names a symptom.
 | 3 API | 250 | `backend/tests/`: `worker_api.rs` (52), `admin_api.rs` (59), `auth_routes.rs` (28), `worker_routes.rs` (24), `boundaries.rs` (18), `public_api.rs` (24), `admin_routes.rs` (13), `authz.rs` (7), `account.rs` (10), `auth_api.rs` (5), `finish.rs` (9), `fake_worker.rs` (1) |
 | 4 Contract | 15 | `routes::worker::contract_fixtures`, over 18 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
 | 5 End-to-end | 22 | Playwright journeys `E-1`..`E-18` (`E-11` in three tests, `E-10` and `E-12` in two each) in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
-| 6 MAGPIE smoke | 15 cases + 16 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-16` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 16 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (6), `magpie_leave.rs` (7), `magpie_routes.rs` (3) |
+| 6 MAGPIE smoke | 16 cases + 16 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-17` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 16 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (6), `magpie_leave.rs` (7), `magpie_routes.rs` (3) |
 
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
@@ -4239,6 +4239,11 @@ surfacing the mismatch as a red build rather than as a dead job in production.
   found, most drawn first, and draws exactly when leaves were found -- an
   inference can find no leave at all, at the default margin of 0, and is kept
   saying so. *(Covered: `case_inference`, one task.)*
+- `M-17` A worker at 24 threads finishes a games job whose players solve their
+  endgames and pre-endgames, 24 games at once: each game's solves get one
+  thread. When every solve took all 24, the games needed 24 + 24 x 24 move
+  generators of MAGPIE's 512 and magpie exited. *(Covered:
+  `case_solvers_many_threads`, one task.)*
 - `M-13` A job with `use_wit` dispatches only once its word info table is
   built; a worker whose table does not match the recorded hash declines with
   `derived_mismatch` and both digests reach `worker_data_gaps`; with the right
