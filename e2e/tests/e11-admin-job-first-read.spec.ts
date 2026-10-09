@@ -19,8 +19,7 @@ test('E-11: an admin job page whose first read fails shows only what the server 
   const b = await api.createStaticConfig(`e11-b-${Date.now()}`, 'score');
   const id = await api.inactiveJob({
     job_type: 'game_pairs',
-    player1_config_id: a,
-    player2_config_id: b,
+    player_config_ids: [a, b],
     pairs_per_batch: 1,
     test_enabled: true,
     min_pairs: 100000,
@@ -88,8 +87,7 @@ test('E-11b: a slow read does not undo what the stream has since said', async ({
   const b = await api.createStaticConfig(`e11b-b-${Date.now()}`, 'score');
   const id = await api.inactiveJob({
     job_type: 'game_pairs',
-    player1_config_id: a,
-    player2_config_id: b,
+    player_config_ids: [a, b],
     pairs_per_batch: 1,
     test_enabled: true,
     min_pairs: 100000,
@@ -159,8 +157,7 @@ test('E-11c: a job deleted while its page is open offers nothing more', async ({
   const b = await api.createStaticConfig(`e11c-b-${Date.now()}`, 'score');
   const id = await api.inactiveJob({
     job_type: 'game_pairs',
-    player1_config_id: a,
-    player2_config_id: b,
+    player_config_ids: [a, b],
     pairs_per_batch: 1,
     test_enabled: true,
     min_pairs: 100000,

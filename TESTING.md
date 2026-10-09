@@ -152,8 +152,9 @@ incidentally by higher tiers.
 | `lib/accountRules.ts` | 1F | Covered (`F-ACCOUNT-*`) |
 | `lib/ratingPool.ts` | 1F | Covered (`F-RATE-*`) |
 | `lib/importWatch.ts`, `lib/poller.ts` | 1F | Covered (`F-IMPORT-*`, `F-POLL-*`) |
+| `lib/roundRobin.ts` | 1F | Covered (`F-RR-*`) |
 | Chart maths | 1F | Covered (`F-CHART-*`). The arithmetic moved out of the components into `lib/charts/*.ts` so it could be tested; the `.svelte` files that draw it are exercised only by tier 5 |
-| Every page under `routes/` | 5 | Partial — the eighteen journeys (E-10 visits `/users`). `/admin/allocation`, `/admin/backups`, `/admin/derived-data`, `/admin/fleet` and `/admin/users` are in none of them; their endpoints are tier 3 |
+| Every page under `routes/` | 5 | Partial — the eighteen journeys (E-10 visits `/users`). `/admin/backups`, `/admin/derived-data`, `/admin/fleet` and `/admin/users` are in none of them (`/admin/allocation` is E-4's); their endpoints are tier 3 |
 
 ### Scripts and cross-repo
 
@@ -962,6 +963,16 @@ Each entry's tests are the `describe` block named for its id.
 - `F-FMT-19` `exactCount` reads a contributor's movegens to the last digit,
   grouped ("1,234,567,890"), and a dash for anything that is not a count.
   *(Covered: `format.test.ts`.)*
+
+### `F-RR-*` — `lib/roundRobin.ts`
+
+- `F-RR-1` `matchups` makes one self-play job of one config under the name as
+  given, every pairing once for more -- seated in the order given (3 → 3,
+  4 → 6) -- and names each "{name}: A vs B", or "A vs B" with no name, as the
+  server does (`I-JOB-15`). *(Covered: `roundRobin.test.ts`.)*
+- `F-RR-2` `matchupSummary` reads "4 configs → 6 jobs", "1 config → 1
+  self-play job", and why none or more than twelve cannot be sent;
+  `matchupsAllowed` is one to twelve. *(Covered: `roundRobin.test.ts`.)*
 
 ### `F-CONS-*` — `lib/consensus.ts`
 
@@ -1898,6 +1909,21 @@ job creation touches needs one caller here.
   opening-rack body does. *(Covered:
   `jobs::a_leave_job_refuses_a_player_it_cannot_generate_leaves_with`,
   `routes::admin::tests::a_leave_body_is_read_as_a_leave_config_and_an_opening_rack_body_is_not`.)*
+- `I-JOB-15` **A games or pairs request naming n ≥ 2 configs is a round
+  robin**: C(n, 2) jobs (3 → 3, 4 → 6), every pairing once, seated in the
+  order listed and named "{name}: A vs B" ("A vs B" unnamed), all inactive at
+  0%, each audited `job.created`, and answered together as `{jobs}`; one
+  config is a self-play job under the name as given. *(Covered:
+  `jobs::a_round_robin_creates_a_job_for_every_pairing`,
+  `routes::admin::tests::pairings_are_every_pair_once_in_the_order_given`; the
+  form's preview of the same rules, `roundRobin.test.ts` (F-RR-1, F-RR-2).)*
+- `I-JOB-16` **A round robin is created whole or not at all.** Every pairing
+  is checked before anything is inserted, and one clash (two simmers on
+  different win% models) refuses the request, naming that pairing, with no job
+  written; a config named twice, more than twelve, none, or a name its
+  pairing would push past 100 characters is refused on its field. *(Covered:
+  `jobs::a_round_robin_with_one_bad_pairing_creates_nothing`,
+  `routes::admin::tests::a_round_robin_names_one_to_twelve_configs_once_each`.)*
 
 ### `I-SUBMIT-*` — result submission (`jobs/mod.rs`, `jobs/*.rs`)
 
@@ -3054,7 +3080,7 @@ below.
   is the pool "X" (a conflict). Both took any text, and a pool's name as typed
   (thirty-third audit, pass 1). *(Covered:
   `admin_routes::a_player_config_and_a_pool_take_a_job_names_rule`.)*
-- `A-ADMIN-2` Creating a job of each type returns `{job}` and the
+- `A-ADMIN-2` Creating a job of each type returns `{jobs: [job]}` and the
   job is inactive at 0%. *(Covered:
   `admin_routes::creating_each_job_type_answers_it_inactive_and_unallocated`;
   a leave job, which runs MAGPIE at creation, by the opt-in
@@ -3748,9 +3774,12 @@ admin in once and the admin journeys reuse its storage state.
   `e2-register-and-api-key.spec.ts`, reading its code from the outbox.)*
 - `E-3` An admin imports input data, reviews the staged diff, and confirms it.
   *(Covered: `e3-input-data-import.spec.ts`, against the fixture tarballs.)*
-- `E-4` An admin creates two player configs and a game-pairs job with
-  **Significance Test** ticked, activates it by giving it an allocation on
-  `/admin/allocation` (and deactivates it there at the end), and watches the dashboard
+- `E-4` An admin creates two player configs and a game-pairs job between them
+  with **Significance Test** ticked -- its players a checklist whose preview
+  says "3 configs → 3 jobs" with a third ticked and "2 configs → 1 job", the
+  job named for its pairing -- lands on `/admin/allocation` with the new job
+  marked and first, activates it there by giving it an allocation (and
+  deactivates it there at the end), and watches the dashboard
   update live over SSE as fake workers contribute; its admin page has the
   match score and Significance Test cards, the latter's sentence giving player 1's
   score per game. **The journey that justifies the tier**: the only place

@@ -101,16 +101,20 @@ export class AdminApi {
     return created.id;
   }
 
-  /** Creates a job on the seeded data and leaves it inactive; returns its id. */
+  /**
+   * Creates a job on the seeded data and leaves it inactive; returns its id.
+   * A games or pairs `config` names its two players as `player_config_ids`
+   * (more would be a round robin of several jobs).
+   */
   async inactiveJob(config: Record<string, unknown>): Promise<string> {
     const data = await this.seededData();
-    const created = await this.post<{ job: { id: string } }>('/api/admin/jobs', {
+    const created = await this.post<{ jobs: { id: string }[] }>('/api/admin/jobs', {
       variant: 'classic',
       letterdist_id: data.letterdist,
       layout_id: data.layout,
       ...config
     });
-    return created.job.id;
+    return created.jobs[0].id;
   }
 
   async playerConfigId(name: string): Promise<string> {
@@ -144,14 +148,14 @@ export class AdminApi {
    */
   async activeJob(config: Record<string, unknown>, allocation: number): Promise<string> {
     const data = await this.seededData();
-    const created = await this.post<{ job: { id: string } }>('/api/admin/jobs', {
+    const created = await this.post<{ jobs: { id: string }[] }>('/api/admin/jobs', {
       variant: 'classic',
       letterdist_id: data.letterdist,
       layout_id: data.layout,
       ...config
     });
-    await this.allocate(created.job.id, allocation);
-    return created.job.id;
+    await this.allocate(created.jobs[0].id, allocation);
+    return created.jobs[0].id;
   }
 }
 

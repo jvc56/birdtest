@@ -288,7 +288,7 @@ def create_and_activate(ctx: Context, data: dict, body: dict) -> str:
               "letterdist_id": data["letterdist"], "layout_id": data["layout"], **body},
         headers=ctx.client._headers(), timeout=1800,
     )
-    job_id = ctx.client.json(response, f"create {body['job_type']} job")["job"]["id"]
+    job_id = ctx.client.json(response, f"create {body['job_type']} job")["jobs"][0]["id"]
     ctx.client.allocate(job_id, 100)
     log(f"created and activated {body['job_type']} job {job_id} "
         f"in {time.time() - started:.1f}s")
@@ -552,8 +552,16 @@ def solving_player(ctx: Context) -> str:
     })
 
 
+def seats(players: dict) -> dict:
+    """A games or pairs body's players, from a player 1 / player 2 pair: the
+    two configs, or one named once for a self-play job (the same config
+    twice in the list is refused)."""
+    p1, p2 = players["player1_config_id"], players["player2_config_id"]
+    return {"player_config_ids": [p1] if p1 == p2 else [p1, p2]}
+
+
 def games_body(players: dict, batch: int, **extra) -> dict:
-    return {"job_type": "games", **players, "games_per_batch": batch, "test_enabled": True,
+    return {"job_type": "games", **seats(players), "games_per_batch": batch, "test_enabled": True,
             "min_games": 1_000_000, "max_games": 1_000_000, **extra}
 
 
@@ -631,7 +639,7 @@ def case_pairs(ctx: Context) -> None:
         expect(sum(penta) == stats["games"]["units_completed"],
                f"pentanomial {penta} does not count every pair: {stats['games']}")
 
-    run_job(ctx, ctx.data, {"job_type": "game_pairs", **static_players(ctx),
+    run_job(ctx, ctx.data, {"job_type": "game_pairs", **seats(static_players(ctx)),
                             "pairs_per_batch": 2, "test_enabled": True,
                             "min_pairs": 1000, "max_pairs": 1000},
             pairs_counted)
@@ -932,7 +940,7 @@ def case_first_divergences(ctx: Context) -> None:
     # Equity against score, which disagree within a few turns, in pairs: four
     # tasks of five pairs.
     job_id = create_and_activate(ctx, ctx.data, {
-        "job_type": "game_pairs", **static_players(ctx), "pairs_per_batch": 5,
+        "job_type": "game_pairs", **seats(static_players(ctx)), "pairs_per_batch": 5,
         "test_enabled": True, "min_pairs": 1_000_000, "max_pairs": 1_000_000,
         "capture_positions": True, "capture_first_divergence": True})
     worker = Worker(ctx, "m14")
@@ -1297,7 +1305,7 @@ def case_capture(ctx: Context) -> None:
         # Players with a wordmap, so the assignment pins a derived file, and
         # first divergences kept, so the result carries a pair's two positions.
         # Equity against score: the pairs diverge.
-        one({"job_type": "game_pairs", **wordmap_players(ctx), "pairs_per_batch": 2,
+        one({"job_type": "game_pairs", **seats(wordmap_players(ctx)), "pairs_per_batch": 2,
              "test_enabled": True, "min_pairs": 1_000_000, "max_pairs": 1_000_000,
              "capture_positions": True, "capture_first_divergence": True}, ctx.data,
             needs_build=True)

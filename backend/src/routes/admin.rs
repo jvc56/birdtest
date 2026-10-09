@@ -1282,8 +1282,10 @@ enum JobTypeConfig {
         max_results_per_rack: i32,
     },
     Game {
-        player1_config_id: Uuid,
-        player2_config_id: Uuid,
+        /// The configs to play each other: one is a self-play job, and n ≥ 2
+        /// a round robin of C(n, 2) jobs, one per pairing (see
+        /// [`pairings`]).
+        player_config_ids: Vec<Uuid>,
         #[serde(default = "two")]
         games_per_batch: i32,
         /// With the test off, the job plays this many games and stops; with it
@@ -1303,8 +1305,8 @@ enum JobTypeConfig {
         capture_first_divergence: bool,
     },
     GamePair {
-        player1_config_id: Uuid,
-        player2_config_id: Uuid,
+        /// As for `Game`: one config is self-play, n ≥ 2 a round robin.
+        player_config_ids: Vec<Uuid>,
         #[serde(default = "one")]
         pairs_per_batch: i32,
         /// With the test off, the job plays this many pairs and stops; with it
@@ -1371,13 +1373,88 @@ fn default_rack_size() -> i32 {
 /// as it does every generation's. Seeding generation 1 here held the creating
 /// request open for the tens of seconds 3.2 million rows take.
 #[derive(Serialize)]
-struct CreatedJob {
-    job: Job,
+struct CreatedJobs {
+    /// Every job the request created, as stored: one, or for a games or
+    /// pairs request naming n ≥ 2 configs, one per pairing in the order of
+    /// [`pairings`].
+    jobs: Vec<Job>,
+}
+
+/// One job a request makes: its name and, for games and pairs, its seating.
+struct PlannedJob {
+    name: String,
+    pair: Option<(Uuid, Uuid)>,
+    /// "A vs B", for an error to name the pairing it is about; `None` for a
+    /// request that makes one job, whose errors need no qualifying.
+    pairing: Option<String>,
+}
+
+impl PlannedJob {
+    /// `err` about this job, named for its pairing when it has one -- in a
+    /// round robin, "player configs disagree on the win% model" alone does
+    /// not say which two.
+    fn qualify(&self, mut err: AppError) -> AppError {
+        if let Some(pairing) = &self.pairing {
+            if err.status.is_client_error() {
+                err.message = format!("{pairing}: {}", err.message);
+            }
+        }
+        err
+    }
+}
+
+/// The jobs `body` asks for: one, or for a games or pairs request naming
+/// n ≥ 2 configs, one per pairing, named "{name}: {A} vs {B}" (or "A vs B"
+/// with no name), A and B the configs' names -- two configs too, so a job's
+/// name says who plays whom however many were asked for. A self-play job (one
+/// config) and every other type keep the name as given.
+async fn plan_jobs(conn: &mut sqlx::PgConnection, body: &CreateJobBody) -> AppResult<Vec<PlannedJob>> {
+    let name = job_name(body);
+    let pairs = pairings(&body.config);
+    let one_job = match pairs.as_slice() {
+        [] => true,
+        [(a, b)] => a == b,
+        _ => false,
+    };
+    if one_job {
+        return Ok(vec![PlannedJob { name, pair: pairs.first().copied(), pairing: None }]);
+    }
+    let ids: Vec<Uuid> = pairs.iter().flat_map(|(a, b)| [*a, *b]).collect();
+    let names: std::collections::HashMap<Uuid, String> =
+        sqlx::query_as::<_, (Uuid, String)>("SELECT id, name FROM player_configs WHERE id = ANY($1)")
+            .bind(&ids)
+            .fetch_all(&mut *conn)
+            .await?
+            .into_iter()
+            .collect();
+    if let Some(missing) = ids.iter().find(|id| !names.contains_key(id)) {
+        return Err(AppError::bad_request("player config not found")
+            .with_field("player_config_ids", format!("no such player config: {missing}")));
+    }
+    let mut planned = Vec::with_capacity(pairs.len());
+    for (a, b) in pairs {
+        let pairing = format!("{} vs {}", names[&a], names[&b]);
+        let full = if name.is_empty() { pairing.clone() } else { format!("{name}: {pairing}") };
+        if let Some(problem) = name_problem(&full) {
+            return Err(AppError::bad_request("job settings are invalid").with_field(
+                "name",
+                format!("named for its pairing, {full:?} breaks a job name's rule ({problem}): shorten the name"),
+            ));
+        }
+        planned.push(PlannedJob { name: full, pair: Some((a, b)), pairing: Some(pairing) });
+    }
+    Ok(planned)
 }
 
 /// Jobs are always created inactive at 0%. The allocation is set later, on
 /// the allocation page, so the admin sets it while looking at the whole
-/// active set.
+/// active set -- for a round robin, the whole set of pairings at once.
+///
+/// A games or pairs request naming n ≥ 2 configs creates every pairing's job
+/// or none: each pairing is checked before anything is inserted (its players
+/// must agree on what MAGPIE cannot vary per player), and all of them are
+/// inserted in one transaction, so a check that only the insert can make (two
+/// files under one name, a wordmap for too many blanks) refuses the lot.
 async fn create_job(
     State(state): State<AppState>,
     admin: AdminUser,
@@ -1385,7 +1462,7 @@ async fn create_job(
     headers: HeaderMap,
     jar: CookieJar,
     ApiJson(body): ApiJson<CreateJobBody>,
-) -> AppResult<(StatusCode, Json<CreatedJob>)> {
+) -> AppResult<(StatusCode, Json<CreatedJobs>)> {
     csrf::verify(&method, &headers, &jar)?;
 
     validate_job_body(&body)?;
@@ -1424,14 +1501,72 @@ async fn create_job(
             .unwrap_or(&state.cfg.min_magpie_version),
     );
 
+    let planned = {
+        let mut conn = state.pool.acquire().await?;
+        let planned = plan_jobs(&mut conn, &body).await?;
+        let capture = matches!(
+            body.config,
+            JobTypeConfig::Game { capture_positions: true, .. }
+                | JobTypeConfig::GamePair { capture_positions: true, .. }
+        );
+        for plan in &planned {
+            if let Some(pair) = plan.pair {
+                validate_pairing(&mut conn, pair, capture, &letterdist_name)
+                    .await
+                    .map_err(|e| plan.qualify(e))?;
+            }
+        }
+        planned
+    };
+
     let mut tx = state.pool.begin().await?;
+    let mut jobs = Vec::with_capacity(planned.len());
+    for plan in &planned {
+        let job = insert_job(&mut tx, &body, &admin, floor, plan, &letterdist_name, blanks)
+            .await
+            .map_err(|e| plan.qualify(e))?;
+        jobs.push(job);
+    }
+    tx.commit().await?;
+
+    for job in &jobs {
+        // The zeroed KLV generation 1 starts from (stored as generation 0): a
+        // multi-megabyte build and an object-store
+        // write, so it happens after the transaction commits rather than inside it.
+        registry::initialize_job_artifacts(&state, job).await?;
+
+        // Queued at creation rather than at activation: a rack info table takes
+        // minutes to build, and the admin who creates a job typically activates it
+        // in the next breath. Requesting it now means the wait happens while they
+        // are still deciding rather than after.
+        request_derived_data(&state, job.id).await?;
+    }
+
+    Ok((StatusCode::CREATED, Json(CreatedJobs { jobs })))
+}
+
+/// One planned job's row, config and audit entry, in the creating
+/// transaction.
+#[allow(clippy::too_many_arguments)]
+async fn insert_job(
+    tx: &mut sqlx::PgConnection,
+    body: &CreateJobBody,
+    admin: &AdminUser,
+    floor: crate::version::Version,
+    plan: &PlannedJob,
+    letterdist_name: &str,
+    blanks: u32,
+) -> AppResult<Job> {
     let job = sqlx::query_as::<_, Job>(
         "INSERT INTO jobs
              (job_type, variant, letterdist_id, layout_id,
               min_magpie_major, min_magpie_minor, min_magpie_patch, bingo_bonus,
-              sim_cutoff, created_by, name)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *",
+              sim_cutoff, created_by, name, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, clock_timestamp()) RETURNING *",
     )
+    // `clock_timestamp()`, not the column's `now()`: a round robin's jobs are
+    // inserted in one transaction, where `now()` is one instant, and every
+    // list that orders by creation then showed its pairings in id order.
     .bind(body.job_type)
     .bind(&body.variant)
     .bind(body.letterdist_id)
@@ -1447,12 +1582,12 @@ async fn create_job(
     // carry it.
     .bind(body.sim_cutoff.unwrap_or(crate::magpie_defaults::SIM_CUTOFF))
     .bind(admin.0.id)
-    .bind(job_name(&body))
+    .bind(&plan.name)
     .fetch_one(&mut *tx)
     .await?;
 
-    insert_job_config(&mut tx, &job, &body.config, &letterdist_name).await?;
-    refuse_one_name_for_two_files(&mut tx, &job).await?;
+    insert_job_config(&mut *tx, &job, &body.config, plan.pair, letterdist_name).await?;
+    refuse_one_name_for_two_files(&mut *tx, &job).await?;
     // MAGPIE builds a wordmap, and so a rack info table, for at most two
     // blanks (`cannot create WMP with more than 2 blanks`, an abort): a job
     // that needs either on `english_super` was created, its build failed
@@ -1460,7 +1595,7 @@ async fn create_job(
     // why (the audit's pass 7). A word info table is built from the `.kwg`
     // alone, which has no blanks, so it is no reason to refuse.
     if blanks > MAGPIE_MAX_WORDMAP_BLANKS
-        && crate::derived::needs_for_job(&mut tx, job.id).await?.iter().any(|need| need.role != "wit")
+        && crate::derived::needs_for_job(&mut *tx, job.id).await?.iter().any(|need| need.role != "wit")
     {
         return Err(AppError::bad_request(
             "no wordmap or rack info table can be built for this letter distribution",
@@ -1475,7 +1610,7 @@ async fn create_job(
     }
 
     audit::log(
-        &mut tx,
+        &mut *tx,
         "job.created",
         Some(admin.0.id),
         None,
@@ -1484,20 +1619,7 @@ async fn create_job(
         Some(job.id),
     )
     .await?;
-    tx.commit().await?;
-
-    // The zeroed KLV generation 1 starts from (stored as generation 0): a
-    // multi-megabyte build and an object-store
-    // write, so it happens after the transaction commits rather than inside it.
-    registry::initialize_job_artifacts(&state, &job).await?;
-
-    // Queued at creation rather than at activation: a rack info table takes
-    // minutes to build, and the admin who creates a job typically activates it
-    // in the next breath. Requesting it now means the wait happens while they
-    // are still deciding rather than after.
-    request_derived_data(&state, job.id).await?;
-
-    Ok((StatusCode::CREATED, Json(CreatedJob { job })))
+    Ok(job)
 }
 
 /// The largest opening-rack batch accepted. A task's racks are expanded into
@@ -1582,6 +1704,61 @@ const MAX_BINGO_BONUS: i32 = 500;
 /// forever and dispatches nothing; a confidence of 100% puts a logarithm of
 /// zero in the test's interval, which then never closes. Every problem is
 /// reported at once, like registration does.
+/// The most player configs one games or pairs request names. Twelve make 66
+/// jobs, every pairing once -- more than a fleet runs at once, and as many as
+/// the allocation page can usefully show.
+const MAX_ROUND_ROBIN_CONFIGS: usize = 12;
+
+/// A games or pairs request's configs: at least one, at most
+/// [`MAX_ROUND_ROBIN_CONFIGS`], none twice. A config named twice would pair
+/// with itself in the middle of a round robin -- a self-play job is asked for
+/// by naming it alone.
+fn round_robin_problems(mut err: AppError, ids: &[Uuid]) -> AppError {
+    if ids.is_empty() {
+        err = err.with_field("player_config_ids", "must name at least one player config");
+    } else if ids.len() > MAX_ROUND_ROBIN_CONFIGS {
+        err = err.with_field(
+            "player_config_ids",
+            format!(
+                "must name at most {MAX_ROUND_ROBIN_CONFIGS} player configs ({} jobs)",
+                MAX_ROUND_ROBIN_CONFIGS * (MAX_ROUND_ROBIN_CONFIGS - 1) / 2
+            ),
+        );
+    }
+    let mut seen = std::collections::HashSet::new();
+    if let Some(twice) = ids.iter().find(|id| !seen.insert(**id)) {
+        err = err.with_field(
+            "player_config_ids",
+            format!("names {twice} twice; name a config alone for a self-play job"),
+        );
+    }
+    err
+}
+
+/// The seatings a games or pairs request asks for, as (player 1, player 2):
+/// one config plays itself, and n ≥ 2 give every pairing once, each seated in
+/// the order the configs were listed. The seat matters little -- a pair swaps
+/// seats within itself, and a games batch is even, so each player moves first
+/// in half of every task's games -- but a fixed rule keeps "A vs B" A's
+/// player-1 side wherever the job is shown. Empty for every other job type.
+fn pairings(config: &JobTypeConfig) -> Vec<(Uuid, Uuid)> {
+    let ids = match config {
+        JobTypeConfig::Game { player_config_ids, .. }
+        | JobTypeConfig::GamePair { player_config_ids, .. } => player_config_ids,
+        _ => return Vec::new(),
+    };
+    if let [only] = ids.as_slice() {
+        return vec![(*only, *only)];
+    }
+    let mut out = Vec::with_capacity(ids.len() * ids.len().saturating_sub(1) / 2);
+    for (i, a) in ids.iter().enumerate() {
+        for b in &ids[i + 1..] {
+            out.push((*a, *b));
+        }
+    }
+    out
+}
+
 fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
     let mut err = AppError::bad_request("job settings are invalid");
     if let Some(problem) = name_problem(&job_name(body)) {
@@ -1686,9 +1863,10 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
             consensus_problems(err, *consensus_pct, *min_results_per_rack, *max_results_per_rack)
         }
         JobTypeConfig::Game {
-            games_per_batch, min_games, max_games, test, capture_positions,
-            capture_first_divergence, ..
+            player_config_ids, games_per_batch, min_games, max_games, test, capture_positions,
+            capture_first_divergence,
         } => {
+            let err = round_robin_problems(err, player_config_ids);
             let mut err = match_test(err, "game", *games_per_batch, *min_games, *max_games, test);
             err = games_batch_field(err, "game", 1, *games_per_batch, *capture_positions);
             if *capture_first_divergence {
@@ -1712,9 +1890,10 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
             err
         }
         JobTypeConfig::GamePair {
-            pairs_per_batch, min_pairs, max_pairs, test, capture_positions,
-            capture_first_divergence, ..
+            player_config_ids, pairs_per_batch, min_pairs, max_pairs, test, capture_positions,
+            capture_first_divergence,
         } => {
+            let err = round_robin_problems(err, player_config_ids);
             let mut err = match_test(err, "pair", *pairs_per_batch, *min_pairs, *max_pairs, test);
             if *capture_first_divergence && !*capture_positions {
                 err = err.with_field(
@@ -2106,10 +2285,37 @@ async fn validate_player_compatibility(
     crate::compat::validate_job_files(&files, letterdist_name)
 }
 
+/// What a games or pairs job's two players must agree on, checked for one
+/// pairing: the win% model, the files MAGPIE loads by name, and with capture
+/// on, what a captured position keeps. A round robin checks every pairing
+/// before it inserts anything.
+async fn validate_pairing(
+    conn: &mut sqlx::PgConnection,
+    (player1, player2): (Uuid, Uuid),
+    capture_positions: bool,
+    letterdist_name: &str,
+) -> AppResult<()> {
+    validate_shared_player_options(&mut *conn, player1, player2).await?;
+    validate_player_compatibility(
+        &mut *conn,
+        &[("player1", player1), ("player2", player2)],
+        letterdist_name,
+    )
+    .await?;
+    if capture_positions {
+        validate_capture_play_cap(&mut *conn, player1, player2).await?;
+    }
+    Ok(())
+}
+
+/// Inserts the job's config row. `pair` is the games or pairs job's seating
+/// (from [`pairings`], already checked by [`validate_pairing`]); `None` for
+/// every other type.
 async fn insert_job_config(
     conn: &mut sqlx::PgConnection,
     job: &Job,
     config: &JobTypeConfig,
+    pair: Option<(Uuid, Uuid)>,
     letterdist_name: &str,
 ) -> AppResult<()> {
     // The untagged config must actually match the declared job type, or the job
@@ -2161,22 +2367,10 @@ async fn insert_job_config(
         (
             JobType::Games,
             JobTypeConfig::Game {
-                player1_config_id, player2_config_id, games_per_batch,
-                min_games, max_games, test, capture_positions, ..
+                games_per_batch, min_games, max_games, test, capture_positions, ..
             },
         ) => {
-            validate_shared_player_options(&mut *conn, *player1_config_id, *player2_config_id)
-                .await?;
-            validate_player_compatibility(
-                &mut *conn,
-                &[("player1", *player1_config_id), ("player2", *player2_config_id)],
-                letterdist_name,
-            )
-            .await?;
-            if *capture_positions {
-                validate_capture_play_cap(&mut *conn, *player1_config_id, *player2_config_id)
-                    .await?;
-            }
+            let (player1_config_id, player2_config_id) = pair.ok_or_else(mismatch)?;
             let test = test.settings(*min_games);
             sqlx::query(
                 "INSERT INTO job_game_config
@@ -2196,22 +2390,11 @@ async fn insert_job_config(
         (
             JobType::GamePairs,
             JobTypeConfig::GamePair {
-                player1_config_id, player2_config_id, pairs_per_batch,
-                min_pairs, max_pairs, test, capture_positions, capture_first_divergence,
+                pairs_per_batch, min_pairs, max_pairs, test, capture_positions,
+                capture_first_divergence, ..
             },
         ) => {
-            validate_shared_player_options(&mut *conn, *player1_config_id, *player2_config_id)
-                .await?;
-            validate_player_compatibility(
-                &mut *conn,
-                &[("player1", *player1_config_id), ("player2", *player2_config_id)],
-                letterdist_name,
-            )
-            .await?;
-            if *capture_positions {
-                validate_capture_play_cap(&mut *conn, *player1_config_id, *player2_config_id)
-                    .await?;
-            }
+            let (player1_config_id, player2_config_id) = pair.ok_or_else(mismatch)?;
             let test = test.settings(*min_pairs);
             sqlx::query(
                 "INSERT INTO job_game_pair_config
@@ -4229,8 +4412,7 @@ mod tests {
     fn game_pairs(overrides: serde_json::Value) -> CreateJobBody {
         let mut config = serde_json::json!({
             "job_type": "game_pairs",
-            "player1_config_id": Uuid::nil(),
-            "player2_config_id": Uuid::nil(),
+            "player_config_ids": [Uuid::nil()],
             "test_enabled": true,
             "min_pairs": 100,
             "max_pairs": 1000,
@@ -4241,6 +4423,45 @@ mod tests {
 
     fn fields(result: AppResult<()>) -> Vec<String> {
         result.expect_err("should be rejected").fields.into_iter().map(|(f, _)| f).collect()
+    }
+
+    /// A games or pairs request names one config (self-play) or a round robin
+    /// of up to twelve, none twice; nothing else.
+    #[test]
+    fn a_round_robin_names_one_to_twelve_configs_once_each() {
+        let with = |ids: Vec<Uuid>| game_pairs(serde_json::json!({ "player_config_ids": ids }));
+        let ids: Vec<Uuid> = (0..13).map(|_| Uuid::new_v4()).collect();
+        for n in [1, 2, 4, 12] {
+            assert!(validate_job_body(&with(ids[..n].to_vec())).is_ok(), "{n} configs");
+        }
+        for refused in [Vec::new(), ids.clone(), vec![ids[0], ids[1], ids[0]]] {
+            assert_eq!(fields(validate_job_body(&with(refused.clone()))), ["player_config_ids"], "{refused:?}");
+        }
+    }
+
+    /// One config plays itself; n ≥ 2 give C(n, 2) pairings, each once, each
+    /// seated in the order the configs were listed.
+    #[test]
+    fn pairings_are_every_pair_once_in_the_order_given() {
+        let ids: Vec<Uuid> = (0..4).map(|_| Uuid::new_v4()).collect();
+        let pairs = |n: usize| pairings(&game_pairs(serde_json::json!({ "player_config_ids": ids[..n] }))
+            .config);
+        assert_eq!(pairs(1), [(ids[0], ids[0])]);
+        assert_eq!(pairs(2), [(ids[0], ids[1])]);
+        assert_eq!(pairs(3), [(ids[0], ids[1]), (ids[0], ids[2]), (ids[1], ids[2])]);
+        let four = pairs(4);
+        assert_eq!(four.len(), 6);
+        assert_eq!(
+            four,
+            [
+                (ids[0], ids[1]), (ids[0], ids[2]), (ids[0], ids[3]),
+                (ids[1], ids[2]), (ids[1], ids[3]), (ids[2], ids[3]),
+            ]
+        );
+        let opening = body(serde_json::json!({
+            "job_type": "opening_rack", "player_config_id": ids[0],
+        }));
+        assert!(pairings(&opening.config).is_empty(), "only games and pairs are paired");
     }
 
     #[test]
@@ -4255,8 +4476,7 @@ mod tests {
         let target_only = |job_type: &str, target: &str| {
             let mut config = serde_json::json!({
                 "job_type": job_type,
-                "player1_config_id": Uuid::nil(),
-                "player2_config_id": Uuid::nil(),
+                "player_config_ids": [Uuid::nil()],
             });
             config[target] = serde_json::json!(500);
             body(config)
@@ -4287,8 +4507,7 @@ mod tests {
         // Left out, the flag is off too: a pre-flag script's body.
         let unflagged = body(serde_json::json!({
             "job_type": "game_pairs",
-            "player1_config_id": Uuid::nil(),
-            "player2_config_id": Uuid::nil(),
+            "player_config_ids": [Uuid::nil()],
             "min_pairs": 100,
             "max_pairs": 1000,
         }));
@@ -4301,8 +4520,7 @@ mod tests {
     fn the_test_needs_its_floor() {
         let mut config = serde_json::json!({
             "job_type": "game_pairs",
-            "player1_config_id": Uuid::nil(),
-            "player2_config_id": Uuid::nil(),
+            "player_config_ids": [Uuid::nil()],
             "test_enabled": true,
             "max_pairs": 1000,
         });
@@ -4332,8 +4550,7 @@ mod tests {
         let games = |batch: serde_json::Value| {
             let mut config = serde_json::json!({
                 "job_type": "games",
-                "player1_config_id": Uuid::nil(),
-                "player2_config_id": Uuid::nil(),
+                "player_config_ids": [Uuid::nil()],
                 "test_enabled": true,
                 "min_games": 100,
                 "max_games": 1000,
@@ -4360,8 +4577,7 @@ mod tests {
         let games = |batch: i32, capture: bool| {
             body(serde_json::json!({
                 "job_type": "games",
-                "player1_config_id": Uuid::nil(),
-                "player2_config_id": Uuid::nil(),
+                "player_config_ids": [Uuid::nil()],
                 "test_enabled": true,
                 "min_games": 100,
                 "max_games": 100_000,

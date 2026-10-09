@@ -54,7 +54,7 @@ needs a separate run with `--fresh`. Do it last: it empties the database.
 | **Anonymous workers** | Workers 1 and 2 |
 | **Data** | The MAGPIE-DATA version your MAGPIE checkout installed, and MAGPIE's two-letter test data (version `20000101`: distribution `english_ab`, lexicon `CSW21_ab`, eight possible full racks) |
 | **Player configs** | `static-equity` and `static-score` on CSW24; `ab-static-equity-no-rit` (the leave job's player) and `ab-sim-2ply-rack` (the opening-rack job's, a 2-ply simmer seeking 80% agreement) on CSW21_ab |
-| **Jobs**, each active at 25% | "dev games (positions saved)" and "dev game pairs (first divergences saved)", `static-equity` against `static-score` on CSW24; "dev opening racks (english_ab)"; "dev leave generation (english_ab)", six generations |
+| **Jobs**, each active at 25% | "dev games (positions saved)" and "dev game pairs (first divergences saved)", `static-equity` against `static-score` on CSW24 (a games or pairs job between two configs is named for its pairing, so these read "…: static-equity vs static-score"; below they are called by the name alone); "dev opening racks (english_ab)"; "dev leave generation (english_ab)", six generations |
 
 The games and pairs jobs run for hours: their cap is 100,000, and neither
 test is acted on before 50,000 games or pairs. The two english_ab jobs finish
@@ -653,8 +653,14 @@ Do this last: it empties the database.
 
 ### A-7 Create jobs
 
-**New job**, then **Create job**; each lands on the job's admin page,
-**inactive** at 0%. The fields are named as the settings tables
+**New job**, then **Create job**; each is created **inactive** at 0%. An
+opening-rack or leave job lands on its admin page; a games or game-pairs job
+lands on **Allocation**, the new job marked "new" and listed first. A games or
+pairs job's players are a checklist, seated in the order ticked: tick the
+first-named player first, so `static-equity` vs `static-score` is equity's
+player-1 side, and each such job is named "{name}: A vs B" (so "tester no test"
+is "tester no test: static-equity vs static-score"; below it is called by its
+name alone). The fields are named as the settings tables
 name them (**Job Name**, **Job Type**, **Letter Distribution**, **Board**,
 **Pairs Per Task**, …), and the job types read "Opening Rack Analysis",
 "Games", "Game Pairs" and "Leave Generation". The letter distribution and
@@ -685,6 +691,16 @@ board start on "Choose…": pick `english` and `standard15` each time.
   on its page each saved position to be a pair's two games at one turn, the
   same board and rack, each player to move in one, their ranked moves
   differing at the top; **Random position** never shows a lone game.
+- [ ] **Games** "tester round robin" with four configs ticked (`static-equity`,
+  `static-score`, `tester-static-all` and one more). **Expect** the preview to
+  say "4 configs → 6 jobs" and list "tester round robin: static-equity vs
+  static-score" and the five other pairings, each once, the first ticked on the
+  left; **Create 6 jobs**. **Expect** **Allocation** with "The 6 new jobs are
+  marked new …", all six inactive at 0%. **Do** tick one config alone.
+  **Expect** "1 config → 1 self-play job". **Do** tick 13. **Expect** "At most
+  12 player configs: 13 are ticked." and the submit refused. Two simmers on
+  different win% models in a round robin: **expect** the error to name their
+  pairing, and nothing created.
 - [ ] **Games**: **expect** the batch field to step by 2, and the browser to
   refuse an odd number.
 - [ ] **Opening Rack Analysis** with `static-equity` (recorder best, 10 plays
@@ -1042,7 +1058,10 @@ curl -s -b "$JAR" -H "X-CSRF-Token: $CSRF" -H 'Content-Type: application/json' \
 an allocation above 0% activates it (`200`), 0% deactivates it, and a share
 that would take the active jobs past 100% is `409` — with the seed's games and
 pairs jobs active, 50% is the most left. The allocations endpoint is the only
-switch; it answers `{ "jobs": [...] }`, each named job as it now stands. This one runs no significance test and plays its 20 pairs;
+switch; it answers `{ "jobs": [...] }`, each named job as it now stands.
+Creation answers `{ "jobs": [...] }` too: the two configs here make one job,
+"cli test: A vs B", and three or more would make a job per pairing. Set `JOB`
+to its id. This one runs no significance test and plays its 20 pairs;
 `"test_enabled": true` turns the test on, with `min_pairs` then required (at
 least 1, at most `max_pairs`) and `confidence_pct` optional (95 by default,
 strictly between 50 and 100), and `min_pairs` or `confidence_pct` sent without
@@ -1052,9 +1071,9 @@ it is a `400` naming each.
 curl -s -b "$JAR" -H "X-CSRF-Token: $CSRF" -H 'Content-Type: application/json' \
   -d '{"name":"cli test","job_type":"game_pairs","variant":"classic",
        "letterdist_id":"<letterdist id>","layout_id":"<layout id>",
-       "player1_config_id":"<config id>","player2_config_id":"<config id>",
+       "player_config_ids":["<config id>","<other config id>"],
        "pairs_per_batch":10,"max_pairs":20}' \
-  "$SITE/api/admin/jobs" | jq '.job.id'
+  "$SITE/api/admin/jobs" | jq '.jobs[] | {id, name}'
 curl -s -b "$JAR" -H "X-CSRF-Token: $CSRF" -H 'Content-Type: application/json' -X PUT \
   -d '{"allocations":[{"job_id":"'"$JOB"'","allocation":4}]}' "$SITE/api/admin/jobs/allocations"
 curl -s -b "$JAR" -H "X-CSRF-Token: $CSRF" -H 'Content-Type: application/json' -X PUT \

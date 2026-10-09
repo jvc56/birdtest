@@ -5,6 +5,7 @@
   import { blankFields, jobTypeLabel, leavePlayerConflict, parseTargetRackCounts, targetsText, unchosenText } from '$lib/format';
   import { consensusFields, consensusProblem as checkConsensus } from '$lib/consensus';
   import { confidenceProblem as checkConfidence } from '$lib/matchTest';
+  import { matchups as matchupsOf, matchupsAllowed, matchupSummary } from '$lib/roundRobin';
 
   let configs: PlayerConfig[] = [];
   let files: InputData[] = [];
@@ -38,8 +39,20 @@
 
   // Per-type fields. Only the ones the selected type uses are submitted.
   let playerConfigId = '';
-  let player1 = '';
-  let player2 = '';
+  // A games or pairs job's players, ticked: one is a self-play job, more a
+  // round robin of a job per pairing. Seated in the order they were ticked,
+  // so the admin decides who is player 1 -- the checklist's own order is
+  // newest first, which says nothing about the match -- and the preview
+  // shows the seating before anything is created.
+  let ticked: string[] = [];
+  $: players = ticked
+    .map((id) => configs.find((config) => config.id === id))
+    .filter((config): config is PlayerConfig => config !== undefined);
+  function tick(id: string, on: boolean) {
+    ticked = on ? [...ticked.filter((t) => t !== id), id] : ticked.filter((t) => t !== id);
+  }
+  $: matchups = matchupsOf(players, name, (config) => config.name);
+  $: roundRobin = jobType === 'games' || jobType === 'game_pairs';
   let batchSize = 1;
   // Off by default: without a test the job plays its games and stops, and the
   // test's settings are not sent (the server refuses them without the flag).
@@ -110,11 +123,7 @@
 
   async function loadChoices() {
     [configs, files] = await Promise.all([api.playerConfigs(), api.inputData()]);
-    if (configs.length) {
-      playerConfigId = configs[0].id;
-      player1 = configs[0].id;
-      player2 = configs[configs.length - 1].id;
-    }
+    if (configs.length) playerConfigId = configs[0].id;
     // The letter distribution and board are left for the admin to choose: the
     // first of each was whichever was imported first, and a job made on it
     // unnoticed played with the wrong bag or board.
@@ -155,7 +164,7 @@
       case 'games':
         return {
           ...common,
-          player1_config_id: player1, player2_config_id: player2,
+          player_config_ids: players.map((config) => config.id),
           games_per_batch: batchSize, max_games: maxUnits, ...test,
           ...(testEnabled ? { min_games: minUnits } : {}),
           capture_positions: capturePositions
@@ -163,7 +172,7 @@
       case 'game_pairs':
         return {
           ...common,
-          player1_config_id: player1, player2_config_id: player2,
+          player_config_ids: players.map((config) => config.id),
           pairs_per_batch: batchSize, max_pairs: maxUnits, ...test,
           ...(testEnabled ? { min_pairs: minUnits } : {}),
           capture_positions: capturePositions,
@@ -211,6 +220,11 @@
       fromSubmit = true;
       return;
     }
+    if (roundRobin && !matchupsAllowed(players.length)) {
+      error = `Players: ${matchupSummary(players.length)}`;
+      fromSubmit = true;
+      return;
+    }
     const request = body();
     const blank = blankFields(request);
     if (blank.length) {
@@ -221,7 +235,14 @@
     busy = true;
     try {
       const created = await api.createJob(request);
-      goto(`/admin/jobs/${created.job.id}`);
+      // A games or pairs request may have made many jobs, and every one is
+      // inactive at 0%: the allocation page is where they start, all of them
+      // in view. Any other job's own page is where to go next.
+      if (roundRobin) {
+        goto(`/admin/allocation?new=${created.jobs.map((job) => job.id).join(',')}`);
+      } else {
+        goto(`/admin/jobs/${created.jobs[0].id}`);
+      }
     } catch (e) {
       error = errorText(e);
       fromSubmit = true;
@@ -234,7 +255,8 @@
 <h1 class="mb-2 text-2xl font-semibold">Create a job</h1>
 <p class="mb-6 text-sm text-muted-foreground">
   Jobs are created inactive at 0%. You give them an allocation on the Allocation page, which
-  activates them, so you can review the whole active set first.
+  activates them, so you can review the whole active set first. A games or game-pairs job with
+  several players ticked is a round robin: one job per pairing.
 </p>
 
 <!-- Any edit clears the last server error: a submit the browser blocks never
@@ -410,20 +432,40 @@
       however large the space is.
     </p>
   {:else if jobType === 'games' || jobType === 'game_pairs'}
-    <div class="grid grid-cols-2 gap-3">
-      <div>
-        <label class="label" for="p1">Player 1</label>
-        <select id="p1" class="input" bind:value={player1} required>
-          {#each configs as config}<option value={config.id}>{config.name}</option>{/each}
-        </select>
+    <fieldset class="space-y-2" data-testid="players">
+      <legend class="label">Players</legend>
+      <p class="text-xs text-muted-foreground">
+        Tick one config for a self-play job, or several for a round robin: a job for every
+        pairing, player 1 the one ticked first.
+      </p>
+      <ul class="grid gap-1 sm:grid-cols-2">
+        {#each configs as config (config.id)}
+          <li class="flex min-w-0 items-baseline gap-2">
+            <label class="flex min-w-0 items-center gap-2">
+              <input
+                type="checkbox"
+                checked={ticked.includes(config.id)}
+                on:change={(e) => tick(config.id, e.currentTarget.checked)}
+              />
+              <span class="truncate" title={config.name}>{config.name}</span>
+            </label>
+            <span class="shrink-0 text-xs text-muted-foreground">
+              {config.num_plies > 0 ? `${config.num_plies}-ply sim` : 'static'}
+            </span>
+          </li>
+        {/each}
+      </ul>
+      <div data-testid="matchups" aria-live="polite">
+        <p class="text-sm font-medium" class:field-error={!matchupsAllowed(players.length)}>
+          {matchupSummary(players.length)}
+        </p>
+        {#if matchupsAllowed(players.length)}
+          <ul class="mt-1 list-disc pl-5 text-sm text-muted-foreground">
+            {#each matchups as matchup}<li>{matchup.name || `${matchup.player1.name} (self-play)`}</li>{/each}
+          </ul>
+        {/if}
       </div>
-      <div>
-        <label class="label" for="p2">Player 2</label>
-        <select id="p2" class="input" bind:value={player2} required>
-          {#each configs as config}<option value={config.id}>{config.name}</option>{/each}
-        </select>
-      </div>
-    </div>
+    </fieldset>
     <div class="grid {testEnabled ? 'grid-cols-3' : 'grid-cols-2'} gap-3">
       <div>
         <label class="label" for="batch">
@@ -567,5 +609,7 @@
   <!-- Announced: an error that appears after a submit is otherwise silent to a
        screen reader. -->
   {#if error}<p class="field-error" role="alert">{error}</p>{/if}
-  <button class="btn-primary" disabled={busy}>{busy ? 'Creating…' : 'Create job'}</button>
+  <button class="btn-primary" disabled={busy}>
+    {busy ? 'Creating…' : roundRobin && matchups.length > 1 ? `Create ${matchups.length} jobs` : 'Create job'}
+  </button>
 </form>

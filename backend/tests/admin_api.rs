@@ -953,7 +953,7 @@ async fn a_games_job_may_pit_a_static_player_against_a_simmer() {
             json!({
                 "job_type": "games", "variant": "classic",
                 "letterdist_id": letterdist, "layout_id": layout,
-                "player1_config_id": p1, "player2_config_id": p2,
+                "player_config_ids": [p1, p2],
                 "max_games": 10,
             }),
         )
@@ -1063,7 +1063,7 @@ async fn a_capture_job_refuses_simmers_that_capture_would_change() {
         post_json("/api/admin/jobs", &headers, json!({
             "job_type": "games", "variant": "classic",
             "letterdist_id": letterdist, "layout_id": layout,
-            "player1_config_id": capturing["id"], "player2_config_id": p2,
+            "player_config_ids": [capturing["id"], p2],
             "max_games": 10, "capture_positions": capture,
         }))
     };
@@ -1108,7 +1108,7 @@ async fn a_capture_job_refuses_players_that_record_differently() {
         let mut body = json!({
             "job_type": job_type, "variant": "classic",
             "letterdist_id": letterdist, "layout_id": layout,
-            "player1_config_id": configs[0], "player2_config_id": p2,
+            "player_config_ids": [configs[0], p2],
             "capture_positions": capture,
         });
         body[units] = json!(10);
@@ -1132,7 +1132,7 @@ async fn a_capture_job_refuses_players_that_record_differently() {
         let mut body = json!({
             "job_type": job_type, "variant": "classic",
             "letterdist_id": letterdist, "layout_id": layout,
-            "player1_config_id": configs[0], "player2_config_id": configs[1],
+            "player_config_ids": [configs[0], configs[1]],
             "capture_positions": capture, "capture_first_divergence": true,
         });
         body[units] = json!(10);
@@ -1148,7 +1148,7 @@ async fn a_capture_job_refuses_players_that_record_differently() {
     let stored: bool = sqlx::query_scalar(
         "SELECT capture_first_divergence FROM job_game_pair_config WHERE job_id = $1",
     )
-    .bind(body["job"]["id"].as_str().unwrap().parse::<uuid::Uuid>().unwrap())
+    .bind(body["jobs"][0]["id"].as_str().unwrap().parse::<uuid::Uuid>().unwrap())
     .fetch_one(&db.pool)
     .await
     .unwrap();
@@ -1230,19 +1230,19 @@ async fn a_player_config_and_a_job_state_every_setting_a_task_needs() {
     let (status, created) = send(&app, post_json("/api/admin/jobs", &headers, json!({
         "job_type": "games", "variant": "classic",
         "letterdist_id": letterdist, "layout_id": layout,
-        "player1_config_id": static_player["id"], "player2_config_id": simmer["id"],
+        "player_config_ids": [static_player["id"], simmer["id"]],
         "max_games": 10,
     }))).await;
     assert_eq!(status, StatusCode::CREATED, "{created}");
-    assert_eq!(created["job"]["bingo_bonus"], json!(50), "{created}");
-    assert_eq!(created["job"]["sim_cutoff"], json!(0.005), "{created}");
+    assert_eq!(created["jobs"][0]["bingo_bonus"], json!(50), "{created}");
+    assert_eq!(created["jobs"][0]["sim_cutoff"], json!(0.005), "{created}");
 
     // A-ADMIN-27: the two may be stated instead, and are kept as stated.
     let job = |extra: serde_json::Value| {
         let mut body = json!({
             "job_type": "games", "variant": "classic",
             "letterdist_id": letterdist, "layout_id": layout,
-            "player1_config_id": static_player["id"], "player2_config_id": simmer["id"],
+            "player_config_ids": [static_player["id"], simmer["id"]],
             "max_games": 10,
         });
         for (key, value) in extra.as_object().unwrap() {
@@ -1252,8 +1252,8 @@ async fn a_player_config_and_a_job_state_every_setting_a_task_needs() {
     };
     let (status, created) = send(&app, job(json!({ "bingo_bonus": 35, "sim_cutoff": 0.5 }))).await;
     assert_eq!(status, StatusCode::CREATED, "{created}");
-    assert_eq!(created["job"]["bingo_bonus"], json!(35), "{created}");
-    assert_eq!(created["job"]["sim_cutoff"], json!(0.5), "{created}");
+    assert_eq!(created["jobs"][0]["bingo_bonus"], json!(35), "{created}");
+    assert_eq!(created["jobs"][0]["sim_cutoff"], json!(0.5), "{created}");
     for (extra, field) in [
         (json!({ "bingo_bonus": -1 }), "bingo_bonus"),
         (json!({ "sim_cutoff": 100.5 }), "sim_cutoff"),
@@ -1434,7 +1434,7 @@ async fn a_config_or_job_no_worker_can_run_is_refused() {
         json!({
             "job_type": "games", "variant": "classic",
             "letterdist_id": letterdist, "layout_id": layout_id,
-            "player1_config_id": player["id"], "player2_config_id": player["id"],
+            "player_config_ids": [player["id"]],
             "test_enabled": true, "min_games": 1, "max_games": 10,
             "confidence_pct": confidence,
         })
@@ -2238,7 +2238,7 @@ async fn a_job_cannot_pin_two_files_under_one_name() {
         post_json("/api/admin/jobs", &headers, json!({
             "job_type": "games", "variant": "classic",
             "letterdist_id": letterdist, "layout_id": layout,
-            "player1_config_id": p1, "player2_config_id": p2,
+            "player_config_ids": [p1, p2],
             "max_games": 10,
         }))
     };
@@ -2357,7 +2357,7 @@ async fn a_wordmap_on_a_distribution_with_more_than_two_blanks_is_refused() {
     let job = |player: &serde_json::Value| json!({
         "job_type": "games", "variant": "classic",
         "letterdist_id": three_blanks, "layout_id": layout,
-        "player1_config_id": player, "player2_config_id": player,
+        "player_config_ids": [player],
         "max_games": 10,
     });
     let (status, body) = send(&app, post_json("/api/admin/jobs", &headers, job(&players[0]))).await;

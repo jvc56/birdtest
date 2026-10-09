@@ -421,13 +421,15 @@ def job_config(job_type: str, players: list, args) -> dict:
     if job_type == "opening_rack":
         return {"player_config_id": players[0], "racks_per_batch": args.racks_per_batch,
                 "rack_size": args.rack_size}
+    # Two players are one job between them (a list of more would be a round
+    # robin, a job per pairing).
     if job_type == "games":
-        return {"player1_config_id": players[0], "player2_config_id": players[1],
+        return {"player_config_ids": players[:2],
                 "games_per_batch": args.batch, "test_enabled": True,
                 "min_games": 100 if args.min_units is None else args.min_units,
                 "max_games": args.max_units}
     if job_type == "game_pairs":
-        return {"player1_config_id": players[0], "player2_config_id": players[1],
+        return {"player_config_ids": players[:2],
                 "pairs_per_batch": args.batch, "test_enabled": True,
                 "min_pairs": 50000 if args.min_units is None else args.min_units,
                 "max_pairs": args.max_units}
@@ -462,7 +464,10 @@ def existing_active_job(client: Client, job_type: str, name: str = "") -> Option
     worker is feeding.
     """
     for job in active_jobs(client):
-        if job["job_type"] == job_type and (not name or job["name"] == name):
+        # A games or pairs job between two configs is stored as
+        # "{name}: A vs B".
+        named = job["name"] == name or job["name"].startswith(f"{name}: ")
+        if job["job_type"] == job_type and (not name or named):
             return job["id"]
     return None
 
@@ -495,10 +500,10 @@ def create_job(client: Client, args, data: dict, players: list,
     if args.min_magpie_version:
         body["min_magpie_version"] = args.min_magpie_version
     created = client.json(client.post("/api/admin/jobs", body), "create job")
-    # Creation answers with the job plus whatever state it had to build first
-    # (leave generation seeds its rack universe here), not a bare id.
-    job_id = created["job"]["id"]
-    log(f"created {job_type} job {job_id}")
+    # Creation answers with every job it made: here one, since a games or
+    # pairs body names two players.
+    job_id = created["jobs"][0]["id"]
+    log(f"created {job_type} job {job_id} ({created['jobs'][0]['name']})")
 
     client.allocate(job_id, allocation)
     log(f"activated it at {allocation}% allocation")

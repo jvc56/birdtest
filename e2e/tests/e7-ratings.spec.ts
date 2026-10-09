@@ -47,8 +47,8 @@ test.beforeAll(async ({ playwright }) => {
     max_pairs: 300
   };
   const jobs = [
-    await api.activeJob({ ...pairs, player1_config_id: ratedId, player2_config_id: thirdId }, 20),
-    await api.activeJob({ ...pairs, player1_config_id: anchorId, player2_config_id: thirdId }, 20),
+    await api.activeJob({ ...pairs, player_config_ids: [ratedId, thirdId] }, 20),
+    await api.activeJob({ ...pairs, player_config_ids: [anchorId, thirdId] }, 20),
     (await seededJob(request)).id
   ];
   for (const job of jobs) await waitUntilSettled(request, job);

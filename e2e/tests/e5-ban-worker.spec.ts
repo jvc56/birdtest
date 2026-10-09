@@ -16,8 +16,10 @@ test.beforeAll(async () => {
   jobId = await api.activeJob(
     {
       job_type: 'games',
-      player1_config_id: await api.playerConfigId('static-equity'),
-      player2_config_id: await api.playerConfigId('static-score'),
+      player_config_ids: [
+        await api.playerConfigId('static-equity'),
+        await api.playerConfigId('static-score')
+      ],
       games_per_batch: 2,
       test_enabled: true,
       min_games: 100000,

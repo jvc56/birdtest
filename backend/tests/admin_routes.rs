@@ -102,11 +102,14 @@ async fn created_config(admin: &Admin, body: Value) -> Value {
     created
 }
 
+/// A games job between `p1` and `p2`: a self-play job when they are one
+/// config, which is named once.
 fn games_job_body(files: &Files, p1: &Value, p2: &Value) -> Value {
+    let players = if p1 == p2 { json!([p1]) } else { json!([p1, p2]) };
     json!({
         "job_type": "games", "variant": "classic",
         "letterdist_id": files.letterdist, "layout_id": files.layout,
-        "player1_config_id": p1, "player2_config_id": p2,
+        "player_config_ids": players,
         "games_per_batch": 2, "max_games": 1000,
     })
 }
@@ -117,7 +120,7 @@ async fn api_games_job(admin: &Admin, files: &Files) -> String {
     let player = created_config(admin, static_config(&format!("p{}", Uuid::new_v4().simple()), files)).await;
     let (status, body) = admin.post("/api/admin/jobs", games_job_body(files, &player["id"], &player["id"])).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
-    body["job"]["id"].as_str().unwrap().to_string()
+    body["jobs"][0]["id"].as_str().unwrap().to_string()
 }
 
 async fn claim(app: &axum::Router, headers: &[(&str, &str)], version: &str, unsupported: &[Uuid]) -> (StatusCode, Value) {
@@ -193,7 +196,7 @@ async fn a_player_config_round_trips_and_one_in_use_cannot_be_deleted() {
 
 // --- A-ADMIN-2, 3, 4: jobs ----------------------------------------------------
 
-/// A-ADMIN-2: creating a job of each type answers `{job}`, and the job is
+/// A-ADMIN-2: creating a job of each type answers `{jobs: [job]}`, and the job is
 /// inactive at 0% and has nothing issued: no task row exists and no worker is
 /// offered it until an admin gives it an allocation. (Leave generation,
 /// whose creation runs MAGPIE, is pinned in `magpie_routes.rs`.)
@@ -212,7 +215,7 @@ async fn creating_each_job_type_answers_it_inactive_and_unallocated() {
             json!({
                 "job_type": "game_pairs", "variant": "classic",
                 "letterdist_id": files.letterdist, "layout_id": files.layout,
-                "player1_config_id": player["id"], "player2_config_id": player["id"],
+                "player_config_ids": [player["id"]],
                 "max_pairs": 100,
             }),
         ),
@@ -230,8 +233,9 @@ async fn creating_each_job_type_answers_it_inactive_and_unallocated() {
         let (status, created) = admin.post("/api/admin/jobs", body).await;
         assert_eq!(status, StatusCode::CREATED, "{job_type}: {created}");
         let keys: Vec<&String> = created.as_object().unwrap().keys().collect();
-        assert_eq!(keys, ["job"], "{job_type}: {created}");
-        let job = &created["job"];
+        assert_eq!(keys, ["jobs"], "{job_type}: {created}");
+        assert_eq!(created["jobs"].as_array().unwrap().len(), 1, "one job: {created}");
+        let job = &created["jobs"][0];
         assert_eq!(job["job_type"], job_type, "{created}");
         assert_eq!(job["status"], "inactive", "{created}");
         assert_eq!(job["allocation"], json!(0), "{created}");
@@ -278,8 +282,8 @@ async fn a_job_keeps_the_name_it_was_created_with() {
 
     let (status, created) = admin.post("/api/admin/jobs", body(json!("  equity vs static  "))).await;
     assert_eq!(status, StatusCode::CREATED, "{created}");
-    assert_eq!(created["job"]["name"], "equity vs static");
-    let id = created["job"]["id"].as_str().unwrap();
+    assert_eq!(created["jobs"][0]["name"], "equity vs static");
+    let id = created["jobs"][0]["id"].as_str().unwrap();
     let (_, list) = admin.get("/api/jobs").await;
     assert_eq!(list["items"][0]["name"], "equity vs static", "{list}");
     let (_, detail) = admin.get(&format!("/api/jobs/{id}")).await;
@@ -287,7 +291,7 @@ async fn a_job_keeps_the_name_it_was_created_with() {
 
     let (status, unnamed) = admin.post("/api/admin/jobs", games_job_body(&files, &player["id"], &player["id"])).await;
     assert_eq!(status, StatusCode::CREATED, "{unnamed}");
-    assert_eq!(unnamed["job"]["name"], "");
+    assert_eq!(unnamed["jobs"][0]["name"], "");
 
     for name in [json!("x".repeat(101)), json!("two\nlines")] {
         let (status, refused) = admin.post("/api/admin/jobs", body(name)).await;
@@ -390,7 +394,7 @@ async fn job_creation_refuses_each_impossible_combination_and_says_which() {
         ("a layout that does not exist", with(&|body| body["layout_id"] = json!(Uuid::new_v4())), "no input data row"),
         ("a lexicon given as the letter distribution", with(&|body| body["letterdist_id"] = json!(files.kwg)), "expected a letterdist row"),
         ("a letter distribution MAGPIE cannot hold", with(&|body| body["letterdist_id"] = json!(oversized)), "cannot be used"),
-        ("a player config that does not exist", with(&|body| body["player2_config_id"] = json!(Uuid::new_v4())), "player config not found"),
+        ("a player config that does not exist", with(&|body| body["player_config_ids"] = json!([plain["id"], Uuid::new_v4()])), "player config not found"),
     ];
     for (name, body, says) in cases {
         let (status, refusal) = admin.post("/api/admin/jobs", body).await;

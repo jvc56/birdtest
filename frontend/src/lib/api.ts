@@ -842,8 +842,12 @@ export const api = {
     ),
   rebuildArtifacts: (id: string, force = false) =>
     post<ArtifactRebuild[]>(`/api/admin/jobs/${id}/rebuild-artifacts?force=${force}`),
+  /**
+   * Every job the request made, inactive at 0%: one, or for a games or pairs
+   * request naming n ≥ 2 player configs, one per pairing.
+   */
   createJob: (body: Record<string, unknown>) =>
-    post<{ job: JobRow }>('/api/admin/jobs', body),
+    post<{ jobs: JobRow[] }>('/api/admin/jobs', body),
   /**
    * Several jobs' allocations at once, the active jobs checked against 100%
    * as they will stand: above 0% activates a job, 0% deactivates one, and a

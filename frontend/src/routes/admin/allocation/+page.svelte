@@ -9,11 +9,17 @@
    * run again.
    */
   import { onMount } from 'svelte';
+  import { page } from '$app/stores';
   import { api, errorText, type JobListItem, type JobStatus } from '$lib/api';
   import { jobTitle, jobTypeLabel } from '$lib/format';
   import JobStatusBadge from '$lib/components/JobStatusBadge.svelte';
 
   let jobs: JobListItem[] = [];
+  // The jobs the creation form just made (`?new=id,id`): a round robin's
+  // pairings, inactive at 0%, marked so they can be found among the rest and
+  // listed first.
+  $: fresh = new Set(($page.url.searchParams.get('new') ?? '').split(',').filter(Boolean));
+  $: listed = [...jobs].sort((a, b) => Number(fresh.has(b.id)) - Number(fresh.has(a.id)));
   /** The allocation each job is set to on the page, by id. */
   let values: Record<string, number> = {};
   let loaded = false;
@@ -107,6 +113,14 @@
   {:else if loaded && !jobs.length}
     <p class="text-muted-foreground">No job is active or inactive: there is nothing to allocate.</p>
   {:else if loaded}
+    {#if fresh.size}
+      <p class="text-sm" data-testid="new-jobs">
+        {fresh.size === 1 ? 'The new job is' : `The ${fresh.size} new jobs are`} marked
+        <span class="rounded-full border border-primary/30 bg-primary/15 px-2 py-0.5 text-xs font-medium text-primary">new</span> and listed first, inactive at 0%: give
+        {fresh.size === 1 ? 'it an allocation' : 'them allocations'} to start
+        {fresh.size === 1 ? 'it' : 'them'}.
+      </p>
+    {/if}
     <form class="card space-y-4" on:submit|preventDefault={save}>
       <div class="overflow-x-auto">
         <table class="table text-sm" data-testid="allocations">
@@ -117,9 +131,12 @@
             </tr>
           </thead>
           <tbody>
-            {#each jobs as job (job.id)}
+            {#each listed as job (job.id)}
               <tr class:font-medium={Number(values[job.id]) !== current(job)}>
-                <td><a href="/admin/jobs/{job.id}">{jobTitle(job)}</a></td>
+                <td>
+                  <a href="/admin/jobs/{job.id}">{jobTitle(job)}</a>
+                  {#if fresh.has(job.id)}<span class="ml-1 rounded-full border border-primary/30 bg-primary/15 px-2 py-0.5 text-xs font-medium text-primary">new</span>{/if}
+                </td>
                 <td>{jobTypeLabel(job.job_type)}</td>
                 <td><JobStatusBadge status={job.status} /></td>
                 <td class="text-right tabular-nums">{current(job)}%</td>

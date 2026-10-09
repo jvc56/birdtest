@@ -35,8 +35,10 @@ test.beforeAll(async ({ browser, playwright }) => {
   const layout = form.getByLabel('Board', { exact: true });
   const board = layout.locator('option', { hasText: `standard15 (${SEEDED_DATA},` });
   await layout.selectOption((await board.getAttribute('value'))!);
-  await form.getByLabel('Player 1').selectOption({ label: a });
-  await form.getByLabel('Player 2').selectOption({ label: b });
+  // Two players ticked: one job between them.
+  await form.getByLabel(a, { exact: true }).check();
+  await form.getByLabel(b, { exact: true }).check();
+  await expect(form.getByTestId('matchups')).toContainText('2 configs → 1 job');
   await form.getByLabel('Games Per Task').fill('2');
   // No match test, the form's default: the job plays its four games and stops.
   await expect(form.getByLabel('Significance Test')).not.toBeChecked();
@@ -44,8 +46,9 @@ test.beforeAll(async ({ browser, playwright }) => {
   await form.getByLabel('Games To Play').fill('4');
   await form.getByLabel('Position Recorder').check();
   await form.getByRole('button', { name: 'Create job' }).click();
-  await expect(form).toHaveURL(/\/admin\/jobs\/[0-9a-f-]{36}$/);
-  jobId = form.url().split('/').pop()!;
+  // A games or pairs job is started from the allocation page, which marks it new.
+  await expect(form).toHaveURL(/\/admin\/allocation\?new=[0-9a-f-]{36}$/);
+  jobId = new URL(form.url()).searchParams.get('new')!;
   await admin.close();
   await api.allocate(jobId, 10);
 
