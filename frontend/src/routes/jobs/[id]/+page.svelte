@@ -379,11 +379,5 @@
         </p>
       {/if}
     </div>
-
-    <p class="text-sm text-muted-foreground">
-      Raw results: <a href="/api/jobs/{jobId}/results">paginated JSON</a>. Bulk
-      downloads are an admin operation — a full scan holds a database connection
-      for as long as it runs.
-    </p>
   </div>
 {/if}

@@ -179,7 +179,6 @@ Open "dev game pairs (first divergences saved)".
 - [ ] **Expect** a Contributors table: `dev-contributor-1`,
   `dev-contributor-2` and "Anonymous · <16 characters>" rows, with compute time
   (on a wide screen) and tasks completed.
-- [ ] **Expect** a link to the results as **paginated JSON**.
 - [ ] **Do** open `/jobs/00000000-0000-4000-8000-000000000000`. **Expect** "no
   such job".
 
