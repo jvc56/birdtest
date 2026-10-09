@@ -211,7 +211,7 @@ On the same job:
   identically." The figures count games, not pairs.
 - [ ] **Expect** after it a **Significance Test** card with a "running" badge and
   one sentence: "static-equity scores x% per game (95% interval a% to b%)." --
-  nothing in Elo anywhere on the card. Then "The test is not acted on until 50,000 pairs
+  no Elo or rating figure anywhere on the card. Then "The test is not acted on until 50,000 pairs
   are complete." and a bar: the interval shaded on a scale of player 1's
   score, a dashed line at 50% and a mark at the score, labelled "even at
   50%, static-equity's score x%". No W/L/D line of its own.
@@ -377,8 +377,19 @@ Open "dev game pairs (first divergences saved)".
   <time> (membership) over N pairs from 1 job, K iterations", and a warning
   if the fit did not converge.
 - [ ] **Expect** a dot plot with ±1 standard-error bars and the anchor in
-  amber, an "All configs" table (rating, ± SE, pairs; the anchor tagged), and
-  "Where the model disagrees with the games".
+  amber, and an "All configs" table (Rating (WESPA scale), ± SE, pairs; the
+  anchor tagged) with a line under it: a gap predicts what it does between
+  WESPA players, and the absolute level is only where the anchor was pinned.
+- [ ] **Expect** a "Cross table": every rated config against every other,
+  best first, each cell the row's win % "±" its standard error over its
+  average spread ("+6.8"), a blank diagonal, "·" where two never played, and
+  the rating in the last column. Each pair of cells mirrors across the
+  diagonal (100 − the win %, the same error, the spread negated). **Do** hover
+  a cell. **Expect** "<row> against <column>: … The ratings predict …%
+  (residual … percentage points)."
+- [ ] Narrow the window to phone width. **Expect** the cross table to scroll
+  sideways inside its card with the config names staying put, and nothing
+  else on the page scrolling sideways.
 - [ ] **Expect** the ratings to shift on a reload a few minutes later: the pool
   is refitted every two minutes while its jobs play.
 - [ ] Signed out or as a contributor, **expect** no membership controls and no

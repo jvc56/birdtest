@@ -21,10 +21,11 @@
 //! identical pairs contribute exactly 0.5 each, so both views land on the same
 //! side of even — but it destroys the magnitude and with it the test's whole
 //! purpose. Take 20,000 games split 9,950-10,050, of which only 100 diverged
-//! and one player took 99: over every pair that is a score rate of 0.4975, or
-//! about -1.7 Elo. Over the divergent games alone it is 0.01, or about -800
-//! Elo. A test fed the second number decides almost immediately, on a
-//! hundredth of the evidence, whatever confidence it is asked for.
+//! and one player took 99: over every pair that is a score rate of 0.4975, a
+//! quarter of a percentage point below even. Over the divergent games alone it
+//! is 0.01, 49 percentage points below. A test fed the second number decides
+//! almost immediately, on a hundredth of the evidence, whatever confidence it
+//! is asked for.
 
 /// Per-game outcome counts. The unit of a plain `games` job, and the shape the
 /// dashboard reports for both job types.
@@ -91,8 +92,8 @@ impl Sample {
 
     /// One **pair** per observation, scored `i / 4` for bucket `i`. The mean is
     /// therefore on the same per-game scale as `from_games` — a pair scoring
-    /// 0.5 is one game's worth each way — so it reads as a per-game score and
-    /// a per-game Elo, while `n` counts pairs.
+    /// 0.5 is one game's worth each way — so it reads as a per-game score,
+    /// while `n` counts pairs.
     pub fn from_pentanomial(pentanomial: &Pentanomial) -> Self {
         let n = pentanomial.pairs();
         if n == 0 {
@@ -167,10 +168,10 @@ mod tests {
         // The 50 divergent pairs on their own: player 1 lost both games of each.
         let divergent_only = Sample::from_pentanomial(&Pentanomial { counts: [50, 0, 0, 0, 0] });
 
-        let elo = |mean: f64| 400.0 * (mean / (1.0 - mean)).log10();
-        approx(elo(all_pairs.mean), -1.74, 0.01);
-        // A score rate of exactly 0 is off the Elo scale entirely; the point is
-        // that it is nowhere near the -1.74 the games actually show.
+        // A quarter of a percentage point below even over every pair...
+        approx(all_pairs.mean - 0.5, -0.0025, 1e-12);
+        // ...and every game lost over the divergent ones: a difference two
+        // hundred times the one the games actually show.
         assert_eq!(divergent_only.mean, 0.0);
         assert!(all_pairs.mean > 0.49);
     }

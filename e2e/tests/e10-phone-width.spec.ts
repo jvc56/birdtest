@@ -190,3 +190,88 @@ test('E-10: a visitor on a phone reads the job list, a job page and the rankings
   await expectTableFits(page);
   await expect(page.getByRole('columnheader', { name: 'Tasks completed' })).toBeInViewport();
 });
+
+/**
+ * E-10b: a rating pool's cross table at phone width. Six configs with long
+ * names make it several screens wide: it scrolls sideways inside its card
+ * while the page does not, and the config names, in a sticky first column,
+ * stay in view as it does. The pool is served from a route: what is under
+ * test is the layout, not a fit.
+ */
+test('E-10b: a rating pool cross table scrolls inside its card on a phone', async ({ page }) => {
+  const ids = Array.from({ length: 6 }, (_, i) => `00000000-0000-4000-8000-00000000000${i}`);
+  const name = (i: number) => `simmer-CSW24-${i + 1}ply-equity-${'x'.repeat(12)}`;
+  const ratings = ids.map((id, i) => ({
+    player_config_id: id,
+    name: name(i),
+    rating: 2000 - 60 * i,
+    stderr: i === 0 ? 0 : 25,
+    pairs_played: 500,
+    connected_to_anchor: true,
+    is_anchor: i === 0
+  }));
+  // Every head-to-head from both sides, the better config scoring 3 points a
+  // rung more.
+  const head_to_heads = ids.flatMap((row, i) =>
+    ids
+      .map((col, j) => ({ col, j }))
+      .filter(({ j }) => j !== i)
+      .map(({ col, j }) => ({
+        row,
+        col,
+        pairs: 100,
+        actual: 0.5 + 0.03 * (j - i),
+        predicted: 0.5 + 0.025 * (j - i),
+        stderr: 0.03,
+        spread: 4.5 * (j - i)
+      }))
+  );
+  await page.route(/\/api\/rating-pools\/[^/?]+$/, (route) =>
+    route.fulfill({
+      json: {
+        id: 'pool',
+        name: 'phone pool',
+        variant: 'classic',
+        letter_distribution: 'english',
+        layout: 'standard15',
+        anchor_player_config_id: ids[0],
+        anchor_rating: 2000,
+        members: ratings.map((r) => ({ player_config_id: r.player_config_id, name: r.name })),
+        run: {
+          id: 'run',
+          computed_at: new Date().toISOString(),
+          trigger: 'evidence',
+          iterations: 5,
+          converged: true,
+          pairs_used: 1500,
+          jobs_used: 15
+        },
+        ratings,
+        head_to_heads
+      }
+    })
+  );
+
+  await page.goto('/ratings/00000000-0000-4000-8000-0000000000aa');
+  const cross = page.getByTestId('cross-table');
+  await expect(cross.locator('tbody tr')).toHaveCount(6);
+  await expectNoSidewaysScroll(page);
+
+  // The table's own box scrolls: it is wider than the box that holds it.
+  const box = cross.locator('xpath=..');
+  const { scrollWidth, clientWidth } = await box.evaluate((el) => ({
+    scrollWidth: el.scrollWidth,
+    clientWidth: el.clientWidth
+  }));
+  expect(scrollWidth, 'the cross table fits a phone, so this proves nothing').toBeGreaterThan(clientWidth);
+
+  // Scrolled to its far end -- the ratings column -- the names are still there.
+  await cross.scrollIntoViewIfNeeded();
+  await box.evaluate((el) => (el.scrollLeft = el.scrollWidth));
+  const firstName = cross.locator('tbody th').first();
+  await expect(firstName).toBeInViewport();
+  await expect(cross.locator('tbody tr').first().locator('td').last()).toBeInViewport();
+  const [nameBox, scrolled] = [(await firstName.boundingBox())!, (await box.boundingBox())!];
+  expect(Math.abs(nameBox.x - scrolled.x)).toBeLessThan(2);
+  await expectNoSidewaysScroll(page);
+});

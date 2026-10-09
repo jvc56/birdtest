@@ -1234,7 +1234,7 @@ CREATE TABLE leave_selection_cursors (
 -- Opening rack jobs write one per rack. Games and game-pairs jobs write one per
 -- turn when `capture_positions` is on: a worker analyses a position on every
 -- turn anyway, and keeping those makes a job a corpus of analysed positions as
--- well as an Elo measurement.
+-- well as a measurement of strength.
 --
 -- The request that produced these is job-type-specific -- opening_rack_requests
 -- or game_requests -- but what comes back is a position analysis either way,
@@ -1686,9 +1686,10 @@ CREATE TABLE player_config_ratings (
     run_id           UUID NOT NULL REFERENCES rating_runs(id) ON DELETE CASCADE,
     player_config_id UUID NOT NULL REFERENCES player_configs(id),
     rating           DOUBLE PRECISION NOT NULL,
-    -- Approximate Elo standard error. Wide bars are the honest signal that a
-    -- config has barely played, or has only played opponents far from its own
-    -- strength; the page shows them next to the rating for that reason.
+    -- Approximate standard error, in rating points. Wide bars are the honest
+    -- signal that a config has barely played, or has only played opponents
+    -- far from its own strength; the page shows them next to the rating for
+    -- that reason.
     stderr           DOUBLE PRECISION NOT NULL,
     pairs_played     BIGINT NOT NULL,
     -- FALSE when no chain of games connects this config to the pool's anchor.
@@ -1700,12 +1701,14 @@ CREATE TABLE player_config_ratings (
     PRIMARY KEY (run_id, player_config_id)
 );
 
--- The residuals of one fit: for every head-to-head with games in it, the score
--- the fit's ratings predict against the score that happened. Stored with the
--- run rather than recomputed on each view of the pool, which rebuilt the
--- pool's evidence matrix -- a grouped scan over every paired result it counts
--- -- on every public page view. Stored, they also describe the evidence this
--- fit used, not evidence that has moved on since.
+-- The cross table of one fit, and its residuals: for every head-to-head with
+-- games in it, once (the row is the config whose name sorts first), the score
+-- that happened, its standard error and the average spread, beside the score
+-- the fit's ratings predict. The page mirrors each row for the other side.
+-- Stored with the run rather than recomputed on each view of the pool, which
+-- rebuilt the pool's evidence matrix -- a grouped scan over every paired
+-- result it counts -- on every public page view. Stored, they also describe
+-- the evidence this fit used, not evidence that has moved on since.
 CREATE TABLE rating_run_residuals (
     run_id               UUID NOT NULL REFERENCES rating_runs(id) ON DELETE CASCADE,
     row_player_config_id UUID NOT NULL REFERENCES player_configs(id),
@@ -1713,6 +1716,12 @@ CREATE TABLE rating_run_residuals (
     pairs                DOUBLE PRECISION NOT NULL,
     actual               DOUBLE PRECISION NOT NULL,  -- the row config's score rate
     predicted            DOUBLE PRECISION NOT NULL,
+    -- The standard error of `actual`, from the pairs' score variance in the
+    -- summed pentanomial (ratings::HeadToHeadEvidence::score_and_stderr).
+    stderr               DOUBLE PRECISION NOT NULL,
+    -- The row config's average spread per game: Σ games·(its mean score − the
+    -- other's) / Σ games over the same game_results rows.
+    spread               DOUBLE PRECISION NOT NULL,
     PRIMARY KEY (run_id, row_player_config_id, col_player_config_id)
 );
 

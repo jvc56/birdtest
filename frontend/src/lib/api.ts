@@ -909,7 +909,10 @@ export interface RatingRow {
   player_config_id: string;
   name: string;
   rating: number;
-  /** Approximate Elo standard error. Wide bars mean "barely measured". */
+  /**
+   * Approximate standard error, in rating points (WESPA's scale: a gap of
+   * 250·ln 3 ≈ 275 is a 75% score). Wide bars mean "barely measured".
+   */
   stderr: number;
   pairs_played: number;
   /**
@@ -921,12 +924,23 @@ export interface RatingRow {
   is_anchor: boolean;
 }
 
-export interface RatingResidual {
+/**
+ * One cell of a pool's cross table, from the row config's side. The API
+ * serves every head-to-head from both sides: the mirror has `1 - actual`,
+ * `1 - predicted` and `-spread`, and the same `stderr`.
+ */
+export interface RatingHeadToHead {
   row: string;
   col: string;
   pairs: number;
+  /** The row config's score per game, (W + ½D) / games, 0 to 1. */
   actual: number;
+  /** What the fitted ratings predict `actual` to be: the gap is the residual. */
   predicted: number;
+  /** The standard error of `actual`, from the pairs' score variance. */
+  stderr: number;
+  /** The row config's average spread per game: its game score minus the other's. */
+  spread: number;
 }
 
 export interface RatingRun {
@@ -961,6 +975,6 @@ export interface RatingPoolDetail {
   members: RatingPoolMember[];
   run: RatingRun | null;
   ratings: RatingRow[];
-  residuals: RatingResidual[];
+  head_to_heads: RatingHeadToHead[];
 }
 

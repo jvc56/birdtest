@@ -2244,12 +2244,16 @@ async fn a_pools_residuals_are_the_ones_its_latest_fit_stored() {
     let pool_page = format!("/api/rating-pools/{pool}");
     let (status, detail) = send(&app, get_request(&pool_page, &[])).await;
     assert_eq!(status, StatusCode::OK, "{detail}");
-    let residuals = detail["residuals"].as_array().unwrap();
-    assert_eq!(residuals.len(), 1, "{detail}");
-    assert_eq!(residuals[0]["row"], json!(anchor), "{detail}");
-    assert_eq!(residuals[0]["col"], json!(rival), "{detail}");
-    assert_eq!(residuals[0]["pairs"], json!(1.0), "{detail}");
-    assert_eq!(residuals[0]["actual"], json!(1.0), "{detail}");
+    // Served from both sides; the anchor's is the one stored.
+    let anchor_side = |detail: &serde_json::Value| {
+        let cells = detail["head_to_heads"].as_array().unwrap();
+        assert_eq!(cells.len(), 2, "{detail}");
+        cells.iter().find(|c| c["row"] == json!(anchor)).unwrap().clone()
+    };
+    let cell = anchor_side(&detail);
+    assert_eq!(cell["col"], json!(rival), "{detail}");
+    assert_eq!(cell["pairs"], json!(1.0), "{detail}");
+    assert_eq!(cell["actual"], json!(1.0), "{detail}");
 
     // A second pair the other way, and no refit. The page still shows the
     // fit's evidence, where a rebuilt matrix would show two pairs, split.
@@ -2259,8 +2263,9 @@ async fn a_pools_residuals_are_the_ones_its_latest_fit_stored() {
     let (_, body) = submit_as(&app, &uuid, token, pair(false)).await;
     assert_eq!(body["accepted"], true, "{body}");
     let (_, detail) = send(&app, get_request(&pool_page, &[])).await;
-    assert_eq!(detail["residuals"][0]["pairs"], json!(1.0), "{detail}");
-    assert_eq!(detail["residuals"][0]["actual"], json!(1.0), "{detail}");
+    let cell = anchor_side(&detail);
+    assert_eq!(cell["pairs"], json!(1.0), "{detail}");
+    assert_eq!(cell["actual"], json!(1.0), "{detail}");
 }
 
 // ---------------------------------------------------------------------------

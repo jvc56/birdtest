@@ -69,7 +69,7 @@ at tier 5 names a symptom.
 | Tier | Tests | Where |
 |---|---|---|
 | 1 Unit | 250 | `#[cfg(test)]` in `jobs::plausibility` (30), `inputdata` (30), `jobs::racks` (17), `stats::bradley_terry` (30), `stats::match_test` (10), `stats::outcomes` (7), `error` (9), `config` (8), `extract` (7), `routes::admin` (16), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (5), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (7), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (8), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `board`, `exports`, `jobs`, `jobs::leave_gen`, `routes` (1 each); `jobs::game_pair` (3), `artifacts` (2) |
-| 1F Frontend unit | 220 | Vitest, `frontend/src/lib/`: `format.test.ts` (46), `jobSettings.test.ts` (13), `matchScore.test.ts` (4), `matchTest.test.ts` (5), `moveList.test.ts` (5), `compare.test.ts` (3), `consensus.test.ts` (8), `cgp.test.ts` (16), `api.test.ts` (18), `auth.test.ts` (17), `accountRules.test.ts` (9), `ratingPool.test.ts` (3), `sse.test.ts` (12), `importWatch.test.ts` (10), `poller.test.ts` (7), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (3), and `charts/`: `ratingDotPlot.test.ts` (19), `labels.test.ts` (2), `residuals.test.ts` (11), `pentanomial.test.ts` (5) |
+| 1F Frontend unit | 218 | Vitest, `frontend/src/lib/`: `format.test.ts` (46), `jobSettings.test.ts` (13), `matchScore.test.ts` (4), `matchTest.test.ts` (5), `moveList.test.ts` (5), `compare.test.ts` (3), `consensus.test.ts` (8), `cgp.test.ts` (16), `api.test.ts` (18), `auth.test.ts` (17), `accountRules.test.ts` (9), `ratingPool.test.ts` (7), `sse.test.ts` (12), `importWatch.test.ts` (10), `poller.test.ts` (7), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (3), and `charts/`: `ratingDotPlot.test.ts` (19), `labels.test.ts` (2), `residuals.test.ts` (5), `pentanomial.test.ts` (5) |
 | 2 Integration | 186 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (33), `scheduler.rs` (19), `jobs.rs` (20), `stats.rs` (19), `input_data.rs` (14), `derived.rs` (9), `leave_generation.rs` (8), `exports.rs` (16), `submissions.rs` (6), `artifacts.rs` (5), `audit.rs` (3) |
 | 3 API | 250 | `backend/tests/`: `worker_api.rs` (52), `admin_api.rs` (59), `auth_routes.rs` (28), `worker_routes.rs` (24), `boundaries.rs` (18), `public_api.rs` (24), `admin_routes.rs` (13), `authz.rs` (7), `account.rs` (10), `auth_api.rs` (5), `finish.rs` (9), `fake_worker.rs` (1) |
 | 4 Contract | 15 | `routes::worker::contract_fixtures`, over 18 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
@@ -584,34 +584,42 @@ computed outside the code, in 40-digit decimal from PLAN.md's formulas.
   `match_test::tests::the_fewest_wins_that_decide_and_one_short`,
   `match_test::tests::identical_pairs_alone_never_decide`,
   `match_test::tests::the_floor_holds_until_it_does_not_and_the_cap_applies_below_it`,
-  `match_test::tests::nothing_played_is_an_even_score_with_every_score_possible`,
-  `match_test::tests::elo_is_the_logistic_inverse_within_its_bounds`.)*
+  `match_test::tests::nothing_played_is_an_even_score_with_every_score_possible`.)*
+  The test carries no Elo or rating-point figure: the `elo` fields its result
+  once had are gone, so nothing beside it reads as a pool's rating.
 - `U-STATS-3b` **The error rate and the power, simulated.** Pairs drawn from a
   pentanomial, the test checked after every batch of 50 from a floor of 500 to
   a cap of 10,000 at 95%, as the finish check does: between equal players
   (three pairs in five split) at most α + 0.02 of 1,000 runs name a winner;
-  a player scoring 53.5% per game (about +24 Elo) is found better in at least
+  a player scoring 53.5% per game is found better in at least
   90% of 200 runs, and never the wrong way round. *(Covered:
   `match_test::tests::equal_players_rarely_get_a_winner_however_often_it_is_checked`,
   `match_test::tests::a_better_player_is_found`.)*
-- `U-STATS-4` A Bradley-Terry standard error equals the analytic
-  (400/ln 10)/√(n·p·(1−p)): 49.1348… Elo for an even 50 games, a tenth of that
-  at 5,000, and 1.2687… for 75% over 100,000. *(Covered:
-  `bradley_terry::tests::more_games_narrow_the_standard_error`.)*
+- `U-STATS-4` The ratings are on WESPA's scale, 250 points per logit: a 75%
+  score fits to 250·ln 3 ≈ 274.65 points, over 100,000 games as over 100
+  pairs, and the residuals predict with the same constant (100 points is
+  59.9%). A Bradley-Terry standard error equals the analytic
+  250/√(n·p·(1−p)): 70.7106… points for an even 50 games, a tenth of that at
+  5,000, and 1.8257… for 75% over 100,000. *(Covered:
+  `bradley_terry::tests::a_75_percent_score_is_250_ln_3_points`,
+  `the_residuals_predict_on_the_same_scale`,
+  `a_well_played_head_to_head_is_its_maximum_likelihood`,
+  `more_games_narrow_the_standard_error`.)*
 - `U-STATS-5` The fit returns noiseless evidence's own ratings, within a few
-  Elo, for the shapes that defeated the old one-config-at-a-time solver and
+  points, for the shapes that defeated the old one-config-at-a-time solver and
   its prior toward the anchor (KL-74): a 12-member group joined to the anchor
-  by one 300-pair job (every member's error at least the link's ≈28 Elo), a
+  by one 300-pair job (every member's error at least the link's ≈34 points), a
   30-member group, a disconnected island (unrated, its internal gap intact)
   and a hundred-member pool (under a second in a debug build); a 20-config
   chain and a 12-rung ladder within 0.6 of each config's error (KL-79). And for
   the shapes the audit's adversarial checks found: a config over a gauntlet of
   twenty lightly played opponents within half its error; conceding a quarter
   or half point lowers the conceding config's rating in the cases pinned (the
-  rare exception, under an Elo, is KL-79's); twenty baselines swept by both the
-  anchor and a config 400 above it leave that config within one error; a
+  rare exception, under a point and a half, is KL-79's); twenty baselines
+  swept by both the anchor and a config 400 above it leave that config within
+  one error; a
   strong tier 1,000 above joined by one job within about half its error; two
-  tiers of lightly played configs 600 or 800 Elo apart, joined by one small
+  tiers of lightly played configs 600 or 800 points apart, joined by one small
   job, the upper within 1.5 of its shown error, which includes the prior's
   pull (1.7 and more without it); a
   newcomer's sweep shrunk the same in a young pool as a mature one; a field
@@ -1007,9 +1015,9 @@ Each entry's tests are the `describe` block named for its id.
   point), and keeps a wide interval within the scores that exist. *(Covered:
   `matchTest.test.ts`.)*
 - `F-TEST-2` `testSentence` states player 1's score per game with its range,
-  named for the players and with nothing in Elo ("… scores 53.1% per game (95%
-  interval 51.2% to 55.0%)."), then names the better player
-  once it is decided, or says neither is when it ended inconclusive.
+  named for the players and with no Elo or rating figure ("… scores 53.1% per
+  game (95% interval 51.2% to 55.0%)."), then names the better player once it
+  is decided, or says neither is when it ended inconclusive.
   *(Covered: `matchTest.test.ts`.)*
 - `F-TEST-3` `confidenceProblem` refuses what job creation refuses of a
   test's confidence, and only that: above 50 and below 100, so 50.05 and
@@ -1150,11 +1158,13 @@ Test the pure functions; do not snapshot the SVG.
 - `F-CHART-4`, `F-CHART-5` Retired with the rating history chart they covered
   (its series cap and colour by config identity). The label shortening it
   shared with the dot plot is covered by `charts/labels.test.ts`.
-- `F-CHART-6` `ResidualMatrix` sorts by absolute residual descending, and flags
-  the non-transitive case only when at least three head-to-heads exceed the
-  threshold on enough pairs to be at least three standard errors out — the
-  same misses on ten pairs each do not raise it. *(Covered: `charts/residuals.test.ts`; the component now sorts
-  itself instead of drawing in the order it is handed.)*
+- `F-CHART-6` The ratings page flags the non-transitive case only when at
+  least three head-to-heads exceed the threshold on enough pairs to be at
+  least three standard errors out — the same misses on ten pairs each do not
+  raise it — and states a residual in signed percentage points in a cross
+  table cell's hover. *(Covered: `charts/residuals.test.ts`. The separate
+  residual table, `ResidualMatrix`, and its ordering and bars went with the
+  cross table, which folds the residual into each cell.)*
 - `F-CHART-7` The pair-outcome table reads each player's row from its own side
   — bucket 4 is player 1's "Won both" and player 2's is bucket 0 — and its
   three rows (won both, won one and drew one, even) hold all five buckets. An
@@ -1227,6 +1237,12 @@ server refuses. Each rule mirrors one in `routes/auth.rs`, with its wording.
   first two under "Add", where adding changed nothing, and gave the second no
   Remove button. *(Covered: `ratingPool.test.ts`.)* (Thirty-third audit, pass
   4.)
+- `F-RATE-2` The cross table orders the latest fit's configs best first and
+  then those with no chain to the anchor, finds a cell by (row, column), counts
+  each head-to-head once for the residual checks (the API serves both sides),
+  shows a cell as "58.8% ±6.2" over a signed spread ("+6.8", never "-0.0"),
+  and spells it out in its hover with what the ratings predict and the
+  residual. *(Covered: `ratingPool.test.ts`.)*
 
 ### `F-DOCS-*` — contributor instructions in `routes/`
 
@@ -2223,6 +2239,19 @@ permanent.
 - `I-RATE-11` A pool with one member (the anchor) and no games produces a run
   rather than an error. *(Covered:
   `ratings::a_pool_of_only_its_anchor_fits_to_an_empty_run`.)*
+- `I-RATE-13` A fit stores each head-to-head's cross-table cell once, from
+  the side of the config whose name sorts first, summing every job between
+  the two whichever seats them: the score, the error from the pairs' score
+  variance in the summed pentanomial (√(491/128000) for [1, 3, 8, 4, 4]) and
+  the games-weighted spread. *(Covered:
+  `ratings::a_head_to_head_is_stored_once_with_both_seatings_summed`.)*
+- `U-RATE-1` to `U-RATE-3` The aggregation, without a database: two jobs
+  seating the configs either way sum to the same pentanomial from one side,
+  with the hand-computed mean 47/80, error √(491/128000) and spread 6.8, and
+  from the other side the mirror image; twenty split pairs have an error of
+  0, where counting games would give ≈7.9 points of win %; and a stored cell
+  is served from both sides, the second its mirror (1 − the score and the
+  prediction, the same error, −the spread). *(Covered: `ratings::tests`.)*
 - `I-RATE-12` A pool deleted after the sweep listed the pools is skipped
   without an error logged, and the sweep goes on to the next. *(Covered:
   `ratings::the_sweep_skips_a_pool_deleted_mid_sweep_quietly`, which deletes
@@ -3263,7 +3292,9 @@ below.
 
 ### `A-RATE-*` — `routes/ratings.rs`
 
-- `A-RATE-1` Pool list and detail render the latest run, with residuals.
+- `A-RATE-1` Pool list and detail render the latest run, with its cross table
+  from both sides: the score, its error (√11/16 for [2, 0, 1, 0, 1]) and the
+  spread mirrored, beside the predicted score.
   *(Covered: `ratings::the_pool_pages_show_the_latest_run_with_its_residuals`,
   `worker_api::a_pools_residuals_are_the_ones_its_latest_fit_stored`.)*
 - `A-RATE-2` A pool with no run renders empty rather than erroring. *(Covered:
@@ -3793,7 +3824,9 @@ admin in once and the admin journeys reuse its storage state.
   appear, removes it, and sees the ratings change. Covers the one flow where a
   write is expected to move numbers elsewhere on the page. The pool is created
   through its form, from the ratings list, with only its anchor; membership,
-  the fit and the moved ratings go through the pool's page.
+  the fit and the moved ratings go through the pool's page, and with three
+  configs the cross table holds every head-to-head from both sides, each
+  cell's hover what the ratings predict, its last column the table's rating.
   *(Covered: `e7-ratings.spec.ts`.)*
 - `E-8` A job detail page renders the pentanomial table — three rows (Won both,
   Won one, drew one, Even) with a column per player, each read from that
@@ -3823,6 +3856,10 @@ admin in once and the admin journeys reuse its storage state.
   header's links ran to 533 pixels on a 393-pixel screen, "Sign in" and
   "Register" off it (thirty-first audit; the header now wraps). Checked against
   a build of the pages with the API mocked: 533 before, 393 after.
+  `E-10b`: a rating pool's cross table, six long-named configs served from a
+  route, scrolls sideways inside its card while the page does not, and its
+  sticky first column keeps the names in view scrolled to the ratings at its
+  far end.
 - `E-11` An admin job page whose first read fails shows nothing the server
   did not say: the data gaps it read apart, the job's own allocation,
   read-only with a link to `/admin/allocation` and no Activate or Deactivate
