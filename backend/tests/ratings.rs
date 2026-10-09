@@ -725,6 +725,41 @@ async fn a_pool_of_only_its_anchor_fits_to_an_empty_run() {
     assert!(residuals(&db, run).await.is_empty());
 }
 
+/// I-RATE-13: a fit stores each head-to-head's cross-table cell once, from
+/// the side of the config whose name sorts first, summing every job between
+/// the two whichever seats them. The anchor is player 1 of 16 pairs
+/// ([1, 3, 7, 3, 2], 32 games) and player 2 of 4 ([2, 1, 1, 0, 0] for the
+/// rival, 8 games), and player 1 is 10 points a game ahead in every batch:
+/// from the anchor's side [1, 3, 8, 4, 4], 47 half-points of 80, an error of
+/// √(491/128000) (the pair-score variance 491/6400 over 20 pairs), and a
+/// spread of (32·10 − 8·10) / 40 = 6.
+#[tokio::test]
+async fn a_head_to_head_is_stored_once_with_both_seatings_summed() {
+    let db = TestDb::new().await;
+    let f = fixture(&db).await;
+    sqlx::query("DELETE FROM game_results").execute(&db.pool).await.unwrap();
+    let first = pairs_job(&db, "classic", f.scope, f.anchor, f.rival).await;
+    pair_result(&db, first, [1, 3, 7, 3, 2]).await;
+    let second = pairs_job(&db, "classic", f.scope, f.rival, f.anchor).await;
+    pair_result(&db, second, [2, 1, 1, 0, 0]).await;
+
+    let run = ratings::recompute(&db.pool, f.pool, Trigger::Manual).await.unwrap();
+    let cells: Vec<(Uuid, Uuid, f64, f64, f64, f64)> = sqlx::query_as(
+        "SELECT row_player_config_id, col_player_config_id, pairs, actual, stderr, spread
+         FROM rating_run_residuals WHERE run_id = $1",
+    )
+    .bind(run)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(cells.len(), 1, "{cells:?}");
+    let (row, col, pairs, actual, stderr, spread) = cells[0];
+    assert_eq!((row, col, pairs), (f.anchor, f.rival, 20.0));
+    assert!((actual - 47.0 / 80.0).abs() < 1e-12, "{actual}");
+    assert!((stderr - (491.0f64 / 128_000.0).sqrt()).abs() < 1e-12, "{stderr}");
+    assert!((spread - 6.0).abs() < 1e-12, "{spread}");
+}
+
 // ---------------------------------------------------------------------------
 // A-RATE: the endpoints
 // ---------------------------------------------------------------------------
@@ -793,13 +828,26 @@ async fn the_pool_pages_show_the_latest_run_with_its_residuals() {
     assert_eq!(anchor_row["rating"], 2000.0);
     assert_eq!(anchor_row["is_anchor"], true);
     assert_eq!(anchor_row["name"], "a-anchor");
-    let residuals = detail["residuals"].as_array().unwrap();
-    assert_eq!(residuals.len(), 1, "{detail}");
-    assert_eq!(residuals[0]["row"], json!(anchor));
-    assert_eq!(residuals[0]["col"], json!(rival));
-    assert_eq!(residuals[0]["pairs"], 4.0, "the latest run's evidence");
-    assert_eq!(residuals[0]["actual"], 3.0 / 8.0);
-    assert!(residuals[0]["predicted"].as_f64().unwrap() > 0.0);
+    // The cross table, from both sides: the anchor's [2, 0, 1, 0, 1] over
+    // four pairs is 6 half-points of 16, with a pair-score variance of
+    // 5/16 − (3/8)² = 11/64 and so an error of √(11/64 / 4) = √11 / 16; every
+    // batch had player 1 ten points a game ahead.
+    let cells = detail["head_to_heads"].as_array().unwrap();
+    assert_eq!(cells.len(), 2, "{detail}");
+    let side = |row: Uuid| cells.iter().find(|c| c["row"] == json!(row)).unwrap();
+    let (ours, theirs) = (side(anchor), side(rival));
+    assert_eq!(ours["col"], json!(rival));
+    assert_eq!(theirs["col"], json!(anchor));
+    assert_eq!(ours["pairs"], 4.0, "the latest run's evidence");
+    assert_eq!(ours["actual"], 3.0 / 8.0);
+    assert_eq!(theirs["actual"], 5.0 / 8.0);
+    let stderr = ours["stderr"].as_f64().unwrap();
+    assert!((stderr - 11f64.sqrt() / 16.0).abs() < 1e-12, "{stderr}");
+    assert_eq!(theirs["stderr"], ours["stderr"]);
+    assert_eq!((ours["spread"].as_f64(), theirs["spread"].as_f64()), (Some(10.0), Some(-10.0)));
+    let predicted = ours["predicted"].as_f64().unwrap();
+    assert!(predicted > 0.0 && predicted < 0.5, "the rival is rated above: {predicted}");
+    assert!((theirs["predicted"].as_f64().unwrap() - (1.0 - predicted)).abs() < 1e-12);
 }
 
 /// A-RATE-2: a pool that has never been fit renders as a pool with no run --
@@ -822,7 +870,7 @@ async fn a_pool_with_no_run_renders_empty() {
     assert_eq!(status, StatusCode::OK, "{detail}");
     assert_eq!(detail["run"], json!(null), "{detail}");
     assert_eq!(detail["ratings"], json!([]));
-    assert_eq!(detail["residuals"], json!([]));
+    assert_eq!(detail["head_to_heads"], json!([]));
     assert_eq!(detail["anchor_player_config_id"], json!(anchor));
 
     let (status, history) =

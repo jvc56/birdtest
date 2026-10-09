@@ -1,51 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import type { RatingResidual } from '$lib/api';
-import {
-  formatResidual,
-  isNonTransitive,
-  magnitude,
-  NOTABLE,
-  notableResiduals,
-  residual,
-  residualBar,
-  residualFill,
-  sortResiduals
-} from './residuals';
+import type { RatingHeadToHead } from '$lib/api';
+import { formatResidual, isNonTransitive, NOTABLE, notableResiduals } from './residuals';
 
-function cell(row: string, col: string, actual: number, predicted: number): RatingResidual {
-  return { row, col, pairs: 1000, actual, predicted };
+function cell(row: string, col: string, actual: number, predicted: number): RatingHeadToHead {
+  return { row, col, pairs: 1000, actual, predicted, stderr: 0.01, spread: 0 };
 }
 
-describe('F-CHART-6 ResidualMatrix ordering', () => {
-  it('sorts by absolute residual, descending, whatever the sign', () => {
-    const cells = [
-      cell('a', 'b', 0.52, 0.5), // +0.02
-      cell('a', 'c', 0.3, 0.5), // -0.20
-      cell('b', 'c', 0.61, 0.5), // +0.11
-      cell('c', 'd', 0.45, 0.5) // -0.05
-    ];
-    expect(sortResiduals(cells).map((c) => residual(c))).toEqual([
-      0.3 - 0.5,
-      0.61 - 0.5,
-      0.45 - 0.5,
-      0.52 - 0.5
-    ]);
-  });
-
-  it('breaks ties by row then column, as the API does, and leaves the input alone', () => {
-    const cells = [cell('b', 'c', 0.6, 0.5), cell('a', 'd', 0.4, 0.5), cell('a', 'c', 0.6, 0.5)];
-    const snapshot = [...cells];
-    expect(sortResiduals(cells).map((c) => `${c.row}${c.col}`)).toEqual(['ac', 'ad', 'bc']);
-    expect(cells).toEqual(snapshot);
-  });
-
-  it('is a no-op on input the API already sorted', () => {
-    const cells = [cell('a', 'b', 0.8, 0.5), cell('a', 'c', 0.35, 0.5), cell('b', 'c', 0.5, 0.49)];
-    expect(sortResiduals(cells)).toEqual(cells);
-  });
-});
-
-describe('F-CHART-6 ResidualMatrix non-transitivity flag', () => {
+describe('F-CHART-6 the non-transitivity warning', () => {
   const big = (row: string, col: string, sign: 1 | -1) => cell(row, col, 0.5 + sign * 0.2, 0.5);
   const small = (row: string, col: string) => cell(row, col, 0.52, 0.5);
 
@@ -88,26 +49,7 @@ describe('F-CHART-6 ResidualMatrix non-transitivity flag', () => {
   });
 });
 
-describe('ResidualMatrix bar and label', () => {
-  it('grows the bar right for a positive residual and left for a negative one', () => {
-    expect(residualBar(0.125)).toEqual({ left: 50, width: 25 });
-    expect(residualBar(-0.125)).toEqual({ left: 25, width: 25 });
-    expect(residualBar(0)).toEqual({ left: 50, width: 0 });
-  });
-
-  it('saturates at the scale maximum rather than overflowing the track', () => {
-    expect(magnitude(0.9)).toBe(1);
-    expect(residualBar(0.9)).toEqual({ left: 50, width: 50 });
-    expect(residualBar(-0.9)).toEqual({ left: 0, width: 50 });
-  });
-
-  it('colours warm above prediction, cool below, grey near zero', () => {
-    expect(residualFill(0)).toBe('hsl(217 19% 20%)');
-    expect(residualFill(0.005)).toBe('hsl(217 19% 20%)');
-    expect(residualFill(0.25)).toBe('hsl(25 85% 52%)');
-    expect(residualFill(-0.25)).toBe('hsl(205 85% 52%)');
-  });
-
+describe('F-CHART-6 a residual as a hover states it', () => {
   it('labels in signed percentage points', () => {
     expect(formatResidual(0.075)).toBe('+7.5');
     expect(formatResidual(-0.03)).toBe('-3.0');

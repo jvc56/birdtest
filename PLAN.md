@@ -579,7 +579,8 @@ Ratings are **displayed on the ratings pages and nowhere else**:
 - `/ratings/[id]` (`GET /api/rating-pools/:id`) — the pool's **newest run**:
   each member's rating with its standard error as a dot plot and a table, the
   run's provenance (trigger, iterations, convergence, evidence consumed), and
-  the residual table showing where the fit disagrees with the games. A config
+  the [cross table](#the-cross-table) of every head-to-head, whose hover shows
+  where the fit disagrees with the games. A config
   with no path of games to the anchor is listed as unrated rather than drawn.
   Admin membership controls appear inline here for admins, with the anchor
   (config and rating) and a Delete button. They work from the pool's members,
@@ -705,12 +706,53 @@ score versus model-predicted score for each head-to-head — say exactly where t
 model is lying. A rock-paper-scissors triangle shows up as three large,
 sign-flipped residuals and as ratings that collapse toward each other. An
 incremental filter cannot show this at all; it just oscillates quietly. The
-ratings page therefore carries the scalar rating as the headline and the residual
-table beside it, and says so when the residuals are large enough that the
-ranking should not be read as one: three or more head-to-heads at least five
+ratings page therefore carries the scalar rating as the headline and the cross
+table beside it -- each cell's hover gives what the ratings predict, and a cell
+they predict badly is amber -- and says so when the residuals are large enough
+that the ranking should not be read as one: three or more head-to-heads at least five
 points off *and* at least three standard errors from zero on the pairs behind
 them (`charts/residuals.ts`). Without the second condition a young pool — a few
 pairs per head-to-head — showed the warning on sampling noise alone.
+
+#### The cross table
+
+Under the ratings, the pool page lays every head-to-head out as a cross table:
+an n × n matrix of the configs the latest fit rated, best first (then any with
+no chain of games to the anchor), with each config's rating in the rightmost
+column. A cell is the row config's record against the column's, from the
+row's side:
+
+- **Win %**, (W + ½D) / games — the pentanomial's half-points over its games,
+  the score the fit itself reads.
+- **± its standard error**, from the pairs, not the games. A pair is the
+  independent unit and scores `k/4` for bucket `k`, the mean of its two games'
+  scores and so already per game; over the head-to-head's summed pentanomial
+  (`N` pairs, mean `m`), `s² = Σ c_k·(k/4)² / N − m²` and the error is
+  `√(s²/N)`, shown in percentage points. Counting the games as independent
+  (`√(m(1−m)/2N)`) would undo what pairing buys: pairs that played identically
+  all score ½ and narrow the error, as they should.
+- **Average spread**, `Σ games·(p1_mean − p2_mean) / Σ games` over the same
+  `game_results` rows, from the row's side.
+
+The evidence is exactly the fit's: the same pool-scoped `game_pairs` jobs
+between two members, summed per pair of configs whichever seats them (a job
+with the configs the other way round is flipped, bucket `k` to `4 − k` and the
+spread negated). A cell's mirror across the diagonal is the same games: 100 −
+the win %, the same error, −the spread. The residual is folded into each
+cell's hover — what the ratings predict, and how far off — and a cell they
+predict badly on enough pairs that it is not chance is amber; three or more
+raise the warning above.
+
+**Stored per run, not computed on request.** The cells come from the grouped
+scan `build_matrix` already makes for the fit (each job's games and
+games-weighted spread beside its pentanomial), so a fit stores them in
+`rating_run_residuals` with its ratings at no extra read: the head-to-head's
+`stderr` and `spread` beside its `actual` and `predicted`, once per
+head-to-head, mirrored by the API (`ratings::both_sides`). Computing them on
+request would be that scan again on every view of a public page — the cost
+the residuals were moved into the run to escape — and could show evidence that
+has moved on from the ratings beside it. On a phone the table scrolls
+sideways inside its card, the config names held in a sticky first column.
 
 #### What counts as evidence
 
@@ -5826,7 +5868,7 @@ do not exist.
 | `GET` | `/api/users` | List all registered user accounts with contribution stats. Paginated. |
 | `GET` | `/api/workers` | Contributor stats for all workers (anonymous and authenticated) — movegens, compute time, tasks and the last result — paginated, ranked by movegens or by `?sort=movegens\|compute\|tasks`. |
 | `GET` | `/api/rating-pools` | Rating pools with their conditions, member counts and last fit time. |
-| `GET` | `/api/rating-pools/:id` | One pool: its members now (`members`: config id and name, the anchor among them) and its latest fit, with run provenance, each rated config's rating with uncertainty, and the residuals. The two sets can differ: a member added since the fit (or whose refit failed) has no rating yet, and one removed since is still rated. |
+| `GET` | `/api/rating-pools/:id` | One pool: its members now (`members`: config id and name, the anchor among them) and its latest fit, with run provenance, each rated config's rating with uncertainty, and the cross table (`head_to_heads`: every head-to-head from both sides, each with its pairs, win score, standard error, average spread and the score the ratings predict). The two sets can differ: a member added since the fit (or whose refit failed) has no rating yet, and one removed since is still rated. |
 | `GET` | `/api/rating-pools/:id/history` | Stored runs' ratings, oldest first, thinned to at most 500 runs evenly spaced over the pool's history, for the six current members rated highest in the newest run. No page draws it now. |
 
 **Rack lookup** canonicalizes the query before matching: uppercased, whitespace
@@ -5857,7 +5899,7 @@ SvelteKit uses file-based routing under `frontend/src/routes/`. Each directory w
 | `/ratings` | Rating pool list — each pool's conditions, member count and last fit. |
 | `/player-configs` | Every player config, newest first: its name, how it searches, its lexicon and leaves. Public, like the job pages that already show players' settings. |
 | `/player-configs/[id]` | One config: a table of its key settings (its files, how moves are sorted, recorded and generated, plies, and whether it infers and solves the pre-endgame and endgame) that "All settings" grows to every setting — the job page's `PlayerSettingsTable` with one column — a JSON download, and the config it was cloned from. The job page's Settings card links each player here. |
-| `/ratings/[id]` | [The ratings page](#the-ratings-page) — ratings with uncertainty, and residuals (no history chart: `GET /api/rating-pools/:id/history` serves API callers). Admin controls for membership appear inline for admins. |
+| `/ratings/[id]` | [The ratings page](#the-ratings-page) — ratings with uncertainty, and the cross table with its residuals (no history chart: `GET /api/rating-pools/:id/history` serves API callers). Admin controls for membership appear inline for admins. |
 
 ### Auth Routes
 
@@ -5916,13 +5958,20 @@ numbers and only the interval says which to believe. A config with no path to th
 anchor is listed beneath the chart as **unrated** rather than drawn at a number.
 
 **A table of every config**, since the chart caps what it draws and the table
-must not. This is also the accessible view of the same data.
+must not. This is also the accessible view of the same data. Its column is
+"Rating (WESPA scale)", with one line under the table saying that a gap means
+what it does between WESPA players and the absolute level only where the
+anchor was pinned ([The scale is WESPA's](#the-scale-is-wespas)).
 
-**Where the model disagrees with the games.** The residual table: actual score
-versus predicted, per head-to-head, largest disagreement first. This is the panel
-that makes non-transitivity visible instead of letting it quietly distort the
-ranking, and when enough head-to-heads are badly mispredicted the page says
-outright that the ratings should be read as a summary rather than a ranking.
+**The cross table.** Every rated config against every other: win %, its
+standard error and the average spread, the rating last ([The cross
+table](#the-cross-table)). Its hover carries what the ratings predict, so this
+is the panel that makes non-transitivity visible instead of letting it quietly
+distort the ranking: a cell the ratings predict badly is amber, and when enough
+head-to-heads are badly mispredicted the page says outright that the ratings
+should be read as a summary rather than a ranking. It replaced a separate
+residual table, listed largest disagreement first, which said the same about
+the model in a list nobody could read against the results.
 
 Admin controls live inline on this page rather than under `/admin`, because
 adding or removing a config is an act whose consequence — every other rating
@@ -6116,8 +6165,7 @@ birdtest/
 │       │       ├── WorkerTable.svelte
 │       │       ├── Pagination.svelte
 │       │       ├── ProgressBar.svelte
-│       │       ├── RatingDotPlot.svelte  # ratings with error bars (not a bar chart: Elo has no zero)
-│       │       ├── ResidualMatrix.svelte # actual vs predicted per head-to-head
+│       │       ├── RatingDotPlot.svelte  # ratings with error bars (not a bar chart: a rating has no zero)
 │       │       └── PlayerCompareTable.svelte # two players side by side, higher green
 │       └── routes/
 │           ├── +layout.svelte      # global layout (nav bar, footer)
@@ -7918,12 +7966,14 @@ CREATE TABLE player_config_ratings (
     PRIMARY KEY (run_id, player_config_id)
 );
 
--- The residuals of one fit: for every head-to-head with games in it, the score
--- the fit's ratings predict against the score that happened. Stored with the
--- run rather than recomputed on each view of the pool, which rebuilt the
--- pool's evidence matrix -- a grouped scan over every paired result it counts
--- -- on every public page view. Stored, they also describe the evidence this
--- fit used, not evidence that has moved on since.
+-- The cross table of one fit, and its residuals: for every head-to-head with
+-- games in it, once (the row is the config whose name sorts first), the score
+-- that happened, its standard error and the average spread, beside the score
+-- the fit's ratings predict. The page mirrors each row for the other side.
+-- Stored with the run rather than recomputed on each view of the pool, which
+-- rebuilt the pool's evidence matrix -- a grouped scan over every paired
+-- result it counts -- on every public page view. Stored, they also describe
+-- the evidence this fit used, not evidence that has moved on since.
 CREATE TABLE rating_run_residuals (
     run_id               UUID NOT NULL REFERENCES rating_runs(id) ON DELETE CASCADE,
     row_player_config_id UUID NOT NULL REFERENCES player_configs(id),
@@ -7931,6 +7981,12 @@ CREATE TABLE rating_run_residuals (
     pairs                DOUBLE PRECISION NOT NULL,
     actual               DOUBLE PRECISION NOT NULL,  -- the row config's score rate
     predicted            DOUBLE PRECISION NOT NULL,
+    -- The standard error of `actual`, from the pairs' score variance in the
+    -- summed pentanomial (ratings::HeadToHeadEvidence::score_and_stderr).
+    stderr               DOUBLE PRECISION NOT NULL,
+    -- The row config's average spread per game: Σ games·(its mean score − the
+    -- other's) / Σ games over the same game_results rows.
+    spread               DOUBLE PRECISION NOT NULL,
     PRIMARY KEY (run_id, row_player_config_id, col_player_config_id)
 );
 

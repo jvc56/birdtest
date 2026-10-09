@@ -853,8 +853,9 @@ async fn old_rating_runs_are_thinned_to_the_last_of_each_day() {
              SELECT id, $2, 2000, 0, 0, true, true FROM runs
          )
          INSERT INTO rating_run_residuals
-             (run_id, row_player_config_id, col_player_config_id, pairs, actual, predicted)
-         SELECT id, $2, $3, 1, 0.5, 0.5 FROM runs",
+             (run_id, row_player_config_id, col_player_config_id, pairs, actual, predicted,
+              stderr, spread)
+         SELECT id, $2, $3, 1, 0.5, 0.5, 0, 0 FROM runs",
     )
     .bind(pool)
     .bind(anchor)

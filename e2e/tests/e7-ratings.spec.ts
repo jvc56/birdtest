@@ -63,7 +63,7 @@ test.afterAll(async () => {
   await api.dispose();
 });
 
-/** A config's row in the pool's table (not in the residuals below it). */
+/** A config's row in the pool's table (not in the cross table below it). */
 function configRow(page: Page, name: string) {
   return page
     .locator('.card', { has: page.getByRole('heading', { name: 'All configs' }) })
@@ -136,6 +136,18 @@ test('E-7: an admin builds a rating pool and watches membership move the ratings
   const withThird = await rating(page, RATED);
   expect(withThird).not.toBe(alone);
   expect(await rating(page, third)).toMatch(/^\d+\.\d$/);
+
+  // The cross table: three configs, each against the other two from its own
+  // side -- a win % with its error over the average spread -- and its rating
+  // last, as the table above prints it.
+  const cross = page.getByTestId('cross-table');
+  await expect(cross.locator('tbody tr')).toHaveCount(3);
+  const cells = cross.locator('td[title]');
+  await expect(cells).toHaveCount(6);
+  await expect(cells.first()).toHaveText(/^\s*\d+\.\d% ±\d+\.\d\s*[-+]?\d+\.\d\s*$/);
+  await expect(cells.first()).toHaveAttribute('title', / against .+ The ratings predict /);
+  const ratedCross = cross.locator('tbody tr', { has: page.locator('th', { hasText: RATED }) });
+  await expect(ratedCross.locator('td').last()).toHaveText(withThird);
 
   // Remove it again: the refit takes its games back out, and the rating it
   // moved returns to exactly what those games alone support.

@@ -69,7 +69,7 @@ at tier 5 names a symptom.
 | Tier | Tests | Where |
 |---|---|---|
 | 1 Unit | 250 | `#[cfg(test)]` in `jobs::plausibility` (30), `inputdata` (30), `jobs::racks` (17), `stats::bradley_terry` (30), `stats::match_test` (10), `stats::outcomes` (7), `error` (9), `config` (8), `extract` (7), `routes::admin` (16), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (5), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (7), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (8), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `board`, `exports`, `jobs`, `jobs::leave_gen`, `routes` (1 each); `jobs::game_pair` (3), `artifacts` (2) |
-| 1F Frontend unit | 220 | Vitest, `frontend/src/lib/`: `format.test.ts` (46), `jobSettings.test.ts` (13), `matchScore.test.ts` (4), `matchTest.test.ts` (5), `moveList.test.ts` (5), `compare.test.ts` (3), `consensus.test.ts` (8), `cgp.test.ts` (16), `api.test.ts` (18), `auth.test.ts` (17), `accountRules.test.ts` (9), `ratingPool.test.ts` (3), `sse.test.ts` (12), `importWatch.test.ts` (10), `poller.test.ts` (7), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (3), and `charts/`: `ratingDotPlot.test.ts` (19), `labels.test.ts` (2), `residuals.test.ts` (11), `pentanomial.test.ts` (5) |
+| 1F Frontend unit | 218 | Vitest, `frontend/src/lib/`: `format.test.ts` (46), `jobSettings.test.ts` (13), `matchScore.test.ts` (4), `matchTest.test.ts` (5), `moveList.test.ts` (5), `compare.test.ts` (3), `consensus.test.ts` (8), `cgp.test.ts` (16), `api.test.ts` (18), `auth.test.ts` (17), `accountRules.test.ts` (9), `ratingPool.test.ts` (7), `sse.test.ts` (12), `importWatch.test.ts` (10), `poller.test.ts` (7), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (3), and `charts/`: `ratingDotPlot.test.ts` (19), `labels.test.ts` (2), `residuals.test.ts` (5), `pentanomial.test.ts` (5) |
 | 2 Integration | 186 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (33), `scheduler.rs` (19), `jobs.rs` (20), `stats.rs` (19), `input_data.rs` (14), `derived.rs` (9), `leave_generation.rs` (8), `exports.rs` (16), `submissions.rs` (6), `artifacts.rs` (5), `audit.rs` (3) |
 | 3 API | 250 | `backend/tests/`: `worker_api.rs` (52), `admin_api.rs` (59), `auth_routes.rs` (28), `worker_routes.rs` (24), `boundaries.rs` (18), `public_api.rs` (24), `admin_routes.rs` (13), `authz.rs` (7), `account.rs` (10), `auth_api.rs` (5), `finish.rs` (9), `fake_worker.rs` (1) |
 | 4 Contract | 15 | `routes::worker::contract_fixtures`, over 18 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
@@ -1147,11 +1147,13 @@ Test the pure functions; do not snapshot the SVG.
 - `F-CHART-4`, `F-CHART-5` Retired with the rating history chart they covered
   (its series cap and colour by config identity). The label shortening it
   shared with the dot plot is covered by `charts/labels.test.ts`.
-- `F-CHART-6` `ResidualMatrix` sorts by absolute residual descending, and flags
-  the non-transitive case only when at least three head-to-heads exceed the
-  threshold on enough pairs to be at least three standard errors out — the
-  same misses on ten pairs each do not raise it. *(Covered: `charts/residuals.test.ts`; the component now sorts
-  itself instead of drawing in the order it is handed.)*
+- `F-CHART-6` The ratings page flags the non-transitive case only when at
+  least three head-to-heads exceed the threshold on enough pairs to be at
+  least three standard errors out — the same misses on ten pairs each do not
+  raise it — and states a residual in signed percentage points in a cross
+  table cell's hover. *(Covered: `charts/residuals.test.ts`. The separate
+  residual table, `ResidualMatrix`, and its ordering and bars went with the
+  cross table, which folds the residual into each cell.)*
 - `F-CHART-7` The pair-outcome table reads each player's row from its own side
   — bucket 4 is player 1's "Won both" and player 2's is bucket 0 — and its
   three rows (won both, won one and drew one, even) hold all five buckets. An
@@ -1224,6 +1226,12 @@ server refuses. Each rule mirrors one in `routes/auth.rs`, with its wording.
   first two under "Add", where adding changed nothing, and gave the second no
   Remove button. *(Covered: `ratingPool.test.ts`.)* (Thirty-third audit, pass
   4.)
+- `F-RATE-2` The cross table orders the latest fit's configs best first and
+  then those with no chain to the anchor, finds a cell by (row, column), counts
+  each head-to-head once for the residual checks (the API serves both sides),
+  shows a cell as "58.8% ±6.2" over a signed spread ("+6.8", never "-0.0"),
+  and spells it out in its hover with what the ratings predict and the
+  residual. *(Covered: `ratingPool.test.ts`.)*
 
 ### `F-DOCS-*` — contributor instructions in `routes/`
 
@@ -2201,6 +2209,19 @@ permanent.
 - `I-RATE-11` A pool with one member (the anchor) and no games produces a run
   rather than an error. *(Covered:
   `ratings::a_pool_of_only_its_anchor_fits_to_an_empty_run`.)*
+- `I-RATE-13` A fit stores each head-to-head's cross-table cell once, from
+  the side of the config whose name sorts first, summing every job between
+  the two whichever seats them: the score, the error from the pairs' score
+  variance in the summed pentanomial (√(491/128000) for [1, 3, 8, 4, 4]) and
+  the games-weighted spread. *(Covered:
+  `ratings::a_head_to_head_is_stored_once_with_both_seatings_summed`.)*
+- `U-RATE-1` to `U-RATE-3` The aggregation, without a database: two jobs
+  seating the configs either way sum to the same pentanomial from one side,
+  with the hand-computed mean 47/80, error √(491/128000) and spread 6.8, and
+  from the other side the mirror image; twenty split pairs have an error of
+  0, where counting games would give ≈7.9 points of win %; and a stored cell
+  is served from both sides, the second its mirror (1 − the score and the
+  prediction, the same error, −the spread). *(Covered: `ratings::tests`.)*
 - `I-RATE-12` A pool deleted after the sweep listed the pools is skipped
   without an error logged, and the sweep goes on to the next. *(Covered:
   `ratings::the_sweep_skips_a_pool_deleted_mid_sweep_quietly`, which deletes
@@ -3238,7 +3259,9 @@ below.
 
 ### `A-RATE-*` — `routes/ratings.rs`
 
-- `A-RATE-1` Pool list and detail render the latest run, with residuals.
+- `A-RATE-1` Pool list and detail render the latest run, with its cross table
+  from both sides: the score, its error (√11/16 for [2, 0, 1, 0, 1]) and the
+  spread mirrored, beside the predicted score.
   *(Covered: `ratings::the_pool_pages_show_the_latest_run_with_its_residuals`,
   `worker_api::a_pools_residuals_are_the_ones_its_latest_fit_stored`.)*
 - `A-RATE-2` A pool with no run renders empty rather than erroring. *(Covered:
@@ -3764,7 +3787,9 @@ admin in once and the admin journeys reuse its storage state.
   appear, removes it, and sees the ratings change. Covers the one flow where a
   write is expected to move numbers elsewhere on the page. The pool is created
   through its form, from the ratings list, with only its anchor; membership,
-  the fit and the moved ratings go through the pool's page.
+  the fit and the moved ratings go through the pool's page, and with three
+  configs the cross table holds every head-to-head from both sides, each
+  cell's hover what the ratings predict, its last column the table's rating.
   *(Covered: `e7-ratings.spec.ts`.)*
 - `E-8` A job detail page renders the pentanomial table — three rows (Won both,
   Won one, drew one, Even) with a column per player, each read from that
@@ -3794,6 +3819,10 @@ admin in once and the admin journeys reuse its storage state.
   header's links ran to 533 pixels on a 393-pixel screen, "Sign in" and
   "Register" off it (thirty-first audit; the header now wraps). Checked against
   a build of the pages with the API mocked: 533 before, 393 after.
+  `E-10b`: a rating pool's cross table, six long-named configs served from a
+  route, scrolls sideways inside its card while the page does not, and its
+  sticky first column keeps the names in view scrolled to the ratings at its
+  far end.
 - `E-11` An admin job page whose first read fails shows nothing the server
   did not say: the data gaps it read apart, the job's own allocation (from the
   stream if the read failed), the failed reads tried again and their error

@@ -1694,12 +1694,14 @@ CREATE TABLE player_config_ratings (
     PRIMARY KEY (run_id, player_config_id)
 );
 
--- The residuals of one fit: for every head-to-head with games in it, the score
--- the fit's ratings predict against the score that happened. Stored with the
--- run rather than recomputed on each view of the pool, which rebuilt the
--- pool's evidence matrix -- a grouped scan over every paired result it counts
--- -- on every public page view. Stored, they also describe the evidence this
--- fit used, not evidence that has moved on since.
+-- The cross table of one fit, and its residuals: for every head-to-head with
+-- games in it, once (the row is the config whose name sorts first), the score
+-- that happened, its standard error and the average spread, beside the score
+-- the fit's ratings predict. The page mirrors each row for the other side.
+-- Stored with the run rather than recomputed on each view of the pool, which
+-- rebuilt the pool's evidence matrix -- a grouped scan over every paired
+-- result it counts -- on every public page view. Stored, they also describe
+-- the evidence this fit used, not evidence that has moved on since.
 CREATE TABLE rating_run_residuals (
     run_id               UUID NOT NULL REFERENCES rating_runs(id) ON DELETE CASCADE,
     row_player_config_id UUID NOT NULL REFERENCES player_configs(id),
@@ -1707,6 +1709,12 @@ CREATE TABLE rating_run_residuals (
     pairs                DOUBLE PRECISION NOT NULL,
     actual               DOUBLE PRECISION NOT NULL,  -- the row config's score rate
     predicted            DOUBLE PRECISION NOT NULL,
+    -- The standard error of `actual`, from the pairs' score variance in the
+    -- summed pentanomial (ratings::HeadToHeadEvidence::score_and_stderr).
+    stderr               DOUBLE PRECISION NOT NULL,
+    -- The row config's average spread per game: Σ games·(its mean score − the
+    -- other's) / Σ games over the same game_results rows.
+    spread               DOUBLE PRECISION NOT NULL,
     PRIMARY KEY (run_id, row_player_config_id, col_player_config_id)
 );
 
