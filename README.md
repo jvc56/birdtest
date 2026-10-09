@@ -680,6 +680,11 @@ every one of the 431 leave values.
 
 ## Deploying
 
+The browser MAGPIE analysis preview at **magpie.birdtest.org** has its own
+[static hosting and versioned release deployment](infra/magpie/README.md).
+It is independent of the backend deployment described below; app source and
+WASM releases live in the MAGPIE repository.
+
 A first deployment, in order (each step is described below):
 
 1. Tools: Terraform 1.9, the AWS CLI with the Session Manager plugin, `jq`,
