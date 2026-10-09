@@ -26,8 +26,11 @@
 #      raises in the same deploy);
 #   7. the plan, shown, scanned for a database, bucket or network destroyed or
 #      replaced (refused), and applied only once you say so;
-#   8. with --reset-db, only now: the site's hostname typed, the service
-#      stopped, the schema dropped and made empty (scripts/prod-sql.sh);
+#   8. with --reset-db, only now: the site's hostname typed (the prompt names
+#      both backup buckets and their dump count), the service stopped, the
+#      schema dropped and made empty (scripts/prod-sql.sh), and every version
+#      under pg/ in the backups bucket and its DR replica deleted (RUNBOOK,
+#      "Resetting the production database");
 #   9. the apply, the service started again after a reset, prod.tfvars
 #      uploaded, a line in ~/birdtest-releases.log, and the wait until the new
 #      release runs and both target groups are healthy (a circuit-breaker

@@ -11,10 +11,17 @@
 #   - every script parses (bash -n);
 #   - deploy.sh refuses a commit that changed 0001_initial.sql without
 #     --reset-db, before building or planning anything; with it, the order is
-#     build and push, plan, the service stopped, the schema dropped, apply,
-#     the service started, prod.tfvars uploaded, and a release log line; a
-#     wrong hostname typed resets nothing; an image ECR already holds is not
-#     built again; red CI and a MAGPIE pin that is not pushed are refused;
+#     build and push, plan, the service stopped, the schema dropped, the
+#     dumps deleted, apply, the service started, prod.tfvars uploaded, and a
+#     release log line; a wrong hostname typed resets nothing; an image ECR
+#     already holds is not built again; red CI and a MAGPIE pin that is not
+#     pushed are refused;
+#   - a reset (reset-prod-db.sh, deploy.sh --reset-db) names both backup
+#     buckets and the dump count before it asks, says RDS's backups stay for
+#     db_backup_retention_days, and then deletes every version and delete
+#     marker under pg/ in both -- each in its own region, more than one page of
+#     each, at most 1000 to a delete, past the governance lock -- and nothing
+#     outside pg/; a delete refused leaves the backend stopped and says so;
 #   - the plan gate refuses a plan that replaces the database (nothing
 #     applied), and lets it through only when asked, with a typed word;
 #   - set-setting.sh's edit of prod.tfvars and its upload, its refusals (an
@@ -128,12 +135,40 @@ min_magpie_version    = "0.1.1"
 EOF
 }
 S3_TFVARS="$FAKE_DIR/s3/state-bucket/birdtest/prod.tfvars"
+DUMPS="$FAKE_DIR/s3v/birdtest-backups-123.json" DUMPS_DR="$FAKE_DIR/s3v/birdtest-backups-dr-123.json"
+# The backups bucket: three dumps of 800 files each, every file in two
+# versions, a manifest overwritten once and three delete markers -- 4,807
+# versions and markers under pg/, five pages -- and one object outside pg/,
+# which a reset leaves. Its replica: two dumps, 1,202, two pages.
+dumps_world() {
+  mkdir -p "$FAKE_DIR/s3v"
+  python3 - "$DUMPS" "$DUMPS_DR" <<'EOF'
+import json, sys
+def world(stamps, files, versions):
+    e = []
+    for s in stamps:
+        for f in range(files):
+            for v in range(versions):
+                e.append({"Key": "pg/%s/toc.%d.dat" % (s, f), "VersionId": "%s-%d-%d" % (s, f, v)})
+        e.append({"Key": "pg/%s.manifest.json" % s, "VersionId": s + "-m"})
+    return e
+primary = world(["2026-10-01", "2026-10-02", "2026-10-03"], 800, 2)
+primary += [{"Key": "pg/2026-10-03.manifest.json", "VersionId": "again"}]
+primary += [{"Key": "pg/old/%d" % i, "VersionId": "dm%d" % i, "DeleteMarker": True} for i in range(3)]
+primary += [{"Key": "elsewhere/keep.txt", "VersionId": "keep"}]
+json.dump(primary, open(sys.argv[1], "w"))
+json.dump(world(["2026-10-01", "2026-10-02"], 600, 1), open(sys.argv[2], "w"))
+EOF
+}
+# How many versions and markers BUCKET-FILE holds under pg/.
+pg_left() { jq '[.[] | select(.Key | startswith("pg/"))] | length' "$1"; }
 # A fresh world: the bucket naming LIVE, ECR holding the tags given, the
 # service at one task running LIVE, no local prod.tfvars, no calls yet.
 fresh() {
   local live=$1; shift
-  rm -rf "$FAKE_DIR"/{calls.log,ecr,runtask,rds,ssm,tfstate_db} "$R"/infra/prod.tfvars* "$WORK/answers"
+  rm -rf "$FAKE_DIR"/{calls.log,ecr,runtask,rds,ssm,tfstate_db,s3v} "$R"/infra/prod.tfvars* "$WORK/answers"
   mkdir -p "$FAKE_DIR/ecr" "$(dirname "$S3_TFVARS")"
+  dumps_world
   tfvars_with "$live" > "$S3_TFVARS"
   local t r
   for t in "$@"; do for r in backend derived-builder frontend; do : > "$FAKE_DIR/ecr/birdtest-$r:$t"; done; done
@@ -173,8 +208,9 @@ pass "deploy.sh refuses a changed 0001 without --reset-db, before building"
 fresh "$A"
 answers y nottherightname
 if run deploy.sh --reset-db; then fail "deploy.sh reset with the wrong hostname typed"; fi
-{ ! called "--desired-count 0" && ! called "ecs run-task" && ! called " apply "; } \
-  || fail "a wrong hostname still stopped, reset or applied something"
+{ ! called "--desired-count 0" && ! called "ecs run-task" && ! called "delete-objects" && ! called " apply "; } \
+  || fail "a wrong hostname still stopped, reset, deleted or applied something"
+[[ "$(pg_left "$DUMPS")" == 4807 && "$(pg_left "$DUMPS_DR")" == 1202 ]] || fail "a wrong hostname still deleted dumps"
 pass "deploy.sh --reset-db resets nothing when the hostname is mistyped"
 
 fresh "$A"
@@ -185,6 +221,8 @@ in_order "docker push $REGISTRY/birdtest-backend:$C" \
          "terraform -chdir=$R/infra plan" \
          "aws ecs update-service --cluster birdtest --service birdtest --desired-count 0" \
          "aws ecs run-task" \
+         "aws s3api delete-objects --bucket birdtest-backups-123 " \
+         "aws s3api delete-objects --bucket birdtest-backups-dr-123 " \
          "terraform -chdir=$R/infra apply" \
          "aws ecs update-service --cluster birdtest --service birdtest --desired-count 1" \
          "aws s3 cp $R/infra/prod.tfvars s3://state-bucket/birdtest/prod.tfvars" \
@@ -196,7 +234,43 @@ grep -q "reset-db host=birdtest.test" "$BIRDTEST_RELEASE_LOG" || fail "the reset
 grep -q "confirm-user.sh --admin" "$WORK/out" || fail "no post-reset checklist"
 { grep -q "CARGO_BUILD_JOBS=2" "$FAKE_DIR/calls.log" && grep -q -- "--platform linux/amd64" "$FAKE_DIR/calls.log"; } \
   || fail "the build is not capped, or not for linux/amd64"
-pass "deploy.sh --reset-db: build, push, plan, stop, reset, apply, start, upload, log, health"
+[[ "$(pg_left "$DUMPS")" == 0 && "$(pg_left "$DUMPS_DR")" == 0 ]] || fail "deploy.sh --reset-db left dumps"
+pass "deploy.sh --reset-db: build, push, plan, stop, reset, dumps deleted, apply, start, upload, log, health"
+
+# The reset on its own, and what it says before it asks.
+fresh "$B"
+answers birdtest.test
+run reset-prod-db.sh || fail "reset-prod-db.sh failed"
+for want in "birdtest-backups-123 (us-east-1): 3 dumps, 4804 object versions, 3 delete markers" \
+            "birdtest-backups-dr-123 (eu-west-1): 2 dumps, 1202 object versions, 0 delete markers" \
+            "delete the dumps in birdtest-backups-123 and birdtest-backups-dr-123 (5 in all)" \
+            "until they expire, 30 days from now"; do
+  grep -qF -- "$want" "$WORK/out" || fail "the reset's warning does not say: $want"
+done
+[[ "$(pg_left "$DUMPS")" == 0 && "$(pg_left "$DUMPS_DR")" == 0 ]] || fail "reset-prod-db.sh left dumps"
+jq -e 'map(select(.Key == "elsewhere/keep.txt")) | length == 1' "$DUMPS" > /dev/null \
+  || fail "the reset deleted an object outside pg/"
+[[ "$(grep -c "s3api delete-objects --bucket birdtest-backups-123 --region us-east-1 " "$FAKE_DIR/calls.log")" == 5 ]] \
+  || fail "the backups bucket was not deleted from in five pages"
+[[ "$(grep -c "s3api delete-objects --bucket birdtest-backups-dr-123 --region eu-west-1 " "$FAKE_DIR/calls.log")" == 2 ]] \
+  || fail "the DR bucket was not deleted from in two pages, in its own region"
+! grep "delete-objects" "$FAKE_DIR/calls.log" | grep -qv -- "--bypass-governance-retention" \
+  || fail "a delete did not bypass the governance lock"
+in_order "aws ecs update-service --cluster birdtest --service birdtest --desired-count 0" \
+         "aws ecs run-task" \
+         "aws s3api delete-objects --bucket birdtest-backups-123 " \
+         "aws s3api delete-objects --bucket birdtest-backups-dr-123 " \
+         "aws ecs update-service --cluster birdtest --service birdtest --desired-count 1"
+grep -q "reset-db host=birdtest.test dumps_deleted=5" "$BIRDTEST_RELEASE_LOG" || fail "the reset's log line does not count the dumps"
+pass "reset-prod-db.sh names both buckets and the dump count, then deletes every version under pg/ in each"
+
+fresh "$B"
+answers birdtest.test
+if FAKE_DUMP_DELETE_FAIL=1 run reset-prod-db.sh; then fail "a reset whose dumps were not deleted succeeded"; fi
+grep -q "dumps remain in birdtest-backups-123" "$WORK/out" || fail "the refused delete is not reported"
+grep -q "AccessDenied" "$WORK/out" || fail "S3's reason is not shown"
+! called "--desired-count 1" || fail "the backend was started with dumps left"
+pass "a delete S3 refuses stops the reset with the backend stopped, and says so"
 
 git -C "$R" checkout -q "$B"
 fresh "$A" "$B"

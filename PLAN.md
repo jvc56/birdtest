@@ -10653,7 +10653,13 @@ and update `_sqlx_migrations` to the current checksum; or `pg_restore --data-onl
 into a freshly migrated empty database, which works when the change is additive and
 fails noisily when it is not. This is the strongest practical argument for cutting
 over to numbered migrations at release: the in-place policy makes every backup older
-than the last schema edit restorable only with archaeology.
+than the last schema edit restorable only with archaeology. Until then a production
+reset (`scripts/reset-prod-db.sh`, `deploy.sh --reset-db`) deletes the nightly dumps
+with the database -- every version under `pg/`, in the backups bucket and its DR
+replica, past the governance lock -- so no dump of an older `0001` outlives the
+schema it was taken under, nor the accounts it holds. RDS's point-in-time backups
+are left to expire: for `db_backup_retention_days` (30) after a reset they are the
+one way back across it (RUNBOOK, "Resetting the production database").
 
 **Verifying a restore.** Do not declare one finished on "the page loads":
 

@@ -6,6 +6,10 @@ state:
 
   calls.log          one line per call, in order ("aws ecs update-service ...")
   s3/<bucket>/<key>  the objects `aws s3 cp` reads and writes
+  s3v/<bucket>.json  a versioned bucket's versions and delete markers, as
+                     [{"Key", "VersionId", "DeleteMarker"}], for
+                     list-object-versions and delete-objects (a bucket with no
+                     file answers the older two-version listing)
   ecr/<repo>:<tag>   the images ECR holds (`docker push` adds one)
   desired            the service's desired count
   running_image      the backend image the service runs (set by apply)
@@ -58,6 +62,7 @@ FLAGS = {
     "--interactive", "--no-publicly-accessible", "--apply-immediately", "--deletion-protection",
     "--no-deletion-protection", "--start-from-head", "--only-show-errors", "--with-decryption",
     "--overwrite", "--enable-execute-command", "--force-new-deployment", "--no-paginate",
+    "--bypass-governance-retention",
 }
 
 
@@ -120,6 +125,11 @@ def aws(args):
         out("2026-10-01 03:10:00        512 2026-10-01T03-00-00Z.manifest.json")
     elif svc == "s3api" and op == "head-bucket":
         pass
+    elif svc == "s3api" and op == "get-bucket-location":
+        out("eu-west-1" if "-dr-" in opt["--bucket"] else "None")
+    elif svc == "s3api" and op in ("list-object-versions", "delete-objects") \
+            and os.path.exists(path("s3v", opt["--bucket"] + ".json")):
+        s3_versions(op, opt)
     elif svc == "s3api" and op == "list-object-versions":
         key = opt["--prefix"]
         out(json.dumps({"Versions": [
@@ -186,6 +196,63 @@ def aws(args):
     else:
         sys.stderr.write("fake aws: no such call: %s\n" % " ".join(args))
         sys.exit(2)
+
+
+def s3_versions(op, opt):
+    """A versioned bucket under a governance Object Lock: every version but a
+    delete marker is locked, so deleting one needs the bypass flag. Called in
+    the wrong region, S3 redirects; one DeleteObjects takes 1000 keys at most.
+    FAKE_DUMP_DELETE_FAIL refuses every version deleted."""
+    bucket = opt["--bucket"]
+    p = path("s3v", bucket + ".json")
+    entries = json.loads(read(p))
+    want = "eu-west-1" if "-dr-" in bucket else "us-east-1"
+    if opt.get("--region") != want:
+        sys.stderr.write("An error occurred (PermanentRedirect): the bucket is in %s\n" % want)
+        sys.exit(254)
+    if op == "list-object-versions":
+        prefix = opt.get("--prefix", "")
+        found = [e for e in entries if e["Key"].startswith(prefix)]
+        if "--no-paginate" in opt:
+            # One ListObjectVersions response: MaxKeys 1000, versions and
+            # delete markers together.
+            page = found[:1000]
+            res = {"IsTruncated": len(found) > 1000, "Prefix": prefix}
+        else:
+            page = found
+            res = {}
+            if not page:
+                return  # the CLI, having followed every page, printed nothing
+        v = [{"Key": e["Key"], "VersionId": e["VersionId"], "IsLatest": False}
+             for e in page if not e.get("DeleteMarker")]
+        m = [{"Key": e["Key"], "VersionId": e["VersionId"], "IsLatest": True}
+             for e in page if e.get("DeleteMarker")]
+        if v:
+            res["Versions"] = v
+        if m:
+            res["DeleteMarkers"] = m
+        out(json.dumps(res))
+        return
+    spec = opt["--delete"]
+    assert spec.startswith("file://"), spec
+    objects = json.loads(read(spec[7:]))["Objects"]
+    if len(objects) > 1000:
+        sys.stderr.write("An error occurred (MalformedXML) when calling the DeleteObjects operation\n")
+        sys.exit(254)
+    by_id = {(e["Key"], e["VersionId"]): e for e in entries}
+    errors, gone = [], set()
+    for o in objects:
+        k = (o["Key"], o["VersionId"])
+        e = by_id.get(k)
+        locked = e is not None and not e.get("DeleteMarker")
+        if locked and (os.environ.get("FAKE_DUMP_DELETE_FAIL")
+                       or "--bypass-governance-retention" not in opt):
+            errors.append({"Key": k[0], "VersionId": k[1], "Code": "AccessDenied",
+                           "Message": "Access Denied because object protected by object lock."})
+        else:
+            gone.add(k)
+    write(p, json.dumps([e for e in entries if (e["Key"], e["VersionId"]) not in gone]))
+    out(json.dumps({"Errors": errors}) if errors else "{}")
 
 
 def ecs(op, opt, q):
@@ -282,6 +349,7 @@ def terraform(args):
         raw = {"region": "us-east-1", "cluster_name": "birdtest", "ops_task_definition": "birdtest-ops",
                "log_group_name": "/ecs/birdtest", "service_security_group_id": "sg-service",
                "db_security_group_id": "sg-db", "backups_bucket": "birdtest-backups-123",
+               "backups_dr_bucket": "birdtest-backups-dr-123",
                "artifacts_bucket": "birdtest-artifacts-123", "backup_task_definition": "birdtest-backup"}
         js = {"service_subnet_ids": ["subnet-1", "subnet-2"],
               "ssm_parameter_names": ["/birdtest/DATABASE_URL", "/birdtest/SESSION_SIGNING_KEY"]}

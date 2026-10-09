@@ -385,7 +385,8 @@ docker compose restart backend
 
 Production is the same: `scripts/deploy.sh` refuses a commit that changed an
 applied migration, and `scripts/deploy.sh --reset-db` empties the production
-database as part of the deploy (below, "Operator scripts").
+database as part of the deploy, deleting the nightly dumps with it (below,
+"Operator scripts"; RUNBOOK, "Resetting the production database").
 
 After release, a schema change is a new numbered migration, never an edit, and
 it is **additive**: new tables, new nullable or defaulted columns, new
@@ -1073,7 +1074,7 @@ Session Manager plugin for ECS Exec), `terraform`, `jq`, `git`, `gh`,
 | Script | Does |
 | --- | --- |
 | `deploy.sh [--reset-db] [--set KEY=VALUE]` | Deploys the checked-out commit of main: a clean tree, CI green for it (`gh`), the MAGPIE pin pushed to `birdtest-contribute` (`MAGPIE_DIR`, default `~/MAGPIE`); builds and pushes the images ECR lacks (`linux/amd64`, `CARGO_BUILD_JOBS=2`, `MAKE_JOBS=3`), retags `prod.tfvars`, plans, applies, uploads, waits for both target groups. Refuses a commit that changed a migration the live release applied (until launch `0001_initial.sql`, edited in place) unless `--reset-db`. |
-| `reset-prod-db.sh [--no-start]` | Empties the production database (the hostname typed): the service stopped, the schema dropped and made again, the service started so the backend applies `0001`. Then: register, `confirm-user.sh --admin`, import the input data. `deploy.sh --reset-db` does the same once its plan is approved and before the new task starts. |
+| `reset-prod-db.sh [--no-start]` | RUNBOOK "Resetting the production database": empties it (the hostname typed, in a prompt that names both backup buckets and their dump count): the backend's service stopped, the schema dropped and made again, every version under `pg/` in the backups bucket and its DR replica deleted, the backend started so it applies `0001`. RDS's automated backups are left to expire (30 days). Then: register, `confirm-user.sh --admin`, import the input data. `deploy.sh --reset-db` does the same once its plan is approved and before the new task starts. |
 | `rollback.sh [--to TAG] [--reset-db]` | RUNBOOK "Rolling back a deploy": the previous release from the log, or the one a circuit breaker went back to. |
 | `set-setting.sh KEY=VALUE...` | Changes `prod.tfvars` values (e.g. `mail_max_per_second=14`) and applies them. |
 | `check-alerts.sh` | The alert-path checks above. |
@@ -1107,6 +1108,10 @@ exits non-zero, and no successful backup in 36 hours. A restore drill runs
 monthly, restoring the newest dump into a throwaway database and verifying it
 (`scripts/restore-drill.sh`) — the only check that catches a dump that has been
 silently producing unusable output.
+
+Until launch a production reset (`scripts/reset-prod-db.sh`, `deploy.sh
+--reset-db`) deletes the nightly dumps with the database, in both buckets;
+RDS's point-in-time backups are the one way back across it, for their 30 days.
 
 Recovering from anything is [RUNBOOK.md](RUNBOOK.md).
 

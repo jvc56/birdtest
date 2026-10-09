@@ -41,7 +41,8 @@ with the scratch database a Postgres started inside that shell the way
 **Scripts.** Several procedures here are also scripts that run from your
 machine with your AWS login (README.md, "Operator scripts"): §0
 (`scripts/assess-damage.sh`), §1's mechanical stages (`scripts/pitr-restore.sh`),
-§3 (`scripts/restore-artifact.sh`), rolling back (`scripts/rollback.sh`) and
+§3 (`scripts/restore-artifact.sh`), rolling back (`scripts/rollback.sh`),
+resetting the database before launch (`scripts/reset-prod-db.sh`) and
 rotating the password (`scripts/rotate-db-password.sh`). Each section says
 which; the blocks stay for doing it by hand, and for reading what the script
 does.
@@ -1977,6 +1978,75 @@ If the release's migration was not additive (it dropped or renamed something
 the previous image reads), the previous image will fail on it: fix forward
 with a new release instead, or restore to before the deploy with §1, which
 loses every write since.
+
+---
+
+## Resetting the production database (until launch)
+
+Until launch a schema change edits `0001_initial.sql` in place, and a
+database migrated by the old file refuses the new backend. A release that
+changes it ships with a reset: `scripts/deploy.sh --reset-db` (once its plan
+is approved, before the new backend starts), `scripts/rollback.sh --reset-db`
+for a rollback across such a change, or `scripts/reset-prod-db.sh` for a reset
+on its own. Each one first counts the nightly dumps and prints, for the
+backups bucket and its DR replica, how many dumps, object versions and delete
+markers `pg/` holds; then asks for the site's hostname, in a prompt that names
+both buckets and the dump count. Then:
+
+1. The backend's service is stopped. The frontend's runs on: pages load and
+   the API answers 503, and `birdtest-backend-down` mails ten minutes in and
+   clears once the backend is back.
+2. The database role's other sessions are ended (a derived-data build, or the
+   03:00 backup, which then mails a failure) and the public schema is dropped
+   and made again, through the ops task. `audit_log` and the `backups` table go
+   with it.
+3. The nightly dumps are deleted: every object version and delete marker under
+   `pg/`, in the backups bucket and in its DR replica, each bucket in its own
+   region and by version (a plain delete would only add a delete marker, and a
+   delete by version is never replicated), bypassing the governance Object
+   Lock. A dump of the old schema restores only with the release that wrote it
+   (PLAN.md, "Restoring across a schema change"), and it holds every account's
+   address and password hash.
+4. The backend is started (by the deploy's apply, or by `reset-prod-db.sh`
+   unless `--no-start`), and applies `0001` to the empty schema.
+
+**What a reset leaves: RDS's automated backups.** A point-in-time restore (§1)
+to a moment before the reset stays possible until those expire,
+`db_backup_retention_days` (30) days after it. That is the only way back from
+a reset, and after those days there is none.
+
+The deletes need `s3:ListBucketVersions`, `s3:DeleteObjectVersion` and
+`s3:BypassGovernanceRetention` on both buckets, which the deployers'
+`AdministratorAccess` (LAUNCH_PLAN Part 2) holds; no KMS permission, since
+nothing is read. If S3 refuses one part-way, the script stops with the
+database reset and the backend stopped, and says which bucket: run the same
+command again, which resets the empty database again and deletes the rest. Or
+the dumps step by hand:
+
+```bash
+export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
+DR_BUCKET=$(terraform -chdir=infra output -raw backups_dr_bucket)
+for B in "$BUCKET" "$DR_BUCKET"; do
+  R=$(aws s3api get-bucket-location --bucket "$B" --query LocationConstraint --output text)
+  [ "$R" = None ] && R=us-east-1
+  # One listing page (at most 1000, as many as one delete takes) at a time,
+  # from the start again each time, until nothing is left.
+  while :; do
+    aws s3api list-object-versions --region "$R" --bucket "$B" --prefix pg/ --no-paginate --output json \
+      | jq '{Objects: [(.Versions // [])[], (.DeleteMarkers // [])[] | {Key, VersionId}], Quiet: true}' \
+      > /tmp/dump-page.json
+    [ "$(jq '.Objects | length' /tmp/dump-page.json)" -gt 0 ] || break
+    OUT=$(aws s3api delete-objects --region "$R" --bucket "$B" --bypass-governance-retention \
+      --delete file:///tmp/dump-page.json --output json)
+    if [ -n "$(printf '%s' "$OUT" | jq -r '(.Errors // [])[] | .Key')" ]; then
+      echo "$OUT"
+      break
+    fi
+  done
+  echo "$B: $(aws s3api list-object-versions --region "$R" --bucket "$B" --prefix pg/ \
+    --query 'length([Versions || `[]`, DeleteMarkers || `[]`][])' --output text) left under pg/"
+done
+```
 
 ---
 

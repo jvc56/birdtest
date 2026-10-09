@@ -527,26 +527,122 @@ CREATE SCHEMA public;
 SELECT count(*) AS tables_left FROM pg_tables WHERE schemaname = 'public';
 "
 
-# Asks for the hostname, stops the service and empties the schema. The
-# service is left stopped: the caller starts it (the backend applies 0001 to
-# the empty schema as it starts).
+# ---------------------------------------------------------------------------
+# The nightly dumps, which a reset deletes
+# ---------------------------------------------------------------------------
+
+# Sets OPS_DUMP_BUCKETS to the backups bucket and its DR replica, and
+# OPS_DUMP_REGIONS to each one's region (the replica's is dr_region, which
+# Terraform has no output for: S3 says).
+ops_dump_buckets() {
+  local b region
+  OPS_DUMP_BUCKETS=("$(tf -raw backups_bucket)" "$(tf -raw backups_dr_bucket)")
+  OPS_DUMP_REGIONS=()
+  for b in "${OPS_DUMP_BUCKETS[@]}"; do
+    [[ -n "$b" ]] || ops_die "no backups_bucket or backups_dr_bucket output from Terraform"
+    region=$(aws s3api get-bucket-location --bucket "$b" --query LocationConstraint --output text) \
+      || ops_die "could not read the region of $b (s3:GetBucketLocation)"
+    # us-east-1 has no location constraint, and reads as None.
+    [[ -n "$region" && "$region" != None && "$region" != null ]] || region=us-east-1
+    OPS_DUMP_REGIONS+=("$region")
+  done
+}
+
+# What pg/ holds in BUCKET, as "<dumps> <object versions> <delete markers>":
+# a dump counted once by its top-level manifest, pg/<stamp>.manifest.json,
+# which scripts/backup.sh writes last, whatever versions of it there are.
+# Every page of the listing (the CLI follows them).
+ops_dump_census() {
+  local bucket=$1 region=$2 listing=$OPS_TMP/dump-census.json
+  aws s3api list-object-versions --bucket "$bucket" --region "$region" --prefix pg/ \
+    --output json > "$listing" \
+    || ops_die "could not list the dumps in $bucket (s3:ListBucketVersions)"
+  jq -rs '(.[0] // {}) as $r
+    | ([($r.Versions // [])[].Key | select(test("^pg/[^/]+\\.manifest\\.json$"))] | unique | length) as $dumps
+    | "\($dumps) \(($r.Versions // []) | length) \(($r.DeleteMarkers // []) | length)"' "$listing"
+}
+
+# Deletes every object version and delete marker under pg/ in BUCKET: a page
+# of at most 1000 at a time (one ListObjectVersions response, and
+# DeleteObjects' own limit), then the listing again from the start, until it
+# is empty -- what was deleted is gone from it, so no continuation marker is
+# kept. By version, so the bytes go and not just the current object: a plain
+# delete would only add a delete marker. Each request bypasses the governance
+# Object Lock both buckets hold (a replica carries its source's retention),
+# which s3:BypassGovernanceRetention allows; and each bucket is done itself,
+# since a delete by version is never replicated.
+ops_delete_dumps() {
+  local bucket=$1 region=$2 page=$OPS_TMP/dump-page.json batch=$OPS_TMP/dump-batch.json
+  local n out errors total=0 last="" sum
+  while :; do
+    aws s3api list-object-versions --bucket "$bucket" --region "$region" --prefix pg/ \
+      --no-paginate --output json > "$page" \
+      || ops_die "could not list the dumps in $bucket; $total deleted so far"
+    jq -s '{Objects: [(.[0] // {}) | (.Versions // [])[], (.DeleteMarkers // [])[]
+                      | {Key, VersionId}], Quiet: true}' "$page" > "$batch"
+    n=$(jq '.Objects | length' "$batch")
+    ((n > 0)) || break
+    ((n <= 1000)) || ops_die "a listing of $bucket returned $n versions, more than one delete takes"
+    # The same page twice would be a loop that never ends.
+    sum=$(cksum < "$batch")
+    [[ "$sum" != "$last" ]] || ops_die "the same versions in $bucket came back after they were deleted"
+    last=$sum
+    out=$(aws s3api delete-objects --bucket "$bucket" --region "$region" \
+      --delete "file://$batch" --bypass-governance-retention --output json) \
+      || ops_die "deleting dumps in $bucket failed; $total deleted so far"
+    errors=$(printf '%s' "$out" | jq -rs '(.[0].Errors // [])[] | "  \(.Key) \(.VersionId // ""): \(.Code) \(.Message // "")"')
+    if [[ -n "$errors" ]]; then
+      printf '%s\n' "$errors" | head -5 >&2
+      ops_die "$(printf '%s\n' "$errors" | grep -c .) versions in $bucket were not deleted (above, the first five); $total deleted so far"
+    fi
+    total=$((total + n))
+  done
+  ops_say "deleted $total object versions and delete markers under pg/ in $bucket"
+}
+
+# Asks for the hostname, stops the backend's service, empties the schema and
+# deletes the nightly dumps in both buckets. The backend is left stopped: the
+# caller starts it (it applies 0001 to the empty schema as it starts). The
+# frontend's service is not touched: pages load, and say the API is away.
 ops_reset_database() {
-  local host
+  local host i census dumps=0 lines="" pitr
   host=$(ops_site_host)
+  ops_dump_buckets
+  for i in "${!OPS_DUMP_BUCKETS[@]}"; do
+    census=$(ops_dump_census "${OPS_DUMP_BUCKETS[$i]}" "${OPS_DUMP_REGIONS[$i]}")
+    read -r -a census <<<"$census"
+    [[ ${#census[@]} == 3 ]] || ops_die "could not count the dumps in ${OPS_DUMP_BUCKETS[$i]}"
+    dumps=$((dumps + census[0]))
+    lines+=$(printf '\n    %s (%s): %s dumps, %s object versions, %s delete markers' \
+      "${OPS_DUMP_BUCKETS[$i]}" "${OPS_DUMP_REGIONS[$i]}" "${census[0]}" "${census[1]}" "${census[2]}")
+  done
+  pitr=$(ops_tfvar db_backup_retention_days)
+  pitr=${pitr:-30}
   cat >&2 <<EOF
 
   RESETTING THE PRODUCTION DATABASE of $host
   Every account, admin flag, API key, job, result and the imported input
   data are deleted: the schema is dropped and the backend makes it again.
-  The nightly dumps in the backups bucket are kept (of the old schema).
+  The nightly dumps are deleted too, every version under pg/, in the backups
+  bucket and its DR replica:$lines
+  Not RDS's automated backups: a point-in-time restore to before the reset
+  (RUNBOOK §2) stays possible until they expire, $pitr days from now
+  (db_backup_retention_days).
 
 EOF
-  ops_confirm_typed "$host" "reset its database"
+  ops_confirm_typed "$host" \
+    "reset its database and delete the dumps in ${OPS_DUMP_BUCKETS[0]} and ${OPS_DUMP_BUCKETS[1]} ($dumps in all)"
   ops_stop_service
   ops_say "dropping and recreating the public schema (through the ops task)"
   INFRA_DIR=$OPS_INFRA "$OPS_ROOT/scripts/prod-sql.sh" "$OPS_RESET_SQL" \
-    || ops_die "the reset failed (nothing was dropped if it says so above). The service is stopped: run this again, or start it with  aws ecs update-service --cluster $OPS_CLUSTER --service $OPS_SERVICE --desired-count 1"
-  ops_log_release "reset-db host=$host"
+    || ops_die "the reset failed (nothing was dropped if it says so above), and no dump was deleted. The backend is stopped: run this again, or start it with  aws ecs update-service --cluster $OPS_CLUSTER --service $OPS_SERVICE --desired-count 1"
+  # After the drop, not before: it ended any 03:00 backup's session, so no
+  # dump of the old database is written after these are gone.
+  for i in "${!OPS_DUMP_BUCKETS[@]}"; do
+    ( ops_delete_dumps "${OPS_DUMP_BUCKETS[$i]}" "${OPS_DUMP_REGIONS[$i]}" ) \
+      || ops_die "the database is reset, but dumps remain in ${OPS_DUMP_BUCKETS[$i]} (above). The backend is stopped: run the same command again, which resets the empty database again and deletes the rest"
+  done
+  ops_log_release "reset-db host=$host dumps_deleted=$dumps"
 }
 
 # ---------------------------------------------------------------------------
