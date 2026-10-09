@@ -1196,7 +1196,8 @@ async fn rack_samples(
                 .bind(id)
                 .fetch_one(pool)
                 .await?;
-        let index = crate::jobs::racks::RackIndex::new(&job_letters(&state, &job).await?, size as usize)?;
+        let letters = job_letters(&state, &job).await?;
+        let index = crate::jobs::racks::RackIndex::new(&letters, size as usize)?;
         let probes: Vec<String> = {
             let mut rng = rand::thread_rng();
             (0..n as i64 * PROBES_PER_SAMPLE)
@@ -1221,8 +1222,8 @@ async fn rack_samples(
         .fetch_all(pool)
         .await?;
     } else {
-        // A rack analysed more than once, for a consensus, is one rack.
-        racks.sort_unstable();
+        // A rack analysed more than once, for a consensus, is one rack; the
+        // read is in rack order, so its analyses are side by side.
         racks.dedup();
         racks.shuffle(&mut rand::thread_rng());
     }

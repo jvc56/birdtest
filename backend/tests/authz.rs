@@ -293,6 +293,7 @@ const ROUTES: &[(&str, &str, Access, &str)] = &[
     ("GET", "/api/jobs", Public, ""),
     ("GET", "/api/jobs/:id", Public, ""),
     ("GET", "/api/jobs/:id/results", Public, ""),
+    ("GET", "/api/jobs/:id/rack-samples", Public, ""),
     ("GET", "/api/jobs/:id/stream", Public, ""),
     ("GET", "/api/users", Public, ""),
     ("GET", "/api/workers", Public, ""),
