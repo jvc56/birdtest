@@ -740,8 +740,9 @@ dispatching: its seed cursor is back at zero, a leave job re-seeds generation
 `(job_id, generation, rack)` — that the restored rows need. Copied over them
 with `ON CONFLICT DO NOTHING`, the restored rows lose silently, their claims and
 results then fail their foreign keys, and the restore reports success with the
-contributors' work still gone. So first, from the admin page or the API,
-**deactivate the job** (a purged completed job is already inactive). Then
+contributors' work still gone. So first make sure **the job is inactive**: a
+purge leaves every job inactive at 0%, and one given an allocation since is set
+back to 0% on `/admin/allocation` (or with `PUT /api/admin/jobs/allocations`). Then
 delete what it has generated since the purge — nothing of it predates the
 mistake — in one transaction: `scripts/ops-sql/clear-job.sql`, which reads
 the job's id as `:'job'`. It puts a purged job that completed again since
@@ -984,7 +985,7 @@ from its claims (only the rows that are wrong), then each task's `state` and
 counters -- `claims_issued` and `last_completed_at` from the claims, the
 dashboard's progress totals as the reads they replaced computed them -- and
 last puts `claims_baseline` level with the jobs being served, as activation
-and purge do (`scheduler::join_at_parity`), so the job neither owes nor is
+does (`scheduler::join_at_parity`), so the job neither owes nor is
 owed a backlog. The file's comments say why each statement is as it is.
 
 ```bash
@@ -1216,11 +1217,12 @@ leaderboard visible.
 
 ### 2.5 Start the job again
 
-§2.0 deactivated it, and nothing since has put it back. A job that was active
-before the mistake is activated again with the allocation it had: the
-**Activate** button on its admin page, or `POST /api/admin/jobs/:id/activate`
-with `{"allocation": N}` and the CSRF header (a different `N` changes the job's
-share). A job that was completed stays as §2.3 left it.
+§2.0 left it inactive at 0%, and nothing since has put it back. A job that was
+active before the mistake is activated again with the allocation it had, on
+`/admin/allocation` -- or `PUT /api/admin/jobs/allocations` with
+`{"allocations": [{"job_id": "<id>", "allocation": N}]}` and the CSRF header (a
+different `N` changes the job's share). A job that was completed stays as §2.3
+left it.
 
 ### 2.6 A deleted rating pool
 

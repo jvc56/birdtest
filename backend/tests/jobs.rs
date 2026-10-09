@@ -84,6 +84,13 @@ impl Admin {
     async fn create_job(&self, body: Value) -> (StatusCode, Value) {
         self.post("/api/admin/jobs", body).await
     }
+
+    /// Sets one job's allocation, the only way a job is activated or
+    /// deactivated.
+    async fn allocate(&self, job: Uuid, allocation: i32) -> (StatusCode, Value) {
+        let body = json!({ "allocations": [{ "job_id": job, "allocation": allocation }] });
+        self.call("PUT", "/api/admin/jobs/allocations", Some(body)).await
+    }
 }
 
 /// The job's letter distribution and board.
@@ -196,7 +203,7 @@ async fn each_job_type_stores_every_setting_it_was_created_with() {
         ("min_magpie_minor", json!(2)),
         ("min_magpie_patch", json!(3)),
         ("status", json!("inactive")),
-        ("allocation", Value::Null),
+        ("allocation", json!(0)),
     ] {
         assert_eq!(job[column], expected, "jobs.{column}: {job}");
     }
@@ -750,7 +757,7 @@ async fn api_games_job(db: &TestDb, admin: &Admin) -> Uuid {
 
 /// `(status, allocation, activated_at IS NOT NULL, deactivated on record)`. A
 /// deactivation's only record is its audit row, which says who and when.
-async fn lifecycle(db: &TestDb, job: Uuid) -> (String, Option<i32>, bool, bool) {
+async fn lifecycle(db: &TestDb, job: Uuid) -> (String, i32, bool, bool) {
     sqlx::query_as(
         "SELECT status::text, allocation, activated_at IS NOT NULL,
                 EXISTS (SELECT 1 FROM audit_log a
@@ -775,31 +782,31 @@ async fn claim(app: &Router) -> StatusCode {
     send(app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await.0
 }
 
-/// I-JOB-6: a job is created inactive with no allocation; activation sets its
-/// allocation and `activated_at` and puts it on offer; deactivation takes it
-/// off offer without destroying its tasks, and it can be activated again;
-/// completion is terminal -- neither activation nor deactivation moves it
-/// again, and nothing is dispatched from it.
+/// I-JOB-6: a job is created inactive at 0%; an allocation above 0% sets
+/// `activated_at` and puts it on offer; 0% takes it off offer -- inactive, at
+/// 0% -- without destroying its tasks, and it can be given an allocation
+/// again; completion is terminal and holds the job at 0% -- no allocation
+/// moves it again, and nothing is dispatched from it.
 #[tokio::test]
 async fn a_job_moves_through_its_lifecycle_and_completion_is_final() {
     let db = TestDb::new().await;
     let admin = Admin::new(&db, db.state().await).await;
     let job = api_games_job(&db, &admin).await;
-    assert_eq!(lifecycle(&db, job).await, ("inactive".into(), None, false, false));
+    assert_eq!(lifecycle(&db, job).await, ("inactive".into(), 0, false, false));
     assert_eq!(claim(&admin.app).await, StatusCode::NO_CONTENT, "an inactive job is not offered");
 
-    let (status, body) =
-        admin.post(&format!("/api/admin/jobs/{job}/activate"), json!({ "allocation": 40 })).await;
+    let (status, body) = admin.allocate(job, 40).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["allocation"], 40, "{body}");
-    assert_eq!(lifecycle(&db, job).await, ("active".into(), Some(40), true, false));
+    assert_eq!(body["jobs"][0]["allocation"], 40, "{body}");
+    assert_eq!(body["jobs"][0]["status"], "active", "{body}");
+    assert_eq!(lifecycle(&db, job).await, ("active".into(), 40, true, false));
     assert_eq!(claim(&admin.app).await, StatusCode::OK, "an active job is offered");
     assert_eq!(task_count(&db, job).await, 1);
 
-    let (status, body) = admin.call("POST", &format!("/api/admin/jobs/{job}/deactivate"), None).await;
+    let (status, body) = admin.allocate(job, 0).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    let (state, _, _, deactivated) = lifecycle(&db, job).await;
-    assert_eq!((state.as_str(), deactivated), ("inactive", true));
+    let (state, allocation, _, deactivated) = lifecycle(&db, job).await;
+    assert_eq!((state.as_str(), allocation, deactivated), ("inactive", 0, true));
     assert_eq!(task_count(&db, job).await, 1, "deactivation keeps the job's tasks");
     let open_claims: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM task_claims c JOIN tasks t ON t.id = c.task_id
@@ -812,35 +819,40 @@ async fn a_job_moves_through_its_lifecycle_and_completion_is_final() {
     assert_eq!(open_claims, 1, "and the claim already out on them");
     assert_eq!(claim(&admin.app).await, StatusCode::NO_CONTENT, "but offers nothing more");
 
-    let (status, body) =
-        admin.post(&format!("/api/admin/jobs/{job}/activate"), json!({ "allocation": 60 })).await;
+    let (status, body) = admin.allocate(job, 60).await;
     assert_eq!(status, StatusCode::OK, "an inactive job can be activated again: {body}");
-    assert_eq!(lifecycle(&db, job).await.1, Some(60));
+    assert_eq!(lifecycle(&db, job).await.1, 60);
 
     let (status, body) = admin.call("POST", &format!("/api/admin/jobs/{job}/complete"), None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["status"], "completed", "{body}");
+    assert_eq!(body["allocation"], 0, "a completed job holds 0%: {body}");
 
-    let (status, body) =
-        admin.post(&format!("/api/admin/jobs/{job}/activate"), json!({ "allocation": 10 })).await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert_eq!(body["message"], "a completed job cannot be reactivated");
-    let (status, body) = admin.call("POST", &format!("/api/admin/jobs/{job}/deactivate"), None).await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert_eq!(body["message"], "a completed job cannot be deactivated");
+    for allocation in [10, 0] {
+        let (status, body) = admin.allocate(job, allocation).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["fields"][0]["field"], "allocations[0].job_id", "{body}");
+        assert_eq!(
+            body["fields"][0]["message"],
+            "the job is completed, and a completed job cannot be reactivated",
+            "{body}"
+        );
+    }
     // Completed again -- from a stale page, after the server's own finish
     // check -- is a conflict, not a second completion on record (pass 23).
     let (status, body) = admin.call("POST", &format!("/api/admin/jobs/{job}/complete"), None).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["message"], "this job is already completed");
-    assert_eq!(lifecycle(&db, job).await.0, "completed", "completion is terminal");
+    assert_eq!(lifecycle(&db, job).await, ("completed".into(), 0, true, true), "completion is terminal");
     assert_eq!(claim(&admin.app).await, StatusCode::NO_CONTENT, "a completed job is not offered");
     assert_eq!(task_count(&db, job).await, 1);
 }
 
 /// I-JOB-7: an allocation outside 0-100 is refused by the endpoint, and by the
 /// schema's CHECK for a write that bypasses it; the ends of the range are
-/// accepted.
+/// accepted. And the schema holds the allocation to the status: active
+/// exactly when above 0%, so neither an active job at 0% nor an inactive or
+/// completed one above it can be written.
 #[tokio::test]
 async fn an_allocation_outside_0_to_100_is_refused() {
     let db = TestDb::new().await;
@@ -848,30 +860,40 @@ async fn an_allocation_outside_0_to_100_is_refused() {
     let job = api_games_job(&db, &admin).await;
 
     for allocation in [101, -1, 1000] {
-        let (status, body) = admin
-            .post(&format!("/api/admin/jobs/{job}/activate"), json!({ "allocation": allocation }))
-            .await;
+        let (status, body) = admin.allocate(job, allocation).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{allocation}: {body}");
-        assert_eq!(body["message"], "allocation must be between 0 and 100", "{body}");
+        assert_eq!(body["fields"][0]["field"], "allocations[0].allocation", "{body}");
+        assert_eq!(body["fields"][0]["message"], "must be between 0 and 100", "{body}");
     }
-    assert_eq!(lifecycle(&db, job).await, ("inactive".into(), None, false, false), "unchanged");
+    assert_eq!(lifecycle(&db, job).await, ("inactive".into(), 0, false, false), "unchanged");
 
-    for allocation in [0, 100] {
-        let (status, body) = admin
-            .post(&format!("/api/admin/jobs/{job}/activate"), json!({ "allocation": allocation }))
-            .await;
-        assert_eq!(status, StatusCode::OK, "{allocation}: {body}");
-        assert_eq!(lifecycle(&db, job).await.1, Some(allocation));
+    for (allocation, status) in [(0, "inactive"), (100, "active")] {
+        let (code, body) = admin.allocate(job, allocation).await;
+        assert_eq!(code, StatusCode::OK, "{allocation}: {body}");
+        let (now, at, _, _) = lifecycle(&db, job).await;
+        assert_eq!((now.as_str(), at), (status, allocation));
     }
 
     // The schema holds the same line for anything that writes the row
     // directly.
-    let err = sqlx::query("UPDATE jobs SET allocation = 101 WHERE id = $1")
-        .bind(job)
-        .execute(&db.pool)
-        .await
-        .expect_err("the CHECK refuses 101");
-    assert_eq!(err.as_database_error().unwrap().constraint(), Some("jobs_allocation_check"));
+    let refused = |sql: &'static str| {
+        let pool = db.pool.clone();
+        async move {
+            let err = sqlx::query(sql).bind(job).execute(&pool).await.expect_err(sql);
+            err.as_database_error().unwrap().constraint().map(str::to_string)
+        }
+    };
+    assert_eq!(
+        refused("UPDATE jobs SET allocation = 101 WHERE id = $1").await.as_deref(),
+        Some("jobs_allocation_check")
+    );
+    for sql in [
+        "UPDATE jobs SET allocation = 0 WHERE id = $1",
+        "UPDATE jobs SET status = 'inactive' WHERE id = $1",
+        "UPDATE jobs SET status = 'completed' WHERE id = $1",
+    ] {
+        assert_eq!(refused(sql).await.as_deref(), Some("jobs_allocation_is_status"), "{sql}");
+    }
 }
 
 /// Claims and completes one games task, with a captured position whose moves
@@ -1071,7 +1093,7 @@ async fn deleting_a_job_leaves_nothing_anywhere_that_points_at_it() {
     games_history(&admin.app).await;
     // A second claim, left open.
     assert_eq!(claim(&admin.app).await, StatusCode::OK);
-    sqlx::query("UPDATE jobs SET status = 'inactive' WHERE id = $1")
+    sqlx::query("UPDATE jobs SET status = 'inactive', allocation = 0 WHERE id = $1")
         .bind(games)
         .execute(&db.pool)
         .await
@@ -1379,6 +1401,9 @@ async fn a_purged_job_hands_out_its_seed_space_again_from_the_start() {
     assert_eq!(claims, 0);
     let (status, row) = admin.call("GET", &format!("/api/jobs/{job}"), None).await;
     assert_eq!(status, StatusCode::OK, "the job row survives: {row}");
+    assert_eq!((&row["job"]["status"], &row["job"]["allocation"]), (&json!("inactive"), &json!(0)), "{row}");
+    let (status, body) = admin.allocate(job, 50).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 
     let mut after = Vec::new();
     for _ in 0..3 {
@@ -1426,8 +1451,7 @@ async fn a_catalan_games_job_runs_and_a_catalan_rack_job_is_refused_at_creation(
     assert_eq!(status, StatusCode::CREATED, "{created}");
     let games: Uuid = created["job"]["id"].as_str().unwrap().parse().unwrap();
     db.derived_ready(games).await;
-    let (status, body) =
-        admin.post(&format!("/api/admin/jobs/{games}/activate"), json!({ "allocation": 50 })).await;
+    let (status, body) = admin.allocate(games, 50).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let (status, assignment) =
         send(&admin.app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;

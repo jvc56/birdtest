@@ -12,6 +12,10 @@
 -- and the empty string where it is NULL (a job an admin completed has no
 -- verdict): :'var' always quotes, so NULLIF is what turns empty back into NULL.
 --
+-- Only `completed` or `inactive`: the job is inactive at 0% here, and the
+-- schema refuses an active job at 0%. A job that was active is given its
+-- allocation again on the admin allocation page instead.
+--
 -- prod-psql: needs job old_status old_verdict old_lower old_upper old_units
 -- prod-psql: writes
 \if :{?old_units}

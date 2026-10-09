@@ -16,7 +16,7 @@
   <div class="card">
     <p class="text-xs uppercase text-muted-foreground">Allocation</p>
     <p class="mt-1 text-xl tabular-nums">
-      {stats.job.allocation === null ? '—' : `${stats.job.allocation}%`}
+      {stats.job.allocation}%
     </p>
   </div>
   <div class="card">

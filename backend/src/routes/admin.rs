@@ -22,8 +22,6 @@ pub fn router() -> Router<AppState> {
         .route("/player-configs/:id", get(get_player_config).delete(delete_player_config))
         .route("/jobs", post(create_job))
         .route("/jobs/allocations", put(set_allocations))
-        .route("/jobs/:id/activate", post(activate_job))
-        .route("/jobs/:id/deactivate", post(deactivate_job))
         .route("/jobs/:id/complete", post(complete_job))
         .route("/jobs/:id/consensus", patch(update_consensus))
         .route("/jobs/:id/purge", post(purge_job))
@@ -1377,8 +1375,9 @@ struct CreatedJob {
     job: Job,
 }
 
-/// Jobs are always created inactive. Allocation is supplied later, at
-/// activation, so the admin sets it while looking at the whole active set.
+/// Jobs are always created inactive at 0%. The allocation is set later, on
+/// the allocation page, so the admin sets it while looking at the whole
+/// active set.
 async fn create_job(
     State(state): State<AppState>,
     admin: AdminUser,
@@ -2259,107 +2258,6 @@ async fn insert_job_config(
     Ok(())
 }
 
-#[derive(Deserialize)]
-struct ActivateBody {
-    allocation: i32,
-}
-
-/// Activation sets the allocation. The active jobs must sum to at most 100%,
-/// which is checked here rather than in the schema — the intermediate states
-/// an admin passes through while rebalancing would violate a DB constraint
-/// even when the end state is fine. An allocation of 0 is accepted and means
-/// what `inactive` means: the job is offered to nobody until it is raised.
-async fn activate_job(
-    State(state): State<AppState>,
-    admin: AdminUser,
-    Path(id): Path<Uuid>,
-    method: Method,
-    headers: HeaderMap,
-    jar: CookieJar,
-    ApiJson(body): ApiJson<ActivateBody>,
-) -> AppResult<Json<Job>> {
-    csrf::verify(&method, &headers, &jar)?;
-    let purges = refuse_while_purging(&state, id)?;
-
-    if !(0..=100).contains(&body.allocation) {
-        return Err(AppError::bad_request("allocation must be between 0 and 100"));
-    }
-
-    // A leave-generation job cannot dispatch without its generation-0 KLV.
-    // Creation writes it after committing, so a failed object-store write
-    // there leaves a job that exists without one; activating it as-is would
-    // make every claim against it fail. Built here, outside the transaction,
-    // for the same reason creation builds it outside its own.
-    let unlocked = crate::jobstats::load_job(&state.pool, id).await?;
-    if !registry::job_artifacts_ready(&state.pool, &unlocked).await? {
-        registry::initialize_job_artifacts(&state, &unlocked).await?;
-    }
-    // Again at activation, because the builder may have moved since creation:
-    // a deployment with a newer MAGPIE needs this job's files rebuilt under
-    // the new builder before it can dispatch, and nothing else would ask.
-    request_derived_data(&state, id).await?;
-
-    let mut tx = state.pool.begin().await?;
-    let job = load_job_for_update(&mut tx, id).await?;
-    refuse_if_purged_since(&state.dispatch_holds, id, purges)?;
-    if job.status == JobStatus::Completed {
-        return Err(AppError::conflict("a completed job cannot be reactivated"));
-    }
-
-    // Serializes activations. The row lock above covers only this job, so two
-    // jobs activated at once would each read the other's allocation as absent
-    // and together exceed 100%.
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('birdtest.activate'))")
-        .execute(&mut *tx)
-        .await?;
-
-    let others = sqlx::query_scalar::<_, Option<i64>>(
-        "SELECT SUM(allocation) FROM jobs WHERE status = 'active' AND id <> $1",
-    )
-    .bind(id)
-    .fetch_one(&mut *tx)
-    .await?
-    .unwrap_or(0);
-
-    if others + body.allocation as i64 > 100 {
-        return Err(AppError::conflict(format!(
-            "the other active jobs already allocate {others}% — {}% is the most this job can take",
-            100 - others
-        )));
-    }
-
-    sqlx::query("UPDATE jobs SET status = 'active', allocation = $1, activated_at = now() WHERE id = $2")
-        .bind(body.allocation)
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
-    // The job joins the others level with the lowest of the jobs being
-    // served, rather than with a lifetime deficit to work off at their
-    // expense. Activation is also how an allocation is changed, and a new
-    // allocation rescales the ratio, so this runs every time. Under the
-    // activation lock, so two jobs activated together each see the other or
-    // neither.
-    crate::scheduler::join_at_parity(&mut tx, id, state.cfg.heartbeat_timeout).await?;
-    let updated = sqlx::query_as::<_, Job>("SELECT * FROM jobs WHERE id = $1")
-        .bind(id)
-        .fetch_one(&mut *tx)
-        .await?;
-
-    audit::log_status_change(
-        &mut tx,
-        "job.activated",
-        admin.0.id,
-        id,
-        status_name(job.status),
-        "active",
-    )
-    .await?;
-    tx.commit().await?;
-    state.finish_checks.rearm_idle(id);
-    super::worker::push_after_change(&state, id);
-    Ok(Json(updated))
-}
-
 /// The most jobs one allocation change names: more than any fleet runs at once.
 const MAX_ALLOCATION_ROWS: usize = 200;
 
@@ -2386,16 +2284,20 @@ struct AllocationsResult {
 /// the first before the second could be raised, and an admin rebalancing
 /// three jobs had to work out an order that never passed through 101%.
 ///
-/// A row above 0% leaves its job active at that allocation, activating it if
-/// it was not; a row at 0% leaves it inactive, deactivating it if it was
-/// active (its last allocation is kept, as deactivation keeps it). A job the
-/// request does not name keeps what it has. A completed job, or one being
-/// purged, is refused, and so is everything else in the request with it:
-/// nothing changes unless all of it does.
+/// This is the only way a job is activated or deactivated: the allocation is
+/// the switch (`jobs_allocation_is_status`). A row above 0% leaves its job
+/// active at that allocation, activating it if it was not; a row at 0% leaves
+/// it inactive at 0%, deactivating it if it was active. Nothing of the old
+/// share is kept: a separate activate and deactivate, with a remembered
+/// allocation between them, made "inactive" and "0%" two states that could
+/// disagree -- an active job at 0% was on offer to nobody while every page
+/// called it running. A job the request does not name keeps what it has. A
+/// completed job, or one being purged, is refused, and so is everything else
+/// in the request with it: nothing changes unless all of it does.
 ///
-/// Each job that changes is audited as activation and deactivation are --
-/// `job.activated` / `job.deactivated` when its status changes -- and a new
-/// allocation as `job.allocation_changed`, from what to what.
+/// Each job that changes is audited once: `job.activated` / `job.deactivated`
+/// when its status changes, and `job.allocation_changed` when an active job
+/// stays active at a new share -- each with the allocation from what to what.
 async fn set_allocations(
     State(state): State<AppState>,
     admin: AdminUser,
@@ -2430,9 +2332,12 @@ async fn set_allocations(
         purges.insert(row.job_id, refuse_while_purging(&state, row.job_id)?);
     }
 
-    // What activation does first, for each job this activates: a leave job's
-    // generation-0 KLV, and its derived files under this deployment's
-    // builder. Outside the transaction, as there.
+    // First, for each job this activates: a leave job's generation-0 KLV --
+    // creation writes it after committing, so a failed object-store write
+    // there leaves a job without one, and every claim against it would fail
+    // -- and its derived files under this deployment's builder, which may
+    // have moved since creation. Outside the transaction, for the reason
+    // creation builds them outside its own.
     for row in body.allocations.iter().filter(|r| r.allocation > 0) {
         let unlocked = match crate::jobstats::load_job(&state.pool, row.job_id).await {
             Ok(job) => job,
@@ -2449,9 +2354,10 @@ async fn set_allocations(
     }
 
     let mut tx = state.pool.begin().await?;
-    // Every row first, in id order, then the activation lock: the order
-    // `activate_job` takes them in (a row, then the lock), so the two never
-    // wait on each other the wrong way round.
+    // Every row first, in id order, then the activation lock, which
+    // serializes allocation changes: the row locks cover only the jobs named,
+    // so two requests naming different jobs would each read the other's
+    // allocations as they were and together exceed 100%.
     let mut ids: Vec<Uuid> = body.allocations.iter().map(|r| r.job_id).collect();
     ids.sort();
     let locked: Vec<Job> = sqlx::query_as::<_, Job>(
@@ -2506,11 +2412,11 @@ async fn set_allocations(
     let mut changed = Vec::new();
     for row in &body.allocations {
         let job = &before[&row.job_id];
-        let active = job.status == JobStatus::Active;
+        if row.allocation == job.allocation {
+            continue;
+        }
+        let moved = format!("{}% -> {}%", job.allocation, row.allocation);
         if row.allocation > 0 {
-            if active && job.allocation == Some(row.allocation) {
-                continue;
-            }
             sqlx::query(
                 "UPDATE jobs SET status = 'active', allocation = $1, activated_at = now() WHERE id = $2",
             )
@@ -2518,52 +2424,49 @@ async fn set_allocations(
             .bind(row.job_id)
             .execute(&mut *tx)
             .await?;
-            // As activation does, and for the same reason: a new allocation
-            // rescales the job's ratio, so it joins level with the jobs being
-            // served rather than with a deficit to work off.
+            // The job joins the others level with the lowest of the jobs
+            // being served, rather than with a lifetime deficit to work off at
+            // their expense -- and a new allocation rescales its ratio, so an
+            // active job's change does the same.
             crate::scheduler::join_at_parity(&mut tx, row.job_id, state.cfg.heartbeat_timeout).await?;
-            if !active {
-                audit::log_status_change(
-                    &mut tx,
-                    "job.activated",
-                    admin.0.id,
-                    row.job_id,
-                    status_name(job.status),
-                    "active",
-                )
-                .await?;
-                activated.push(row.job_id);
-            }
-            if job.allocation != Some(row.allocation) {
-                let from = job.allocation.map_or("none".to_string(), |a| format!("{a}%"));
-                audit::log_detail(
-                    &mut tx,
-                    "job.allocation_changed",
-                    admin.0.id,
-                    "job",
-                    row.job_id.to_string(),
-                    Some(row.job_id),
-                    format!("{from} -> {}%", row.allocation),
-                )
-                .await?;
-            }
-            changed.push(row.job_id);
-        } else if active {
-            sqlx::query("UPDATE jobs SET status = 'inactive' WHERE id = $1")
+        } else {
+            sqlx::query("UPDATE jobs SET status = 'inactive', allocation = 0 WHERE id = $1")
                 .bind(row.job_id)
                 .execute(&mut *tx)
                 .await?;
+        }
+        // One row per job: a status change when it switched on or off,
+        // naming the allocation it moved between, and otherwise the new
+        // allocation alone.
+        let to = if row.allocation > 0 { JobStatus::Active } else { JobStatus::Inactive };
+        if to != job.status {
+            let action = if to == JobStatus::Active { "job.activated" } else { "job.deactivated" };
             audit::log_status_change(
                 &mut tx,
-                "job.deactivated",
+                action,
                 admin.0.id,
                 row.job_id,
                 status_name(job.status),
-                "inactive",
+                status_name(to),
+                Some(&moved),
             )
             .await?;
-            changed.push(row.job_id);
+            if to == JobStatus::Active {
+                activated.push(row.job_id);
+            }
+        } else {
+            audit::log_detail(
+                &mut tx,
+                "job.allocation_changed",
+                admin.0.id,
+                "job",
+                row.job_id.to_string(),
+                Some(row.job_id),
+                moved,
+            )
+            .await?;
         }
+        changed.push(row.job_id);
     }
 
     let after: std::collections::HashMap<Uuid, Job> =
@@ -2590,49 +2493,6 @@ async fn set_allocations(
     Ok(Json(AllocationsResult { jobs }))
 }
 
-async fn deactivate_job(
-    State(state): State<AppState>,
-    admin: AdminUser,
-    Path(id): Path<Uuid>,
-    method: Method,
-    headers: HeaderMap,
-    jar: CookieJar,
-) -> AppResult<Json<Job>> {
-    csrf::verify(&method, &headers, &jar)?;
-    let purges = refuse_while_purging(&state, id)?;
-
-    let mut tx = state.pool.begin().await?;
-    let before = load_job_for_update(&mut tx, id).await?;
-    refuse_if_purged_since(&state.dispatch_holds, id, purges)?;
-    // Completion is final as far as the lifecycle actions go (only a purge,
-    // or an opening-rack job's consensus edit, takes a job out of it).
-    // Flipping a completed job to inactive would be a way around that rule:
-    // activation only refuses jobs that are *currently* completed, so
-    // deactivate-then-activate would restart it.
-    if before.status == JobStatus::Completed {
-        return Err(AppError::conflict("a completed job cannot be deactivated"));
-    }
-    let job = sqlx::query_as::<_, Job>(
-        "UPDATE jobs SET status = 'inactive' WHERE id = $1 RETURNING *",
-    )
-    .bind(id)
-    .fetch_one(&mut *tx)
-    .await?;
-
-    audit::log_status_change(
-        &mut tx,
-        "job.deactivated",
-        admin.0.id,
-        id,
-        status_name(before.status),
-        "inactive",
-    )
-    .await?;
-    tx.commit().await?;
-    super::worker::push_after_change(&state, id);
-    Ok(Json(job))
-}
-
 async fn complete_job(
     State(state): State<AppState>,
     admin: AdminUser,
@@ -2653,11 +2513,13 @@ async fn complete_job(
     if before.status == JobStatus::Completed {
         return Err(AppError::conflict("this job is already completed"));
     }
-    let job =
-        sqlx::query_as::<_, Job>("UPDATE jobs SET status = 'completed' WHERE id = $1 RETURNING *")
-            .bind(id)
-            .fetch_one(&mut *tx)
-            .await?;
+    // At 0%, as every completed job is: its share goes back to the fleet.
+    let job = sqlx::query_as::<_, Job>(
+        "UPDATE jobs SET status = 'completed', allocation = 0 WHERE id = $1 RETURNING *",
+    )
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await?;
 
     audit::log_status_change(
         &mut tx,
@@ -2666,6 +2528,7 @@ async fn complete_job(
         id,
         status_name(before.status),
         "completed",
+        None,
     )
     .await?;
     tx.commit().await?;
@@ -2694,11 +2557,9 @@ struct ConsensusResult {
     config: OpeningRackConfig,
     /// How many of its racks the settings leave unsettled.
     unsettled_racks: i64,
-    /// Whether the change took a completed job back out of completed.
+    /// Whether the change took a completed job back out of completed. A
+    /// reopened job is inactive at 0% until an allocation is set for it.
     reopened: bool,
-    /// Why a reopened job is inactive rather than active: the other active
-    /// jobs leave no room for its allocation.
-    reopened_inactive_reason: Option<String>,
 }
 
 /// Changes an opening-rack job's consensus settings -- the fewest and most
@@ -2708,9 +2569,8 @@ struct ConsensusResult {
 /// the fields given change; none that differ is a `200` that writes nothing.
 ///
 /// The job then starts or stops to match. A completed job the change leaves
-/// with unsettled racks is reopened: active at its allocation if the other
-/// active jobs leave room for it, inactive otherwise (the admin then makes
-/// room and activates it). Either way a completed job's final exports become
+/// with unsettled racks is reopened, inactive at 0%: the admin gives it an
+/// allocation when it should run. A completed job's final exports become
 /// snapshots, since the standings they carry are the old settings': the job
 /// has a new final corpus once it completes again, or, left completed, once
 /// it is exported again. An active job
@@ -2834,62 +2694,26 @@ async fn consensus_body(
     )
     .await?;
 
-    // A completed job with racks to analyse again goes back to work. A job
-    // the server completed has its first pass covered (it completes only
-    // once every rack is settled), so what it hands out now are the
-    // unsettled racks. One an admin force-completed may not: `next_request`
+    // A completed job with racks to analyse again is taken back out of
+    // completed. A job the server completed has its first pass covered (it
+    // completes only once every rack is settled), so what it hands out once
+    // given an allocation are the unsettled racks. One an admin force-completed may not: `next_request`
     // resumes its first pass where it stopped before it reissues anything.
     // That is the behaviour as built; whether an edit should undo a
     // force-complete at all is an open question (PLAN.md, "Editing the
     // consensus").
-    let mut reopened_inactive_reason = None;
     let reopened = job.status == JobStatus::Completed && unsettled > 0;
     if reopened {
-        // Serialized with activations, which check the same sum.
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtext('birdtest.activate'))")
+        // Inactive, at the 0% a completed job holds: completion kept nothing
+        // of its old share to come back to, and the fleet may have been given
+        // to other jobs since. The admin sets its allocation when it should
+        // run (on the allocation page), as for a job just created.
+        sqlx::query("UPDATE jobs SET status = 'inactive' WHERE id = $1")
+            .bind(id)
             .execute(&mut *tx)
             .await?;
-        let others = sqlx::query_scalar::<_, Option<i64>>(
-            "SELECT SUM(allocation) FROM jobs WHERE status = 'active' AND id <> $1",
-        )
-        .bind(id)
-        .fetch_one(&mut *tx)
-        .await?
-        .unwrap_or(0);
-        // A job never activated has no allocation, and one at 0% is offered to
-        // nobody: either way it comes back inactive, for the admin to give
-        // it one.
-        let allocation = job.allocation.unwrap_or(0);
-        let fits = allocation > 0 && others + i64::from(allocation) <= 100;
-        if fits {
-            sqlx::query("UPDATE jobs SET status = 'active', activated_at = now() WHERE id = $1")
-                .bind(id)
-                .execute(&mut *tx)
-                .await?;
-            crate::scheduler::join_at_parity(&mut tx, id, state.cfg.heartbeat_timeout).await?;
-        } else {
-            sqlx::query("UPDATE jobs SET status = 'inactive' WHERE id = $1")
-                .bind(id)
-                .execute(&mut *tx)
-                .await?;
-            reopened_inactive_reason = Some(if allocation == 0 {
-                "it has no allocation: activate it with one".to_string()
-            } else {
-                format!(
-                    "the other active jobs allocate {others}%, which leaves no room for its \
-                     {allocation}%: free some and activate it"
-                )
-            });
-        }
-        audit::log_status_change(
-            &mut tx,
-            if fits { "job.activated" } else { "job.deactivated" },
-            admin_id,
-            id,
-            "completed",
-            if fits { "active" } else { "inactive" },
-        )
-        .await?;
+        audit::log_status_change(&mut tx, "job.deactivated", admin_id, id, "completed", "inactive", None)
+            .await?;
     }
     // Any change to a completed job's settings, not only one that reopens
     // it: each line of an export carries its rack's standing under the
@@ -2914,17 +2738,6 @@ async fn consensus_body(
     // a 5xx would skip the finish check below and invite a second edit.
     // Logged instead, as the purge does.
     if job.status == JobStatus::Active {
-        if reopened {
-            // As activation does: the builder may have moved since the job
-            // last dispatched.
-            if let Err(err) = request_derived_data(&state, id).await {
-                tracing::error!(
-                    job_id = %id, error = %err.message,
-                    "could not queue a reopened job's derived file builds; deactivating and \
-                     activating it queues them"
-                );
-            }
-        }
         // A check paced out under the old settings must not delay the one
         // that can now complete it -- or wait on racks they unsettled.
         state.finish_checks.rearm_idle(id);
@@ -2945,7 +2758,7 @@ async fn consensus_body(
             job
         }
     };
-    Ok(Json(ConsensusResult { job, config, unsettled_racks: unsettled, reopened, reopened_inactive_reason }))
+    Ok(Json(ConsensusResult { job, config, unsettled_racks: unsettled, reopened }))
 }
 
 /// An edit's request, checked: the job's settings as they stand (`FOR UPDATE`
@@ -3000,7 +2813,7 @@ async fn unchanged_consensus(
     .bind(job.id)
     .fetch_one(&mut *conn)
     .await?;
-    Ok(ConsensusResult { job, config, unsettled_racks: unsettled, reopened: false, reopened_inactive_reason: None })
+    Ok(ConsensusResult { job, config, unsettled_racks: unsettled, reopened: false })
 }
 
 /// What a job is about to lose, as a single line for `audit_log.reason`.
@@ -3377,18 +3190,21 @@ async fn purge_body(
     // alone, a purged job would restart owing the scheduler every claim it ever
     // had, and reporting progress it no longer has any results for.
     //
-    // A completed job goes back to inactive: it has nothing left to be complete
-    // about, and a completed job cannot be activated, so one purged in place
-    // was an empty job nothing could ever run again -- where the purge is
-    // meant to start it over. Active and inactive jobs keep their state.
+    // And the job starts over as a new one does: inactive at 0%, whatever it
+    // was. A completed job has nothing left to be complete about, and one
+    // purged in place was an empty job nothing could ever run again. An
+    // active one stops too, so a purge leaves every job in the one state a
+    // created job is in, and the emptied job takes no claims until the admin
+    // gives it an allocation again -- which joins it at parity with the jobs
+    // being served then, as any activation does, rather than owed every claim
+    // the jobs beside it have issued.
     sqlx::query(
         "UPDATE jobs SET claims_issued = 0, games_completed = 0, racks_analyzed = 0,
                          racks_settled = 0, racks_without_consensus = 0,
                          tasks_total = 0, tasks_completed = 0, last_completed_at = NULL,
                          test_decided_status = NULL, test_decided_lower = NULL,
                          test_decided_upper = NULL, test_decided_units = NULL,
-                         status = CASE WHEN status = 'completed' THEN 'inactive'::job_status
-                                       ELSE status END
+                         status = 'inactive', allocation = 0, claims_baseline = 0
          WHERE id = $1",
     )
     .bind(id)
@@ -3461,13 +3277,6 @@ async fn purge_body(
         Some(id),
     )
     .await?;
-    // A job back at zero claims would otherwise be first in every candidate
-    // list until it had re-issued as many as the jobs beside it. Last, not
-    // beside the counters it follows: the other jobs go on issuing claims for
-    // the minutes the cascade above takes, and parity taken before it left the
-    // purged job that far behind, heading every candidate list until it had
-    // caught up.
-    crate::scheduler::join_at_parity(&mut tx, id, state.cfg.heartbeat_timeout).await?;
     // One matrix build per pool on the next sweep, which is what the sweep
     // did every time before it had its cheap check. Before the give-back:
     // this can wait out a running fit, and waiting with every contributor's
@@ -3957,8 +3766,8 @@ async fn rebuild_artifacts(
     // declines, and sets the job aside. Deactivate first.
     if query.force && job.status == JobStatus::Active {
         return Err(AppError::conflict(
-            "deactivate the job before forcing a rebuild: workers mid-task would refuse the \
-             rewritten objects",
+            "deactivate the job (0% on the allocation page) before forcing a rebuild: workers \
+             mid-task would refuse the rewritten objects",
         ));
     }
     let job_data = crate::jobs::load_job_data(&mut conn, job.id).await?;

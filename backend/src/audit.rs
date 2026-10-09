@@ -83,7 +83,9 @@ pub async fn log_server_completion(
     Ok(())
 }
 
-/// Status transitions carry the old and new value so the log reads as a history.
+/// Status transitions carry the old and new value so the log reads as a history,
+/// and an activation or deactivation the allocation it moved between in
+/// `reason` ("0% -> 40%"): the allocation is what switches a job on and off.
 pub async fn log_status_change(
     conn: &mut PgConnection,
     action: &str,
@@ -91,11 +93,12 @@ pub async fn log_status_change(
     job_id: Uuid,
     old_status: &str,
     new_status: &str,
+    reason: Option<&str>,
 ) -> AppResult<()> {
     sqlx::query(
         "INSERT INTO audit_log
-             (action, actor_user_id, target_type, target_id, job_id, old_status, new_status)
-         VALUES ($1, $2, 'job', $3, $4, $5, $6)",
+             (action, actor_user_id, target_type, target_id, job_id, old_status, new_status, reason)
+         VALUES ($1, $2, 'job', $3, $4, $5, $6, $7)",
     )
     .bind(action)
     .bind(actor_user_id)
@@ -103,6 +106,7 @@ pub async fn log_status_change(
     .bind(job_id)
     .bind(old_status)
     .bind(new_status)
+    .bind(reason)
     .execute(conn)
     .await?;
     Ok(())

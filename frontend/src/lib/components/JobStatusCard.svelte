@@ -14,7 +14,6 @@
   export let stats: JobStats;
 
   $: status = stats.job.status;
-  $: allocation = stats.job.allocation;
   $: test = stats.games?.test && status !== 'completed' ? testState(status, stats.games) : null;
 </script>
 
@@ -28,9 +27,7 @@
           ? ` ${datetime(stats.completion.at)}`
           : ''}: {completionText(stats)}.
       {:else}
-        Paused: no worker is offered its tasks{allocation === null
-          ? '. It has not been activated yet'
-          : ' until it is activated again'}.
+        Paused: no worker is offered its tasks until it is given an allocation.
       {/if}
       {#if test}
         <span class="text-muted-foreground">Its significance test is {testLabel(test)} (see the Significance Test card).</span>

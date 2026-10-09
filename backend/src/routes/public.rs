@@ -61,7 +61,7 @@ struct JobListItem {
     name: String,
     job_type: JobType,
     status: String,
-    allocation: Option<i32>,
+    allocation: i32,
     created_at: chrono::DateTime<chrono::Utc>,
     tasks_total: i64,
     tasks_completed: i64,

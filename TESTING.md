@@ -1400,11 +1400,12 @@ The single most important group. Every entry is about a decision made in SQL.
   `admin_api::a_newly_activated_job_joins_at_parity_instead_of_taking_everything`,
   which re-shares two jobs to 75/25 and asserts exactly 9/3 of the next twelve
   claims; `worker_api::every_claim_advances_the_dispatch_counter`.)*
-- `I-SCHED-3` A job at 0% is offered to nobody, exactly as an inactive one is:
-  every claim goes to the other active job, and with every active job at 0%
-  the answer is `204`, not a shutdown — including when a parked job is too new
-  for the worker or in its unsupported set, which shuts nobody down until the
-  job is raised above 0% (`a_parked_job_shuts_nobody_down`). There is no
+- `I-SCHED-3` A job at 0% is inactive (`jobs_allocation_is_status`) and
+  offered to nobody: every claim goes to the other active job, and with every
+  job at 0% the answer is `204`, not a shutdown — including when a parked job is
+  too new for the worker or in its unsupported set, which shuts nobody down
+  until the job is raised above 0% (`a_parked_job_shuts_nobody_down`; an active
+  job at 0% once could, and the schema no longer has one). There is no
   priority. *(Covered: `worker_api::a_job_at_zero_allocation_is_offered_to_nobody`,
   `worker_api::a_parked_job_shuts_nobody_down`.)*
 - `I-SCHED-3a` **A job joins at parity.** A job activated beside one with a
@@ -1748,9 +1749,10 @@ job creation touches needs one caller here.
   the job follows** (`PATCH /api/admin/jobs/:id/consensus`). A job wanting one
   analysis per rack still keeps a progress row per rack, so raising its
   minimum and maximum after it completed restates every rack unsettled,
-  reopens it active at its allocation (`job.consensus_changed`, "min 1 -> 2,
-  max 1 -> 3; 4 racks unsettled", then `job.activated`), demotes its final
-  export to a snapshot, and reissues the racks from those rows; lowering them
+  reopens it inactive at 0% (`job.consensus_changed`, "min 1 -> 2, max 1 -> 3;
+  4 racks unsettled", then `job.deactivated` from completed), demotes its final
+  export to a snapshot, and, once given an allocation, reissues the racks from
+  those rows; lowering them
   again while a reissue is in flight settles every rack, and that reissue's
   submission completes the job without counting its racks a second time, and
   every line of its corpus then carries its rack's standing, each rack having
@@ -1767,9 +1769,8 @@ job creation touches needs one caller here.
   or below 50%, no analyses, a most below the fewest or above 100, any
   consensus for a static player), and refuses any job but an opening-rack
   one; a change that changes nothing writes no audit row; and a completed job
-  reopened where the other active jobs leave no room for its allocation comes
-  back inactive, with the reason in the response. *(Covered:
-  `worker_api::a_consensus_edit_is_checked_and_reopens_inactive_without_room`.)*
+  it reopens comes back inactive at 0%, the 0% every completed job holds.
+  *(Covered: `worker_api::a_consensus_edit_is_checked_and_reopens_inactive`.)*
 - `I-OR-EDIT-3` **A finish check overtaken by a consensus edit does not
   complete the job.** A check that read every rack settled, completing after
   an edit unsettled them, leaves the job active, and its racks are reissued:
@@ -1796,8 +1797,7 @@ job creation touches needs one caller here.
   `worker_api::a_refused_or_unchanged_consensus_edit_holds_nothing`.)*
   (Thirty-third audit, pass 2.)
 - `I-OR-EDIT-6` **An action that waited on a job's row is told it was purged
-  only when it was.** An activate, deactivate, force-complete or allocation
-  change that took the row before a consensus edit queued on it is refused as
+  only when it was.** A force-complete or allocation change that took the row before a consensus edit queued on it is refused as
   running ("a purge, delete or consensus change of this job is running"): the
   edit's hold is not counted, and it was answered "the job was purged while
   this waited". A purge started meanwhile is still "purged", by count, after
@@ -1823,13 +1823,17 @@ job creation touches needs one caller here.
   first claim starts the seeding of its generation-1 universe. *(Covered:
   `admin_routes::creating_each_job_type_answers_it_inactive_and_unallocated`
   (no task for any type), `leave_gen::generation_ones_universe_is_seeded_by_the_first_claim_too`.)*
-- `I-JOB-6` Activation sets `allocation` and `activated_at`; deactivation clears
-  the schedule without destroying tasks; completion is terminal. *(Covered:
+- `I-JOB-6` A job is created inactive at 0%; an allocation above 0% activates
+  it and sets `activated_at`; 0% deactivates it, at 0%, without destroying
+  tasks; completion is terminal and holds the job at 0%, and no allocation,
+  not even 0%, moves a completed job. *(Covered:
   `jobs::a_job_moves_through_its_lifecycle_and_completion_is_final`,
   `admin_api::a_completed_job_cannot_be_deactivated`.)*
-- `I-JOB-7` An allocation outside 0–100 is rejected. *(Covered:
-  `jobs::an_allocation_outside_0_to_100_is_refused`; the sum across jobs is
-  `A-BOUND-7`.)*
+- `I-JOB-7` An allocation outside 0–100 is rejected, and the schema holds a job
+  active exactly when above 0% (`jobs_allocation_is_status`): neither an active
+  job at 0% nor an inactive or completed one above it can be written.
+  *(Covered: `jobs::an_allocation_outside_0_to_100_is_refused`; the sum across
+  jobs is `A-BOUND-7`.)*
 - `I-JOB-8` `purge_job` deletes tasks and claims, leaves the job row, and lets
   task generation resume cleanly from the right seed -- the start of its
   space, which is what PLAN.md specifies. *(Covered:
@@ -2457,7 +2461,8 @@ import can be watched) and a per-test MinIO bucket.
   an anchor move that brings a new member in, which writes that addition too.
   The entry first said "exactly one row"; the census is the second on purpose.
   *(Covered: `audit::every_destructive_admin_action_writes_exactly_its_record`,
-  across deactivate, complete, a consensus change, purge and delete of a job,
+  across a deactivation (an allocation change to 0%, its row carrying "50% ->
+  0%"), complete, a consensus change, purge and delete of a job,
   user delete, ban,
   unban, input-file delete, player-config delete, pool-member removal, an
   anchor move and a pool delete. Deleting an input file or a player config
@@ -3050,7 +3055,7 @@ below.
   (thirty-third audit, pass 1). *(Covered:
   `admin_routes::a_player_config_and_a_pool_take_a_job_names_rule`.)*
 - `A-ADMIN-2` Creating a job of each type returns `{job}` and the
-  job is inactive with no allocation. *(Covered:
+  job is inactive at 0%. *(Covered:
   `admin_routes::creating_each_job_type_answers_it_inactive_and_unallocated`;
   a leave job, which runs MAGPIE at creation, by the opt-in
   `magpie_routes::a_leave_job_is_created_inactive_with_its_generation_zero_leaves_stored`.)*
@@ -3066,8 +3071,9 @@ below.
   refused at creation, not by every claim as a 500. *(Covered:
   `admin_routes::job_creation_refuses_each_impossible_combination_and_says_which`,
   which asserts the player-config half too.)*
-- `A-ADMIN-4` Activate / deactivate / complete / purge / delete each return the
-  documented shape and are reflected in a subsequent read. *(Covered:
+- `A-ADMIN-4` An allocation change (activating and deactivating) / complete /
+  purge / delete each return the documented shape and are reflected in a
+  subsequent read. *(Covered:
   `admin_routes::each_lifecycle_action_answers_its_shape_and_a_read_agrees`; the
   allocation cap by `A-BOUND-7`.)*
 - `A-ADMIN-5` Import start → poll → confirm over HTTP, including that polling
@@ -3117,8 +3123,8 @@ below.
 - `A-ADMIN-14` `delete_user` over HTTP. *(Covered:
   `admin_api::a_user_with_history_can_be_deleted`; an admin cannot delete
   themself, `A-BOUND-8`.)*
-- `A-ADMIN-15` Purging a completed job returns it to inactive, clears its
-  stored verdict, and it can be activated again. *(Covered:
+- `A-ADMIN-15` Purging a completed job returns it to inactive at 0% (as a purge
+  does every job), clears its stored verdict, and it can be activated again. *(Covered:
   `admin_api::purging_a_completed_job_returns_it_to_inactive`.)* (Eleventh
   audit's fix, twelfth audit's test.)
 - `A-ADMIN-15b` An export's `job.export_started` row is written in the
@@ -3146,8 +3152,8 @@ below.
   fourteenth audit).
 - `A-ADMIN-19` A purge or delete of a job whose purge or delete is already
   running is `409` (checked and held in one step: a double click got two), as
-  are activating, deactivating and completing it; all are allowed once it has
-  finished. *(Covered:
+  are an allocation change (activating or deactivating it) and completing it;
+  all are allowed once it has finished. *(Covered:
   `admin_api::a_second_purge_or_delete_is_refused_while_one_runs`.)* (Fourteenth
   audit.)
 - `A-ADMIN-20` A job cannot pin two different files under one role and name
@@ -3214,9 +3220,10 @@ below.
 - `A-ADMIN-28` **Several jobs' allocations in one request**
   (`PUT /api/admin/jobs/allocations`), checked as a whole: 50/50 becomes 60/40,
   which one job at a time refuses (50 + 60 is over 100). A job named at 0% is
-  deactivated and an inactive one named above 0% activated; each change is
-  audited (`job.allocation_changed` from what to what, `job.activated` /
-  `job.deactivated` for a status change). A request totalling over 100%, naming
+  deactivated, at 0%, and an inactive one named above 0% activated; each change
+  is audited once, from what to what (`job.activated` / `job.deactivated` for a
+  job switched on or off, `job.allocation_changed` for an active job's new
+  share). A request totalling over 100%, naming
   a completed job, a job twice, an allocation outside 0–100, or nothing,
   changes nothing. *(Covered:
   `admin_api::allocations_are_set_together_and_checked_as_a_whole`; the route's
@@ -3538,7 +3545,7 @@ silent.
   `boundaries::a_decline_list_is_cut_to_its_cap_and_each_field_to_its_bound`,
   `contract_fixtures::decline_gap_fields_are_bounded`.)*
 - `A-BOUND-7` An activation that would take active allocations past 100% is
-  refused, naming the headroom, and two concurrent activations cannot together
+  refused, naming the total and what the other jobs hold, and two concurrent activations cannot together
   exceed it. *(Covered:
   `boundaries::an_activation_past_100_percent_is_refused_naming_the_headroom`,
   `boundaries::two_concurrent_activations_cannot_exceed_100_percent`.)*
@@ -3742,7 +3749,8 @@ admin in once and the admin journeys reuse its storage state.
 - `E-3` An admin imports input data, reviews the staged diff, and confirms it.
   *(Covered: `e3-input-data-import.spec.ts`, against the fixture tarballs.)*
 - `E-4` An admin creates two player configs and a game-pairs job with
-  **Significance Test** ticked, activates it with an allocation, and watches the dashboard
+  **Significance Test** ticked, activates it by giving it an allocation on
+  `/admin/allocation` (and deactivates it there at the end), and watches the dashboard
   update live over SSE as fake workers contribute; its admin page has the
   match score and Significance Test cards, the latter's sentence giving player 1's
   score per game. **The journey that justifies the tier**: the only place
@@ -3787,11 +3795,10 @@ admin in once and the admin journeys reuse its storage state.
   "Register" off it (thirty-first audit; the header now wraps). Checked against
   a build of the pages with the API mocked: 533 before, 393 after.
 - `E-11` An admin job page whose first read fails shows nothing the server
-  did not say: the data gaps it read apart, the job's own allocation (from the
-  stream if the read failed), the failed reads tried again and their error
-  cleared, a value the admin types kept through the retries, and Activate
-  sending it — through an action's read too, since only Activate sends it
-  (the job's own allocation is shown beside the box). And `E-11b`: a read
+  did not say: the data gaps it read apart, the job's own allocation,
+  read-only with a link to `/admin/allocation` and no Activate or Deactivate
+  (the allocation is set only there), and the failed reads tried again and
+  their error cleared. And `E-11b`: a read
   started before a live payload does not land over it — a slow retry put back
   the status the stream had moved past, on a job that sends nothing more. And
   `E-11c`: a job deleted while its page is open (by another admin) is said to
@@ -4494,8 +4501,8 @@ scripts/seed.py [--api URL] [--job-type TYPE] [--tarball-date YYYYMMDD]
    with `--dev-job` (repeatable), dev.py's named jobs instead -- the two on
    the two-letter test data import it first (`--small-tarball-date`,
    `--small-git-ref`) -- or, with `--no-job`, none.
-6. Activate it with an allocation; dev.py's new jobs share what the active
-   ones leave free.
+6. Give it an allocation (`PUT /api/admin/jobs/allocations`), which activates
+   it; dev.py's new jobs share what the active ones leave free.
 
 Re-running is safe: an unconfirmed account is confirmed, an imported tarball is
 skipped, and an active job of the same type -- and name, for dev.py's -- is

@@ -276,8 +276,8 @@ export interface JobListItem {
   name: string;
   job_type: JobType;
   status: JobStatus;
-  /** The job's share of claims while active (not of worker time: PLAN's KL-88); null until first activated. 0% means what inactive means. */
-  allocation: number | null;
+  /** The job's share of claims (not of worker time: PLAN's KL-88): above 0 exactly when the job is active, so 0% is what inactive means and a completed job holds 0. */
+  allocation: number;
   created_at: string;
   tasks_total: number;
   tasks_completed: number;
@@ -288,15 +288,15 @@ export interface JobListItem {
 }
 
 /**
- * A job's own row, as the admin actions (create, activate, deactivate,
- * complete) return it -- not the list's summary, which adds counts.
+ * A job's own row, as the admin actions (create, set allocations, complete)
+ * return it -- not the list's summary, which adds counts.
  */
 export interface JobRow {
   id: string;
   name: string;
   job_type: JobType;
   status: JobStatus;
-  allocation: number | null;
+  allocation: number;
   variant: string;
   created_at: string;
 }
@@ -389,7 +389,7 @@ export interface JobStats {
     name: string;
     job_type: JobType;
     status: JobStatus;
-    allocation: number | null;
+    allocation: number;
       min_magpie_version: string;
     created_at: string;
     created_by: string | null;
@@ -844,22 +844,20 @@ export const api = {
     post<ArtifactRebuild[]>(`/api/admin/jobs/${id}/rebuild-artifacts?force=${force}`),
   createJob: (body: Record<string, unknown>) =>
     post<{ job: JobRow }>('/api/admin/jobs', body),
-  activateJob: (id: string, allocation: number) =>
-    post<JobRow>(`/api/admin/jobs/${id}/activate`, { allocation }),
-  deactivateJob: (id: string) => post<JobRow>(`/api/admin/jobs/${id}/deactivate`),
   /**
    * Several jobs' allocations at once, the active jobs checked against 100%
    * as they will stand: above 0% activates a job, 0% deactivates one, and a
    * job not named keeps what it has. Nothing changes unless all of it does.
+   * The only way a job is activated or deactivated.
    */
   setAllocations: (rows: { job_id: string; allocation: number }[]) =>
     put<{ jobs: JobRow[] }>('/api/admin/jobs/allocations', { allocations: rows }),
   completeJob: (id: string) => post<JobRow>(`/api/admin/jobs/${id}/complete`),
   /**
    * An opening-rack job's consensus settings, changed: only the fields given.
-   * The job follows -- a completed one with racks unsettled again reopens
-   * (inactive, with the reason, when its allocation no longer fits), and an
-   * active one with every rack settled completes.
+   * The job follows -- a completed one with racks unsettled again reopens,
+   * inactive at 0% until it is given an allocation, and an active one with
+   * every rack settled completes.
    */
   updateConsensus: (
     id: string,
@@ -869,7 +867,6 @@ export const api = {
       job: JobRow;
       unsettled_racks: number;
       reopened: boolean;
-      reopened_inactive_reason: string | null;
     }>(`/api/admin/jobs/${id}/consensus`, body),
   purgeJob: (id: string) => post<{ tasks_reset: number }>(`/api/admin/jobs/${id}/purge`),
   deleteJob: (id: string) => del<void>(`/api/admin/jobs/${id}`),

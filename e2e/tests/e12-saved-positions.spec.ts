@@ -47,7 +47,7 @@ test.beforeAll(async ({ browser, playwright }) => {
   await expect(form).toHaveURL(/\/admin\/jobs\/[0-9a-f-]{36}$/);
   jobId = form.url().split('/').pop()!;
   await admin.close();
-  await api.post(`/api/admin/jobs/${jobId}/activate`, { allocation: 10 });
+  await api.allocate(jobId, 10);
 
   const request = await playwright.request.newContext({ baseURL: env.baseURL });
   await waitUntilSettled(request, jobId);

@@ -349,7 +349,7 @@ pub async fn complete_unless_purged(
     let status = decided.map(|(test, _)| test.status.as_str());
     let mut tx = pool.begin().await?;
     let completed = sqlx::query(
-        "UPDATE jobs SET status = 'completed',
+        "UPDATE jobs SET status = 'completed', allocation = 0,
                          test_decided_status = $3, test_decided_lower = $4,
                          test_decided_upper = $5, test_decided_units = $6
          WHERE id = $1 AND status = 'active' AND claims_issued >= $2

@@ -34,9 +34,10 @@ async function pairsCompleted(page: Page): Promise<number> {
 
 /**
  * E-4: an admin creates two player configs and a game-pairs job, activates it
- * with an allocation, and watches its dashboard move over SSE as the fake
- * workers contribute. The one journey where the built app, the stream, the
- * scheduler and a worker are all in play at once.
+ * by giving it an allocation on the Allocation page, and watches its
+ * dashboard move over SSE as the fake workers contribute. The one journey
+ * where the built app, the stream, the scheduler and a worker are all in play
+ * at once.
  */
 test('E-4: an admin creates configs and a job, activates it, and watches it fill live', async ({ page }) => {
   const suffix = crypto.randomUUID().slice(0, 8);
@@ -77,15 +78,15 @@ test('E-4: an admin creates configs and a job, activates it, and watches it fill
   const status = page.getByTestId('job-status');
   await expect(status.getByText('inactive', { exact: true })).toBeVisible();
 
-  // Activating refetches the job once, after the action; wait that out.
+  // The allocation is the switch, and it is set on the Allocation page.
+  await setAllocation(page, jobId, jobName, 20);
   const isJobFetch = (url: string, method: string) =>
     method === 'GET' && new URL(url).pathname === `/api/jobs/${jobId}`;
-  const refetched = page.waitForResponse((r) => isJobFetch(r.url(), r.request().method()));
-  await page.getByLabel('Allocation %').fill('20');
-  await page.getByRole('button', { name: 'Activate', exact: true }).click();
-  await refetched;
-  await expect(page.getByText('Job activated.')).toBeVisible();
+  const loaded = page.waitForResponse((r) => isJobFetch(r.url(), r.request().method()));
+  await page.goto(`/admin/jobs/${jobId}`);
+  await loaded;
   await expect(status.getByText('active', { exact: true })).toBeVisible();
+  await expect(page.getByTestId('job-allocation')).toContainText('20%');
 
   // From here on the page must update itself. It fetches the job over REST
   // only on load and after an admin action, so count those fetches: the
@@ -116,7 +117,18 @@ test('E-4: an admin creates configs and a job, activates it, and watches it fill
   ).toBeVisible();
 
   // And the admin takes the job out of rotation again, handing its share back.
-  await page.getByRole('button', { name: 'Deactivate' }).click();
-  await expect(page.getByText('Job deactivated.')).toBeVisible();
+  await setAllocation(page, jobId, jobName, 0);
+  await page.goto(`/admin/jobs/${jobId}`);
   await expect(status.getByText('inactive', { exact: true })).toBeVisible();
+  await expect(page.getByTestId('job-allocation')).toContainText('0%');
 });
+
+/** Sets one job's allocation on the Allocation page, and saves. */
+async function setAllocation(page: Page, jobId: string, jobName: string, allocation: number) {
+  await page.goto('/admin/allocation');
+  const input = page.getByLabel(`Allocation for ${jobName}`, { exact: true });
+  await expect(input).toHaveAttribute('id', `alloc-${jobId}`);
+  await input.fill(String(allocation));
+  await page.getByRole('button', { name: 'Save 1 change' }).click();
+  await expect(page.getByText('Saved: 1 job changed.')).toBeVisible();
+}

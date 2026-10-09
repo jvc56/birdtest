@@ -82,7 +82,7 @@
                 </span>
               {/if}
             </td>
-            <td class="tabular-nums">{job.allocation === null ? '—' : `${job.allocation}%`}</td>
+            <td class="tabular-nums">{job.allocation}%</td>
             <td class="text-right tabular-nums">
               {p.value.toLocaleString()} / {p.max.toLocaleString()}
               <span class="text-muted-foreground">{p.unit}</span>

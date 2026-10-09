@@ -202,8 +202,6 @@ const ROUTES: &[(&str, &str, Access, &str)] = &[
         r#"{"job_type":"opening_rack","variant":"classic","letterdist_id":"00000000-0000-4000-8000-000000000001","layout_id":"00000000-0000-4000-8000-000000000001","player_config_id":"00000000-0000-4000-8000-000000000001"}"#,
     ),
     ("PUT", "/api/admin/jobs/allocations", Admin, r#"{"allocations":[{"job_id":"00000000-0000-4000-8000-000000000001","allocation":50}]}"#),
-    ("POST", "/api/admin/jobs/:id/activate", Admin, r#"{"allocation":50}"#),
-    ("POST", "/api/admin/jobs/:id/deactivate", Admin, ""),
     ("POST", "/api/admin/jobs/:id/complete", Admin, ""),
     ("PATCH", "/api/admin/jobs/:id/consensus", Admin, r#"{"consensus_pct":80}"#),
     ("POST", "/api/admin/jobs/:id/purge", Admin, ""),
@@ -458,8 +456,8 @@ async fn every_cookie_backed_write_requires_the_csrf_pair() {
         }
         checked += 1;
     }
-    // 26 admin writes, 3 account writes, logout and sign-out-everywhere.
-    assert_eq!(checked, 31);
+    // 24 admin writes, 3 account writes, logout and sign-out-everywhere.
+    assert_eq!(checked, 29);
 
     // Nothing was done under any of them: the admin is still signed in, and
     // the audit log is empty.

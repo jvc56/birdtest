@@ -153,9 +153,10 @@ const PARITY_TARGET: &str = "(SELECT MIN(p.ratio)
 ///
 /// This is start-time fair queuing's rule: a flow that (re)joins starts at the
 /// system's current virtual time, not at zero. Called wherever a job's
-/// standing changes -- activation (which is also how an allocation is changed)
-/// and purge -- inside that operation's transaction, after it has written the
-/// job's new allocation and counters. From then on the job is simply one more
+/// standing changes -- an allocation change, which is also how a job is
+/// activated (a purge leaves a job inactive, so it rejoins when activated
+/// again) -- inside that operation's transaction, after it has written the
+/// job's new allocation. From then on the job is simply one more
 /// candidate: selection stays deterministic, stays one statement, and still
 /// converges on the configured shares, because every job's numerator counts
 /// from the same moment in the fleet's history.
@@ -202,7 +203,7 @@ pub async fn join_at_parity(
     served_within: std::time::Duration,
 ) -> AppResult<()> {
     // `activated_at` is when the job last joined: activation sets it, and a
-    // purge and a return from a spell unserved are joins too. It starts the
+    // return from a spell unserved is a join too. It starts the
     // settling window, and the rate window of the job's ETA.
     sqlx::query(&format!(
         "UPDATE jobs j
@@ -213,7 +214,7 @@ pub async fn join_at_parity(
                            FROM jobs o
                            WHERE o.status = 'active' AND o.allocation > 0 AND o.id <> $1),
                           0)
-                 * COALESCE(j.allocation, 0)
+                 * j.allocation
              )::bigint
          WHERE j.id = $1"
     ))
@@ -704,8 +705,8 @@ async fn lift_after_claim(state: &AppState, passed_over: &[Uuid], chosen: &Job) 
 /// at 50/50.
 fn pace_for(jobs: &[Job], i: usize) -> Option<f64> {
     let other = if i == 0 { jobs.get(1)? } else { &jobs[0] };
-    let alloc = f64::from(other.allocation.filter(|a| *a > 0)?);
-    let own = f64::from(jobs[i].allocation.filter(|a| *a > 0)?);
+    let alloc = f64::from(Some(other.allocation).filter(|a| *a > 0)?);
+    let own = f64::from(Some(jobs[i].allocation).filter(|a| *a > 0)?);
     Some((other.claims_issued - other.claims_baseline - 1) as f64 / alloc - 1.0 / own)
 }
 
@@ -746,9 +747,8 @@ fn was_recently_busy(job_id: Uuid) -> bool {
 
 /// A job's deficit ratio as the candidate list read it; `None` at 0%.
 fn ratio(job: &Job) -> Option<f64> {
-    job.allocation
-        .filter(|a| *a > 0)
-        .map(|a| (job.claims_issued - job.claims_baseline) as f64 / f64::from(a))
+    (job.allocation > 0)
+        .then(|| (job.claims_issued - job.claims_baseline) as f64 / f64::from(job.allocation))
 }
 
 enum JobClaimError {
@@ -956,7 +956,9 @@ async fn try_claim_from_job(
             // job cannot be reactivated. Guarded on `active` as well: an admin
             // may have deactivated the job between selection and here, and
             // that decision stands.
-            let completed = sqlx::query("UPDATE jobs SET status = 'completed' WHERE id = $1 AND status = 'active'")
+            let completed = sqlx::query(
+                "UPDATE jobs SET status = 'completed', allocation = 0 WHERE id = $1 AND status = 'active'",
+            )
                 .bind(job.id)
                 .execute(&mut *tx)
                 .await
@@ -1266,7 +1268,7 @@ async fn issue_claim(
          SET claims_issued = claims_issued + 1, tasks_total = tasks_total + $3,
              last_claimed_at = now(),
              claims_baseline = CASE
-                 WHEN NOT COALESCE(allocation > 0, FALSE) THEN claims_baseline
+                 WHEN NOT allocation > 0 THEN claims_baseline
                  WHEN {STALE}
                      THEN LEAST(claims_baseline,
                                 claims_issued - floor({PARITY_TARGET} * allocation)::bigint,
@@ -1276,7 +1278,7 @@ async fn issue_claim(
                  ELSE claims_baseline
              END,
              activated_at = CASE
-                 WHEN COALESCE(allocation > 0, FALSE) AND {STALE} THEN now()
+                 WHEN allocation > 0 AND {STALE} THEN now()
                  ELSE activated_at
              END
          WHERE id = $1 AND status = 'active'"

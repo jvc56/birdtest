@@ -233,8 +233,8 @@
 
 <h1 class="mb-2 text-2xl font-semibold">Create a job</h1>
 <p class="mb-6 text-sm text-muted-foreground">
-  Jobs are created inactive. You set the allocation when you activate one, so you can review the
-  whole active set first.
+  Jobs are created inactive at 0%. You give them an allocation on the Allocation page, which
+  activates them, so you can review the whole active set first.
 </p>
 
 <!-- Any edit clears the last server error: a submit the browser blocks never

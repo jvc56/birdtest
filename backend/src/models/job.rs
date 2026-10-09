@@ -27,9 +27,10 @@ pub struct Job {
     /// What the admin called it; empty for a job created without one.
     pub name: String,
     pub job_type: JobType,
-    /// The job's share of the fleet while active; `None` until first
-    /// activated. There is no priority: 0% is what `inactive` means.
-    pub allocation: Option<i32>,
+    /// The job's share of the fleet: above 0% exactly when the job is active
+    /// (`jobs_allocation_is_status`), so 0% is what `inactive` means and a
+    /// completed job holds 0%. There is no priority.
+    pub allocation: i32,
     pub status: JobStatus,
     pub created_by: Option<Uuid>,
     /// Rules setting, not a file: 'classic' | 'wordsmog'.
@@ -52,8 +53,9 @@ pub struct Job {
     pub claims_issued: i64,
     /// Where the job's share is measured from: the scheduler orders on
     /// `(claims_issued - claims_baseline) / allocation`. Reset to parity with
-    /// the jobs being served on activation, on an allocation change and on a
-    /// purge (`scheduler::join_at_parity`); lifted to parity when a claim passes
+    /// the jobs being served on activation and on an allocation change
+    /// (`scheduler::join_at_parity`; a purge zeroes it with the job inactive);
+    /// lifted to parity when a claim passes
     /// the job over for want of a task (`scheduler::lift_passed_over`), on its
     /// first claim after a heartbeat timeout unserved, and on each claim within
     /// `scheduler::JOIN_SETTLE` of joining.
@@ -81,8 +83,8 @@ pub struct Job {
     pub racks_settled: i64,
     pub racks_without_consensus: i64,
     pub created_at: DateTime<Utc>,
-    /// When the job last joined the jobs on offer: its activation, a purge, or
-    /// its first claim after a spell unserved. The scheduler settles a job for
+    /// When the job last joined the jobs on offer: its activation, or its
+    /// first claim after a spell unserved. The scheduler settles a job for
     /// an hour from it (`scheduler::JOIN_SETTLE`); the ETA's rate is measured
     /// from it.
     pub activated_at: Option<DateTime<Utc>>,

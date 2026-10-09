@@ -149,8 +149,8 @@ Open "dev game pairs (first divergences saved)".
   "CSW24 · classic · static, by equity vs static, by score".
 - [ ] **Expect** a full-width Status card: the badge ("active") and nothing
   beside it -- the badge says it plainly, and its allocation has its own card.
-  (Inactive: "Paused: no worker is offered its tasks until it is activated
-  again." and "Its significance test is paused while the job is inactive (see the
+  (Inactive: "Paused: no worker is offered its tasks until it is given an
+  allocation." and "Its significance test is paused while the job is inactive (see the
   Significance Test card).")
 - [ ] **Expect** under it three cards in a row: Allocation, Tasks completed and
   Estimated time left.
@@ -654,7 +654,7 @@ Do this last: it empties the database.
 ### A-7 Create jobs
 
 **New job**, then **Create job**; each lands on the job's admin page,
-**inactive**, with no allocation. The fields are named as the settings tables
+**inactive** at 0%. The fields are named as the settings tables
 name them (**Job Name**, **Job Type**, **Letter Distribution**, **Board**,
 **Pairs Per Task**, …), and the job types read "Opening Rack Analysis",
 "Games", "Game Pairs" and "Leave Generation". The letter distribution and
@@ -710,13 +710,12 @@ board start on "Choose…": pick `english` and `standard15` each time.
   settings, **Save** disabled until one changes. Set the minimum above the
   maximum. **Expect** "The most analyses must be at least the fewest, and at
   most 100." Set Minimum 3 and Maximum 4. **Expect** "Saved: N racks
-  unsettled, so the job reopened." -- active again at its allocation, any
-  final export of it now a snapshot, and its Job settings saying 3 and 4 -- or,
-  with the other active jobs leaving no room for its allocation, "…so the job
-  reopened, inactive — the other active jobs allocate …%: free some and
-  activate it." The audit log has `job.consensus_changed` ("min 2 -> 3, max 3
-  -> 4; N racks unsettled") and `job.activated` (or `job.deactivated`). Once
-  it has completed again, set Consensus % to 60. **Expect** "Saved: the job is
+  unsettled, so the job reopened, inactive at 0% — give it an allocation on the
+  Allocation page to run it." -- inactive at 0%, any final export of it now a
+  snapshot, and its Job settings saying 3 and 4. The audit log has
+  `job.consensus_changed` ("min 2 -> 3, max 3 -> 4; N racks unsettled") and
+  `job.deactivated` (from completed). **Do** give it 25% on **Allocation**.
+  Once it has completed again, set Consensus % to 60. **Expect** "Saved: the job is
   completed, with 0 racks unsettled." Lowering the settings on an active job
   until no rack is unsettled completes it.
 - [ ] **Do** leave the letter distribution on "Choose…" and submit. **Expect**
@@ -729,51 +728,56 @@ board start on "Choose…": pick `english` and `standard15` each time.
 
 ### A-8 Activate, share out and deactivate
 
-The seeded games and pairs jobs hold 50% between them once the two english_ab
-jobs have finished (100% while those run).
+The allocation is the only switch: above 0% a job is active, at 0% inactive,
+and both are set on **Allocation** (admin tabs). The seeded games and pairs
+jobs hold 50% between them once the two english_ab jobs have finished (100%
+while those run).
 
-- [ ] **Do** activate "tester cap" at 60%. **Expect** "the other active jobs
-  already allocate 50% — 50% is the most this job can take".
-- [ ] **Do** deactivate "dev games (positions saved)" (its **Manage** page → **Deactivate**).
-  **Expect** "Job deactivated." and **inactive** in the Status card with
-  "Paused: no worker is offered its tasks …", the same cards as the public
-  page's; its public page no longer says "live".
-- [ ] **Do** activate "tester cap" at 25%. **Expect** "Job activated.", "Now:
-  25%", and the workers taking its tasks.
-- [ ] **Do** type 150, then 2.5, and **Activate**. **Expect** "Enter a
-  whole-number allocation from 0 to 100."
-- [ ] **Do** change an active job's share and **Activate** again. **Expect** the
+- [ ] **Do** open a job's **Manage** page. **Expect** "Allocation: N% of
+  claims" read-only with a link to the Allocation page, and no Activate or
+  Deactivate button.
+- [ ] **Do** open **Allocation**. **Expect** every active and inactive job,
+  none completed, each with its status, its share now and a box set to it (0
+  for an inactive job), the total "N% of 100% allocated", and **No changes**
+  disabled.
+- [ ] **Do** set "tester cap" to 60 and **Save**. **Expect** the total red,
+  "lower some jobs before saving", and the save disabled.
+- [ ] **Do** set "dev games (positions saved)" to 0 and **Save**. **Expect**
+  "Saved: 1 job changed.", the games job inactive at 0%, and on its **Manage**
+  page **inactive** in the Status card with "Paused: no worker is offered its
+  tasks …", the same cards as the public page's; its public page no longer
+  says "live".
+- [ ] **Do** set "tester cap" to 25 and **Save**. **Expect** it active at 25%
+  and the workers taking its tasks.
+- [ ] **Do** type 150, then 2.5, in a box. **Expect** "Every allocation must be
+  a whole number from 0 to 100." and the save disabled.
+- [ ] **Do** change an active job's share and **Save** again. **Expect** the
   new share taken.
-- [ ] **Do** deactivate every job but one, at 25%. **Expect** that job to get
-  all the work: shares weigh only against the other active jobs.
-- [ ] **Do** open **Allocation** (admin tabs). **Expect** every active and
-  inactive job, none completed, each with its status, its share now and a box
-  set to it (0 for an inactive job), the total "N% of 100% allocated", and
-  **No changes** disabled. **Do** set the seeded games job to 0 and "tester
-  cap" to its share plus the games job's. **Expect** the total unchanged, the
-  two rows in bold and **Save 2 changes**. **Do** raise one to push the total
-  over 100. **Expect** the total red, "lower some jobs before saving", and the
-  save disabled. Put it back and **Save**. **Expect** "Saved: 2 jobs changed.",
-  the games job inactive and "tester cap" at its new share, and in the audit
-  log `job.deactivated` and `job.allocation_changed` ("25% -> 75%").
+- [ ] **Do** set every job but one to 0, the one at 25%. **Expect** that job to
+  get all the work: shares weigh only against the other active jobs.
+- [ ] **Do** set the seeded games job to 0 and "tester cap" to its share plus
+  the games job's. **Expect** the total unchanged, the two rows in bold and
+  **Save 2 changes**. **Save**. **Expect** "Saved: 2 jobs changed.", the games
+  job inactive at 0% and "tester cap" at its new share, and in the audit log
+  `job.deactivated` ("25% -> 0%") and `job.allocation_changed` ("25% -> 50%").
 - [ ] **Do** **Share equally**. **Expect** 100% split among the jobs above 0%.
 - [ ] **Do** create a game-pairs job with **Oldest MAGPIE** `9.9.9`, and
   make it the only active one. **Expect** every worker told its MAGPIE is too
-  old and stopping. Deactivate it and restart the workers.
+  old and stopping. Set it to 0% and restart the workers.
 
 ### A-9 Finish, purge and delete
 
 - [ ] **Do** let "tester cap" run. **Expect** it completed within a few
-  minutes, with the cap note (V-7), and Activate, Deactivate and Force
-  complete disabled.
-- [ ] **Do** activate "tester decided". **Expect** a decided test (V-7).
+  minutes, with the cap note (V-7), its allocation 0% ("completed jobs hold
+  0%"), Force complete disabled, and the job gone from **Allocation**.
+- [ ] **Do** give "tester decided" an allocation. **Expect** a decided test (V-7).
 - [ ] **Do** **Force complete** a running job and confirm. **Expect** "Job
-  force-completed." and "an admin force-completed it before its test
-  decided".
+  force-completed.", its allocation 0%, and "an admin force-completed it
+  before its test decided".
 - [ ] **Do** **Purge results** on a completed job and confirm. **Expect**
-  "Results purged. The job is inactive: activate it to start over from its
-  first task." and its counts at zero. On an active job: "Results purged; the
-  job starts over from its first task."
+  "Results purged. The job is inactive at 0%: give it an allocation on the
+  Allocation page to start over from its first task." and its counts at zero.
+  On an active job the same: a purge leaves every job inactive at 0%.
 - [ ] **Do** open a job's **Manage** page in two tabs and **Delete job** in one.
   **Expect** that tab on the jobs list, without the job, and the other saying
   "This job no longer exists." with every action disabled.
@@ -821,7 +825,7 @@ closes in seconds rather than never.
   occurrences per rack per generation "100, 200, 300". **Expect** "3
   generations: 100 → 200 → 300." under the targets. (**Do** type "100, 0" there first. **Expect** a red
   "Every target must be between 1 and 1,000,000, not 0.")
-- [ ] **Do** make room (A-8) and activate it at 25%. **Expect** its wordmap built
+- [ ] **Do** make room (A-8) and give it 25% on **Allocation**. **Expect** its wordmap built
   on **Derived data** within about fifteen seconds (A-6).
 - [ ] **Expect**, on its public page, the generations closing one after another
   — "Generation 2 of 3 — target 200 occurrences per rack", "Targets by
@@ -832,8 +836,8 @@ closes in seconds rather than never.
 - [ ] **Do** **Check artifacts**. **Expect** "Checked 3 generations: 0
   rewritten, 0 differing from the recorded hash." and a row a generation.
 - [ ] **Do** **Force rebuild** and confirm. **Expect** every generation
-  rewritten. (On an active job it is refused: "deactivate the job before
-  forcing a rebuild …".)
+  rewritten. (On an active job it is refused: "deactivate the job (0% on
+  the allocation page) before forcing a rebuild …".)
 - [ ] **Do** export it ([A-10](#a-10-export-a-job)). **Expect** a download.
 
 ### A-13 Rating pools
@@ -1034,10 +1038,11 @@ curl -s -b "$JAR" -H "X-CSRF-Token: $CSRF" -H 'Content-Type: application/json' \
   "$SITE/api/admin/player-configs"
 ```
 
-**Create a job, activate it, deactivate it.** Created inactive (`201`);
-activation sets the share (`200`), and a share that would take the active
-jobs past 100% is `409` — with the seed's games and pairs jobs active, 50% is
-the most left. This one runs no significance test and plays its 20 pairs;
+**Create a job, activate it, deactivate it.** Created inactive at 0% (`201`);
+an allocation above 0% activates it (`200`), 0% deactivates it, and a share
+that would take the active jobs past 100% is `409` — with the seed's games and
+pairs jobs active, 50% is the most left. The allocations endpoint is the only
+switch; it answers `{ "jobs": [...] }`, each named job as it now stands. This one runs no significance test and plays its 20 pairs;
 `"test_enabled": true` turns the test on, with `min_pairs` then required (at
 least 1, at most `max_pairs`) and `confidence_pct` optional (95 by default,
 strictly between 50 and 100), and `min_pairs` or `confidence_pct` sent without
@@ -1050,20 +1055,22 @@ curl -s -b "$JAR" -H "X-CSRF-Token: $CSRF" -H 'Content-Type: application/json' \
        "player1_config_id":"<config id>","player2_config_id":"<config id>",
        "pairs_per_batch":10,"max_pairs":20}' \
   "$SITE/api/admin/jobs" | jq '.job.id'
-curl -s -b "$JAR" -H "X-CSRF-Token: $CSRF" -H 'Content-Type: application/json' \
-  -d '{"allocation":4}' "$SITE/api/admin/jobs/$JOB/activate"
-curl -s -b "$JAR" -H "X-CSRF-Token: $CSRF" -X POST "$SITE/api/admin/jobs/$JOB/deactivate"
+curl -s -b "$JAR" -H "X-CSRF-Token: $CSRF" -H 'Content-Type: application/json' -X PUT \
+  -d '{"allocations":[{"job_id":"'"$JOB"'","allocation":4}]}' "$SITE/api/admin/jobs/allocations"
+curl -s -b "$JAR" -H "X-CSRF-Token: $CSRF" -H 'Content-Type: application/json' -X PUT \
+  -d '{"allocations":[{"job_id":"'"$JOB"'","allocation":0}]}' "$SITE/api/admin/jobs/allocations"
 ```
 
 **Change an opening-rack job's consensus.** Only the fields sent change; the
 answer is the job, its settings, how many racks they leave unsettled, and
-whether a completed job reopened (and, reopened inactive, why). A job of
+whether a completed job reopened (inactive at 0%, until it is given an
+allocation). A job of
 another type, or settings creation would refuse, is a `400`.
 
 ```bash
 curl -s -b "$JAR" -H "X-CSRF-Token: $CSRF" -H 'Content-Type: application/json' \
   -X PATCH -d '{"min_results_per_rack":2,"max_results_per_rack":3,"consensus_pct":80}' \
-  "$SITE/api/admin/jobs/<opening-rack job id>/consensus" | jq '{unsettled_racks, reopened, reopened_inactive_reason, status: .job.status}'
+  "$SITE/api/admin/jobs/<opening-rack job id>/consensus" | jq '{unsettled_racks, reopened, status: .job.status}'
 ```
 
 **Operational health**: the fleet, the derived-file queue, the backups, and

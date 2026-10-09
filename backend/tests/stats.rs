@@ -543,7 +543,7 @@ async fn the_eta_is_none_without_recent_throughput() {
     let eta = stats(&db, job).await.eta_seconds.expect("recent throughput");
     assert!(eta.is_finite() && eta > 0.0, "{eta}");
 
-    sqlx::query("UPDATE jobs SET status = 'inactive' WHERE id = $1")
+    sqlx::query("UPDATE jobs SET status = 'inactive', allocation = 0 WHERE id = $1")
         .bind(job)
         .execute(&db.pool)
         .await

@@ -35,11 +35,6 @@
   //   newest one started and no stream payload arrived while it was out: a
   //   read that landed late put back a status the stream had already moved
   //   past, and an inactive or completed job sends nothing to correct it.
-  // - The allocation box is the admin's alone. It is filled once, from the
-  //   first payload that says the job's allocation, and no read touches it
-  //   after that; the job's current allocation is shown beside it. (Each
-  //   earlier attempt to keep the two in step lost a value the admin had
-  //   typed, and Activate sent the old one.)
   // - The job, its data gaps and its export are read apart, so a failure of
   //   one shows as that and not as an empty answer, and failed reads are
   //   tried again on the next live payload and every five seconds.
@@ -50,8 +45,6 @@
   let config: JobConfig | null = null;
   // null until read: shown as "could not load", never as "none".
   let gaps: DataGap[] | null = null;
-  let allocation: number | null = null;
-  let allocationFilled = false;
   let reloadGen = 0;
   let streamPayloads = 0;
   // Why the page's reads last failed, if they did; kept apart from `error`
@@ -104,12 +97,6 @@
     window.clearTimeout(exportPoll);
   }
 
-  function fillAllocation(value: JobStats) {
-    if (allocationFilled) return;
-    allocation = value.job.allocation ?? 100;
-    allocationFilled = true;
-  }
-
   async function reload() {
     const gen = ++reloadGen;
     const exportGenAtStart = exportGen;
@@ -132,7 +119,6 @@
     const failures: string[] = [];
     if (job.status === 'fulfilled') {
       if (streamPayloads === payloadsAtStart) stats = job.value;
-      fillAllocation(job.value);
     } else if (!goneIf(job.reason)) failures.push((job.reason as Error).message);
     if (gapsRead.status === 'fulfilled') gaps = gapsRead.value;
     else if (!gone) failures.push((gapsRead.reason as Error).message);
@@ -227,7 +213,6 @@
       (value) => {
         streamPayloads += 1;
         stats = value;
-        fillAllocation(value);
         if ((loadError || exportError) && !reloading && !gone) reload();
       },
       (status) => status === 404 && markGone()
@@ -240,18 +225,8 @@
     };
   });
 
-  function activate() {
-    const value = allocation;
-    if (value === null || !Number.isInteger(Number(value)) || value < 0 || value > 100) {
-      notice = '';
-      error = 'Enter a whole-number allocation from 0 to 100.';
-      return;
-    }
-    run(() => api.activateJob(jobId, Number(value)), 'Job activated.');
-  }
-
-  // One action at a time: a double click sent two activations, or rebuilt
-  // every generation twice.
+  // One action at a time: a double click sent two purges, or rebuilt every
+  // generation twice.
   async function run(action: () => Promise<unknown>, message: string) {
     if (busy) return;
     busy = true;
@@ -325,19 +300,16 @@
     if (busy) return;
     if (
       !confirm(
-        'Purge this job? Every task, claim and result it holds is deleted and the job starts over (a completed job returns to inactive, to be activated again). This cannot be undone.'
+        'Purge this job? Every task, claim and result it holds is deleted and the job starts over, inactive at 0% until you give it an allocation. This cannot be undone.'
       )
     )
       return;
-    // Only an active job goes on running: a completed one returns to inactive
-    // and an inactive one stays so. Said as "starts over", an admin who had
-    // purged a completed job watched it do nothing.
-    const running = stats?.job.status === 'active';
+    // Every job comes back inactive at 0%, as a created one is. Said as
+    // "starts over", an admin who had purged a completed job watched it do
+    // nothing.
     run(
       () => api.purgeJob(jobId),
-      running
-        ? 'Results purged; the job starts over from its first task.'
-        : 'Results purged. The job is inactive: activate it to start over from its first task.'
+      'Results purged. The job is inactive at 0%: give it an allocation on the Allocation page to start over from its first task.'
     );
   }
 
@@ -345,7 +317,7 @@
     if (busy) return;
     if (
       !confirm(
-        'Force-complete this job? It stops dispatching: a completed job cannot be reactivated (only a purge, which deletes its results, starts it over).'
+        'Force-complete this job? It stops dispatching and its allocation goes to 0%: a completed job cannot be reactivated (only a purge, which deletes its results, starts it over).'
       )
     )
       return;
@@ -416,51 +388,17 @@
         An allocation is a share of claims, not of worker time: a job whose tasks take longer holds
         more of the fleet than its share.
       </p>
+      <p class="text-sm" data-testid="job-allocation">
+        Allocation: <span class="tabular-nums font-medium">{stats.job.allocation}%</span> of claims
+        {#if stats.job.status === 'completed'}
+          (completed jobs hold 0%)
+        {:else if stats.job.allocation === 0}
+          (inactive: offered to nobody)
+        {/if}
+        · <a href="/admin/allocation">change it on the Allocation page</a>
+      </p>
       <div class="flex flex-wrap items-end gap-3">
-        <div>
-          <label
-            class="label"
-            for="alloc"
-            title="A share of claims, not of worker time: a job whose tasks take longer holds more of the fleet than its share (PLAN KL-88)."
-          >
-            Allocation % of claims
-          </label>
-          <input
-            id="alloc"
-            type="number"
-            min="0"
-            max="100"
-            class="input w-28"
-            bind:value={allocation}
-            on:input={() => (allocationFilled = true)}
-          />
-          <p class="mt-1 text-xs text-muted-foreground">
-            {#if stats.job.allocation === null}
-              Set: none
-            {:else if stats.job.status === 'active'}
-              Now: {stats.job.allocation}%
-            {:else if stats.job.status === 'completed'}
-              Was: {stats.job.allocation}% (completed)
-            {:else}
-              Set: {stats.job.allocation}% (offered to nobody while {stats.job.status})
-            {/if}
-          </p>
-        </div>
-        <!-- A completed job is final: the server refuses all three (409). -->
-        <button
-          class="btn-primary"
-          disabled={busy || gone || stats.job.status === 'completed'}
-          on:click={activate}
-        >
-          Activate
-        </button>
-        <button
-          class="btn-secondary"
-          disabled={busy || gone || stats.job.status === 'completed'}
-          on:click={() => run(() => api.deactivateJob(jobId), 'Job deactivated.')}
-        >
-          Deactivate
-        </button>
+        <!-- A completed job is final: the server refuses a second completion (409). -->
         <button
           class="btn-secondary"
           disabled={busy || gone || stats.job.status === 'completed'}
@@ -484,10 +422,9 @@
         <button class="btn-destructive" disabled={busy || gone} on:click={remove}>Delete job</button>
       </div>
       <p class="text-xs text-muted-foreground">
-        The active jobs may allocate at most 100% between them; activation is rejected if this
-        job's share would push the total over. A share of 0% is the same as inactive: the job
-        is offered to nobody until it is raised. To move shares between jobs in one step, use
-        <a href="/admin/allocation">Allocation</a>.
+        The allocation is the job's on/off switch: above 0% it is active, and at 0% it is inactive
+        and offered to nobody. The active jobs may allocate at most 100% between them, so shares are
+        set together on the Allocation page.
       </p>
 
       {#if rebuild}

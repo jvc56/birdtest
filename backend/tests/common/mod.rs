@@ -570,6 +570,16 @@ pub fn put_json(path: &str, headers: &[(&str, &str)], body: serde_json::Value) -
     builder.body(Body::from(body.to_string())).unwrap()
 }
 
+/// Sets one job's allocation, the only way a job is activated (above 0%) or
+/// deactivated (0%). Answers `{ "jobs": [the job] }`.
+pub fn allocate(job: Uuid, allocation: i32, headers: &[(&str, &str)]) -> Request<Body> {
+    put_json(
+        "/api/admin/jobs/allocations",
+        headers,
+        serde_json::json!({ "allocations": [{ "job_id": job, "allocation": allocation }] }),
+    )
+}
+
 /// Headers for an admin session: the session cookie plus the CSRF double-submit
 /// pair.
 pub fn admin_headers(cfg: &Config, user_id: Uuid) -> Vec<(String, String)> {

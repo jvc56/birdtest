@@ -36,6 +36,10 @@ impl Admin {
         send(&self.app, post_json(path, &self.refs(), body)).await
     }
 
+    async fn put(&self, path: &str, body: Value) -> (StatusCode, Value) {
+        send(&self.app, put_json(path, &self.refs(), body)).await
+    }
+
     async fn get(&self, path: &str) -> (StatusCode, Value) {
         send(&self.app, get_request(path, &self.headers)).await
     }
@@ -190,8 +194,8 @@ async fn a_player_config_round_trips_and_one_in_use_cannot_be_deleted() {
 // --- A-ADMIN-2, 3, 4: jobs ----------------------------------------------------
 
 /// A-ADMIN-2: creating a job of each type answers `{job}`, and the job is
-/// inactive, has no allocation and has nothing issued: no task row exists and
-/// no worker is offered it until an admin activates it. (Leave generation,
+/// inactive at 0% and has nothing issued: no task row exists and no worker is
+/// offered it until an admin gives it an allocation. (Leave generation,
 /// whose creation runs MAGPIE, is pinned in `magpie_routes.rs`.)
 #[tokio::test]
 async fn creating_each_job_type_answers_it_inactive_and_unallocated() {
@@ -230,7 +234,7 @@ async fn creating_each_job_type_answers_it_inactive_and_unallocated() {
         let job = &created["job"];
         assert_eq!(job["job_type"], job_type, "{created}");
         assert_eq!(job["status"], "inactive", "{created}");
-        assert_eq!(job["allocation"], Value::Null, "{created}");
+        assert_eq!(job["allocation"], json!(0), "{created}");
         assert_eq!(job["claims_issued"], json!(0), "{created}");
         assert_eq!(job["created_by"], json!(admin.id), "{created}");
         assert_eq!(
@@ -412,9 +416,10 @@ async fn job_creation_refuses_each_impossible_combination_and_says_which() {
     assert_eq!(count(&db, "SELECT COUNT(*) FROM player_configs").await, 3);
 }
 
-/// A-ADMIN-4: activate, deactivate and complete each answer with the job as it
-/// now stands, purge with how many tasks it reset, and delete with `204` -- and
-/// the public job page read afterwards agrees with each.
+/// A-ADMIN-4: an allocation change answers with the jobs it named as they now
+/// stand, complete with the job, purge with how many tasks it reset, and
+/// delete with `204` -- and the public job page read afterwards agrees with
+/// each.
 #[tokio::test]
 async fn each_lifecycle_action_answers_its_shape_and_a_read_agrees() {
     let db = TestDb::new().await;
@@ -427,9 +432,18 @@ async fn each_lifecycle_action_answers_its_shape_and_a_read_agrees() {
     };
     let action = |name: &str| format!("/api/admin/jobs/{job}/{name}");
 
-    let (status, body) = admin.post(&action("activate"), json!({ "allocation": 40 })).await;
+    let allocate = |allocation: i32| {
+        admin.put(
+            "/api/admin/jobs/allocations",
+            json!({ "allocations": [{ "job_id": job, "allocation": allocation }] }),
+        )
+    };
+    let (status, body) = allocate(40).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!((&body["id"], &body["status"], &body["allocation"]), (&json!(job), &json!("active"), &json!(40)));
+    let keys: Vec<&String> = body.as_object().unwrap().keys().collect();
+    assert_eq!(keys, ["jobs"], "{body}");
+    let row = &body["jobs"][0];
+    assert_eq!((&row["id"], &row["status"], &row["allocation"]), (&json!(job), &json!("active"), &json!(40)));
     let (_, page) = read().await;
     assert_eq!((&page["job"]["status"], &page["job"]["allocation"]), (&json!("active"), &json!(40)), "{page}");
 
@@ -447,11 +461,12 @@ async fn each_lifecycle_action_answers_its_shape_and_a_read_agrees() {
     .await;
     assert_eq!(accepted, json!({ "accepted": true }));
 
-    let (status, body) = admin.post(&action("deactivate"), json!({})).await;
+    let (status, body) = allocate(0).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!((&body["id"], &body["status"]), (&json!(job), &json!("inactive")));
+    let row = &body["jobs"][0];
+    assert_eq!((&row["id"], &row["status"], &row["allocation"]), (&json!(job), &json!("inactive"), &json!(0)));
     let (_, page) = read().await;
-    assert_eq!(page["job"]["status"], "inactive", "{page}");
+    assert_eq!((&page["job"]["status"], &page["job"]["allocation"]), (&json!("inactive"), &json!(0)), "{page}");
     assert_eq!((&page["tasks_total"], &page["tasks_completed"]), (&json!(1), &json!(1)), "{page}");
 
     let (status, body) = admin.post(&action("purge"), json!({})).await;
@@ -462,7 +477,7 @@ async fn each_lifecycle_action_answers_its_shape_and_a_read_agrees() {
 
     let (status, body) = admin.post(&action("complete"), json!({})).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!((&body["id"], &body["status"]), (&json!(job), &json!("completed")));
+    assert_eq!((&body["id"], &body["status"], &body["allocation"]), (&json!(job), &json!("completed"), &json!(0)));
     let (_, page) = read().await;
     assert_eq!(page["job"]["status"], "completed", "{page}");
 
@@ -806,15 +821,10 @@ async fn the_audit_log_pages_and_filters_by_job() {
     let files = files(&db).await;
     let first = api_games_job(&admin, &files).await;
     let second = api_games_job(&admin, &files).await;
-    for (path, body) in [
-        (format!("/api/admin/jobs/{first}/activate"), json!({ "allocation": 40 })),
-        (format!("/api/admin/jobs/{first}/deactivate"), json!({})),
-        (format!("/api/admin/jobs/{second}/activate"), json!({ "allocation": 40 })),
-        (format!("/api/admin/jobs/{first}/activate"), json!({ "allocation": 30 })),
-        (format!("/api/admin/jobs/{first}/deactivate"), json!({})),
-    ] {
-        let (status, body) = admin.post(&path, body).await;
-        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+    for (job, allocation) in [(&first, 40), (&first, 0), (&second, 40), (&first, 30), (&first, 0)] {
+        let rows = json!({ "allocations": [{ "job_id": job, "allocation": allocation }] });
+        let (status, body) = admin.put("/api/admin/jobs/allocations", rows).await;
+        assert_eq!(status, StatusCode::OK, "{job} at {allocation}%: {body}");
     }
     // A row about no job at all.
     let nuisance = db.user("nuisance", false).await;
@@ -840,8 +850,8 @@ async fn the_audit_log_pages_and_filters_by_job() {
     let ids: Vec<i64> = walked.iter().map(|row| row["id"].as_i64().unwrap()).collect();
     assert!(ids.windows(2).all(|pair| pair[0] > pair[1]), "every row once, in order: {ids:?}");
     assert_eq!(
-        (&walked[0]["old_status"], &walked[0]["new_status"]),
-        (&json!("active"), &json!("inactive")),
+        (&walked[0]["old_status"], &walked[0]["new_status"], &walked[0]["reason"]),
+        (&json!("active"), &json!("inactive"), &json!("30% -> 0%")),
         "{:?}",
         walked[0]
     );

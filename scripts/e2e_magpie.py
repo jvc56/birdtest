@@ -270,10 +270,12 @@ def ranked_moves(job_id_results: list) -> int:
 
 
 def deactivate_everything(ctx: Context) -> None:
-    page = ctx.get("/api/jobs?per_page=100", "list jobs")
-    for job in page["items"]:
-        if job["status"] == "active":
-            ctx.post(f"/api/admin/jobs/{job['id']}/deactivate", "deactivate job")
+    """Every active job to 0%, in one allocation change."""
+    page = ctx.get("/api/jobs?status=active&per_page=100", "list jobs")
+    rows = [{"job_id": job["id"], "allocation": 0} for job in page["items"]]
+    if rows:
+        ctx.client.json(ctx.client.put("/api/admin/jobs/allocations", {"allocations": rows}),
+                        "deactivate jobs")
 
 
 def create_and_activate(ctx: Context, data: dict, body: dict) -> str:
@@ -287,7 +289,7 @@ def create_and_activate(ctx: Context, data: dict, body: dict) -> str:
         headers=ctx.client._headers(), timeout=1800,
     )
     job_id = ctx.client.json(response, f"create {body['job_type']} job")["job"]["id"]
-    ctx.post(f"/api/admin/jobs/{job_id}/activate", "activate job", {"allocation": 100})
+    ctx.client.allocate(job_id, 100)
     log(f"created and activated {body['job_type']} job {job_id} "
         f"in {time.time() - started:.1f}s")
     return job_id

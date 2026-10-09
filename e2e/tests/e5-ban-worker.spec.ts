@@ -28,7 +28,7 @@ test.beforeAll(async () => {
 });
 
 test.afterAll(async () => {
-  await api.post(`/api/admin/jobs/${jobId}/deactivate`);
+  await api.allocate(jobId, 0);
   await api.dispose();
 });
 

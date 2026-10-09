@@ -39,6 +39,19 @@ export class AdminApi {
     return body<T>(response, `POST ${path}`);
   }
 
+  async put<T>(path: string, data: unknown): Promise<T> {
+    const response = await this.ctx.put(path, { data, headers: { 'x-csrf-token': this.csrf } });
+    return body<T>(response, `PUT ${path}`);
+  }
+
+  /**
+   * Sets one job's allocation: the only way a job is activated (above 0%) or
+   * deactivated (0%).
+   */
+  async allocate(jobId: string, allocation: number): Promise<void> {
+    await this.put('/api/admin/jobs/allocations', { allocations: [{ job_id: jobId, allocation }] });
+  }
+
   async delete(path: string): Promise<void> {
     const response = await this.ctx.delete(path, { headers: { 'x-csrf-token': this.csrf } });
     if (!response.ok()) throw new Error(`DELETE ${path}: ${response.status()} ${await response.text()}`);
@@ -137,7 +150,7 @@ export class AdminApi {
       layout_id: data.layout,
       ...config
     });
-    await this.post(`/api/admin/jobs/${created.job.id}/activate`, { allocation });
+    await this.allocate(created.job.id, allocation);
     return created.job.id;
   }
 }

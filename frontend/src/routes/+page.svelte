@@ -67,7 +67,7 @@
               <JobStatusBadge status={job.status} />
             </div>
             <p class="mt-1 text-sm text-muted-foreground">
-              {#if job.name}{jobTypeLabel(job.job_type)} · {/if}{job.allocation ?? 0}% allocation
+              {#if job.name}{jobTypeLabel(job.job_type)} · {/if}{job.allocation}% allocation
             </p>
           </a>
         {/each}

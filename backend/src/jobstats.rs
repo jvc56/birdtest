@@ -74,7 +74,7 @@ pub struct JobSummary {
     pub name: String,
     pub job_type: JobType,
     pub status: String,
-    pub allocation: Option<i32>,
+    pub allocation: i32,
     pub min_magpie_version: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub created_by: Option<String>,

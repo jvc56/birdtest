@@ -176,6 +176,20 @@ class Client:
             f"{self.api}{path}", json=body or {}, headers=self._headers(), timeout=120
         )
 
+    def put(self, path: str, body: dict) -> requests.Response:
+        return self.session.put(
+            f"{self.api}{path}", json=body, headers=self._headers(), timeout=120
+        )
+
+    def allocate(self, job_id: str, allocation: int) -> None:
+        """Sets one job's allocation: the only way a job is activated (above
+        0%) or deactivated (0%)."""
+        self.json(
+            self.put("/api/admin/jobs/allocations",
+                     {"allocations": [{"job_id": job_id, "allocation": allocation}]}),
+            f"set job {job_id} to {allocation}%",
+        )
+
     def json(self, response: requests.Response, what: str):
         if response.status_code >= 400:
             raise SeedError(f"{what}: {response.status_code} {response.text[:400]}")
@@ -486,10 +500,7 @@ def create_job(client: Client, args, data: dict, players: list,
     job_id = created["job"]["id"]
     log(f"created {job_type} job {job_id}")
 
-    client.json(
-        client.post(f"/api/admin/jobs/{job_id}/activate", {"allocation": allocation}),
-        "activate job",
-    )
+    client.allocate(job_id, allocation)
     log(f"activated it at {allocation}% allocation")
     return job_id
 
@@ -633,7 +644,8 @@ def create_dev_jobs(client: Client, args, data: dict) -> None:
     share = (100 - taken) // len(new) if new else 0
     if new and share < 1:
         raise SeedError(f"the active jobs already take {taken}% of the fleet, leaving nothing "
-                        "for a new one; deactivate some, or start with --reset-db")
+                        "for a new one; set some to 0% on the Allocation page, or start with "
+                        "--reset-db")
     for job in wanted:
         if job not in new:
             log(f"{dev_job_name(job)} is already active ({running[job]}); reusing it")

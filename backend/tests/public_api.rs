@@ -268,7 +268,7 @@ async fn the_job_list_filters_by_status() {
     let admin = db.user("root", true).await;
     let active = db.bare_job("games", admin).await;
     let inactive = db.bare_job("games", admin).await;
-    sqlx::query("UPDATE jobs SET status = 'inactive' WHERE id = $1")
+    sqlx::query("UPDATE jobs SET status = 'inactive', allocation = 0 WHERE id = $1")
         .bind(inactive)
         .execute(&db.pool)
         .await
@@ -1593,7 +1593,7 @@ async fn live_pushes_are_spaced_by_the_stats_interval_but_admin_changes_are_not(
     // Mid-interval, a deactivation is pushed within a second or two.
     let refs: Vec<(&str, &str)> = headers.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
     let (status, deactivated) =
-        send(&app, post_json(&format!("/api/admin/jobs/{job}/deactivate"), &refs, serde_json::json!({}))).await;
+        send(&app, allocate(job, 0, &refs)).await;
     assert_eq!(status, StatusCode::OK, "{deactivated}");
     let event = tokio::time::timeout(std::time::Duration::from_secs(3), async {
         loop {
@@ -1818,7 +1818,7 @@ async fn a_pairs_position_without_a_partner_turn_says_so() {
     }
 
     // Out of the way, so the next claim is the games job's.
-    sqlx::query("UPDATE jobs SET status = 'inactive' WHERE id = $1")
+    sqlx::query("UPDATE jobs SET status = 'inactive', allocation = 0 WHERE id = $1")
         .bind(job)
         .execute(&db.pool)
         .await

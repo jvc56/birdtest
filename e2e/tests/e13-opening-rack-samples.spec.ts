@@ -39,7 +39,7 @@ test.beforeAll(async ({ playwright }) => {
 test.afterAll(async () => {
   // The fixture's rack space is small enough that the job may have finished.
   const stats = await api.get<{ job: { status: string } }>(`/api/jobs/${jobId}`);
-  if (stats.job.status === 'active') await api.post(`/api/admin/jobs/${jobId}/deactivate`);
+  if (stats.job.status === 'active') await api.allocate(jobId, 0);
   await api.dispose();
 });
 

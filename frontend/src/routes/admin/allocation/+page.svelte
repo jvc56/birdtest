@@ -36,7 +36,7 @@
       const [active, inactive] = await Promise.all([every('active'), every('inactive')]);
       jobs = [...active, ...inactive];
       values = Object.fromEntries(
-        jobs.map((job) => [job.id, job.status === 'active' ? (job.allocation ?? 0) : 0])
+        jobs.map((job) => [job.id, job.allocation])
       );
       loaded = true;
     } catch (e) {
@@ -46,7 +46,7 @@
 
   onMount(load);
 
-  const current = (job: JobListItem) => (job.status === 'active' ? (job.allocation ?? 0) : 0);
+  const current = (job: JobListItem) => job.allocation;
   $: total = jobs.reduce((sum, job) => sum + (Number(values[job.id]) || 0), 0);
   $: invalid = jobs.some((job) => {
     const v = values[job.id];
@@ -93,8 +93,9 @@
     <h1 class="text-2xl font-semibold">Allocation</h1>
     <p class="text-sm text-muted-foreground">
       Each job's share of the claims workers make. The active jobs may allocate at most 100%
-      between them; set them all here and save once. Above 0% a job is active; at 0% it is
-      inactive. Completed jobs cannot run again and are not listed.
+      between them; set them all here and save once. This is the only place a job is switched on
+      or off: above 0% it is active, and at 0% it is inactive. Completed jobs cannot run again and
+      are not listed.
     </p>
   </div>
 

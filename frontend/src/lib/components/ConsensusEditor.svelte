@@ -63,9 +63,7 @@
       const result = await api.updateConsensus(jobId, fields);
       const racks = `${result.unsettled_racks.toLocaleString()} rack${result.unsettled_racks === 1 ? '' : 's'} unsettled`;
       notice = result.reopened
-        ? result.job.status === 'active'
-          ? `Saved: ${racks}, so the job reopened.`
-          : `Saved: ${racks}, so the job reopened, inactive — ${result.reopened_inactive_reason}.`
+        ? `Saved: ${racks}, so the job reopened, inactive at 0% — give it an allocation on the Allocation page to run it.`
         : result.job.status === 'completed'
           ? `Saved: the job is completed, with ${racks}.`
           : `Saved: ${racks}.`;
@@ -114,9 +112,8 @@
       {#if problem}<p class="field-error">{problem}</p>{/if}
       <p class="text-xs text-muted-foreground">
         Saving restates every rack under the new settings. Raising them unsettles racks, which a
-        completed job reopens to analyse again (inactive, if the other active jobs leave no room for
-        its allocation); lowering them settles racks, and an active job with none left unsettled
-        completes.
+        completed job reopens to analyse again (inactive at 0%, until you give it an allocation);
+        lowering them settles racks, and an active job with none left unsettled completes.
       </p>
       <button class="btn-primary" type="submit" disabled={disabled || busy || !!problem || unchanged}>
         Save

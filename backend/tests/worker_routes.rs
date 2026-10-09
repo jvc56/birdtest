@@ -270,7 +270,7 @@ async fn idle_and_each_shutdown_reason_are_distinct_answers() {
     first_claim(&app).await;
     let (status, body) = claim(&app, &[], claim_body("1.0.0", &[])).await;
     assert_eq!((status, &body), (StatusCode::NO_CONTENT, &Value::Null), "idle is not a shutdown");
-    sqlx::query("UPDATE jobs SET status = 'inactive' WHERE id = $1")
+    sqlx::query("UPDATE jobs SET status = 'inactive', allocation = 0 WHERE id = $1")
         .bind(capped)
         .execute(&db.pool)
         .await
@@ -317,7 +317,7 @@ async fn idle_and_each_shutdown_reason_are_distinct_answers() {
     assert_eq!(shutdown["download_url"], download, "{body}");
 
     // Below every job's own floor, with no data problem.
-    sqlx::query("UPDATE jobs SET status = 'inactive' WHERE id = $1")
+    sqlx::query("UPDATE jobs SET status = 'inactive', allocation = 0 WHERE id = $1")
         .bind(job)
         .execute(&db.pool)
         .await

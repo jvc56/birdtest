@@ -392,16 +392,19 @@ CREATE TABLE jobs (
     -- a job created without one (through the API; the form asks for it).
     name       TEXT NOT NULL DEFAULT '' CHECK (char_length(name) <= 100),
     job_type   job_type NOT NULL,
-    -- NULL until the job is first activated; set by the admin at activation
-    -- time. Every active job's share of the fleet: the scheduler hands each
-    -- claim to the active job furthest behind
+    -- Every active job's share of the fleet: the scheduler hands each claim
+    -- to the active job furthest behind
     -- `(claims_issued - claims_baseline) / allocation`, and the active jobs
-    -- may allocate at most 100% between them. There is
-    -- no priority: a job that should get nothing for now is set to 0%, which
-    -- is exactly what `inactive` means, and a job that should get everything
-    -- is the only one above 0%.
-    allocation INT CHECK (allocation BETWEEN 0 AND 100),
-    -- Jobs start inactive; admin activates with an allocation percentage.
+    -- may allocate at most 100% between them. There is no priority: a job
+    -- that should get nothing for now is at 0%, and a job that should get
+    -- everything is the only one above 0%.
+    allocation INT NOT NULL DEFAULT 0 CHECK (allocation BETWEEN 0 AND 100),
+    -- Jobs start inactive at 0%. The allocation is the only switch: setting
+    -- one above 0% activates a job and setting it to 0% deactivates it, so
+    -- `inactive` and 0% are one state rather than two that could disagree --
+    -- an active job at 0% was on offer to nobody while every page called it
+    -- running. A completed job is not active, so it holds 0% too: nothing
+    -- of its old share is kept to come back to (see `jobs_allocation_is_status`).
     status     job_status NOT NULL DEFAULT 'inactive',
     -- SET NULL if the creating admin's account is deleted.
     created_by           UUID REFERENCES users(id) ON DELETE SET NULL,
@@ -447,7 +450,8 @@ CREATE TABLE jobs (
     claims_issued   BIGINT NOT NULL DEFAULT 0 CHECK (claims_issued >= 0),
     -- Where this job's share is measured *from*. The scheduler orders on
     -- `(claims_issued - claims_baseline) / allocation`, and the baseline is
-    -- reset -- on activation, on an allocation change, on a purge -- so that
+    -- reset -- on activation and on an allocation change (a purge leaves the
+    -- job inactive, to be reset when it is activated again) -- so that
     -- the job's ratio equals the lowest ratio among the other jobs being
     -- served (see `last_claimed_at` below): it joins at parity and takes its
     -- share from then on.
@@ -483,6 +487,9 @@ CREATE TABLE jobs (
     test_decided_lower  DOUBLE PRECISION,
     test_decided_upper  DOUBLE PRECISION,
     test_decided_units  BIGINT,
+    -- The invariant above, for every status: active exactly when above 0%,
+    -- which holds an inactive or completed job at 0%.
+    CONSTRAINT jobs_allocation_is_status CHECK ((status = 'active') = (allocation > 0)),
     CONSTRAINT jobs_test_decided_together CHECK (
         (test_decided_status IS NULL) = (test_decided_lower IS NULL)
         AND (test_decided_status IS NULL) = (test_decided_upper IS NULL)
