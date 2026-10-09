@@ -443,6 +443,30 @@ export function playerRows(players: PlayerSettings[], unused = NONE): SettingRow
   return rowsFor(players, false, unused);
 }
 
+/** A player settings table's rows, "differences first". */
+export interface SettingBlocks {
+  /** Every setting the players differ in, key or not; empty for one player. */
+  differences: SettingRow[];
+  /** The rest of the rows asked for: the key rows, or with `all` every one. */
+  shared: SettingRow[];
+}
+
+/**
+ * The rows of a player settings table, split for reading differences first:
+ * what the players differ in, from every setting -- a difference is what a
+ * reader of two configs is looking for, and a non-key one hidden behind
+ * "All settings" was missed -- then what they share, the key rows unless
+ * `all`. One player shares everything with itself.
+ */
+export function settingBlocks(players: PlayerSettings[], all: boolean, unused = NONE): SettingBlocks {
+  const listed = all ? playerRows(players, unused) : keySettings(players, unused);
+  if (players.length < 2) return { differences: [], shared: listed };
+  return {
+    differences: playerRows(players, unused).filter((r) => r.differs),
+    shared: listed.filter((r) => !r.differs)
+  };
+}
+
 /** The players' searches in one line, for beside a job's lexicon and variant. */
 export function playersLine(c: JobConfig): string {
   const unused = unusedPlayerSettings(c);

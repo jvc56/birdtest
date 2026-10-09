@@ -164,16 +164,23 @@ Open "dev game pairs (first divergences saved)".
   Recorder "yes (first divergences)", Sim Cutoff, Minimum Pairs (50,000),
   Pairs Per Task and Oldest MAGPIE, and no download link.
 - [ ] **Expect** after it a **Player settings** card: the players side by side,
-  headed "Player 1" and "Player 2" with each name linking to its config's
-  page, and nothing else under it: Lexicon, Leaves, Sorted By, Move Recorder,
-  Moves Generated, Plies, Uses Inference "—", Uses Preendgame "no" and Uses
-  Endgame "no", the rows they differ in (Sorted By) bold.
+  headed "Player 1" and "Player 2", each with its colour dot (green, purple:
+  the colours their moves are drawn in under Saved positions) and its name
+  linking to its config's page. First a **Differences (N)** block, tinted
+  amber with a bar down its left, of every setting they differ in (Sorted
+  By); then a **Show N shared settings** link and nothing else under it.
+  **Do** press it. **Expect** the key rows they share under the block --
+  Lexicon, Leaves, Move Recorder, Moves Generated, Plies, Uses Inference "—",
+  Uses Preendgame "no" and Uses Endgame "no" -- and the link now reading
+  **Hide shared settings**. (Two players alike, or one, show no block and
+  every row open.)
 - [ ] **Do** press **All settings** on the Player settings card. **Expect**
-  every setting after the key rows (no simulation rows: neither simulates),
-  Moves Recorded, Plies Recorded "—" (both are static) and Movegen Margin "—"
-  (neither recorder keeps moves by equity). The button now reads **Key
-  settings only** and puts the card back. On a job that records no positions
-  ("tester no test", A-7), Moves Recorded is in grey: it never reads it.
+  the shared rows open, with every setting after the key rows (no simulation
+  rows: neither simulates), Moves Recorded, Plies Recorded "—" (both are
+  static) and Movegen Margin "—" (neither recorder keeps moves by equity). The
+  button now reads **Key settings only** and puts the card back. On a job that
+  records no positions ("tester no test", A-7), Moves Recorded is in grey: it
+  never reads it.
 - [ ] At phone width, **expect** the tables to wrap (or scroll inside the
   card), never the page.
 - [ ] **Expect** a Contributors table: `dev-contributor-1`,

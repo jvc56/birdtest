@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { jobSettings, keySettings, playerRows, playersLine, playerSummary, show, unusedPlayerSettings, type JobConfig, type PlayerSettings } from './jobSettings';
+import { jobSettings, keySettings, playerRows, playersLine, playerSummary, settingBlocks, show, unusedPlayerSettings, type JobConfig, type PlayerSettings } from './jobSettings';
 
 const staticPlayer: PlayerSettings = {
   role: 'player 1', id: 'p1', name: 'static-NWL23', lexicon: 'NWL23', leaves: 'NWL23', win_pct: null,
@@ -247,6 +247,32 @@ describe('F-SET-1 job settings', () => {
     const rows = playerRows(config.players);
     expect(byLabel(rows, 'Plies')).toEqual({ id: 'num_plies', label: 'Plies', values: ['0', '4'], differs: true });
     expect(byLabel(rows, 'Lexicon').differs).toBe(false);
+  });
+
+  it('reads differences first: every setting the players differ in, then the rest asked for', () => {
+    // A difference outside the key rows (Stopping %, Time Limit) is one too:
+    // folded behind "All settings" it was missed.
+    const { differences, shared } = settingBlocks(config.players, false, unusedPlayerSettings(config));
+    expect(labels(differences)).toEqual(labels(playerRows(config.players, unusedPlayerSettings(config)).filter((r) => r.differs)));
+    expect(labels(differences)).toEqual(expect.arrayContaining(['Plies', 'Uses Inference', 'Stopping %']));
+    expect(differences.every((r) => r.differs)).toBe(true);
+    // Shared: the key rows the players agree on, in order, and nothing else.
+    expect(labels(shared)).toEqual(['Lexicon', 'Leaves', 'Sorted By', 'Move Recorder', 'Moves Generated', 'Uses Preendgame', 'Uses Endgame']);
+    // Every setting asked for: the shared rows grow, the differences do not.
+    const every = settingBlocks(config.players, true, unusedPlayerSettings(config));
+    expect(every.differences).toEqual(differences);
+    expect(labels(every.shared)).toEqual(expect.arrayContaining(['Movegen Margin', 'Wordmap']));
+    expect(every.shared.some((r) => r.differs)).toBe(false);
+    // A setting the job never reads is never a difference.
+    const margins = settingBlocks([staticPlayer, { ...staticPlayer, movegen_margin: 9 }], true, unusedPlayerSettings(config));
+    expect(labels(margins.differences)).toEqual([]);
+    expect(byLabel(margins.shared, 'Movegen Margin').unused).toBe(true);
+  });
+
+  it('shares everything with one player, or two alike', () => {
+    expect(settingBlocks([staticPlayer], false)).toEqual({ differences: [], shared: keySettings([staticPlayer]) });
+    expect(settingBlocks([staticPlayer], true).shared).toEqual(playerRows([staticPlayer]));
+    expect(settingBlocks([staticPlayer, { ...staticPlayer, role: 'player 2' }], false).differences).toEqual([]);
   });
 
   it('shows how a player solves the end of the game, where the job reaches it', () => {

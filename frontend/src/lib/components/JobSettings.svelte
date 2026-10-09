@@ -3,9 +3,10 @@
    * What a job runs with, as two cards: the job's own settings and its
    * type's, every one of them, in one ordered list, then its players' -- one
    * column for a single player (an opening-rack or leave job's), two side by
-   * side for a games or pairs job, those they differ in bold, those the job
-   * never reads muted. The players' card shows their key rows and has an
-   * "All settings" toggle for the rest. Public, like the rest of the page.
+   * side for a games or pairs job, what they differ in first and what they
+   * share folded under it, those the job never reads muted. The players'
+   * card shows their key rows and has an "All settings" toggle for the rest.
+   * Public, like the rest of the page.
    */
   import { jobSettings, unusedPlayerSettings, type JobConfig } from '$lib/jobSettings';
   import PlayerSettingsTable from './PlayerSettingsTable.svelte';
