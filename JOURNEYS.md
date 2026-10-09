@@ -211,7 +211,7 @@ On the same job:
   identically." The figures count games, not pairs.
 - [ ] **Expect** after it a **Significance Test** card with a "running" badge and
   one sentence: "static-equity scores x% per game (95% interval a% to b%)." --
-  nothing in Elo anywhere on the card. Then "The test is not acted on until 50,000 pairs
+  no Elo or rating figure anywhere on the card. Then "The test is not acted on until 50,000 pairs
   are complete." and a bar: the interval shaded on a scale of player 1's
   score, a dashed line at 50% and a mark at the score, labelled "even at
   50%, static-equity's score x%". No W/L/D line of its own.

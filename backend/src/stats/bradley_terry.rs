@@ -16,6 +16,38 @@
 //! * Adding or removing a config from the pool is a re-fit, not a surgical
 //!   undo of its historical updates, so it is correct by construction.
 //!
+//! WESPA's Glicko, the obvious system to borrow for a word game, was weighed
+//! and rejected for more than the drift it tracks:
+//!
+//! * **Order matters.** Glicko updates one rating period at a time, so the
+//!   same results in another order give other ratings. Results arrive in
+//!   whatever order volunteers finish them, and a purge or a rerun would
+//!   reshuffle every rating. This fit uses all the evidence at once.
+//! * **The uncertainty never shrinks.** WESPA floors RD at 50 to 75 by band to
+//!   keep a human's rating responsive. A bot with 100,000 games would keep
+//!   moving as if it were uncertain by ±50, where this fit's standard error
+//!   shrinks with the evidence.
+//! * **Periods would be arbitrary.** There are no tournaments. A period of a
+//!   day, a batch or a job is a choice, and each choice gives other numbers.
+//! * **The calibration is for humans.** Newcomer seeding (five virtual games
+//!   at 1500), an initial RD of 300 and the RD bands are fitted to WESPA's
+//!   players; bot ratings would land in bands that depend on where the anchor
+//!   sits.
+//! * **Game pairs lose their advantage.** Glicko updates per game, and a pair
+//!   fed to it as two games throws away the variance reduction pairs exist
+//!   for. Here a pair is one observation scored in quarters (`crate::ratings`).
+//!
+//! What is kept of WESPA is its scale. A gap of Δ points predicts a score of
+//! `1 / (1 + e^(−Δ/250))`, with [`POINTS_PER_LOGIT`] WESPA's k, so a gap
+//! reads as the win expectation the same gap gives two established WESPA
+//! players (to within a few percent, from Glicko's g of 0.95 to 0.99 between
+//! them): 100 points is 59.9%, where on Elo's 400/ln 10 (about 174 points per
+//! logit) it was 64.0%. Only gaps compare. Bot-against-bot results say nothing
+//! about strength against people, so the absolute level is wherever the
+//! pool's anchor is pinned (2000 by default) and means no more than that.
+//! The audits' figures quoted for the constants below are converted to this
+//! scale; the tests say how theirs are read.
+//!
 //! What this model *cannot* represent is non-transitivity: if A beats B, B
 //! beats C and C beats A, no assignment of one number per player reproduces
 //! that, and no scalar rating system can. The fit returns the best scalar
@@ -23,8 +55,11 @@
 //! honest way to surface a rock-paper-scissors triangle rather than letting it
 //! quietly distort the numbers.
 
-/// Elo points per unit of natural-log strength.
-const ELO_PER_LN: f64 = 400.0 / std::f64::consts::LN_10;
+/// Rating points per unit of natural-log strength: WESPA's k, so a rating gap
+/// predicts the score it would between two established WESPA players (see
+/// the module doc). Every rating, standard error and convergence threshold in
+/// points goes through it; the priors are in log-strength units and do not.
+pub const POINTS_PER_LOGIT: f64 = 250.0;
 
 /// Virtual drawn games a config with no games plays against the pool's centre;
 /// fewer as it plays more (`PRIOR_FADE_GAMES`).
@@ -42,7 +77,7 @@ const ELO_PER_LN: f64 = 400.0 / std::f64::consts::LN_10;
 /// objective stays strictly concave: one answer, continuous in the scores, and
 /// conceding a point lowers a config's rating against its opponent's (its own
 /// moves the same way too, all but about once in 500 fuzzed cases, and then by
-/// under an Elo while its opponent's moves further the right way). The pull is toward the pool's
+/// under a point and a half while its opponent's moves further the right way). The pull is toward the pool's
 /// centre, not the anchor, so a field or group far from the anchor is not
 /// dragged back to it; and it joins configs only through the centre, never to
 /// each other, so configs that everyone swept tie no two others together.
@@ -50,21 +85,21 @@ const ELO_PER_LN: f64 = 400.0 / std::f64::consts::LN_10;
 /// Every prior this fit had before pulled some shape of pool where the
 /// evidence was fine (KL-74, and the thirty-second audit's adversarial checks):
 /// two draws per config against the anchor, a field or thinly linked group far
-/// from it (a 30-member group 200 Elo low); two per config spread over its
+/// from it (a 30-member group 290 points low); two per config spread over its
 /// opponents, a config over a gauntlet of lightly played ones; draws only where
-/// the maximum likelihood diverges, a jump of 200 Elo when a newcomer conceded
+/// the maximum likelihood diverges, a jump of 290 points when a newcomer conceded
 /// a quarter point; and Firth's penalty, which is not concave, two answers for
 /// a config between far-apart opponents.
 const PRIOR_GAMES: f64 = 2.0;
 
-/// How much wider the virtual games' logistic is than real games': 2 is about
-/// 350 Elo, against 174. A config's pull toward the centre levels off, however
+/// How much wider the virtual games' logistic is than real games': 2 is 500
+/// points per logit, against 250. A config's pull toward the centre levels off, however
 /// far it is, at its virtual games over `2 · PRIOR_SCALE` of a game, and along
 /// a thin chain of configs — a ladder, each played only against the next —
 /// those pulls add up; at the real games' scale and unfaded they compressed a
-/// 12-rung ladder 100 Elo apart by some 190 Elo at its top, where at this scale
-/// it was some 60 before the fade and some 40 after (the audit's Monte Carlo,
-/// against the old prior's 390). Wider still shrinks a barely played config
+/// 12-rung ladder 144 points apart by some 270 at its top, where at this scale
+/// it was some 85 before the fade and some 60 after (the audit's Monte Carlo,
+/// against the old prior's 560). Wider still shrinks a barely played config
 /// less, and it swings more: this is where the two costs meet.
 const PRIOR_SCALE: f64 = 2.0;
 
@@ -73,8 +108,8 @@ const PRIOR_SCALE: f64 = 2.0;
 /// for the barely played; left whole on the well played, its pulls — levelling
 /// off at a constant each, however far a config is from the centre — added up
 /// across any group far from the centre and joined to it thinly: twelve strong
-/// configs at +1,000 over one 300-pair link, 345 Elo low, nearly four errors
-/// (the audit's adversarial check). Faded at 200, that group is some 70 to 100
+/// configs at +1,440 over one 300-pair link, 500 points low, nearly four errors
+/// (the audit's adversarial check). Faded at 200, that group is some 100 to 145
 /// low, about half an error, and a newcomer's first few pairs are shrunk almost
 /// as before. It depends only on the game counts, so the objective stays concave.
 const PRIOR_FADE_GAMES: f64 = 200.0;
@@ -83,7 +118,7 @@ const PRIOR_FADE_GAMES: f64 = 200.0;
 /// virtual games are all that hold a block that swept, or was swept by,
 /// everything outside it — an anchor that never took a point — to the rest of
 /// the pool; at a twentieth of a game each, such a block floated thousands of
-/// Elo on unrelated configs' pulls, with every error infinite (the audit's
+/// points on unrelated configs' pulls, with every error infinite (the audit's
 /// adversarial check). A fifth holds it, at the price of a stronger pull on a
 /// strong tier joined thinly (KL-79).
 const PRIOR_FLOOR_GAMES: f64 = 0.2;
@@ -93,19 +128,19 @@ const PRIOR_FLOOR_GAMES: f64 = 0.2;
 /// the limit only bounds a pathology.
 const MAX_ITERATIONS: usize = 1_000;
 /// Largest full Newton step in any log-strength (natural-log units; 1e-6 is
-/// about 2e-4 Elo) below which the fit has converged. Measured on the full
+/// 2.5e-4 points) below which the fit has converged. Measured on the full
 /// step, not the accepted one: rounding in an objective of hundreds of
 /// thousands (head-to-heads of a million pairs) can make a line search accept
 /// a tiny fraction of a step that is not tiny.
 const CONVERGENCE: f64 = 1e-6;
-/// Within this radius (natural-log units, about 87 Elo) the full Newton step is
+/// Within this radius (natural-log units, 125 points) the full Newton step is
 /// taken without the line search: that close, rounding in the objective rather
 /// than its curvature is what would reject it, and a fit at the answer then
 /// crept at 1/512 of a step until it ran out of iterations, marked unconverged.
 const FULL_STEP_RADIUS: f64 = 0.5;
-/// The most any config's log-strength may move in one step: 8 is about 1,400
-/// Elo. The line search asks only that the whole objective improve, so an
-/// unbounded step could throw one weakly held config thousands of Elo away
+/// The most any config's log-strength may move in one step: 8 is 2,000
+/// points. The line search asks only that the whole objective improve, so an
+/// unbounded step could throw one weakly held config thousands of points away
 /// while the others' gains paid for it, saturating every head-to-head it has
 /// and leaving the curvature singular (thirty-second audit). Capped, a long
 /// chain of clean sweeps still converges, in more steps.
@@ -171,7 +206,7 @@ impl Matrix {
 #[derive(Debug, Clone, Copy)]
 pub struct Rated {
     pub rating: f64,
-    /// Approximate standard error in Elo, from the inverse of the full Fisher
+    /// Approximate standard error in points, from the inverse of the full Fisher
     /// information over the anchor's component, so a config's error includes
     /// the uncertainty of every link between it and the anchor, widened by the
     /// prior's pull on it (see `standard_errors`). Two approximations remain:
@@ -234,13 +269,13 @@ impl Fit {
                 if cell.games <= 0.0 {
                     continue;
                 }
-                let elo_diff = self.ratings[i].rating - self.ratings[j].rating;
+                let gap = self.ratings[i].rating - self.ratings[j].rating;
                 out.push(Residual {
                     i,
                     j,
                     games: cell.games,
                     actual: cell.score / cell.games,
-                    predicted: 1.0 / (1.0 + 10f64.powf(-elo_diff / 400.0)),
+                    predicted: 1.0 / (1.0 + (-gap / POINTS_PER_LOGIT).exp()),
                 });
             }
         }
@@ -427,9 +462,9 @@ pub fn fit(matrix: &Matrix, anchor: usize, anchor_rating: f64) -> Fit {
         }
         // No step along a Newton direction gains anything: the objective is
         // flat to rounding here. Converged only if the full step was already
-        // negligible, measured in Elo rather than in the shrunken step.
+        // negligible, measured in points rather than in the shrunken step.
         if !accepted {
-            converged = largest * ELO_PER_LN < 1e-3;
+            converged = largest * POINTS_PER_LOGIT < 1e-3;
             break;
         }
     }
@@ -453,7 +488,7 @@ pub fn fit(matrix: &Matrix, anchor: usize, anchor_rating: f64) -> Fit {
         .map(|i| {
             // The anchor's rating is the input, not a round trip through its
             // strength: the pool's fixed point must be stored as stated.
-            let rating = if i == anchor { anchor_rating } else { anchor_rating + theta[i] * ELO_PER_LN };
+            let rating = if i == anchor { anchor_rating } else { anchor_rating + theta[i] * POINTS_PER_LOGIT };
             Rated { rating, stderr: stderr[i], games: matrix.games_played(i), component: component[i] }
         })
         .collect();
@@ -497,7 +532,7 @@ fn damped_newton_step(curvature: &[f64], m: usize, gradient: &[f64]) -> Option<V
     None
 }
 
-/// Standard errors in Elo from the inverse of the Fisher information over the
+/// Standard errors in points from the inverse of the Fisher information over the
 /// anchor's component — the full matrix, so a group's error includes the
 /// uncertainty of every link between it and the anchor — widened by how far
 /// the prior holds each config from where its games alone would put it.
@@ -505,8 +540,8 @@ fn damped_newton_step(curvature: &[f64], m: usize, gradient: &[f64]) -> Option<V
 /// That shift is one Newton step on the games alone from the answer:
 /// `I⁻¹ · ∇prior`, since at the answer the games' gradient is the prior's,
 /// negated. It is what the prior's pull costs, and the pulls add up across a
-/// group joined to the rest thinly: two tiers of lightly played configs 600 Elo
-/// apart and joined by one small job put the upper one nearly two errors low
+/// group joined to the rest thinly: two tiers of lightly played configs 860
+/// points apart and joined by one small job put the upper one nearly two errors low
 /// with the games' error alone (the audit's adversarial check), and no weighting
 /// of the prior removes that without moving it to another shape. Added to the
 /// variance, `PULL_IN_ERROR` times over, it makes the error say when a number
@@ -558,7 +593,7 @@ fn standard_errors(
         }
     }
     // Singular only if the information underflows (a mismatch of thousands of
-    // Elo); the errors then stay infinite, which is what they are.
+    // points); the errors then stay infinite, which is what they are.
     if let Some(factor) = cholesky(&information, m) {
         let pull: Vec<f64> = members.iter().map(|&i| prior_gradient[i]).collect();
         let shift = cholesky_solve(&factor, m, &pull);
@@ -568,7 +603,7 @@ fn standard_errors(
             let pull = PULL_IN_ERROR * shift[k];
             let variance = cholesky_solve(&factor, m, &unit)[k] + pull * pull;
             if variance > 0.0 && variance.is_finite() {
-                stderr[i] = ELO_PER_LN * variance.sqrt();
+                stderr[i] = POINTS_PER_LOGIT * variance.sqrt();
             }
         }
     }
@@ -578,8 +613,9 @@ fn standard_errors(
 /// How many times the prior's one-step shift goes into a config's error. One
 /// Newton step underestimates a pull that has saturated, the more so the
 /// further apart a thinly joined group is: at 1, tiers of lightly played configs
-/// 800 Elo apart had their 95% interval cover the truth 64 to 86% of the time;
-/// at 1.5, 95 to 100%, at 600 Elo as at 800 (the audit's adversarial check).
+/// 1,150 points apart had their 95% interval cover the truth 64 to 86% of the
+/// time; at 1.5, 95 to 100%, at 860 points as at 1,150 (the audit's
+/// adversarial check).
 /// Most errors grow a few percent; a thinly held config's, or a newcomer's
 /// clean sweep's, by a fifth to a third.
 const PULL_IN_ERROR: f64 = 1.5;
@@ -636,6 +672,10 @@ fn cholesky_solve(l: &[f64], m: usize, b: &[f64]) -> Vec<f64> {
     y
 }
 
+/// The setups below are in rating points on today's scale. The failures they
+/// quote from the audits (KL-74, KL-79, the thirty-second audit) are in Elo,
+/// the scale of the time -- 400/ln 10, about 174 points per logit -- on which
+/// each setup's gaps were 1.44 times as wide in logits as they are now.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -670,15 +710,31 @@ mod tests {
         assert!(fit_lopsided.ratings[1].rating > ANCHOR + 100.0);
     }
 
-    /// A 75% score rate is about 191 Elo in the Bradley-Terry model, the same
-    /// number the Elo formula gives, since they are the same model.
+    /// The scale is WESPA's: a 75% score rate is odds of 3, a gap of
+    /// 250·ln 3 ≈ 274.65 points, where Elo's 400·log10 3 put it at 191.
     #[test]
-    fn the_scale_matches_the_elo_formula() {
+    fn a_75_percent_score_is_250_ln_3_points() {
         let mut m = matrix(2);
         m.add(0, 1, 100_000.0, 25_000.0);
         let fit = fit(&m, 0, ANCHOR);
-        let expected = 400.0 * (0.75f64 / 0.25).log10();
-        assert!((fit.ratings[1].rating - ANCHOR - expected).abs() < 1.0);
+        let expected = 250.0 * 3f64.ln();
+        assert!((expected - 274.653).abs() < 1e-3);
+        assert!((fit.ratings[1].rating - ANCHOR - expected).abs() < 1.0, "{:?}", fit.ratings[1]);
+    }
+
+    /// And the residuals predict with the same constant: 100 points is 59.9%,
+    /// the win expectation of a 100-point gap between established WESPA
+    /// players.
+    #[test]
+    fn the_residuals_predict_on_the_same_scale() {
+        let mut m = matrix(2);
+        m.add(0, 1, 100.0, 50.0);
+        let mut fit = fit(&m, 0, ANCHOR);
+        fit.ratings[0].rating = ANCHOR + 100.0;
+        fit.ratings[1].rating = ANCHOR;
+        let predicted = fit.residuals(&m)[0].predicted;
+        assert!((predicted - 1.0 / (1.0 + (-0.4f64).exp())).abs() < 1e-12, "{predicted}");
+        assert!((predicted - 0.599).abs() < 5e-4, "{predicted}");
     }
 
     /// The fit does not depend on the order results were added, which is the
@@ -754,22 +810,22 @@ mod tests {
         assert!(many.ratings[1].stderr < few.ratings[1].stderr);
 
         // And by exactly as much as the analytic standard error says:
-        // (400 / ln 10) / sqrt(n·p·(1-p)), with p = 1/2 for an even
-        // head-to-head. Computed outside this code: 49.134811709710… at 50
+        // 250 / sqrt(n·p·(1-p)), with p = 1/2 for an even head-to-head.
+        // Computed outside this code: 70.710678118654752… (250/√12.5) at 50
         // games and a tenth of that at 5,000.
         let close = |got: f64, want: f64| {
             assert!((got - want).abs() < want * 1e-6, "{got} != {want}");
         };
-        close(few.ratings[1].stderr, 49.134_811_709_710_03);
-        close(many.ratings[1].stderr, 4.913_481_170_971_004);
+        close(few.ratings[1].stderr, 70.710_678_118_654_75);
+        close(many.ratings[1].stderr, 7.071_067_811_865_475);
 
         // Away from even the p(1-p) term matters: 75% over 100,000 games is
-        // 1.268655383138… Elo. The prior's virtual games move p by about
-        // 1e-6, so this is held to 0.1%.
+        // 250/√18,750 = 1.825741858350553… points. The prior's virtual games
+        // move p by about 1e-6, so this is held to 0.1%.
         let mut lopsided = matrix(2);
         lopsided.add(0, 1, 100_000.0, 25_000.0);
         let got = fit(&lopsided, 0, ANCHOR).ratings[1].stderr;
-        assert!((got - 1.268_655_383_138_294).abs() < 1.268_655_383_138_294e-3, "{got}");
+        assert!((got - 1.825_741_858_350_553).abs() < 1.825_741_858_350_553e-3, "{got}");
     }
 
     /// The case that rules out freezing a rating once it is "established": A
@@ -835,7 +891,7 @@ mod tests {
     fn noiseless(truth: &[f64], pairs: &[(usize, usize, f64)]) -> Matrix {
         let mut m = matrix(truth.len());
         for &(i, j, games) in pairs {
-            let p = 1.0 / (1.0 + 10f64.powf(-(truth[i] - truth[j]) / 400.0));
+            let p = 1.0 / (1.0 + (-(truth[i] - truth[j]) / POINTS_PER_LOGIT).exp());
             m.add(i, j, games, games * p);
         }
         m
@@ -867,13 +923,13 @@ mod tests {
         let fit = fit(&noiseless(&truth, &pairs), 0, ANCHOR);
         assert_near_truth(&fit, &truth, 3.0);
         // The whole group moves with the link: every member's error is at
-        // least the link's, (400 / ln 10) / √(300·p(1-p)) ≈ 28 Elo here.
+        // least the link's, 250 / √(300·p(1-p)) ≈ 34 points here.
         for rated in &fit.ratings[1..] {
             assert!(rated.stderr > 25.0, "stderr {} understates the link", rated.stderr);
         }
     }
 
-    /// KL-74: a 20-config chain, each 50 Elo above the last and joined to it by
+    /// KL-74: a 20-config chain, each 50 points above the last and joined to it by
     /// 300 pairs. The top used to be fitted 36.5 Elo low.
     #[test]
     fn a_long_chain_reaches_its_top() {
@@ -994,7 +1050,7 @@ mod tests {
         assert!(fit.converged, "unconverged after {} iterations", fit.iterations);
         for (i, rated) in fit.ratings.iter().enumerate() {
             // Config 15 swept 25,000 pairs, and config 7 lost 25,050 without
-            // scoring: thousands of Elo from the rest, but finite and
+            // scoring: thousands of points from the rest, but finite and
             // converged, where saturation reached -8,168 and 18,130.
             assert!((-4_000.0..8_000.0).contains(&rated.rating), "config {i} at {}", rated.rating);
             if fit.is_rateable(i) {
@@ -1022,19 +1078,19 @@ mod tests {
     }
 
     /// A well-played head-to-head is its maximum likelihood, the prior's pull
-    /// a fraction of an Elo: 75% over 100 pairs is 400·log10(3) above.
+    /// a fraction of a point: 75% over 100 pairs is 250·ln 3 above.
     #[test]
     fn a_well_played_head_to_head_is_its_maximum_likelihood() {
         let mut m = matrix(2);
         m.add(0, 1, 100.0, 25.0);
         let got = fit(&m, 0, ANCHOR).ratings[1].rating;
-        let want = ANCHOR + 400.0 * 3f64.log10();
+        let want = ANCHOR + POINTS_PER_LOGIT * 3f64.ln();
         assert!((got - want).abs() < 1.0, "{got} against {want}");
     }
 
     /// KL-74, again: a strong config rated by a gauntlet of lightly played
     /// opponents. Twenty configs level with the anchor over 100 pairs each,
-    /// and a config 600 Elo above them playing five pairs against each. A
+    /// and a config 600 points above them playing five pairs against each. A
     /// prior of virtual draws on every head-to-head it played — whatever the
     /// split — held it 2 to 4 standard errors low.
     #[test]
@@ -1102,7 +1158,8 @@ mod tests {
     #[test]
     fn shared_swept_baselines_do_not_pull_a_config_toward_the_anchor() {
         let mut m = matrix(22);
-        let p = 1.0 / (1.0 + 10f64.powf(-1.0));
+        // The hub 400 points above the anchor.
+        let p = 1.0 / (1.0 + (-400.0 / POINTS_PER_LOGIT).exp());
         m.add(0, 1, 50.0, 50.0 * (1.0 - p));
         for i in 2..22 {
             m.add(0, i, 10.0, 10.0);
@@ -1115,7 +1172,7 @@ mod tests {
     }
 
     /// A ladder, each config played only against the next: twelve rungs 100
-    /// Elo apart over 100 pairs each. Every config's pull toward the centre
+    /// points apart over 100 pairs each. Every config's pull toward the centre
     /// adds up along it; the old prior, at the real games' scale and toward the
     /// anchor, held the top some 390 Elo low in the audit's Monte Carlo, three
     /// times its error.
@@ -1125,15 +1182,15 @@ mod tests {
         let pairs: Vec<_> = (0..11).map(|k| (k, k + 1, 100.0)).collect();
         let fit = fit(&noiseless(&truth, &pairs), 0, ANCHOR);
         assert!(fit.converged);
-        // Some tens of Elo low, well inside the top's error of ±120: the
-        // cost of the prior, recorded in KL-79.
+        // Some tens of points low, well inside the top's error: the cost of
+        // the prior, recorded in KL-79.
         let top = fit.ratings[11];
         assert!((top.rating - truth[11]).abs() < 0.6 * top.stderr, "{top:?}");
     }
 
-    /// Two tiers: the anchor and twenty configs within 150 Elo of it, all
-    /// against each other over 100 pairs, and twelve strong configs 1,000 Elo
-    /// above, against each other over 1,000, joined by one 300-pair job. A
+    /// Two tiers: the anchor and twenty configs within 150 points of it, all
+    /// against each other over 100 pairs, and twelve strong configs 1,000
+    /// points above, against each other over 1,000, joined by one 300-pair job. A
     /// pull toward the pool's centre left whole on well played configs held
     /// the strong tier 345 Elo low, nearly four errors (the audit's
     /// adversarial check); faded with their games, it is well inside one.
@@ -1206,15 +1263,15 @@ mod tests {
             fit.ratings[1]
         };
         // A 5,000–0 sweep says only that the field is far above: its level is
-        // the prior's, with an error of some ±700 to ±1,300 Elo, and the young
-        // configs move it by a fraction of that, where they moved it 1,600
-        // with an error of ±137,763.
+        // the prior's, with an error of some ±1,100 to ±1,900 points, and the
+        // young configs move it by a fraction of that, where they moved it
+        // 1,600 Elo with an error of ±137,763.
         let (alone, with_young) = (field(0), field(6));
-        assert!(alone.stderr < 2_000.0 && with_young.stderr < 2_000.0, "{alone:?} {with_young:?}");
+        assert!(alone.stderr < 3_000.0 && with_young.stderr < 3_000.0, "{alone:?} {with_young:?}");
         assert!((alone.rating - with_young.rating).abs() < 0.5 * alone.stderr, "{alone:?} {with_young:?}");
     }
 
-    /// Two tiers of lightly played configs 600 or 800 Elo apart — twenty
+    /// Two tiers of lightly played configs 600 or 800 points apart — twenty
     /// each, five pairs a head-to-head within a tier, one 20-pair job between
     /// them. The prior's pulls add up across the upper tier and hold it 260 to
     /// 430 Elo low, nearly two of the games' errors — a 95% interval that

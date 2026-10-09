@@ -10,6 +10,7 @@ mod common;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use birdtest::ratings::{self, Trigger};
+use birdtest::stats::bradley_terry::POINTS_PER_LOGIT;
 use common::*;
 use serde_json::json;
 use std::collections::HashMap;
@@ -339,7 +340,8 @@ async fn a_pairs_job_against_a_non_member_is_not_evidence() {
 }
 
 /// I-RATE-2 (job type): a plain `games` job between two members is not
-/// evidence -- it is not side-balanced, and going first is worth real Elo.
+/// evidence -- it is not side-balanced, and going first is worth real rating
+/// points.
 ///
 /// Twice: once as the app builds one (a `job_game_config` row, results with no
 /// pentanomial), and once in a state the app forbids -- a `games` job that
@@ -695,7 +697,7 @@ async fn pools_of_different_scopes_fit_different_consistent_ratings() {
         assert_eq!(got, expected);
         for (row, col, _, _, predicted) in residuals {
             let diff = stored[&row].rating - stored[&col].rating;
-            let implied = 1.0 / (1.0 + 10f64.powf(-diff / 400.0));
+            let implied = 1.0 / (1.0 + (-diff / POINTS_PER_LOGIT).exp());
             assert!((predicted - implied).abs() < 1e-12, "{predicted} vs {implied}");
         }
     }

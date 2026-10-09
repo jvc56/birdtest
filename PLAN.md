@@ -217,8 +217,8 @@ rack analysis and positions captured during games.
 `games` and `game_pairs` jobs can keep the position analyses their workers
 produce while playing, by setting `capture_positions`. A worker analyses a
 position on every turn regardless; this decides whether those are recorded
-rather than discarded, turning a job run to settle an Elo question into a corpus
-of analysed positions as well.
+rather than discarded, turning a job run to settle which player is stronger
+into a corpus of analysed positions as well.
 
 A `game_pairs` job can keep less: with `capture_first_divergence` as well, only
 each pair's **first divergence**. A pair's two games share their tiles and swap
@@ -452,7 +452,7 @@ Why this method, and the choices in it:
   the chance of ever naming a winner between them is at most about α, split
   between the two sides. Simulated, checked after every batch of 50 pairs from
   500 to 10,000, equal players got a winner in at most α + 2% of runs, and a
-  player scoring 53.5% per game (about +24 Elo) was found better in at least
+  player scoring 53.5% per game was found better in at least
   90% of them (TESTING.md, `U-STATS-3b`).
 - **It needs only stored sums.** n, μ̂ and σ̂² come from the stored counts at
   any moment, in any order, so it is recomputed on every read, as the SPRT
@@ -490,12 +490,14 @@ running for ever. Before anything is played the mean is ½ and the interval
 every score. The status is one of `running`, `player1_better`,
 `player2_better`, `inconclusive`.
 
-**Elo is for display.** `elo(s) = −400·log10(1/s − 1)` is applied to μ̂ and to
-both bounds, clamped at ±1000 where a bound reaches 0 or 1. A pair's `i/4` is
-player 1's per-game score, so the Elo is per game for both job types. The job
-page's Significance Test card says it in one sentence ("static-equity scores 53.1% per
-game (95% interval 51.2% to 55.0%).") over a bar of the interval around 50%;
-the Elo figures are in the API, and the card shows none.
+**No rating scale.** The result is player 1's per-game score and its interval
+(a pair's `i/4` is a per-game score, so both job types read alike), and
+nothing on a rating scale is derived from it: the Elo figures the API once
+carried beside them are gone, so no number on a job's page can be mistaken for
+a pool's rating, whose scale is WESPA's ([The scale is
+WESPA's](#the-scale-is-wespas)). The job page's Significance Test card says it in
+one sentence ("static-equity scores 53.1% per game (95% interval 51.2% to
+55.0%).") over a bar of the interval around 50%.
 
 #### The pentanomial, and why pairs are the unit
 
@@ -522,10 +524,10 @@ exactly at even and both views land on the same side of it, but it destroys the
 magnitude and with it the test's purpose. Take 20,000 games split 9,950-10,050,
 of which only 100 diverged and one player took 99 of them:
 
-| Sample | Score rate | Implied difference |
+| Sample | Score rate | Below even |
 |---|---|---|
-| Every pair (10,000 of them) | 0.4975 | about **-1.7 Elo** |
-| The 50 divergent pairs alone | 0.01 | about **-800 Elo** |
+| Every pair (10,000 of them) | 0.4975 | **0.25** percentage points |
+| The 50 divergent pairs alone | 0.01 | **49** percentage points |
 
 Same games. A test fed the second number decides almost immediately, on a
 hundredth of the evidence, whatever confidence it is asked for, and reports
@@ -546,8 +548,8 @@ system is read while dispatching, claiming, validating or completing a task, and
 no job decision reads a rating. The coupling runs one way: a fit reads finished
 `game_results` and writes a snapshot. The match test stays where it belongs,
 on the job config tables — it is a per-job **stopping rule**, not a
-measurement, and the Elo it shows is one comparison's score rather than
-anyone's rating.
+measurement, and the score it shows is one comparison's rather than anyone's
+rating.
 
 Everything below lives in four `rating_*` tables and one module. See
 the [Schema](#schema-1) ("Ratings") for the tables and [Two things the fit has to
@@ -613,6 +615,51 @@ the filter buys nothing while costing path dependence, and the question "should
 a bot's rating be fixed once it is established?" has no good answer because
 *establishing* one incrementally is the wrong move to begin with.
 
+#### Why not WESPA's Glicko
+
+WESPA rates people with Glicko, and a word game's own system is the obvious one
+to borrow. It was weighed and is **not implemented**. Beyond the drift
+above, which a fixed config does not have:
+
+- **Order matters.** Glicko updates one rating period at a time, so the same
+  results in a different order give different ratings. Results arrive in
+  whatever order volunteers finish them, and purges and reruns would reshuffle
+  ratings. Bradley-Terry uses all the evidence at once and does not care about
+  order.
+- **The uncertainty never shrinks.** WESPA's RD floor (50 to 75 by band) is
+  there to keep human ratings responsive. For a bot with 100,000 games it means
+  the rating keeps moving as if it were uncertain by ±50, where Bradley-Terry's
+  standard error shrinks with the evidence.
+- **Periods would be arbitrary.** There are no tournaments. Any choice of
+  period (a day, a batch, a job) is arbitrary and changes the numbers.
+- **The calibration is for humans.** Newcomer seeding (five virtual games at
+  1500), an initial RD of 300 and the RD bands are calibrated to WESPA's human
+  population. Bot ratings would land in bands that depend on where the anchor
+  sits.
+- **Game pairs lose their advantage.** Glicko's updates are per game; feeding
+  it pairs throws away the variance reduction game pairs exist for.
+
+The same reasoning is in `stats/bradley_terry.rs`'s module doc. What is taken
+from WESPA is its scale, below.
+
+#### The scale is WESPA's
+
+A rating gap Δ predicts a score of `1 / (1 + e^(−Δ/250))`: 250 points per
+logit (`bradley_terry::POINTS_PER_LOGIT`), WESPA's k. WESPA's Glicko predicts
+`1 / (1 + e^(−gΔ/250))` between two players, with g about 0.95 to 0.99 between
+established ones, so a gap in birdtest predicts the win % the same gap does
+between two established WESPA players, to within about 1 to 5%: 100 points is
+59.9%, and a 75% score is 250·ln 3 ≈ 275 points. (Until October 2026 the fit
+used Elo's 400/ln 10 ≈ 174 points per logit, on which 100 points was 64.0%.)
+Standard errors, the residuals' predicted scores and the convergence test all
+use the same constant; the priors are in log-strength units and do not.
+
+What the scale cannot match is the **absolute level**. Bot-against-bot results
+say nothing about strength against people, so a number is only as meaningful
+as the anchor's: the default 2000 reads as a strong club player's, and an admin
+can pin a pool's anchor anywhere. The ratings page says so under its table,
+and labels the column "Rating (WESPA scale)".
+
 What birdtest actually has is a static tournament: N configs and a matrix of
 pairwise results. The right tool is a **batch maximum-likelihood fit** over the
 whole matrix at once — Bradley-Terry, solved by Newton's method,
@@ -630,13 +677,13 @@ Three properties follow, and they are the reasons for the choice:
   No other rating is ever frozen.
 
 The fit is Newton's method on the log-strengths, with a backtracking line
-search, no step moving any config more than about 1,400 Elo, a small step
+search, no step moving any config more than 2,000 points, a small step
 taken whole, and damping if rounding makes the curvature fail to factor. The
 objective, the likelihood plus the prior below, is strictly concave, so it has
 one answer; each step solves for every config at once through the full
 curvature, which is what a group of configs that moves together needs. (Without the step bound, clean sweeps that
-contradict the rest of a pool could throw one config thousands of Elo away in a
-single step, where every head-to-head it has saturates and the fit stalls; the
+contradict the rest of a pool could throw one config thousands of points away in
+a single step, where every head-to-head it has saturates and the fit stalls; the
 thirty-second audit's adversarial check found that.) Minorization-maximization, which the fit used until the thirty-second
 audit, updated one config at a time and crept toward such a group's answer,
 stopping at its iteration cap short of it (KL-74). A step is a Cholesky
@@ -672,8 +719,8 @@ configs in the pool.
 
 Plain `games` jobs are excluded deliberately. `-gp` plays both orderings of every
 seed, so a pair is **side-balanced by construction**; an unpaired job is not, and
-going first in a word game is worth real Elo. Pooling unbalanced results would
-bias every rating toward whoever happened to start more often. Including them
+going first in a word game is worth real rating points. Pooling unbalanced
+results would bias every rating toward whoever happened to start more often. Including them
 would require an explicit side-advantage term in the model, which is not worth
 the complexity while every rating-relevant job is paired anyway.
 
@@ -717,27 +764,27 @@ listed the pool before the delete skips it without logging a failure.
   bot's first job looks like — and undefined for a config with no games. So
   every config, the anchor included, plays virtual drawn games against a
   virtual config at the pool's *centre*, the plain mean of every rating, on a
-  logistic twice as wide as real games' (about 350 Elo against 174): two for a
-  config with no games, fading with its real ones as `2 / (1 + g/200)` but
+  logistic twice as wide as real games' (500 points a logit against 250): two
+  for a config with no games, fading with its real ones as `2 / (1 + g/200)` but
   never below a fifth, since the prior is for the barely played. That
   keeps every rating finite and the objective strictly concave: one answer,
   continuous in the scores, and conceding a point lowers a config against its
   opponent (its own rating, too, all but about once in 500 fuzzed cases, by
-  under an Elo). The
+  under a point and a half). The
   pull is toward the pool's centre, not the anchor, so a field or group far
   from the anchor is not dragged back to it; and it joins configs only through
   the centre, never to each other. Its cost is a pull that levels off at a
   constant per config, however far a config is from the centre, and adds up
-  along a thin chain: a 12-rung ladder, each rung 100 Elo above the last and
-  played only against it over 100 pairs, has its top some 40 Elo low, about a
+  along a thin chain: a 12-rung ladder, each rung 144 points above the last and
+  played only against it over 100 pairs, has its top some 60 points low, about a
   third of its error (KL-79). The wider scale and the fade are what keep that
   small: left whole on well played configs, the pulls held a strong tier joined
-  to the rest by one job some 345 Elo low, nearly four errors. The
+  to the rest by one job some 500 points low, nearly four errors. The
   thirty-second audit tried six other priors, and each pulled some shape of
   pool where the evidence was fine: two draws per config against the anchor, a field or thinly linked group
-  far from it (a 30-member group 200 Elo low, KL-74); two per config spread
+  far from it (a 30-member group 290 points low, KL-74); two per config spread
   over its opponents, a config over a gauntlet of lightly played ones; draws
-  only where the maximum likelihood diverges, a 200-Elo jump when a newcomer
+  only where the maximum likelihood diverges, a 290-point jump when a newcomer
   conceded a quarter point; Firth's penalty, which is not concave, two answers
   for a config between far-apart opponents; the centre prior left whole, a
   thinly joined strong tier held nearly four errors low; and a centre fitted as
@@ -752,14 +799,14 @@ listed the pool before the delete skips it without logging a failure.
 Standard errors come from the inverse of the full Fisher information over the
 anchor's component, counting each paired game as one trial, so a config's
 error includes the uncertainty of every link between it and the anchor: a
-group joined to the anchor by one 300-pair job carries that job's ±28 Elo,
-where the diagonal the fit used until the thirty-second audit showed ±2 (KL-74).
+group joined to the anchor by one 300-pair job carries that job's ±40 points,
+where the diagonal the fit used until the thirty-second audit showed ±3 (KL-74).
 Each error is also widened by how far the prior holds that config from where
 its games alone would put it — one Newton step on the games from the answer,
 `I⁻¹ · ∇prior`, taken one and a half times since one step underestimates a
 pull that has saturated — added to its variance. The prior's pulls add up
 across a group joined to the rest thinly, which no weighting of it removes
-(KL-79): two tiers of lightly played configs 600 to 800 Elo apart, joined by
+(KL-79): two tiers of lightly played configs 860 to 1,150 points apart, joined by
 one small job, put the upper one about two of the games' errors low, its 95%
 interval covering the truth 30 to 65% of the time; with the pull in its error,
 95 to 100%. Two further approximations remain, and both widen the errors. Counting a pair (two games,
@@ -972,7 +1019,7 @@ Shows all jobs with: job type, status, allocation, and a completion counter (tas
 
 **Games / Game pairs**
 
-- A **Significance Test** card, for a job that runs the test (one without has none, and `games.test` is `null`): a status badge (`running`, `player 1 better`, `player 2 better`, `inconclusive`, or paused or undecided from the job's own status), one sentence — "static-equity scores 53.1% per game (95% interval 51.2% to 55.0%)." (nothing in Elo) and, once decided, which player is better at that confidence — a bar of the interval on a scale of player 1's score with 50% marked, and a folded explanation with the job's own confidence.
+- A **Significance Test** card, for a job that runs the test (one without has none, and `games.test` is `null`): a status badge (`running`, `player 1 better`, `player 2 better`, `inconclusive`, or paused or undecided from the job's own status), one sentence — "static-equity scores 53.1% per game (95% interval 51.2% to 55.0%)." (nothing on a rating scale) and, once decided, which player is better at that confidence — a bar of the interval on a scale of player 1's score with 50% marked, and a folded explanation with the job's own confidence.
 - The pentanomial (game pairs only), in the Significance Test card: the pair outcomes the test is computed from, as three rows (won both, won one and drew one, even) with a column per player and each count's share of the pairs (`lib/charts/pentanomial.ts` `PAIR_OUTCOMES`). Ratings are not here — they are pool-scoped and live on the [ratings page](#the-ratings-page).
 - A **match score** card, after the settings and before the Significance Test card: a table with a column per player and a row each for wins, losses, draws, average score per game and average spread, the better figure of each row green and the worse red (`MatchScore.svelte`, `lib/matchScore.ts`). A pairs job has a second table beside it, **Games that diverged**, over only the games of the pairs whose two games did not play identically (`games.divergent`). It counts games for a pairs job too. For a job without a test it is the job's result. The averages are the batches' `p1_score_mean` / `p2_score_mean` weighted by their games, over every result of the job (one per task; `jobstats::SCORE_MEANS`).
 - **Saved positions**, for a job with `capture_positions` set: one captured position at a time, drawn on the job's own board (`Board.svelte`) — its premium squares from the layout, the tiles with their letters and scores (a blank in lower case, scoring nothing), both racks and scores with the player to move marked, and the tiles the move before it placed outlined — beside its ranked moves — each with its win percentage, how often the simulation played it out (**Iters**), and its first two plies' average score and bingo percentage (P1-S, P1-BP, P2-S, P2-BP, P1 the reply) when it was simulated, and a solved move's depth as **Solved Plies** — and its CGP as text. A simulated position past turn 0 whose player inferred the opponent's leave first (its previous move not a pass) shows that inference under the moves: "Inferred from MOVE: N possible leaves, average equity E", and up to ten of the leaves the opponent most likely kept, with their draws and equity. **Random position** draws another (`GET /api/jobs/:id/positions/random`); a rack search shows that rack's positions newest first, one at a time with **Next** and **Previous** (`GET /api/jobs/:id/positions?rack=`). On a game-pairs job each position comes with its `partner`, the same turn of the pair's other game, and one of the two is drawn at a time ("Game 1 of the pair", "Game 2 of the pair"), with a toggle between them naming each game's player to move ("static-equity's move"); a rack both games hold finds the pair once. A job keeping only first divergences (`capture_first_divergence`) shows exactly the turn each pair's players first chose differently. There is no list of the newest positions: a job that captures holds millions, and one at a time on a board is what the section is for. The CGP and the move notation are read by `lib/cgp.ts` as MAGPIE writes them (`game_get_cgp_string`, `move_get_string`: `8G HUH` across, `E9 (E)RUVIM` down, letters played through in parentheses, `[L·L]` for a multi-letter tile); a position it cannot read is shown as text. The board scales to its box, so a phone shows it whole. On an `xl` screen the pane is a grid of `27rem minmax(0,1fr)`: the board has a fixed column, so it is the same size whatever position it shows, and the moves start right beside it, every cell on one line with tight padding (as in the opening-rack lookup's table); narrower, the moves go under the board. Signed-in users only; a signed-out visitor is told to sign in. The public has the results feed. Clicking a ranked move to preview it on the board is a follow-up.
@@ -1018,8 +1065,7 @@ JobStats {
                                      spread_mean },   // pairs: the games that diverged
                        min_units, max_units,
                        p1_score_mean, p2_score_mean, spread_mean,   // null before any game
-                       test: { mean, lower, upper, elo, elo_lower, elo_upper,
-                               confidence_pct, status } | null,
+                       test: { mean, lower, upper, confidence_pct, status } | null,
                        decided?: { status, lower, upper, units } }
   opening_racks?:    { racks_analyzed, racks_settled, racks_without_consensus, racks_total }
   leave_generation?: { current_generation, generation_count,
@@ -1684,7 +1730,8 @@ what the workers are checked against.
 | Anonymous workers identified by UUID | Enables per-worker contribution tracking and result filtering without requiring account creation |
 | No pre-aggregation for dashboard v1, except measured exceptions | Simple stats don't require it; avoids premature optimization. Measurement (Dashboard, "What these reads cost") found the reads that grew with history badly enough to matter, and only those are kept as running totals: four on `jobs` and a contribution counter per identity |
 | AWS throughout | Learning goals; avoids future migration pain; production-grade from day one |
-| Batch Bradley-Terry instead of incremental Elo/Glicko | Player configs have fixed strength, so there is no drift for a sequential filter to track; a batch fit is order-independent and makes add/remove a refit rather than an unwind |
+| Batch Bradley-Terry instead of incremental Elo/Glicko | Player configs have fixed strength, so there is no drift for a sequential filter to track; a batch fit is order-independent and makes add/remove a refit rather than an unwind. WESPA's Glicko in particular would add arbitrary rating periods, an RD floor that never lets a bot's rating settle, human calibration and per-game updates that waste game pairs ([Why not WESPA's Glicko](#why-not-wespas-glicko)) |
+| Ratings on WESPA's scale, 250 points per logit | A rating gap predicts the win % the same gap does between established WESPA players; the absolute level stays the anchor's, since bot games say nothing about strength against people |
 | Named `player_configs` table | Reusable across jobs; maps directly to MAGPIE per-player arguments (`-r1`/`-r2`, `-s1`/`-s2`, etc.); **immutable once created** — no update endpoint exists; deletion only if no job references the config |
 | Frontend dark mode only | Single theme simplifies the component library configuration; no light/dark toggle in v1 |
 | Deficit-based job selection, measured from when a job joins | Deterministic; guarantees long-run allocation accuracy — as a share of claims, not of worker time (KL-88) — regardless of claim timing; no randomness means reproducible behavior. No starvation of any job above 0% — which holds because a job's deficit is measured from a baseline reset to parity on activation, allocation change and purge (`claims_baseline`), not over its lifetime, and a job with nothing to hand out is lifted to parity rather than banking debt (`scheduler::lift_passed_over`, `issue_claim`): a lifetime deficit let a newly activated job take every claim until it had issued as many as the oldest job beside it |
@@ -3310,7 +3357,8 @@ What is left unsolved is that a merge still rewrites most of a 432 MB relation a
 A worker playing a game already analyzes a position on every turn: it generates
 candidate moves, ranks them, and picks one. Those analyses used to be discarded.
 With `capture_positions` set on a `games` or `game_pairs` job they are kept, so a
-job run to settle an Elo question also produces a corpus of analyzed positions.
+job run to settle which player is stronger also produces a corpus of analyzed
+positions.
 
 #### What is capturable, and what it costs
 
@@ -3375,8 +3423,8 @@ rather than a worst case:
 | `max_pairs = 40,000` | 1,800,000 | 18,000,000 |
 | `max_games = 400,000` | 9,000,000 | 90,000,000 |
 
-Turning capture on roughly doubles the storage a job produces per unit of Elo
-information, and does so in the largest table in the schema. That is why it is off
+Turning capture on roughly doubles the storage a job produces per unit of
+strength information, and does so in the largest table in the schema. That is why it is off
 by default.
 
 **`games_per_batch` becomes the memory and payload control.** With no per-task cap,
@@ -5859,10 +5907,10 @@ Protected by a layout guard (`/admin/+layout.svelte`) that requires `is_admin = 
 different question, and the design choices in them are load-bearing:
 
 **Ratings, as a dot plot with error bars.** Deliberately not a bar chart: a bar
-encodes magnitude from zero, and Elo has no meaningful zero — the scale is
-anchored wherever the pool's anchor was pinned, so bar length would imply a ratio
-that does not exist. A dot on a common scale encodes position, which is what a
-rating is. The error bar matters as much as the dot, because a config with two
+encodes magnitude from zero, and a rating has no meaningful zero — only gaps
+mean anything, and the level is wherever the pool's anchor was pinned — so bar
+length would imply a ratio that does not exist. A dot on a common scale encodes
+position, which is what a rating is. The error bar matters as much as the dot, because a config with two
 hundred pairs and one with two million otherwise produce identical-looking
 numbers and only the interval says which to believe. A config with no path to the
 anchor is listed beneath the chart as **unrated** rather than drawn at a number.
@@ -7403,7 +7451,7 @@ CREATE TABLE leave_selection_cursors (
 -- Opening rack jobs write one per rack. Games and game-pairs jobs write one per
 -- turn when `capture_positions` is on: a worker analyses a position on every
 -- turn anyway, and keeping those makes a job a corpus of analysed positions as
--- well as an Elo measurement.
+-- well as a measurement of strength.
 --
 -- The request that produced these is job-type-specific -- opening_rack_requests
 -- or game_requests -- but what comes back is a position analysis either way,
@@ -7855,9 +7903,10 @@ CREATE TABLE player_config_ratings (
     run_id           UUID NOT NULL REFERENCES rating_runs(id) ON DELETE CASCADE,
     player_config_id UUID NOT NULL REFERENCES player_configs(id),
     rating           DOUBLE PRECISION NOT NULL,
-    -- Approximate Elo standard error. Wide bars are the honest signal that a
-    -- config has barely played, or has only played opponents far from its own
-    -- strength; the page shows them next to the rating for that reason.
+    -- Approximate standard error, in rating points. Wide bars are the honest
+    -- signal that a config has barely played, or has only played opponents
+    -- far from its own strength; the page shows them next to the rating for
+    -- that reason.
     stderr           DOUBLE PRECISION NOT NULL,
     pairs_played     BIGINT NOT NULL,
     -- FALSE when no chain of games connects this config to the pool's anchor.

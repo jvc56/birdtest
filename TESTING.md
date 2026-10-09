@@ -583,34 +583,42 @@ computed outside the code, in 40-digit decimal from PLAN.md's formulas.
   `match_test::tests::the_fewest_wins_that_decide_and_one_short`,
   `match_test::tests::identical_pairs_alone_never_decide`,
   `match_test::tests::the_floor_holds_until_it_does_not_and_the_cap_applies_below_it`,
-  `match_test::tests::nothing_played_is_an_even_score_with_every_score_possible`,
-  `match_test::tests::elo_is_the_logistic_inverse_within_its_bounds`.)*
+  `match_test::tests::nothing_played_is_an_even_score_with_every_score_possible`.)*
+  The test carries no Elo or rating-point figure: the `elo` fields its result
+  once had are gone, so nothing beside it reads as a pool's rating.
 - `U-STATS-3b` **The error rate and the power, simulated.** Pairs drawn from a
   pentanomial, the test checked after every batch of 50 from a floor of 500 to
   a cap of 10,000 at 95%, as the finish check does: between equal players
   (three pairs in five split) at most α + 0.02 of 1,000 runs name a winner;
-  a player scoring 53.5% per game (about +24 Elo) is found better in at least
+  a player scoring 53.5% per game is found better in at least
   90% of 200 runs, and never the wrong way round. *(Covered:
   `match_test::tests::equal_players_rarely_get_a_winner_however_often_it_is_checked`,
   `match_test::tests::a_better_player_is_found`.)*
-- `U-STATS-4` A Bradley-Terry standard error equals the analytic
-  (400/ln 10)/√(n·p·(1−p)): 49.1348… Elo for an even 50 games, a tenth of that
-  at 5,000, and 1.2687… for 75% over 100,000. *(Covered:
-  `bradley_terry::tests::more_games_narrow_the_standard_error`.)*
+- `U-STATS-4` The ratings are on WESPA's scale, 250 points per logit: a 75%
+  score fits to 250·ln 3 ≈ 274.65 points, over 100,000 games as over 100
+  pairs, and the residuals predict with the same constant (100 points is
+  59.9%). A Bradley-Terry standard error equals the analytic
+  250/√(n·p·(1−p)): 70.7106… points for an even 50 games, a tenth of that at
+  5,000, and 1.8257… for 75% over 100,000. *(Covered:
+  `bradley_terry::tests::a_75_percent_score_is_250_ln_3_points`,
+  `the_residuals_predict_on_the_same_scale`,
+  `a_well_played_head_to_head_is_its_maximum_likelihood`,
+  `more_games_narrow_the_standard_error`.)*
 - `U-STATS-5` The fit returns noiseless evidence's own ratings, within a few
-  Elo, for the shapes that defeated the old one-config-at-a-time solver and
+  points, for the shapes that defeated the old one-config-at-a-time solver and
   its prior toward the anchor (KL-74): a 12-member group joined to the anchor
-  by one 300-pair job (every member's error at least the link's ≈28 Elo), a
+  by one 300-pair job (every member's error at least the link's ≈34 points), a
   30-member group, a disconnected island (unrated, its internal gap intact)
   and a hundred-member pool (under a second in a debug build); a 20-config
   chain and a 12-rung ladder within 0.6 of each config's error (KL-79). And for
   the shapes the audit's adversarial checks found: a config over a gauntlet of
   twenty lightly played opponents within half its error; conceding a quarter
   or half point lowers the conceding config's rating in the cases pinned (the
-  rare exception, under an Elo, is KL-79's); twenty baselines swept by both the
-  anchor and a config 400 above it leave that config within one error; a
+  rare exception, under a point and a half, is KL-79's); twenty baselines
+  swept by both the anchor and a config 400 above it leave that config within
+  one error; a
   strong tier 1,000 above joined by one job within about half its error; two
-  tiers of lightly played configs 600 or 800 Elo apart, joined by one small
+  tiers of lightly played configs 600 or 800 points apart, joined by one small
   job, the upper within 1.5 of its shown error, which includes the prior's
   pull (1.7 and more without it); a
   newcomer's sweep shrunk the same in a young pool as a mature one; a field
@@ -996,9 +1004,9 @@ Each entry's tests are the `describe` block named for its id.
   point), and keeps a wide interval within the scores that exist. *(Covered:
   `matchTest.test.ts`.)*
 - `F-TEST-2` `testSentence` states player 1's score per game with its range,
-  named for the players and with nothing in Elo ("… scores 53.1% per game (95%
-  interval 51.2% to 55.0%)."), then names the better player
-  once it is decided, or says neither is when it ended inconclusive.
+  named for the players and with no Elo or rating figure ("… scores 53.1% per
+  game (95% interval 51.2% to 55.0%)."), then names the better player once it
+  is decided, or says neither is when it ended inconclusive.
   *(Covered: `matchTest.test.ts`.)*
 - `F-TEST-3` `confidenceProblem` refuses what job creation refuses of a
   test's confidence, and only that: above 50 and below 100, so 50.05 and

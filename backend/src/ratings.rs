@@ -68,14 +68,14 @@ async fn load_pool(conn: &mut PgConnection, pool_id: Uuid) -> AppResult<Pool> {
 /// seed, so counting them as two independent observations would overstate how
 /// much evidence there is. A pair contributes one observation worth its
 /// half-point score over four, which puts the score on the same per-game scale
-/// the Elo formula expects while keeping the sample size honest.
+/// the fit's logistic expects while keeping the sample size honest.
 ///
 /// Only `game_pairs` jobs matching the pool's `(variant, letterdist, layout)`
 /// scope count, and only where **both** configs are pool members. Plain `games`
 /// jobs are excluded on purpose: `-gp` plays both orderings of every seed, so a
 /// pair is side-balanced by construction, while an unpaired job is not, and
-/// going first is worth real Elo. Pooling unbalanced results would bias every
-/// rating in the direction of whoever happened to start more often.
+/// going first is worth real rating points. Pooling unbalanced results would
+/// bias every rating in the direction of whoever happened to start more often.
 async fn build_matrix(
     conn: &mut PgConnection,
     pool_id: Uuid,

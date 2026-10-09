@@ -1700,10 +1700,11 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
             }
             // MAGPIE alternates the first mover within one run, from player 1,
             // and every task is a run of its own: at a batch of 1 player 1
-            // moved first in every game of the job, and the SPRT then in use passed two
-            // identical players on the first move alone (+42 Elo; the audit's
-            // pass 18). An even batch gives each player the first move equally
-            // in every task. Game pairs swap it within each pair already.
+            // moved first in every game of the job, so the first move's edge
+            // read as player 1's strength: enough for the test of the time to
+            // pass two identical players (the audit's pass 18). An even batch
+            // gives each player the first move equally in every task. Game
+            // pairs swap it within each pair already.
             if *games_per_batch >= 1 && games_per_batch % 2 != 0 {
                 err = err.with_field(
                     "games_per_batch",

@@ -908,7 +908,10 @@ export interface RatingRow {
   player_config_id: string;
   name: string;
   rating: number;
-  /** Approximate Elo standard error. Wide bars mean "barely measured". */
+  /**
+   * Approximate standard error, in rating points (WESPA's scale: a gap of
+   * 250·ln 3 ≈ 275 is a 75% score). Wide bars mean "barely measured".
+   */
   stderr: number;
   pairs_played: number;
   /**

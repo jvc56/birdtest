@@ -1227,7 +1227,7 @@ CREATE TABLE leave_selection_cursors (
 -- Opening rack jobs write one per rack. Games and game-pairs jobs write one per
 -- turn when `capture_positions` is on: a worker analyses a position on every
 -- turn anyway, and keeping those makes a job a corpus of analysed positions as
--- well as an Elo measurement.
+-- well as a measurement of strength.
 --
 -- The request that produced these is job-type-specific -- opening_rack_requests
 -- or game_requests -- but what comes back is a position analysis either way,
@@ -1679,9 +1679,10 @@ CREATE TABLE player_config_ratings (
     run_id           UUID NOT NULL REFERENCES rating_runs(id) ON DELETE CASCADE,
     player_config_id UUID NOT NULL REFERENCES player_configs(id),
     rating           DOUBLE PRECISION NOT NULL,
-    -- Approximate Elo standard error. Wide bars are the honest signal that a
-    -- config has barely played, or has only played opponents far from its own
-    -- strength; the page shows them next to the rating for that reason.
+    -- Approximate standard error, in rating points. Wide bars are the honest
+    -- signal that a config has barely played, or has only played opponents
+    -- far from its own strength; the page shows them next to the rating for
+    -- that reason.
     stderr           DOUBLE PRECISION NOT NULL,
     pairs_played     BIGINT NOT NULL,
     -- FALSE when no chain of games connects this config to the pool's anchor.

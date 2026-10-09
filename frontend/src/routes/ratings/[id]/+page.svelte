@@ -174,7 +174,7 @@
         <thead>
           <tr>
             <th>Player config</th>
-            <th class="text-right">Rating</th>
+            <th class="text-right">Rating (WESPA scale)</th>
             <th class="text-right">± SE</th>
             <th class="text-right">Pairs</th>
             {#if isAdmin}<th></th>{/if}
@@ -241,6 +241,11 @@
         </tbody>
       </table>
       </div>
+      <p class="text-xs text-muted-foreground">
+        A gap between two ratings predicts the score the same gap does between two established
+        WESPA players; the absolute level is only where the anchor was pinned, since bot games say
+        nothing about strength against people.
+      </p>
 
       {#if isAdmin}
         <div class="flex flex-wrap items-end gap-2 border-t border-border pt-3">
