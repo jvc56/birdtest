@@ -1664,7 +1664,7 @@ mod contract_fixtures {
             let job_name = value["job_name"].as_str().unwrap_or_else(|| panic!("{name}: no job_name"));
             assert!(!job_name.is_empty(), "{name}");
             let limit = value["max_task_seconds"].as_i64().unwrap_or_else(|| panic!("{name}: no max_task_seconds"));
-            assert!((60..=86_400).contains(&limit), "{name}: {limit}");
+            assert!((600..=86_400).contains(&limit), "{name}: {limit}");
             let request: TaskRequest = serde_json::from_value(value["task_request"].clone()).unwrap();
             match request {
                 TaskRequest::Games(r) | TaskRequest::GamePairs(r) => {

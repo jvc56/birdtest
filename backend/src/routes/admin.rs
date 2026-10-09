@@ -59,9 +59,14 @@ pub fn router() -> Router<AppState> {
 // ---------------------------------------------------------------------------
 
 /// The longest and shortest task time limit an admin may set: the column's
-/// CHECK. Under a minute no batch is worth a claim; over a day a lost claim
-/// held its task for that long.
-const MIN_TASK_SECONDS: i32 = 60;
+/// CHECK, which a test cannot get under either (one that wants a claim past
+/// its deadline moves the claim's `deadline_at`). Ten minutes, because a
+/// task's first claim on a machine may build the job's rack info table
+/// first -- a minute to three, which cannot be stopped part-way and is kept
+/// for every task after it -- and a limit near that would stop that task,
+/// every time, on every new machine. Over a day a lost claim held its task
+/// for that long.
+const MIN_TASK_SECONDS: i32 = 600;
 const MAX_TASK_SECONDS: i32 = 86_400;
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -109,7 +114,7 @@ async fn put_settings(
     if !(MIN_TASK_SECONDS..=MAX_TASK_SECONDS).contains(&body.max_task_seconds) {
         return Err(AppError::bad_request("settings are invalid").with_field(
             "max_task_seconds",
-            format!("must be between {MIN_TASK_SECONDS} and {MAX_TASK_SECONDS} (a minute to a day)"),
+            format!("must be between {MIN_TASK_SECONDS} and {MAX_TASK_SECONDS} (ten minutes to a day)"),
         ));
     }
     let mut tx = state.pool.begin().await?;

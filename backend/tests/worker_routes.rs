@@ -1368,7 +1368,7 @@ async fn an_assignment_names_its_job_and_states_the_limit_it_was_claimed_under()
     assert_eq!(first["max_task_seconds"], json!(3600), "the default: {first}");
     assert_eq!(claim_limit(&db, &first["claim_token"]).await, 3600);
 
-    sqlx::query("UPDATE settings SET max_task_seconds = 120").execute(&db.pool).await.unwrap();
+    sqlx::query("UPDATE settings SET max_task_seconds = 900").execute(&db.pool).await.unwrap();
     sqlx::query("UPDATE jobs SET name = 'NWL23 static mirror' WHERE id = $1")
         .bind(job)
         .execute(&db.pool)
@@ -1378,8 +1378,8 @@ async fn an_assignment_names_its_job_and_states_the_limit_it_was_claimed_under()
     let (status, second) = claim_as(&app, &worker).await;
     assert_eq!(status, StatusCode::OK, "{second}");
     assert_eq!(second["job_name"], "NWL23 static mirror", "{second}");
-    assert_eq!(second["max_task_seconds"], json!(120), "the setting at the claim: {second}");
-    assert_eq!(claim_limit(&db, &second["claim_token"]).await, 120);
+    assert_eq!(second["max_task_seconds"], json!(900), "the setting at the claim: {second}");
+    assert_eq!(claim_limit(&db, &second["claim_token"]).await, 900);
     assert_eq!(claim_limit(&db, &first["claim_token"]).await, 3600, "an earlier claim keeps its own");
 }
 

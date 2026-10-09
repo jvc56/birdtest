@@ -872,8 +872,9 @@ async fn the_audit_log_pages_and_filters_by_job() {
 
 // --- A-ADMIN-30, 31 ----------------------------------------------------------
 
-/// A-ADMIN-30: the task time limit is the admin's to set, from a minute to a
-/// day: read with who set it last, refused on its field outside that range,
+/// A-ADMIN-30: the task time limit is the admin's to set, from ten minutes to
+/// a day: read with who set it last, refused on its field outside that range
+/// (and by the column's CHECK, so nothing gets under it another way),
 /// and each change audited once (`settings.changed`, from what to what) -- a
 /// change to what it already is writes nothing. The claims made after a
 /// change are given it.
@@ -888,12 +889,14 @@ async fn the_task_time_limit_is_an_admin_setting_and_each_change_is_audited() {
     assert_eq!(settings["max_task_seconds"], json!(3600), "{settings}");
     assert!(settings["updated_by"].is_null(), "nobody has changed them: {settings}");
 
-    for refused in [0, 59, 86_401] {
+    for refused in [0, 60, 599, 86_401] {
         let (status, body) = admin.put("/api/admin/settings", json!({ "max_task_seconds": refused })).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}: {body}");
         assert_eq!(body["fields"][0]["field"], "max_task_seconds", "{refused}: {body}");
     }
     assert_eq!(count(&db, changes).await, 0);
+    let checked = sqlx::query("UPDATE settings SET max_task_seconds = 599").execute(&db.pool).await;
+    assert!(checked.is_err(), "the column refuses what the API does");
 
     let (status, settings) = admin.put("/api/admin/settings", json!({ "max_task_seconds": 1800 })).await;
     assert_eq!(status, StatusCode::OK, "{settings}");
@@ -918,6 +921,10 @@ async fn the_task_time_limit_is_an_admin_setting_and_each_change_is_audited() {
     let (status, assignment) = claim(&admin.app, &[], "1.0.0", &[]).await;
     assert_eq!(status, StatusCode::OK, "{assignment}");
     assert_eq!(assignment["max_task_seconds"], json!(1800), "{assignment}");
+
+    // The floor itself is a limit an admin may set.
+    let (status, settings) = admin.put("/api/admin/settings", json!({ "max_task_seconds": 600 })).await;
+    assert_eq!((status, &settings["max_task_seconds"]), (StatusCode::OK, &json!(600)), "{settings}");
 }
 
 /// A-ADMIN-31: a games or pairs job states how MAGPIE spends its threads,

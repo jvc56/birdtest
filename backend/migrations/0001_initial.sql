@@ -1815,8 +1815,15 @@ CREATE TABLE settings (
     -- it stood then, so a change applies to claims made after it. A claim
     -- past its deadline and a minute's grace is reclaimed even while its
     -- worker heartbeats, and its result refused (`task_claims.deadline_at`).
-    -- A minute at the least, a day at the most.
-    max_task_seconds  INT NOT NULL DEFAULT 3600 CHECK (max_task_seconds BETWEEN 60 AND 86400),
+    -- Ten minutes at the least, a day at the most. The floor is not the
+    -- shortest batch worth a claim but the first claim on a machine: it may
+    -- build the job's rack info table first, a minute to three that cannot
+    -- be stopped part-way (and is kept for every task after it), so a limit
+    -- near that would stop the task that paid for it, every time, on every
+    -- new machine. The API refuses what this refuses (`routes::admin`); a
+    -- test that wants a claim past its deadline moves the claim's
+    -- `deadline_at`, not this.
+    max_task_seconds  INT NOT NULL DEFAULT 3600 CHECK (max_task_seconds BETWEEN 600 AND 86400),
     -- Who changed them last, and when; NULL until anyone has. SET NULL, like
     -- jobs.created_by: the settings outlive the admin.
     updated_by        UUID REFERENCES users(id) ON DELETE SET NULL,

@@ -4,12 +4,17 @@
    * task time limit. Every claim is given the limit as it stands when it is
    * made, so a change applies to the claims made after it, and a claim keeps
    * the deadline it was given.
+   *
+   * Ten minutes at the least, as the server holds it: a task's first claim on
+   * a machine may build the job's rack info table, a minute to three that
+   * cannot be stopped part-way, and a limit near that would stop that task
+   * every time.
    */
   import { onMount } from 'svelte';
   import { api, errorText, type Settings } from '$lib/api';
   import { computeTime, datetime } from '$lib/format';
 
-  const MIN_SECONDS = 60;
+  const MIN_SECONDS = 600;
   const MAX_SECONDS = 86_400;
 
   let settings: Settings | null = null;
@@ -71,12 +76,14 @@
         {#if valid}
           {computeTime(maxTaskSeconds)}.
         {:else}
-          <span class="field-error">A whole number of seconds from {MIN_SECONDS} to {MAX_SECONDS.toLocaleString()} (a minute to a day).</span>
+          <span class="field-error">A whole number of seconds from {MIN_SECONDS} to {MAX_SECONDS.toLocaleString()} (ten minutes to a day).</span>
         {/if}
         A worker stops a task that runs this long and hands it back, and a claim that runs a minute
         past it is taken back whether or not its worker still answers. A job's page counts its tasks
         that hit the limit; three in a row with none completed between set the job aside, since its
-        batch is too big for the limit. A change applies to the claims made after it.
+        batch is too big for the limit. Ten minutes at the least: a worker's first task of a job may
+        spend a few of them building data it cannot stop part-way. A change applies to the claims
+        made after it.
       </p>
     </div>
     <p class="text-xs text-muted-foreground">

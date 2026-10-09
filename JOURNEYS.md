@@ -963,20 +963,20 @@ which counts toward nothing.
 - [ ] **Do** **Settings**. **Expect** Task Time Limit (Seconds) 3600, "1h",
   "Never changed: these are the defaults.", and **Save** disabled until the
   value changes.
-- [ ] **Do** type 59. **Expect** "A whole number of seconds from 60 to 86,400
-  (a minute to a day)." and **Save** disabled; sent anyway, the server
+- [ ] **Do** type 599. **Expect** "A whole number of seconds from 600 to 86,400
+  (ten minutes to a day)." and **Save** disabled; sent anyway, the server
   refuses it on the field.
-- [ ] **Do** set 120 and **Save**. **Expect** "Saved. Claims made from now on
+- [ ] **Do** set 600 and **Save**. **Expect** "Saved. Claims made from now on
   are given the new limit." and "Last changed by dev, <now>". The audit log
-  has `settings.changed` ("max_task_seconds 3600 -> 120").
+  has `settings.changed` ("max_task_seconds 3600 -> 600").
 - [ ] **Do** create a **Games** job of A-4's simmer against itself, with a
-  batch big enough that a task takes longer than two minutes, and give it an
+  batch big enough that a task takes longer than ten minutes, and give it an
   allocation.
-  **Expect** each task MAGPIE claims to stop at two minutes, and the job's
+  **Expect** each task MAGPIE claims to stop at ten minutes, and the job's
   page to say "1 task hit the time limit — lower the batch size." and then
   more. **Expect**, after the third in a row, the job inactive at 0%, its
   Status card reading "Set aside by the server: 3 tasks in a row hit the
-  2-minute time limit with none completed between: …", and `job.set_aside`
+  10-minute time limit with none completed between: …", and `job.set_aside`
   in the audit log ("N% -> 0%: …").
 - [ ] **Do** give it an allocation again. **Expect** it active, the reason gone
   and the count of tasks that hit the limit still shown; three more in a row
@@ -1166,7 +1166,7 @@ curl -s -b "$JAR" "$SITE/api/admin/backups"
 curl -s -b "$JAR" "$SITE/api/admin/audit-log?action=job.activated&per_page=5"
 ```
 
-**The task time limit.** Read it, and set it: 60 to 86,400 seconds, or a
+**The task time limit.** Read it, and set it: 600 to 86,400 seconds, or a
 `400` on `max_task_seconds`. Claims made after the change are given it.
 
 ```bash

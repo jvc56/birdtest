@@ -3332,7 +3332,9 @@ below.
   (The test predates the entry, and cited `A-ADMIN-20`; thirty-third audit.)
 - `A-ADMIN-30` The task time limit is an admin setting (`GET`/`PUT
   /api/admin/settings`): 3600 by default with nobody named as having changed
-  it, refused on its field below 60 or above 86,400, and each change audited
+  it, refused on its field below 600 or above 86,400 (and by the column's
+  CHECK, so a test moves a claim's deadline rather than the limit; 600 itself
+  accepted), and each change audited
   once (`settings.changed`, "max_task_seconds 3600 -> 1800", the admin as
   actor) -- a change to what it already is writes nothing; the claims made
   after a change are given it. *(Covered:
@@ -3758,7 +3760,7 @@ copy.
 - `C-9` `anon-uuid-assignment.json`, a first claim that mints a UUID.
   *(Covered: `contract_fixtures::a_first_claim_is_assigned_a_worker_uuid`.)*
 - `C-11` Every assignment fixture names its job (`job_name`, never empty)
-  and states its time limit (`max_task_seconds`, 60 to 86,400), and a games
+  and states its time limit (`max_task_seconds`, 600 to 86,400), and a games
   or pairs request its `threading_mode`, `igp` or `pgp` -- no other request
   type one. *(Covered:
   `contract_fixtures::every_assignment_names_its_job_its_time_limit_and_a_games_threading_mode`,

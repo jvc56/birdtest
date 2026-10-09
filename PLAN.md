@@ -72,7 +72,7 @@ Individual claims are rows in `task_claims`. When a claim's heartbeat times out,
 
 #### Task time limit
 
-A task may run for at most **`settings.max_task_seconds`** — one hour by default, a minute to a day, set on `/admin/settings` (`PUT /api/admin/settings`) and read at each claim. Every assignment states it (`max_task_seconds`) beside the job's name (`job_name`, never empty: a job created without one is named for its type and id), and every claim stores its own deadline, `task_claims.deadline_at` = claim time plus the limit as it stood then, so a change applies to the claims made after it. A heartbeat is not enough to keep a task: a job whose one unit outlasts any machine — a game pair of deep simmers — had its tasks held for as long as their workers lived, and handed out again when they gave up.
+A task may run for at most **`settings.max_task_seconds`** — one hour by default, ten minutes to a day, set on `/admin/settings` (`PUT /api/admin/settings`) and read at each claim. Every assignment states it (`max_task_seconds`) beside the job's name (`job_name`, never empty: a job created without one is named for its type and id), and every claim stores its own deadline, `task_claims.deadline_at` = claim time plus the limit as it stood then, so a change applies to the claims made after it. A heartbeat is not enough to keep a task: a job whose one unit outlasts any machine — a game pair of deep simmers — had its tasks held for as long as their workers lived, and handed out again when they gave up. The floor is ten minutes, not one, because a task's first claim on a machine may build the job's rack info table first — a minute to three, which cannot be stopped part-way and is kept for every task after it — and a limit near that would stop that task every time on every new machine. The column's CHECK holds the same floor as the API, so nothing gets under it; a test that wants a claim past its deadline moves the claim's `deadline_at` and `claimed_at` back instead.
 
 - **The worker stops at the limit.** MAGPIE stops a task that reaches `max_task_seconds` by its usual stop path, hands it back unfinished and declines it `time_limit`. The decline releases the claim at once, like any other, and is counted against the job (`jobs.time_limit_declines`): the job's page says "N tasks hit the time limit — lower the batch size". A `time_limit` decline is a task the worker could run, so it does not undo the job's settling, as `task_failed` does not.
 - **The server stops waiting a minute later** (`scheduler::DEADLINE_GRACE`). Reclamation lapses a claim past its deadline and the grace whether or not its worker still heartbeats — a build that ignores the limit, a solve hung but heartbeating — in the same statement that lapses a silent one, so the two can never both release one claim. A result for such a claim is answered `accepted: false`, as a lapsed claim's is, whether or not reclamation got to it first (a job nobody claims from is never swept, KL-1), and the claim is released in that transaction, its task back out at once. Neither happens while the process is in its startup grace, nor while a job's claims are in the grace after a purge or delete let go of them without committing (`scheduler::deadlines_enforced`): those are the spells in which a worker could not reach its claim — an outage, a purge's `503`s — and a result that could not land sooner is not late by its worker's doing.
@@ -4819,7 +4819,7 @@ exactly three entries: `kwg`, `letterdist`, `layout`.
 worker calls the job when it says what it is running: the admin's name for it,
 or for a job created without one its type and the start of its id
 (`games job 1d4a7f60`), never empty. `max_task_seconds` is how long the worker
-may run this task, a whole number of seconds from 60 to 86,400: the limit as it
+may run this task, a whole number of seconds from 600 to 86,400: the limit as it
 stood when this claim was made, from which the claim's deadline was set. A
 worker that reaches it stops the task, hands it back unfinished and declines it
 `time_limit`; a minute past the deadline the claim lapses whatever the worker
@@ -5691,7 +5691,7 @@ Every action on a job below — allocations, complete, consensus, purge, delete,
 | `POST` | `/api/admin/derived-data/retry` | Put one `failed` build back in the queue: `{ role, name, builder, kwg_id, klv_id, letterdist_id }`, as `GET /api/admin/derived-data` lists them (`klv_id` null for a wordmap); without the builder, `kwg_id` or `letterdist_id` it is a `400`, since rows can share a role and name, and a row that matches no failed build of this version's builders — a rack info table sent without its `klv_id` among them — is a `404`. Explicit rather than automatic: a failed attempt is tried again after 5 and then 15 minutes, which a passing outage survives, so a build that has failed three times failed for a reason a fourth attempt does not change — a missing or damaged input, a broken binary. |
 | `GET` | `/api/admin/fleet` | What the field is running, from `task_claims.magpie_version`: workers and claims per version, over the claims completed in the last seven days and those made in that week and still open — an open claim older than a week, which lazy reclamation can leave behind long after its worker went (KL-1), is not counted (KL-32). |
 | `GET` | `/api/admin/settings` | The settings an admin changes at run time: `{ max_task_seconds, updated_by, updated_at }`, `updated_by` the admin's name (null until anyone has changed them). |
-| `PUT` | `/api/admin/settings` | Change them: `{ "max_task_seconds": int }`, 60 to 86,400 (a minute to a day; anything else is a `400` on the field). The limit applies to the claims made after the change; every claim keeps the deadline it was given. Audited as `settings.changed`, from what to what; a change to what it already is writes nothing. Answers the settings as they now stand. The `/admin/settings` page sends it. |
+| `PUT` | `/api/admin/settings` | Change them: `{ "max_task_seconds": int }`, 600 to 86,400 (ten minutes to a day — a first claim may build a rack info table that cannot be stopped; anything else is a `400` on the field, and the column's CHECK refuses it too). The limit applies to the claims made after the change; every claim keeps the deadline it was given. Audited as `settings.changed`, from what to what; a change to what it already is writes nothing. Answers the settings as they now stand. The `/admin/settings` page sends it. |
 | `GET` | `/api/admin/backups` | Recent backup runs and how stale the newest successful one is. Read-only: backups are performed by a scheduled task, never by the server — see [Backups and Restore](#backups-and-restore). |
 | `POST` | `/api/admin/rating-pools` | Create a rating pool: name (as a job's: at most 100 characters, one line, stored trimmed), scope, and the anchor config that fixes the scale. The anchor joins as a member automatically. |
 | `POST` | `/api/admin/rating-pools/:id/members` | Add a player config to the pool and refit it. Returns the new run id; `run_id` is `null` for a config that is already a member (a second click, or the anchor), which is neither logged nor refitted. |
@@ -8176,8 +8176,15 @@ CREATE TABLE settings (
     -- it stood then, so a change applies to claims made after it. A claim
     -- past its deadline and a minute's grace is reclaimed even while its
     -- worker heartbeats, and its result refused (`task_claims.deadline_at`).
-    -- A minute at the least, a day at the most.
-    max_task_seconds  INT NOT NULL DEFAULT 3600 CHECK (max_task_seconds BETWEEN 60 AND 86400),
+    -- Ten minutes at the least, a day at the most. The floor is not the
+    -- shortest batch worth a claim but the first claim on a machine: it may
+    -- build the job's rack info table first, a minute to three that cannot
+    -- be stopped part-way (and is kept for every task after it), so a limit
+    -- near that would stop the task that paid for it, every time, on every
+    -- new machine. The API refuses what this refuses (`routes::admin`); a
+    -- test that wants a claim past its deadline moves the claim's
+    -- `deadline_at`, not this.
+    max_task_seconds  INT NOT NULL DEFAULT 3600 CHECK (max_task_seconds BETWEEN 600 AND 86400),
     -- Who changed them last, and when; NULL until anyone has. SET NULL, like
     -- jobs.created_by: the settings outlive the admin.
     updated_by        UUID REFERENCES users(id) ON DELETE SET NULL,
