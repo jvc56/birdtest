@@ -2715,14 +2715,19 @@ async fn set_allocations(
         }
         let moved = format!("{}% -> {}%", job.allocation, row.allocation);
         if row.allocation > 0 {
-            // A job set aside for its time-limit declines starts a new run of
-            // them, and is no longer set aside (`worker::record_time_limit`):
-            // the admin has decided it should run, and may have raised the
-            // limit since. An active job's new share keeps its run.
+            // A job set aside for tasks that hit the time limit starts a new
+            // run of them, and is no longer set aside
+            // (`worker::record_time_limit`): the admin has decided it should
+            // run, and may have raised the limit since. The run starts now, so
+            // an overrun from before it, counted later, is not part of it. An
+            // active job's new share keeps its run.
             sqlx::query(
                 "UPDATE jobs SET status = 'active', allocation = $1, activated_at = now(),
                                  time_limit_streak = CASE WHEN status = 'active'
                                                           THEN time_limit_streak ELSE 0 END,
+                                 time_limit_streak_since = CASE WHEN status = 'active'
+                                                                THEN time_limit_streak_since
+                                                                ELSE now() END,
                                  set_aside_reason = NULL
                  WHERE id = $2",
             )
@@ -3513,7 +3518,8 @@ async fn purge_body(
                          last_completed_at = NULL,
                          test_decided_status = NULL, test_decided_lower = NULL,
                          test_decided_upper = NULL, test_decided_units = NULL,
-                         time_limit_declines = 0, time_limit_streak = 0, set_aside_reason = NULL,
+                         time_limit_declines = 0, time_limit_streak = 0,
+                         time_limit_streak_since = NULL, set_aside_reason = NULL,
                          status = 'inactive', allocation = 0, claims_baseline = 0
          WHERE id = $1",
     )

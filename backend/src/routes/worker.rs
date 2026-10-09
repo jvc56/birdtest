@@ -455,11 +455,12 @@ const DECLINE_REASONS: [&str; 6] = [
     "time_limit",
 ];
 
-/// Time-limit declines in a row, with no task of the job completed between,
-/// that set the job aside (`Job::time_limit_streak`). One is a slow machine
-/// or an unlucky batch, and its task goes to another worker (none is handed
-/// back a task it declined within the hour); three with nothing completed
-/// between is a batch too big for the limit.
+/// Tasks in a row that hit the time limit -- `time_limit` declines and
+/// overruns (`task_claims.overrun`) -- with no task of the job completed
+/// between, that set the job aside (`Job::time_limit_streak`). One is a slow
+/// machine or an unlucky batch, and its task goes to another worker (none is
+/// handed back a task it declined within the hour); three with nothing
+/// completed between is a batch too big for the limit.
 pub const TIME_LIMIT_STREAK: i32 = 3;
 
 /// A task loads at most a handful of files, so an honest decline names a
@@ -556,7 +557,7 @@ async fn decline_task(
     }
     // After the claim and its task, as every path takes the job's row.
     let set_aside = if body.reason == "time_limit" {
-        record_time_limit(&mut tx, job_id, max_task_seconds).await?
+        record_time_limit(&mut tx, job_id, Some(max_task_seconds)).await?
     } else {
         false
     };
@@ -610,10 +611,13 @@ async fn decline_task(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Counts a `time_limit` decline against its job, and sets the job aside --
-/// inactive at 0%, with the reason on the job and in the audit log -- once
-/// [`TIME_LIMIT_STREAK`] of them have come in a row with no task of the job
-/// completed between (an accepted result zeroes the run). Whether it did.
+/// Counts the tasks of a job that hit the time limit -- a `time_limit` decline
+/// when `declined` gives its claim's limit, and every overrun reclamation has
+/// marked on the job's claims and nobody has counted yet
+/// (`task_claims.overrun`) -- and sets the job aside, inactive at 0% with the
+/// reason on the job and in the audit log, once [`TIME_LIMIT_STREAK`] of them
+/// have come in a row with no task of the job completed between. Whether it
+/// did.
 ///
 /// A job whose one unit outlasts the limit -- a game pair of deep simmers --
 /// fails every task the same way on every worker, and handed out again each
@@ -622,23 +626,67 @@ async fn decline_task(
 /// created, so the cure is a new job with a smaller batch, or a longer limit
 /// (`/admin/settings`) and an allocation again, which starts the run afresh.
 ///
+/// The run is in order of when each happened. A decline is counted as it
+/// arrives. An overrun is counted later than it happened -- reclamation marks
+/// it without the job's row, and this, run by whoever next holds that row,
+/// counts it -- so it joins the run only if its deadline came after the run
+/// began (`jobs.time_limit_streak_since`: the last accepted result, or the
+/// allocation that put the job back); one from before counts toward the
+/// total alone. Called by the job's next claim (`scheduler::count_overruns`),
+/// a `time_limit` decline, and a result refused past its deadline.
+///
+/// The job's row first, then its overruns: every caller takes them in that
+/// order, so two of them queue on the row rather than lock the same claims
+/// in two orders. Nothing else locks an abandoned claim -- a submission, a
+/// decline, a heartbeat and reclamation take only open ones -- but a purge or
+/// a delete, which holds the job's dispatch lock throughout (the claim path
+/// takes it before calling this) and waits out the open claim a decline or a
+/// refusal holds. Each of those callers holds its claim and task already: the
+/// order every submission takes, claim, task, job.
+///
 /// Like `set_allocations` at 0%: the status and the allocation in one write,
 /// keeping `jobs_allocation_is_status`, and one audit row with the share it
-/// moved from. Only an active job is set aside; a job already off counts the
-/// decline and nothing more. Holding the claim and its task, as a submission
-/// does before it takes the job's row.
-async fn record_time_limit(
+/// moved from. Only an active job is set aside; a job already off counts and
+/// nothing more.
+pub(crate) async fn record_time_limit(
     tx: &mut sqlx::PgConnection,
     job_id: Uuid,
-    max_task_seconds: i32,
+    declined: Option<i32>,
 ) -> AppResult<bool> {
+    let since: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT time_limit_streak_since FROM jobs WHERE id = $1 FOR UPDATE")
+            .bind(job_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    // Through `task_claims_overrun_idx`, which holds only the uncounted.
+    let (overruns, in_run, overrun_limit): (i64, i64, Option<i32>) = sqlx::query_as(
+        "WITH counted AS (
+             UPDATE task_claims SET overrun = 'counted'
+             WHERE job_id = $1 AND overrun = 'pending'
+             RETURNING deadline_at, EXTRACT(EPOCH FROM deadline_at - claimed_at)::int AS limit_secs
+         )
+         SELECT COUNT(*), COUNT(*) FILTER (WHERE $2::timestamptz IS NULL OR deadline_at > $2),
+                (array_agg(limit_secs ORDER BY deadline_at DESC))[1]
+         FROM counted",
+    )
+    .bind(job_id)
+    .bind(since)
+    .fetch_one(&mut *tx)
+    .await?;
+    // The limit the reason names: the decline's, or the latest overrun's.
+    let Some(max_task_seconds) = declined.or(overrun_limit) else {
+        return Ok(false);
+    };
+    let declined = i64::from(declined.is_some());
     let (streak, allocation): (i32, i32) = sqlx::query_as(
-        "UPDATE jobs SET time_limit_declines = time_limit_declines + 1,
-                         time_limit_streak = time_limit_streak + 1
+        "UPDATE jobs SET time_limit_declines = time_limit_declines + $2,
+                         time_limit_streak = time_limit_streak + $3
          WHERE id = $1
          RETURNING time_limit_streak, allocation",
     )
     .bind(job_id)
+    .bind(declined + overruns)
+    .bind(i32::try_from(declined + in_run).unwrap_or(i32::MAX))
     .fetch_one(&mut *tx)
     .await?;
     if streak < TIME_LIMIT_STREAK || allocation == 0 {
@@ -944,9 +992,23 @@ async fn submit_result(
     // -- and its result is answered as a lapsed claim's is. Released here,
     // as the sweep would, so the task goes back out now. Not while the sweep
     // would spare it (`scheduler::deadlines_enforced`).
+    //
+    // It is an overrun as the sweep marks one -- the worker is plainly alive,
+    // and ran the task past the limit -- and counted against the job now,
+    // with the claim and its task held, as a decline is
+    // (`record_time_limit`): a job whose tasks all finish a little too late
+    // would otherwise be handed out for ever.
     if claim.get::<bool, _>("past_deadline") && scheduler::deadlines_enforced(&state, job_id) {
         scheduler::release_claim(&mut tx, claim_id, "abandoned").await?;
+        sqlx::query("UPDATE task_claims SET overrun = 'pending' WHERE id = $1")
+            .bind(claim_id)
+            .execute(&mut *tx)
+            .await?;
+        let set_aside = record_time_limit(&mut tx, job_id, None).await?;
         tx.commit().await?;
+        if set_aside {
+            push_after_change(&state, job_id);
+        }
         tracing::debug!(claim_token = %body.claim_token, "refusing a result past its claim's deadline");
         return Ok(Json(ResultAck { accepted: false }));
     }
@@ -1055,8 +1117,9 @@ async fn submit_result(
     //
     // `last_completed_at` rides along. Every accepted submission completes its
     // task, so every one takes the lock regardless -- which is also what ends
-    // a run of time-limit declines (`time_limit_streak`, `record_time_limit`):
-    // a completed task shows the job's batch fits the limit.
+    // a run of tasks that hit the time limit (`time_limit_streak`, and when
+    // the next began, `record_time_limit`): a completed task shows the job's
+    // batch fits the limit.
     //
     // So does the claim's `movegens`, the same figure its contributor was
     // credited with above: the job's share of the contributors' totals, kept
@@ -1070,7 +1133,7 @@ async fn submit_result(
                              racks_settled = racks_settled + $5,
                              racks_without_consensus = racks_without_consensus + $6,
                              movegens = movegens + $7,
-                             time_limit_streak = 0,
+                             time_limit_streak = 0, time_limit_streak_since = now(),
                              last_completed_at = now()
              WHERE id = $1
                AND ($2 <> 0 OR $3 <> 0 OR $4 <> 0 OR $5 <> 0 OR $6 <> 0 OR $7 <> 0

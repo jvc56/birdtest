@@ -463,6 +463,20 @@ async fn shutdown_or_idle(
 /// build, a hung solve still heartbeating) would otherwise hold the task's
 /// one slot for as long as it ran.
 ///
+/// A claim lapsed at its deadline whose worker was alive when it lapsed --
+/// its last heartbeat within `timeout_secs` of the deadline and the grace,
+/// however late this sweep comes round -- is marked an overrun
+/// (`task_claims.overrun`, `pending`): a task that hit the time limit, which
+/// counts toward setting its job aside as a `time_limit` decline does. A
+/// solve or a build that overruns MAGPIE's stop declines only after the
+/// claim has lapsed, and that decline is a `404`, so without this a job whose
+/// tasks always overrun would be handed out for ever. One whose worker had
+/// gone silent by then is a dead worker's, and is not. Marked here and
+/// counted later, by whoever next holds the job's row for it
+/// ([`count_overruns`], `routes::worker::record_time_limit`): this statement
+/// runs over every candidate job on the claim path, and taking their rows
+/// would serialize every claim behind it.
+///
 /// Safe against a submission for the same claim racing it: the submit path
 /// holds the claim row locked from its lookup to its commit, and this
 /// statement skips a locked claim rather than waiting on it, so a claim is
@@ -486,7 +500,8 @@ pub async fn reclaim_expired(pool: &PgPool, job_id: Uuid, timeout_secs: f64) -> 
 /// The scan is the same either way: the planner reaches the expired claims
 /// through the partial index on open claims -- one entry per claim currently in
 /// flight across the fleet -- and filters by job afterwards, because
-/// no index on `task_claims` leads with the job. Run per job, a claim request
+/// no index on `task_claims` leads with the job (but the overruns', which
+/// holds next to nothing). Run per job, a claim request
 /// therefore paid that scan once per candidate, for a set of rows that does not
 /// depend on the job at all. Run once over all of them it is a single pass and
 /// a single round trip.
@@ -497,7 +512,10 @@ pub async fn reclaim_expired_for(
 ) -> AppResult<u64> {
     let result = sqlx::query(
         "WITH lapsed AS (
-             SELECT c.id
+             SELECT c.id,
+                    c.deadline_at < now() - make_interval(secs => $3)
+                    AND COALESCE(c.last_heartbeat_at, c.claimed_at)
+                        >= c.deadline_at + make_interval(secs => $3 - $2) AS overran
              FROM task_claims c
              JOIN tasks t ON t.id = c.task_id
              WHERE t.job_id = ANY($1)
@@ -508,7 +526,8 @@ pub async fn reclaim_expired_for(
          ),
          expired AS (
              UPDATE task_claims c
-             SET state = 'abandoned'
+             SET state = 'abandoned',
+                 overrun = CASE WHEN lapsed.overran THEN 'pending'::claim_overrun END
              FROM lapsed
              WHERE c.id = lapsed.id
              RETURNING c.task_id
@@ -590,6 +609,68 @@ pub fn deadlines_enforced(state: &AppState, job_id: Uuid) -> bool {
         && !state.dispatch_holds.reclaimable(&[job_id]).is_empty()
 }
 
+/// Counts the overruns reclamation marked on the claims of `job_ids`
+/// (`task_claims.overrun`) against their jobs, and returns the jobs that set
+/// aside (`routes::worker::record_time_limit`).
+///
+/// Reclamation marks them without taking any job's row; this is where they
+/// are counted, by the job's next claim, holding the job's dispatch lock as
+/// that claim would: a purge or a delete holds it for all it does, so the two
+/// never meet, and the claims of the job queue behind it rather than hand out
+/// a task of a job about to be set aside. Then the job's row, then its
+/// overruns. Each job in a transaction of its own, before the claim's.
+///
+/// What a claim with nothing to count pays is one statement, through
+/// `task_claims_overrun_idx`: it holds only the overruns nobody has counted
+/// yet -- each lives from the reclamation that marks it to its job's next
+/// claim, decline or late result -- so it is all but always empty, and never
+/// more than the claims that were in flight. A job held by a purge or a
+/// delete (`jobs::DispatchHolds`), or whose dispatch lock does not come within
+/// its bounded wait, is left to the next claim. Not fatal: a failure is
+/// logged, and the overrun counted next time.
+async fn count_overruns(state: &AppState, job_ids: &[Uuid]) -> Vec<Uuid> {
+    let pending: Vec<Uuid> = match sqlx::query_scalar(
+        "SELECT DISTINCT job_id FROM task_claims WHERE overrun = 'pending' AND job_id = ANY($1)",
+    )
+    .bind(job_ids)
+    .fetch_all(&state.pool)
+    .await
+    {
+        Ok(pending) => pending,
+        Err(err) => {
+            tracing::error!(error = %err, "looking for overruns to count failed");
+            return Vec::new();
+        }
+    };
+    let mut set_aside = Vec::new();
+    for job_id in pending {
+        if state.dispatch_holds.is_held(job_id) {
+            continue;
+        }
+        match count_overruns_of(state, job_id).await {
+            Ok(true) => {
+                // No admin action is coming to push this to open pages.
+                crate::routes::worker::push_after_change(state, job_id);
+                set_aside.push(job_id);
+            }
+            Ok(false) => {}
+            Err(err) => tracing::error!(%job_id, error = %err.message, "counting overruns failed"),
+        }
+    }
+    set_aside
+}
+
+/// [`count_overruns`] for one job: whether it set the job aside.
+async fn count_overruns_of(state: &AppState, job_id: Uuid) -> AppResult<bool> {
+    let mut tx = state.pool.begin().await?;
+    if !crate::jobs::try_lock_job_dispatch(&mut tx, job_id).await? {
+        return Ok(false);
+    }
+    let set_aside = crate::routes::worker::record_time_limit(&mut tx, job_id, None).await?;
+    tx.commit().await?;
+    Ok(set_aside)
+}
+
 /// Walk the candidate jobs in deficit order and hand out the first available
 /// unit of work.
 pub async fn claim(
@@ -646,6 +727,18 @@ pub async fn claim(
         let job_ids: Vec<Uuid> = jobs.iter().map(|job| job.id).collect();
         if let Err(err) = reclaim_lapsed(state, &job_ids).await {
             tracing::error!(error = %err.message, "reclaiming expired claims failed");
+        }
+        // Then the overruns that reclamation -- this one or an earlier one --
+        // marked and nobody has counted: a job they set aside is offered to
+        // nobody, this worker included, who is handed other work or none.
+        let set_aside = count_overruns(state, &job_ids).await;
+        let jobs: Vec<Job> = if set_aside.is_empty() {
+            jobs
+        } else {
+            jobs.into_iter().filter(|job| !set_aside.contains(&job.id)).collect()
+        };
+        if jobs.is_empty() {
+            return shutdown_or_idle(state, caps).await;
         }
 
         let mut retry_outer = false;

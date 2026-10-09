@@ -958,7 +958,8 @@ closes in seconds rather than never.
 Needs a MAGPIE that stops a task at the assignment's `max_task_seconds` and
 declines it `time_limit` (from the pin after this change). An older one runs
 on, and the server takes the claim back a minute past its deadline instead,
-which counts toward nothing.
+which -- the worker still heartbeating -- counts the same, at the job's next
+claim. A claim whose worker had stopped heartbeating counts toward nothing.
 
 - [ ] **Do** **Settings**. **Expect** Task Time Limit (Seconds) 3600, "1h",
   "Never changed: these are the defaults.", and **Save** disabled until the

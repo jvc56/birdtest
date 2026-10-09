@@ -84,9 +84,10 @@ pub struct Job {
     pub test_decided_lower: Option<f64>,
     pub test_decided_upper: Option<f64>,
     pub test_decided_units: Option<i64>,
-    /// Tasks a worker stopped at the time limit and handed back (`time_limit`
-    /// declines), and how many of those in a row with nothing completed
-    /// between: at [`crate::routes::worker::TIME_LIMIT_STREAK`] the job is set
+    /// Tasks that hit the time limit -- `time_limit` declines, and claims
+    /// taken back at their deadline while their worker was alive
+    /// (`task_claims.overrun`, counted later) -- and how many of those in a
+    /// row with nothing completed between: at [`crate::routes::worker::TIME_LIMIT_STREAK`] the job is set
     /// aside, and `set_aside_reason` says why. The reason is read only while
     /// the job is inactive; an allocation clears it.
     pub time_limit_declines: i64,

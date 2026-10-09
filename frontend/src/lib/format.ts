@@ -57,7 +57,8 @@ export function computeTime(seconds: number | null): string {
 
 /**
  * What a job page says of its tasks that hit the time limit: workers stop a
- * task at the limit and hand it back, so a job whose batch is too big for it
+ * task at the limit and hand it back (or the server takes it back a minute
+ * later), so a job whose batch is too big for it
  * makes no progress, and the cure is the admin's -- a smaller batch. `null`
  * while none has.
  */

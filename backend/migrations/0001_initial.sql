@@ -487,18 +487,27 @@ CREATE TABLE jobs (
     test_decided_lower  DOUBLE PRECISION,
     test_decided_upper  DOUBLE PRECISION,
     test_decided_units  BIGINT,
-    -- Tasks of this job a worker stopped at the time limit
-    -- (`settings.max_task_seconds`) and handed back, declining them
-    -- `time_limit`: the job page says how many, since the cure is a smaller
-    -- batch. And how many of those came in a row with no task of the job
-    -- completed between, which an accepted result zeroes: at three the job is
-    -- set aside -- inactive at 0%, with `set_aside_reason` saying why -- since
-    -- a job whose one unit always outlasts the limit would otherwise be
-    -- handed out, run for the limit and handed back for ever. Giving it an
+    -- Tasks of this job that hit the time limit (`settings.max_task_seconds`):
+    -- those a worker stopped and handed back, declining them `time_limit`,
+    -- and those whose claim the server took back at the deadline while the
+    -- worker still heartbeat (`task_claims.overrun`, counted once the job's
+    -- row is next taken). The job page says how many, since the cure is a
+    -- smaller batch. And how many of those came in a row with no task of the
+    -- job completed between, which an accepted result zeroes: at three the
+    -- job is set aside -- inactive at 0%, with `set_aside_reason` saying why
+    -- -- since a job whose one unit always outlasts the limit would otherwise
+    -- be handed out, run for the limit and handed back for ever. Giving it an
     -- allocation again starts the run afresh and clears the reason; a purge
     -- zeroes all three.
     time_limit_declines BIGINT NOT NULL DEFAULT 0 CHECK (time_limit_declines >= 0),
     time_limit_streak   INT NOT NULL DEFAULT 0 CHECK (time_limit_streak >= 0),
+    -- When the run `time_limit_streak` counts began: the last accepted result,
+    -- or the allocation that put the job back; NULL for a job whose run has
+    -- not been broken. An overrun is counted after the fact, so whether it is
+    -- part of the run is a question of when it happened -- its deadline --
+    -- not of when it was counted: one that overran before the completion or
+    -- the allocation that ended its run counts toward the total alone.
+    time_limit_streak_since TIMESTAMPTZ,
     -- Why the server switched the job off, when it did; read only while the
     -- job is inactive.
     set_aside_reason    TEXT,
@@ -978,6 +987,11 @@ CREATE INDEX tasks_queue_idx   ON tasks (job_id, created_at) WHERE state = 'avai
 -- this", the other is a claim that lapsed. Only the first is diagnostic.
 CREATE TYPE claim_state AS ENUM ('claimed', 'completed', 'abandoned', 'declined');
 
+-- An abandoned claim that ran past its deadline with its worker alive
+-- (`task_claims.overrun`): `pending` until it is counted against its job,
+-- then `counted`.
+CREATE TYPE claim_overrun AS ENUM ('pending', 'counted');
+
 CREATE TABLE task_claims (
     id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     task_id              UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -1002,6 +1016,20 @@ CREATE TABLE task_claims (
     -- it; the default, the limit's own default, is for a row written any
     -- other way (a script, a test's fixture).
     deadline_at          TIMESTAMPTZ NOT NULL DEFAULT now() + interval '1 hour',
+    -- Set on a claim taken back past its deadline while its worker was still
+    -- alive: reclamation found it heartbeating within the heartbeat timeout
+    -- of the moment it lapsed (deadline plus grace), or the worker submitted
+    -- a result for it too late. NULL for every other claim -- a lapse whose
+    -- worker had gone silent is what a dead worker leaves, and says nothing
+    -- about the job. Such a claim is a task that hit the time limit as surely
+    -- as a `time_limit` decline: a solve or a build that overruns MAGPIE's
+    -- stop declines after the claim has lapsed, and that decline is a `404`.
+    -- Counted against the job (`jobs.time_limit_declines`, `time_limit_streak`)
+    -- by whoever next holds the job's row for it -- the job's next claim,
+    -- a decline or a late result -- since reclamation runs over many jobs in
+    -- one statement on the claim path and takes no job's row: `pending` until
+    -- then, `counted` after.
+    overrun              claim_overrun,
     last_heartbeat_at    TIMESTAMPTZ,
     completed_at         TIMESTAMPTZ,
     -- The move generations this claim's accepted result reported (the
@@ -1020,7 +1048,7 @@ CREATE TABLE task_claims (
 )
 -- Room on each page for a claim's heartbeats. A heartbeat changes only
 -- `last_heartbeat_at`, which no index covers, so it can be a HOT update -- an
--- in-page rewrite that touches none of this table's eight indexes -- but only
+-- in-page rewrite that touches none of this table's nine indexes -- but only
 -- if the row's page has space, and claims are appended, so at the default
 -- fillfactor of 100 a claim's first heartbeat found its page full and wrote a
 -- new entry into every index: two a minute for every claim in flight.
@@ -1859,10 +1887,17 @@ CREATE TABLE audit_log (
 CREATE UNIQUE INDEX task_claims_token_idx     ON task_claims (claim_token);
 CREATE INDEX        task_claims_task_idx      ON task_claims (task_id);
 CREATE INDEX        task_claims_open_idx      ON task_claims (task_id) WHERE state = 'claimed';
+-- Overruns not yet counted against their job (`task_claims.overrun`). Every
+-- claim request asks which of its candidate jobs have one, and this is what
+-- keeps that cheap: an entry lives from the reclamation that records it to
+-- the job's next claim, decline or late result, so the index is all but
+-- always empty -- a probe, not a scan of the job's claims.
+CREATE INDEX        task_claims_overrun_idx   ON task_claims (job_id) WHERE overrun = 'pending';
 -- Completed claims by time. The ETA (`jobstats::estimate_eta`, on every
 -- detail view and live push) asks "how many of this job's claims completed
 -- in the last hour" (the job list's `stalled` flag reads
--- `jobs.last_completed_at` instead), and no index on task_claims leads with the job, so
+-- `jobs.last_completed_at` instead), and no index on task_claims leads with the job (but
+-- the overruns', which holds next to nothing), so
 -- the alternative plan walks every task of the job and every claim of each
 -- -- the job's whole history, for a question about its last hour. Through
 -- this index the scan is bounded by the fleet's recent completions instead,

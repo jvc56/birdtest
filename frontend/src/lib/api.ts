@@ -404,7 +404,10 @@ export interface JobStats {
     /** The lexicons in play. A games job comparing two reads "CSW21 vs NWL23". */
     lexicon: string | null;
     variant: string | null;
-    /** Tasks a worker stopped at the time limit and handed back. */
+    /**
+     * Tasks that hit the time limit: stopped and handed back, or taken back at
+     * the deadline while their worker was alive.
+     */
     time_limit_declines: number;
     /**
      * Why the server switched the job off, while it is off: three of its tasks

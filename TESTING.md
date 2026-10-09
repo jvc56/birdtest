@@ -3113,14 +3113,15 @@ below.
   the field names by `C-11`.)*
 - `A-WORKER-24` A claim past its deadline and the minute's grace lapses at the
   next reclamation **even while its worker heartbeats**, and its task goes
-  back out; inside the grace it stands, and a process in its startup grace
-  lapses nothing on a deadline either. *(Covered:
+  back out, the claim marked an overrun (`A-WORKER-27`); inside the grace it
+  stands, and a process in its startup grace lapses nothing on a deadline
+  either. *(Covered:
   `worker_routes::a_claim_past_its_deadline_lapses_even_while_heartbeating`.)*
 - `A-WORKER-25` A result for a claim past its deadline and the grace is
   answered `accepted: false` whether or not a reclamation got there first,
-  and the claim is released then, its task available and nothing stored;
-  inside the grace, or while the process is in its startup grace, the result
-  is accepted. *(Covered:
+  and the claim is released then, its task available and nothing stored (and
+  counted against the job as an overrun, `A-WORKER-29`); inside the grace, or
+  while the process is in its startup grace, the result is accepted. *(Covered:
   `worker_routes::a_result_past_its_claims_deadline_is_refused_and_frees_the_task`.)*
 - `A-WORKER-26` A `time_limit` decline is counted against its job, which the
   job's page shows (`job.time_limit_declines`); three in a row with no task of
@@ -3129,6 +3130,32 @@ below.
   an accepted result between them starts the run again. An allocation puts it
   back, its reason cleared and its run started afresh. *(Covered:
   `worker_routes::three_time_limit_declines_in_a_row_set_the_job_aside`.)*
+- `A-WORKER-27` A claim lapsed at its deadline while its worker still
+  heartbeat is an **overrun**: reclamation marks it (`task_claims.overrun`,
+  `pending`) and leaves the job's row alone, and the job's next claim counts
+  it (`counted`, the job's `time_limit_declines` and `time_limit_streak`).
+  Three in a row set the job aside as three `time_limit` declines do, with
+  the same reason and `job.set_aside` row, and the claim that counted the
+  third is handed another job's task. *(Covered:
+  `worker_routes::three_overruns_with_the_worker_alive_set_the_job_aside_at_the_next_claim`.)*
+- `A-WORKER-28` A claim lapsed at its deadline whose worker had gone silent
+  -- never heartbeat, or stopped a heartbeat timeout before the claim lapsed
+  -- counts toward nothing; what decides is whether the worker was alive when
+  the claim lapsed (deadline and grace), not when reclamation came round, so
+  one that heartbeat to the end and went quiet after is an overrun.
+  *(Covered:
+  `worker_routes::a_silent_workers_lapse_at_the_deadline_counts_toward_nothing`.)*
+- `A-WORKER-29` `time_limit` declines, overruns and results refused past
+  their deadline make one run, in the order they happened: an accepted result
+  ends it, and an overrun whose deadline came before that result, counted
+  after it, counts toward the total and not the run
+  (`jobs.time_limit_streak_since`). A refused late result is counted at once;
+  three in a row set the job aside, and nothing more is handed out. *(Covered:
+  `worker_routes::declines_overruns_and_late_results_make_one_run_that_a_completion_ends`.)*
+- `A-WORKER-30` A purge ends the run, deleting the claims an uncounted overrun
+  is marked on; an allocation that puts a job back starts a run that an
+  overrun from before it, counted after, is not part of. *(Covered:
+  `worker_routes::a_purge_or_an_allocation_starts_the_run_afresh`.)*
 - `A-WORKER-15` `client-version` reports the configured floor and a download
   URL. *(Covered:
   `worker_routes::client_version_reports_the_configured_floor_and_download_url`.)*

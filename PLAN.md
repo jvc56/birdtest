@@ -76,10 +76,13 @@ A task may run for at most **`settings.max_task_seconds`** — one hour by defau
 
 - **The worker stops at the limit.** MAGPIE stops a task that reaches `max_task_seconds` by its usual stop path, hands it back unfinished and declines it `time_limit`. The decline releases the claim at once, like any other, and is counted against the job (`jobs.time_limit_declines`): the job's page says "N tasks hit the time limit — lower the batch size". A `time_limit` decline is a task the worker could run, so it does not undo the job's settling, as `task_failed` does not.
 - **The server stops waiting a minute later** (`scheduler::DEADLINE_GRACE`). Reclamation lapses a claim past its deadline and the grace whether or not its worker still heartbeats — a build that ignores the limit, a solve hung but heartbeating — in the same statement that lapses a silent one, so the two can never both release one claim. A result for such a claim is answered `accepted: false`, as a lapsed claim's is, whether or not reclamation got to it first (a job nobody claims from is never swept, KL-1), and the claim is released in that transaction, its task back out at once. Neither happens while the process is in its startup grace, nor while a job's claims are in the grace after a purge or delete let go of them without committing (`scheduler::deadlines_enforced`): those are the spells in which a worker could not reach its claim — an outage, a purge's `503`s — and a result that could not land sooner is not late by its worker's doing.
-- **Three in a row set the job aside.** `jobs.time_limit_streak` counts the job's `time_limit` declines since a task of it was last completed; every accepted result zeroes it (in the `UPDATE jobs` every submission already makes). The third in a row sets the job aside: inactive at 0% in one write, as `set_allocations` leaves a job at 0%, so `jobs_allocation_is_status` holds; a `job.set_aside` audit row with no actor, from its share ("50% -> 0%: …"); and the reason on the job (`jobs.set_aside_reason`), which its page shows in place of "Paused". Three rather than one: one is a slow machine or an unlucky batch, and a declined task goes to another worker (a worker is not handed back a task it declined within the hour); three with nothing completed between is a batch too big for the limit. A job's batch is fixed at its creation, so the cure is a new job with a smaller batch, or a longer limit — and an allocation, which clears the reason and starts the run afresh. A purge zeroes all three columns.
-- **Lock order.** The decline holds its claim (`FOR UPDATE`, under the five-second claim lock wait, and answered `503` while a purge or delete holds the job, as before), then its task (`release_claim`), then the job's row (`record_time_limit`): claim, then task, then job, the order every submission and purge takes. The deadline's refusal of a result takes the claim and its task only. Reclamation still skips a locked claim, deadline or not.
+- **A lapse with the worker alive is an overrun.** A solve or a build that overruns MAGPIE's stop declines only after the claim has lapsed, and that decline is a `404`; a build that ignores the limit never declines. Either way the task hit the limit, and a job whose tasks always do would be handed out for ever. So reclamation, lapsing a claim at its deadline, marks it an overrun (`task_claims.overrun = 'pending'`) when its worker was alive when it lapsed: its last heartbeat within the heartbeat timeout of the deadline and grace, however late the sweep comes round. One whose worker had gone silent by then is what a dead worker leaves, and is not marked. A result refused past its deadline marks its claim too — that worker is plainly alive. An overrun counts toward setting the job aside as a `time_limit` decline does.
+- **Three in a row set the job aside.** `jobs.time_limit_streak` counts the job's `time_limit` declines and overruns since a task of it was last completed; every accepted result zeroes it (in the `UPDATE jobs` every submission already makes). `jobs.time_limit_declines`, the page's "N tasks hit the time limit", counts both. The third in a row sets the job aside: inactive at 0% in one write, as `set_allocations` leaves a job at 0%, so `jobs_allocation_is_status` holds; a `job.set_aside` audit row with no actor, from its share ("50% -> 0%: …"); and the reason on the job (`jobs.set_aside_reason`), which its page shows in place of "Paused". Three rather than one: one is a slow machine or an unlucky batch, and a declined task goes to another worker (a worker is not handed back a task it declined within the hour); three with nothing completed between is a batch too big for the limit. A job's batch is fixed at its creation, so the cure is a new job with a smaller batch, or a longer limit — and an allocation, which clears the reason and starts the run afresh. A purge zeroes all three columns, and deletes the claims an uncounted overrun is marked on.
+- **Overruns are counted lazily, in order.** Reclamation runs over every candidate job in one statement on the claim path, and taking their rows there would serialize every claim behind it, so it only marks an overrun. It is counted (`pending` → `counted`, `worker::record_time_limit`) by whoever next holds the job's row for it: the job's next claim (`scheduler::count_overruns`, after reclamation and before anything is handed out), a `time_limit` decline, or a result refused past its deadline. Counted late, an overrun joins the run only if its deadline came after the run began — `jobs.time_limit_streak_since`, set by every accepted result and by the allocation that puts an inactive job back — and otherwise counts toward the total alone: an overrun from before a completion is not part of the run that completion ended. A job the claim's count sets aside is dropped from that claim's candidates, so the claim that found it is handed another job's task, or none.
+- **What a claim pays.** One statement per claim request, asking which candidate jobs have an uncounted overrun, through `task_claims_overrun_idx` — a partial index on `job_id` holding only `pending` overruns, each from the reclamation that marks it to its job's next claim, decline or late result: all but always empty, and never more than the claims that were in flight. Only a job that has one pays more: a short transaction of its own under the job's dispatch lock (`try_lock_job_dispatch`'s bounded wait; a job a purge or delete holds, or whose lock does not come, is left to the next claim), and a failure is logged, not fatal.
+- **Lock order.** The decline holds its claim (`FOR UPDATE`, under the five-second claim lock wait, and answered `503` while a purge or delete holds the job, as before), then its task (`release_claim`), then the job's row (`record_time_limit`): claim, then task, then job, the order every submission and purge takes. The deadline's refusal of a result takes the same three, its claim, task and job. Counting overruns takes the job's row and then the job's `pending` claims — the job's row first, by every caller, so two counts queue on the row rather than lock the same claims in two orders. Nothing else locks an abandoned claim (a submission, a decline, a heartbeat and reclamation take only open ones) but a purge or a delete, which holds the job's dispatch lock throughout — the claim path's count takes that lock first, and a decline or a refusal holds an open claim the purge waits out before it takes the job's row. Reclamation still skips a locked claim, deadline or not, and takes no job's row.
 
-Only declines count toward setting a job aside, not deadline lapses: a lapse is also what a dead worker leaves, and reclamation runs over many jobs in one statement on the claim path, where taking job rows would serialize every claim behind it. A fleet that ignores the limit is handed its tasks again after each lapse, as before; a fleet on a MAGPIE that honours it sets the job aside.
+A fleet on a MAGPIE that honours the limit declines `time_limit`; a fleet that ignores it, or a task that overruns the stop, is taken back a minute past the deadline and counted as an overrun; either way three in a row set the job aside. Only a worker that was silent when its claim lapsed counts toward nothing.
 
 #### Task Generation
 
@@ -93,7 +96,7 @@ Every job type generates its tasks **on demand**: the next task request is gener
 2. The system selects the active job **most behind its configured allocation share** — specifically, among active jobs with an allocation above 0%, the one with the lowest ratio of `(claims_issued - claims_baseline) / allocation`, where `jobs.claims_issued` counts every claim ever issued for that job, **including abandoned and declined ones** — a claim consumed real dispatch capacity at the moment it was issued regardless of what happened to it afterward, so the count only ever goes up (a purge, which deletes the claims it counts, resets it). It is a counter rather than a `COUNT(*)` over `task_claims` because selection runs on every claim request, and a count grows with each job's whole history. Excluding abandoned claims would let a job with flaky or slow workers accumulate a disproportionate share by having its timeouts discounted, and would make the count non-monotonic — the opposite of what the deficit-based scheduler needs. Ties are broken by job creation order (oldest first). This is a deterministic deficit-based selection; no randomness is involved.
 
    **A job's share is measured from when it joined, not from when it was created.** `jobs.claims_baseline` is reset — on an allocation change, which is also how a job is activated (a purge zeroes it with the job left inactive, to rejoin when activated again) — so that the job's ratio equals the **lowest ratio among the other jobs being served** (`scheduler::join_at_parity`), and it takes its share from then on. *Being served* means a claim issued within the heartbeat timeout of the most recent claim of any other job on offer — `jobs.last_claimed_at`, which rides the `UPDATE jobs` every claim already makes — measured from the latest claim rather than from now, so after a quiet spell (a deployment gap, a quiet night) the jobs that were being served when the fleet stopped still set the pace; with no other job ever claimed, the highest ratio on offer, or zero. Joining is then **settled**: for an hour after it joined (`scheduler::JOIN_SETTLE`, from `jobs.activated_at`, which every join sets), each claim of the job lifts it level with the lowest of the claiming worker's other candidates — the ones it just passed over included — less one claim of that job and one of this one, the slack the turn check allows (`scheduler::issue_claim`, `pace_for`). A worker that declines the job because it cannot run it at all (`missing_data`, `magpie_version`, `unknown_job_type`, `derived_mismatch`) undoes the settling its claim gave (`scheduler::unsettle`): the server cannot filter a data gap, so every worker without the job's data is issued one claim of it, and that claim had settled a job only a minority could run at the majority's pace — past the minority's own lagging job, where the minority never reached it (none of 400 claims). Two more rules keep a job with nothing to hand out from banking debt: **a job passed over for want of a task is lifted to where the job the worker claims stood before its claim** (`scheduler::lift_passed_over`, after the claim commits, skipping a row somebody holds) — a games job whose every game is in flight, a generation being built, a dispatch hold (a seeding, a purge) — and **a job not served for a heartbeat timeout rejoins at parity on its first claim back, which starts its settling** (`scheduler::issue_claim`) — one whose MAGPIE floor was above the fleet's, whose data was not out. Every one of these only ever raises a job's ratio. The reason for the two steps is that a fleet split by capability — a release rolling out, data some workers lack — has no single pace: each class of workers runs its jobs at its own rate, and a job only some can run lags the rest for as long as the split lasts. That lag is the scheduler working (the minority's job gets all of the minority), but it means no one join point is right. What each single point did (the thirty-second audit, passes 19 and 20): level with the lowest of *every* job on offer, a newcomer was level with a job nobody could run and took twelve of the next twelve claims; level with the *leader*, a newcomer only the lagging class could run starved behind that class's job — none of the next 1,000 claims; bounding every job's lag behind the job just claimed to make up for that scrambled the jobs that lagged together (two at 45% split 978 : 22) and made a concurrent burst to a small job permanent (64 to 87 claims where 30 is fair); and level with the lowest *served*, a newcomer everyone could run was level with a job only a minority could run and took the majority's claims until it had caught theirs — the majority job's first claim came 331st, and an allocation changed from 20% to 19% did the same. Settled against the next candidate only, a job that paused for one claim let a newcomer be settled past it; and settling forgave the payback of a concurrent burst (307 to 324 claims where 30 is fair) until claims were checked for their turn. Joined at the lowest served, a job is below no class's pace, so it is never starved; settled, the first claim from each class that runs faster puts it level with that class's jobs, so it takes nothing over; and a structural lag is never lifted, because within the class that runs it a lagging job keeps pace. The limits of the hour and of the lift are KL-89. This is start-time fair queuing's rule — a flow that (re)joins starts at the current virtual time, of the workers that will serve it, and a flow with nothing to send earns no credit — and it is what makes "no starvation" true. Measured over a job's whole life, as it was, every change to the set of jobs was a takeover: a job activated beside one that had issued two million claims had a ratio of zero, so it was first in every candidate list until it had issued two million of its own, and the older job — at the same 50% — got *nothing* for as long as that took. A purge (which zeroes `claims_issued`), a reactivation after a week switched off, and an allocation raised from 10% to 50% (which cuts the ratio to a fifth) all did the same. With the baseline, the shares an admin sets are the shares the fleet sees from that moment, selection is still one deterministic statement, and the long-run ratios still converge on the allocations, because every job's numerator counts from the same point in the fleet's history. The baseline can be negative (a job with no claims joining a busy fleet is credited the claims that put it level).
-3. Expired claims for the candidate jobs are lazily reclaimed, in one statement: each timed-out `task_claims` row — silent for the heartbeat timeout, or past its [deadline](#task-time-limit) and a minute's grace however recently it heartbeat — is flipped to `abandoned`, `active_claim_count` is decremented, and their tasks return to `available`. A claim somebody holds locked — a submission, a decline, a purge — is skipped rather than waited on (`FOR UPDATE SKIP LOCKED`): it is not lapsed in any sense that matters, and the next claim request reclaims it if it still needs to be.
+3. Expired claims for the candidate jobs are lazily reclaimed, in one statement: each timed-out `task_claims` row — silent for the heartbeat timeout, or past its [deadline](#task-time-limit) and a minute's grace however recently it heartbeat — is flipped to `abandoned`, `active_claim_count` is decremented, and their tasks return to `available`. A claim somebody holds locked — a submission, a decline, a purge — is skipped rather than waited on (`FOR UPDATE SKIP LOCKED`): it is not lapsed in any sense that matters, and the next claim request reclaims it if it still needs to be. One lapsed at its deadline with its worker alive is marked an overrun, and the overruns not yet counted against the candidate jobs are counted then; a job they set aside is not a candidate for this claim ([Task time limit](#task-time-limit)).
 4. The system acquires the next task (one being re-dispatched, or else one generated on demand), inserts a `task_claims` row, increments `active_claim_count`, and issues a claim token (UUID) to the worker.
 5. The server responds with the **task request** for that job type.
 6. The worker performs the task and submits a **task response** along with the claim token.
@@ -4823,8 +4826,9 @@ may run this task, a whole number of seconds from 600 to 86,400: the limit as it
 stood when this claim was made, from which the claim's deadline was set. A
 worker that reaches it stops the task, hands it back unfinished and declines it
 `time_limit`; a minute past the deadline the claim lapses whatever the worker
-does, and a result for it is answered `accepted: false` (see
-[Task time limit](#task-time-limit)).
+does, and a result for it is answered `accepted: false` — either counted
+against the job as a task that hit the limit, as the decline is, if the worker
+was still alive (see [Task time limit](#task-time-limit)).
 
 `min_magpie_version` is always present. `worker_uuid` is present **only** when the
 request carried no identity at all and the server just minted one; the client
@@ -4962,6 +4966,7 @@ a task that failed or a result refused, counts as one, five in a row ending
 its run (a task handed back because the worker is stopping is sent as
 `task_failed` too, and counts as nothing). `time_limit` is counted against the
 job, not the worker: three in a row with no task of the job completed between
+— declines, and claims lapsed at their deadline with the worker alive, alike —
 set the job aside ([Task time limit](#task-time-limit)). Outside leave generation, the server does not offer a worker a task
 it declined within the hour (counted from the claim's last heartbeat); a
 declined leave task is reissued as it stands.
@@ -5577,7 +5582,7 @@ insert).
 | `user.registered` | Registration |
 | `task.declined` | A worker declining, with the reason in `reason` |
 | `job.created` / `job.activated` / `job.deactivated` / `job.completed` | Admin job lifecycle; an activation or deactivation (an allocation change that switched the job on or off) carries the allocation from what to what in `reason` ("0% -> 40%"); `job.completed` also for a job the server completes (its stopping rule: the match test, its last generation), with no actor and the verdict in `reason` (`player1_better`, `player2_better`, `inconclusive`) — or `reached_target` for a games or pairs job without a test |
-| `job.set_aside` | The server switching a job off because three of its tasks in a row hit the time limit with none completed between (`worker::record_time_limit`): no actor, `active` -> `inactive`, and in `reason` the allocation it moved from and why ("50% -> 0%: 3 tasks in a row hit the 1-hour time limit …"), which the job's `set_aside_reason` repeats for its page |
+| `job.set_aside` | The server switching a job off because three of its tasks in a row hit the time limit with none completed between — `time_limit` declines and overruns alike (`worker::record_time_limit`): no actor, `active` -> `inactive`, and in `reason` the allocation it moved from and why ("50% -> 0%: 3 tasks in a row hit the 1-hour time limit …"), which the job's `set_aside_reason` repeats for its page |
 | `settings.changed` | An admin changing a run-time setting (`PUT /api/admin/settings`), from what to what in `reason` ("max_task_seconds 3600 -> 1800"); a change to what it already is writes none |
 | `job.allocation_changed` | An active job's allocation changed to another above 0% through `PUT /api/admin/jobs/allocations`, from what to what in `reason` ("20% -> 35%"); a change to or from 0% is its `job.activated` / `job.deactivated` row instead |
 | `job.consensus_changed` | An opening-rack job's consensus settings changed, the changes and the racks left unsettled in `reason` ("min 1 -> 2, max 1 -> 3; 4 racks unsettled"); beside it `job.deactivated` (from `completed`) when the change reopened a completed job |
@@ -6852,18 +6857,27 @@ CREATE TABLE jobs (
     test_decided_lower  DOUBLE PRECISION,
     test_decided_upper  DOUBLE PRECISION,
     test_decided_units  BIGINT,
-    -- Tasks of this job a worker stopped at the time limit
-    -- (`settings.max_task_seconds`) and handed back, declining them
-    -- `time_limit`: the job page says how many, since the cure is a smaller
-    -- batch. And how many of those came in a row with no task of the job
-    -- completed between, which an accepted result zeroes: at three the job is
-    -- set aside -- inactive at 0%, with `set_aside_reason` saying why -- since
-    -- a job whose one unit always outlasts the limit would otherwise be
-    -- handed out, run for the limit and handed back for ever. Giving it an
+    -- Tasks of this job that hit the time limit (`settings.max_task_seconds`):
+    -- those a worker stopped and handed back, declining them `time_limit`,
+    -- and those whose claim the server took back at the deadline while the
+    -- worker still heartbeat (`task_claims.overrun`, counted once the job's
+    -- row is next taken). The job page says how many, since the cure is a
+    -- smaller batch. And how many of those came in a row with no task of the
+    -- job completed between, which an accepted result zeroes: at three the
+    -- job is set aside -- inactive at 0%, with `set_aside_reason` saying why
+    -- -- since a job whose one unit always outlasts the limit would otherwise
+    -- be handed out, run for the limit and handed back for ever. Giving it an
     -- allocation again starts the run afresh and clears the reason; a purge
     -- zeroes all three.
     time_limit_declines BIGINT NOT NULL DEFAULT 0 CHECK (time_limit_declines >= 0),
     time_limit_streak   INT NOT NULL DEFAULT 0 CHECK (time_limit_streak >= 0),
+    -- When the run `time_limit_streak` counts began: the last accepted result,
+    -- or the allocation that put the job back; NULL for a job whose run has
+    -- not been broken. An overrun is counted after the fact, so whether it is
+    -- part of the run is a question of when it happened -- its deadline --
+    -- not of when it was counted: one that overran before the completion or
+    -- the allocation that ended its run counts toward the total alone.
+    time_limit_streak_since TIMESTAMPTZ,
     -- Why the server switched the job off, when it did; read only while the
     -- job is inactive.
     set_aside_reason    TEXT,
@@ -7339,6 +7353,11 @@ CREATE INDEX tasks_queue_idx   ON tasks (job_id, created_at) WHERE state = 'avai
 -- this", the other is a claim that lapsed. Only the first is diagnostic.
 CREATE TYPE claim_state AS ENUM ('claimed', 'completed', 'abandoned', 'declined');
 
+-- An abandoned claim that ran past its deadline with its worker alive
+-- (`task_claims.overrun`): `pending` until it is counted against its job,
+-- then `counted`.
+CREATE TYPE claim_overrun AS ENUM ('pending', 'counted');
+
 CREATE TABLE task_claims (
     id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     task_id              UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -7363,6 +7382,20 @@ CREATE TABLE task_claims (
     -- it; the default, the limit's own default, is for a row written any
     -- other way (a script, a test's fixture).
     deadline_at          TIMESTAMPTZ NOT NULL DEFAULT now() + interval '1 hour',
+    -- Set on a claim taken back past its deadline while its worker was still
+    -- alive: reclamation found it heartbeating within the heartbeat timeout
+    -- of the moment it lapsed (deadline plus grace), or the worker submitted
+    -- a result for it too late. NULL for every other claim -- a lapse whose
+    -- worker had gone silent is what a dead worker leaves, and says nothing
+    -- about the job. Such a claim is a task that hit the time limit as surely
+    -- as a `time_limit` decline: a solve or a build that overruns MAGPIE's
+    -- stop declines after the claim has lapsed, and that decline is a `404`.
+    -- Counted against the job (`jobs.time_limit_declines`, `time_limit_streak`)
+    -- by whoever next holds the job's row for it -- the job's next claim,
+    -- a decline or a late result -- since reclamation runs over many jobs in
+    -- one statement on the claim path and takes no job's row: `pending` until
+    -- then, `counted` after.
+    overrun              claim_overrun,
     last_heartbeat_at    TIMESTAMPTZ,
     completed_at         TIMESTAMPTZ,
     -- The move generations this claim's accepted result reported (the
@@ -7381,7 +7414,7 @@ CREATE TABLE task_claims (
 )
 -- Room on each page for a claim's heartbeats. A heartbeat changes only
 -- `last_heartbeat_at`, which no index covers, so it can be a HOT update -- an
--- in-page rewrite that touches none of this table's eight indexes -- but only
+-- in-page rewrite that touches none of this table's nine indexes -- but only
 -- if the row's page has space, and claims are appended, so at the default
 -- fillfactor of 100 a claim's first heartbeat found its page full and wrote a
 -- new entry into every index: two a minute for every claim in flight.
@@ -8220,10 +8253,17 @@ CREATE TABLE audit_log (
 CREATE UNIQUE INDEX task_claims_token_idx     ON task_claims (claim_token);
 CREATE INDEX        task_claims_task_idx      ON task_claims (task_id);
 CREATE INDEX        task_claims_open_idx      ON task_claims (task_id) WHERE state = 'claimed';
+-- Overruns not yet counted against their job (`task_claims.overrun`). Every
+-- claim request asks which of its candidate jobs have one, and this is what
+-- keeps that cheap: an entry lives from the reclamation that records it to
+-- the job's next claim, decline or late result, so the index is all but
+-- always empty -- a probe, not a scan of the job's claims.
+CREATE INDEX        task_claims_overrun_idx   ON task_claims (job_id) WHERE overrun = 'pending';
 -- Completed claims by time. The ETA (`jobstats::estimate_eta`, on every
 -- detail view and live push) asks "how many of this job's claims completed
 -- in the last hour" (the job list's `stalled` flag reads
--- `jobs.last_completed_at` instead), and no index on task_claims leads with the job, so
+-- `jobs.last_completed_at` instead), and no index on task_claims leads with the job (but
+-- the overruns', which holds next to nothing), so
 -- the alternative plan walks every task of the job and every claim of each
 -- -- the job's whole history, for a question about its last hour. Through
 -- this index the scan is bounded by the fleet's recent completions instead,

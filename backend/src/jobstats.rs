@@ -83,8 +83,9 @@ pub struct JobSummary {
     pub created_by: Option<String>,
     pub lexicon: Option<String>,
     pub variant: Option<String>,
-    /// Tasks a worker stopped at the time limit and handed back: the page
-    /// says how many, since the cure is a smaller batch.
+    /// Tasks that hit the time limit, stopped and handed back or taken back
+    /// at the deadline with their worker alive: the page says how many, since
+    /// the cure is a smaller batch.
     pub time_limit_declines: i64,
     /// Why the server switched the job off, while it is off: its tasks kept
     /// hitting the time limit. `None` for a job an admin switched off.
