@@ -1249,6 +1249,15 @@ server refuses. Each rule mirrors one in `routes/auth.rs`, with its wording.
   and a page request sent on one as it closed was answered 502. *(Covered:
   `nginxConfig.test.ts`; that it fails at 65 was checked by hand, and the
   template passes `nginx -t` in the image.)* (Thirty-third audit, pass 1.)
+- `F-NGINX-3` Nginx gzips what it proxies under `/api/` when it is
+  `application/json` or `application/x-ndjson` -- the paginated results and
+  the results stream, whose long key names gzip takes out -- and never
+  `text/event-stream`, whose events gzip would hold back; `gzip on` appears
+  once, in `location /api/`, so the pages are as they were. Deployed, the ALB
+  sends `/api/` straight to the backend, so this compresses the compose and
+  local stacks only. *(Covered: `nginxConfig.test.ts`; the template passes
+  `nginx -t` in the image, and a JSON and an NDJSON answer came back
+  `Content-Encoding: gzip` through it, an event stream not.)*
 
 ## 2. Integration
 

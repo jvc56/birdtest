@@ -51,6 +51,17 @@ server {
         # download is short; with chunking off, Nginx answered without a
         # length and closed the connection, and a cut stream read as a
         # complete one (the audit's pass 21).
+
+        # The paginated results JSON and the results stream compress to a
+        # sixth or less: their long key names (`blended_utility`) are most of
+        # what gzip takes out. Only those two types -- never
+        # `text/event-stream`, whose events gzip would hold back until its
+        # buffer filled. A compressed stream is still chunked, so a cut one
+        # still shows. Any client, proxied or not.
+        gzip on;
+        gzip_types application/json application/x-ndjson;
+        gzip_proxied any;
+        gzip_vary on;
     }
 
     location /health {

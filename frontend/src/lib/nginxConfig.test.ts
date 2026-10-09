@@ -73,3 +73,39 @@ describe('F-NGINX-2 Nginx keeps an idle connection longer than the load balancer
     expect(seconds(keepalive[0][1])).toBeGreaterThan(Number(alb![1]));
   });
 });
+
+// The results JSON and its NDJSON stream compress to a sixth: their long key
+// names are what gzip takes out. Server-sent events must not be compressed,
+// or gzip holds each event back until its buffer fills and the live pages
+// stop being live.
+describe('F-NGINX-3 Nginx compresses the results, never the event stream', () => {
+  const code = readFileSync(join(__dirname, '..', '..', 'docker', 'default.conf.template'), 'utf8')
+    .split('\n')
+    .map((line) => line.replace(/#.*$/, ''))
+    .join('\n');
+  const types = [...code.matchAll(/^\s*gzip_types\s+([^;]*);/gm)].flatMap((m) => m[1].trim().split(/\s+/));
+
+  it('turns gzip on for application/json and application/x-ndjson', () => {
+    expect(code).toMatch(/^\s*gzip\s+on\s*;/m);
+    expect(types).toEqual(expect.arrayContaining(['application/json', 'application/x-ndjson']));
+  });
+
+  it('never for text/event-stream, nor every type', () => {
+    expect(types).not.toContain('text/event-stream');
+    expect(types).not.toContain('*');
+  });
+
+  it('only where the API is proxied', () => {
+    // The pages and assets keep what they had: `gzip on` outside `location
+    // /api/` would compress text/html, which gzip_types cannot leave out.
+    const start = code.search(/location\s+\/api\/\s*\{/);
+    let end = code.indexOf('{', start);
+    for (let depth = 0; end < code.length; end++) {
+      if (code[end] === '{') depth++;
+      if (code[end] === '}' && --depth === 0) break;
+    }
+    const api = code.slice(start, end + 1);
+    expect(code.match(/^\s*gzip\s+on\s*;/gm)).toHaveLength(1);
+    expect(api).toMatch(/gzip\s+on\s*;/);
+  });
+});
