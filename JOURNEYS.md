@@ -350,8 +350,13 @@ Open "dev game pairs (first divergences saved)".
   them.
 - [ ] **Do** search `QQQQQQQ`. **Expect** "No saved position has the rack
   QQQQQQQ."
+- [ ] **Expect** under the board each player's "Player N", score and (for
+  one) **to move** on a line, its name on the next (a long one cut short,
+  whole on hover), and the two racks' tiles level with each other.
 - [ ] Narrow the window to phone width. **Expect** the board to shrink with
-  it, nothing scrolling sideways.
+  it, nothing scrolling sideways; the rack box and **Search** on a line under
+  **Random position**; and the players' buttons as the two halves of one
+  control, each just a colour dot and the name.
 - [ ] On "tester no test" (A-7), which saves no positions, **expect** no such section.
 
 ### V-11 Ratings

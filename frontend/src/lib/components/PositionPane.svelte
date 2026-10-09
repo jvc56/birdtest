@@ -44,7 +44,7 @@
 <div class="min-w-0 space-y-3" data-testid="saved-position" data-game-index={position.game_index}>
   {#if heading}
     <h3 class="text-sm font-medium" data-testid="position-heading">
-      {heading}{#if mover}<span class="font-normal text-muted-foreground"> · {mover} to move</span>{/if}
+      {heading}{#if mover}<span class="font-normal text-muted-foreground">{` · ${mover} to move`}</span>{/if}
     </h3>
   {/if}
   <p class="text-sm">

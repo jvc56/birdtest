@@ -178,17 +178,24 @@
     {/each}
   </svg>
 
-  <div class="grid gap-2 sm:grid-cols-2">
+  <!-- Side by side, each player's block spans the grid's two rows -- what is
+       said of the player, then the tiles -- through a subgrid, so both racks
+       start at one height whatever is above them: a "to move" badge wrapping
+       under one long name pushed only that player's tiles down. The name has
+       a line of its own, cut short (whole on hover) rather than wrapped. -->
+  <div class="grid gap-x-2 gap-y-3 sm:grid-cols-2 sm:grid-rows-[auto_auto]">
     {#each position.racks as rack, seat}
-      <div class="space-y-1" data-testid="rack">
-        <p class="flex flex-wrap items-baseline gap-x-2 text-sm">
-          <span class="text-muted-foreground">Player {seat + 1}</span>
-          <span class="break-all">{names[seat]}</span>
-          <span class="tabular-nums font-medium" data-testid="score">{position.scores[seat]}</span>
-          {#if toMove === seat}
-            <span class="rounded-full bg-primary px-2 text-xs text-primary-foreground">to move</span>
-          {/if}
-        </p>
+      <div class="grid min-w-0 gap-y-1 sm:row-span-2 sm:grid-rows-subgrid" data-testid="rack">
+        <div class="min-w-0 text-sm">
+          <p class="flex items-baseline gap-x-2 whitespace-nowrap">
+            <span class="text-muted-foreground">Player {seat + 1}</span>
+            <span class="tabular-nums font-medium" data-testid="score">{position.scores[seat]}</span>
+            {#if toMove === seat}
+              <span class="rounded-full bg-primary px-2 text-xs text-primary-foreground">to move</span>
+            {/if}
+          </p>
+          <p class="truncate" title={names[seat]}>{names[seat]}</p>
+        </div>
         <!-- One line, however narrow the board's column: the tiles shrink to
              fit rather than wrap. -->
         <div class="flex min-h-8 gap-1">
