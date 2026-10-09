@@ -3,7 +3,7 @@
 # The commit this image's hashes are produced by, declared once for every
 # stage (each takes it with a bare `ARG MAGPIE_COMMIT`). CI reads it from this
 # line. MIN_MAGPIE_VERSION must never exceed the version this commit reports.
-ARG MAGPIE_COMMIT=856a606251615b41ef44806acab8fd60ba11a199
+ARG MAGPIE_COMMIT=ca94ceb8e524c2d1c7c5f94ce1702003e46061ab
 #
 # The backend, the derived-data builder, and the end-to-end suite's fake
 # worker.
