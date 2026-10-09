@@ -742,11 +742,9 @@ export const api = {
   jobs: (page = 0, status?: JobStatus) =>
     get<Page<JobListItem>>(`/api/jobs?page=${page}${status ? `&status=${status}` : ''}`),
   job: (id: string) => get<JobStats>(`/api/jobs/${id}`),
-  /** Cursor-paginated; see {@link CursorPage}. `?rack=` is `rackLookup`'s one page. */
-  jobResults: (id: string, params: Record<string, string | number | undefined> = {}) =>
-    get<CursorPage<Record<string, unknown>>>(
-      `/api/jobs/${id}/results?${query(params)}`
-    ),
+  /** Up to `n` distinct racks an opening-rack job has analysed, drawn at random. */
+  rackSamples: (id: string, n = 10) =>
+    get<{ racks: string[] }>(`/api/jobs/${id}/rack-samples?${query({ n })}`),
   /**
    * One rack's ranked moves in an opening-rack job, in one page: every analysis
    * of it, each with its best moves -- the whole list when there are few

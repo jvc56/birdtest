@@ -3370,6 +3370,12 @@ below.
   is `null` for a job with no task, or none returned; signed out is a `401`,
   an opening-rack job a `400`, an unknown job a `404`. *(Covered:
   `public_api::a_random_position_is_drawn_from_the_tasks_that_have_one`.)*
+- `A-PUBLIC-4h` `/rack-samples` draws distinct racks an opening-rack job has
+  analysed: none before it has any; from a small job, ten by default, every
+  one when more are asked for, at least one when none are; from a job past a
+  thousand analyses, by probes, ten distinct racks all of the job's. Another
+  job type is a `400`, an unknown job a `404`. *(Covered:
+  `public_api::rack_samples_are_distinct_analysed_racks`.)*
 - `A-PUBLIC-4g` A simulated position's moves carry their win percentage and their
   first two plies' statistics however many more the job recorded (four
   stored, two returned), and the position what its player inferred of the

@@ -35,17 +35,25 @@
   $: lookupIters = rackMoves ? showsIterations(rackMoves) : false;
   $: seeksConsensus = (config?.opening_racks?.max_results_per_rack ?? 1) > 1;
   let rackError = '';
-  // A few racks the job has analysed, to try the search on: the newest, from
-  // the results feed. Read once, when the page knows it is an opening-rack job.
+  // A few racks the job has analysed, to try the search on, drawn at random
+  // across the job: the newest results' were the tail of one batch, racks a
+  // fixed stride apart in the enumeration and so alphabetically close. Read
+  // once the page knows it is an opening-rack job, and again on "Shuffle".
   let sampleRacks: string[] = [];
   let samplesRequested = false;
+  let shuffling = false;
+  function drawSamples() {
+    shuffling = true;
+    api
+      .rackSamples(jobId)
+      .then((samples) => (sampleRacks = samples.racks))
+      // A failed shuffle keeps the racks shown; a failed first draw shows none.
+      .catch(() => {})
+      .finally(() => (shuffling = false));
+  }
   $: if (stats?.opening_racks && !samplesRequested) {
     samplesRequested = true;
-    api
-      .jobResults(jobId, { per_page: 50 })
-      // One record per rack per accepted claim, so a rack can repeat.
-      .then((page) => (sampleRacks = [...new Set(page.items.map((r) => String(r.rack)))].slice(0, 10)))
-      .catch(() => (sampleRacks = []));
+    drawSamples();
   }
 
   onMount(() => {
@@ -243,12 +251,18 @@
               {#each sampleRacks as rack}
                 <button
                   class="rounded border border-border px-2 py-0.5 font-mono text-xs hover:bg-muted"
+                  data-testid="rack-sample"
                   on:click={() => {
                     rackQuery = rack;
                     lookupRack();
                   }}>{rack}</button
                 >
               {/each}
+              <button
+                class="px-1 text-xs text-primary hover:underline disabled:opacity-50"
+                disabled={shuffling}
+                on:click={drawSamples}>Shuffle</button
+              >
             </div>
           {/if}
           {#if rackError}<p class="field-error">{rackError}</p>{/if}

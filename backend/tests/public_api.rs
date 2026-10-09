@@ -729,6 +729,103 @@ async fn rack_lookup_finds_an_analysed_rack() {
     assert_eq!(body["message"], "no such job");
 }
 
+/// A-PUBLIC-4h: `/rack-samples` draws distinct racks an opening-rack job has
+/// analysed: exactly, from a small job read whole; by probes of its rack
+/// space, from a large one. Only an opening-rack job's; an unknown job is a
+/// 404.
+#[tokio::test]
+async fn rack_samples_are_distinct_analysed_racks() {
+    let db = TestDb::new().await;
+    let app = birdtest::app(db.state().await);
+    let job = opening_rack_job(&db, 12).await;
+    let path = format!("/api/jobs/{job}/rack-samples");
+    let racks_of = |body: &serde_json::Value| -> Vec<String> {
+        body["racks"].as_array().unwrap().iter().map(|r| r.as_str().unwrap().to_string()).collect()
+    };
+
+    let (status, body) = send(&app, get_request(&path, &[])).await;
+    assert_eq!((status, &body), (StatusCode::OK, &json!({ "racks": [] })), "nothing analysed yet");
+
+    let (assignment, uuid) = first_claim(&app).await;
+    let mut analysed: Vec<String> = assignment["task_request"]["racks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(analysed.len(), 12);
+    let result = json!({
+        "racks": analysed.iter().map(|rack| json!({
+            "rack": rack, "num_moves": 1, "moves": [{ "move": "8G AB", "score": 8, "equity": 9.5 }],
+        })).collect::<Vec<_>>()
+    });
+    submit(&app, &assignment, &uuid, result).await;
+
+    // A small job, read whole: ten of its racks by default, all of them when
+    // asked for more, never one twice.
+    let (status, body) = send(&app, get_request(&path, &[])).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ten = racks_of(&body);
+    assert_eq!(ten.len(), 10, "{body}");
+    assert_eq!(ten.iter().collect::<std::collections::HashSet<_>>().len(), 10, "{body}");
+    assert!(ten.iter().all(|rack| analysed.contains(rack)), "{body}");
+    let (_, body) = send(&app, get_request(&format!("{path}?n=500"), &[])).await;
+    let mut all = racks_of(&body);
+    all.sort();
+    analysed.sort();
+    assert_eq!(all, analysed, "every rack once, the request held to the cap");
+    let (_, body) = send(&app, get_request(&format!("{path}?n=0"), &[])).await;
+    assert_eq!(racks_of(&body).len(), 1, "at least one is asked for");
+
+    // A large one, probed: past a thousand analyses, spread over the space of
+    // strings the probes are drawn from.
+    let (claim, task): (Uuid, Uuid) =
+        sqlx::query_as("SELECT id, task_id FROM task_claims WHERE claim_token = $1")
+            .bind(Uuid::parse_str(assignment["claim_token"].as_str().unwrap()).unwrap())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    let mut more = std::collections::BTreeSet::new();
+    let mut seed: u64 = 7;
+    while more.len() < 1200 {
+        let rack: String = (0..7)
+            .map(|_| {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                b"?ABCDE"[(seed >> 33) as usize % 6] as char
+            })
+            .collect();
+        if !analysed.contains(&rack) {
+            more.insert(rack);
+        }
+    }
+    let more: Vec<String> = more.into_iter().collect();
+    sqlx::query(
+        "INSERT INTO position_analysis_records (task_claim_id, task_id, job_id, rack, analysis, num_moves)
+         SELECT $1, $2, $3, rack, 'static', 1 FROM unnest($4::text[]) AS rack",
+    )
+    .bind(claim)
+    .bind(task)
+    .bind(job)
+    .bind(&more)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let every: std::collections::HashSet<&String> = analysed.iter().chain(&more).collect();
+    let (status, body) = send(&app, get_request(&path, &[])).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let probed = racks_of(&body);
+    assert_eq!(probed.len(), 10, "{body}");
+    assert_eq!(probed.iter().collect::<std::collections::HashSet<_>>().len(), 10, "{body}");
+    assert!(probed.iter().all(|rack| every.contains(rack)), "{body}");
+
+    let games = db.games_job(2).await;
+    let (status, body) = send(&app, get_request(&format!("/api/jobs/{games}/rack-samples"), &[])).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, _) =
+        send(&app, get_request(&format!("/api/jobs/{}/rack-samples", Uuid::new_v4()), &[])).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
 /// A games job with `capture_positions` on.
 async fn capturing_games_job(db: &TestDb) -> Uuid {
     let job = db.games_job(2).await;

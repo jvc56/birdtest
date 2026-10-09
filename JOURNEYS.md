@@ -263,7 +263,10 @@ Open "dev opening racks (english_ab)".
   say Minimum Analyses Per Rack 2, Maximum Analyses Per Rack 5, Consensus %
   80%, and no Racks in all or Rack size rows), a **Look up a rack** box, and
   under it "Analysed racks to try:" with its racks as buttons, each of A and B
-  only.
+  only and none twice, in random order, then **Shuffle**. **Do** press
+  **Shuffle**. **Expect** the racks drawn again (on a job this small, the
+  same eight in another order; on a large one, other racks from all over the
+  alphabet rather than a run of neighbours).
 - [ ] **Do** click one. **Expect** it fills the box, says which move is best
   in how many of its analyses, and shows each analysis's ranked moves
   (Analysis, #, Move, Score, Equity, Win %, and P1-S, P1-BP, P2-S and P2-BP:

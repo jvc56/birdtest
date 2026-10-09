@@ -26,6 +26,7 @@ pub fn router() -> Router<AppState> {
         .route("/jobs/:id", get(job_detail))
         .route("/jobs/:id/config", get(job_config))
         .route("/jobs/:id/results", get(job_results))
+        .route("/jobs/:id/rack-samples", get(rack_samples))
         .route("/jobs/:id/board", get(job_board))
         .route("/jobs/:id/positions", get(job_positions))
         .route("/jobs/:id/positions/random", get(random_position))
@@ -1123,6 +1124,113 @@ async fn rack_lookup(
 /// many as one analysis can record (`num_plays_recorded` is at most
 /// `i16::MAX`), shared out evenly between them.
 const RACK_LOOKUP_MOVES: i64 = i16::MAX as i64;
+
+#[derive(Deserialize)]
+struct RackSamplesQuery {
+    /// How many racks, at most [`MAX_RACK_SAMPLES`]; 10 unless given.
+    n: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct RackSamples {
+    racks: Vec<String>,
+}
+
+/// The most racks one sample returns.
+const MAX_RACK_SAMPLES: i64 = 50;
+
+/// Probes per rack asked for, on a job too large to read whole: two probes
+/// can land on one rack, and the extra ones make up for it.
+const PROBES_PER_SAMPLE: i64 = 4;
+
+/// The most analyses a job may have and still be read whole for a sample.
+const RACK_SAMPLE_SMALL_JOB: i64 = 1000;
+
+/// A few racks an opening-rack job has analysed, drawn at random, for its page
+/// to offer under the rack lookup. Public, like the lookup.
+///
+/// The page took the first distinct racks of the newest results, which are
+/// the tail of one batch: racks a fixed stride apart in the scattered
+/// enumeration, and so alphabetically close. Not `ORDER BY random()` either,
+/// which reads the whole job -- millions of records. A job of at most
+/// [`RACK_SAMPLE_SMALL_JOB`] analyses is read whole, through
+/// `position_analysis_records_job_rack_idx (job_id, rack)`, and sampled
+/// exactly. A larger one is probed: a rack drawn uniformly from the job's
+/// own rack space ([`RackIndex::rack_at`](crate::jobs::racks::RackIndex)),
+/// then the first analysed rack at or after it in the same index, wrapping to
+/// the first -- one index descent a probe, whatever the job's size, and no
+/// index of its own (a `(job_id, id)` one, to probe ids instead, would cost an
+/// entry per record on the largest table there is). A rack follows a run of
+/// racks not yet analysed as often as the run is long, which the scattered
+/// order keeps short. Duplicates are dropped, so fewer than `n` can come back.
+async fn rack_samples(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Query(query): Query<RackSamplesQuery>,
+) -> AppResult<Json<RackSamples>> {
+    use rand::seq::SliceRandom;
+    use rand::Rng;
+    let job = load_job(&state, id).await?;
+    if job.job_type != JobType::OpeningRack {
+        return Err(AppError::bad_request("only an opening-rack job's racks are sampled"));
+    }
+    let n = query.n.unwrap_or(10).clamp(1, MAX_RACK_SAMPLES) as usize;
+    let pool = &state.read_pool;
+
+    // In the index's order, so the read is a range of it however few of the
+    // table's records are this job's: unordered, the planner may scan the
+    // table for a job it guesses is common.
+    let mut racks: Vec<String> = sqlx::query_scalar(
+        "SELECT r.rack FROM position_analysis_records r
+         WHERE r.job_id = $1 AND r.game_index IS NULL
+         ORDER BY r.rack
+         LIMIT $2",
+    )
+    .bind(id)
+    .bind(RACK_SAMPLE_SMALL_JOB + 1)
+    .fetch_all(pool)
+    .await?;
+    if racks.len() as i64 > RACK_SAMPLE_SMALL_JOB {
+        let size: i32 =
+            sqlx::query_scalar("SELECT rack_size FROM job_opening_rack_config WHERE job_id = $1")
+                .bind(id)
+                .fetch_one(pool)
+                .await?;
+        let index = crate::jobs::racks::RackIndex::new(&job_letters(&state, &job).await?, size as usize)?;
+        let probes: Vec<String> = {
+            let mut rng = rand::thread_rng();
+            (0..n as i64 * PROBES_PER_SAMPLE)
+                .filter_map(|_| index.rack_at(rng.gen_range(0..index.total().max(1))))
+                .collect()
+        };
+        racks = sqlx::query_scalar(
+            "SELECT COALESCE(hit.rack, (
+                        SELECT r.rack FROM position_analysis_records r
+                        WHERE r.job_id = $1 AND r.game_index IS NULL
+                        ORDER BY r.rack LIMIT 1))
+             FROM unnest($2::text[]) WITH ORDINALITY AS p(probe, n)
+             LEFT JOIN LATERAL (
+                 SELECT r.rack FROM position_analysis_records r
+                 WHERE r.job_id = $1 AND r.game_index IS NULL AND r.rack >= p.probe
+                 ORDER BY r.rack LIMIT 1
+             ) hit ON true
+             ORDER BY p.n",
+        )
+        .bind(id)
+        .bind(&probes)
+        .fetch_all(pool)
+        .await?;
+    } else {
+        // A rack analysed more than once, for a consensus, is one rack.
+        racks.sort_unstable();
+        racks.dedup();
+        racks.shuffle(&mut rand::thread_rng());
+    }
+    let mut seen = std::collections::HashSet::new();
+    racks.retain(|rack| seen.insert(rack.clone()));
+    racks.truncate(n);
+    Ok(Json(RackSamples { racks }))
+}
 
 #[derive(Deserialize)]
 struct PositionsQuery {
