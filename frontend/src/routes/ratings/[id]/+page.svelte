@@ -182,11 +182,6 @@
     {/if}
 
     <div class="card space-y-3">
-      <h2 class="text-lg font-medium">Ratings</h2>
-      <RatingDotPlot ratings={pool.ratings} />
-    </div>
-
-    <div class="card space-y-3">
       <h2 class="text-lg font-medium">Cross table</h2>
       {#if table && pool.head_to_heads.length}
         <p class="text-sm text-muted-foreground">
@@ -260,6 +255,11 @@
         WESPA players; the absolute level is only where the anchor was pinned, since bot games say
         nothing about strength against people.
       </p>
+    </div>
+
+    <div class="card space-y-3">
+      <h2 class="text-lg font-medium">Ratings</h2>
+      <RatingDotPlot ratings={pool.ratings} />
     </div>
 
     <!-- The exact figures, and the membership controls: an admin's. A

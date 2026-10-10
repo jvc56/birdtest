@@ -155,13 +155,13 @@ test('E-7: an admin builds a rating pool and watches membership move the ratings
     await expect(cell).toHaveAttribute('data-record', shown > 50 ? 'win' : shown < 50 ? 'loss' : 'even');
   }
 
-  // A visitor reads the plot and the cross table, which comes straight after
-  // it; the exact figures and the controls are an admin's.
+  // A visitor reads the cross table and then the plot under it; the exact
+  // figures and the controls are an admin's.
   const signedOut = await browser.newContext({ storageState: { cookies: [], origins: [] } });
   const visitor = await signedOut.newPage();
   await visitor.goto(page.url());
   await expect(visitor.getByTestId('cross-table').locator('tbody tr')).toHaveCount(3);
-  await expect(visitor.locator('.card > h2')).toHaveText(['Ratings', 'Cross table']);
+  await expect(visitor.locator('.card > h2')).toHaveText(['Cross table', 'Ratings']);
   await expect(visitor.getByRole('heading', { name: 'All configs' })).toHaveCount(0);
   await expect(visitor.getByText('WESPA players')).toBeVisible();
   await signedOut.close();

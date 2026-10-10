@@ -731,7 +731,8 @@ pairs per head-to-head — showed the warning on sampling noise alone.
 
 #### The cross table
 
-Under the ratings, the pool page lays every head-to-head out as a cross table:
+First on the pool page, above the ratings, every head-to-head is laid out as a
+cross table:
 an n × n matrix of the configs the latest fit rated, best first (then any with
 no chain of games to the anchor), with each config's rating in the rightmost
 column. A cell is the row config's record against the column's, from the
@@ -6052,16 +6053,8 @@ Protected by a layout guard (`/admin/+layout.svelte`) that requires `is_admin = 
 `/ratings/[id]` is where a pool's fit is read. Three panels, each answering a
 different question, and the design choices in them are load-bearing:
 
-**Ratings, as a dot plot with error bars.** Deliberately not a bar chart: a bar
-encodes magnitude from zero, and a rating has no meaningful zero — only gaps
-mean anything, and the level is wherever the pool's anchor was pinned — so bar
-length would imply a ratio that does not exist. A dot on a common scale encodes
-position, which is what a rating is. The error bar matters as much as the dot, because a config with two
-hundred pairs and one with two million otherwise produce identical-looking
-numbers and only the interval says which to believe. A config with no path to the
-anchor is listed beneath the chart as **unrated** rather than drawn at a number.
-
-**The cross table**, straight after the plot. Every rated config against every
+**The cross table**, first: the results themselves, before the ratings that
+summarise them. Every rated config against every
 other: win %, its standard error and the average spread, the rating last ([The
 cross table](#the-cross-table)). A cell's background is its record as the cell
 shows it -- green over 50.0%, red under, none at 50.0% (`recordSide`: the
@@ -6077,7 +6070,16 @@ should be read as a summary rather than a ranking. It replaced a separate
 residual table, listed largest disagreement first, which said the same about
 the model in a list nobody could read against the results.
 
-**A table of every config**, for admins only, after the cross table: the
+**Ratings, as a dot plot with error bars**, under the cross table. Deliberately not a bar chart: a bar
+encodes magnitude from zero, and a rating has no meaningful zero — only gaps
+mean anything, and the level is wherever the pool's anchor was pinned — so bar
+length would imply a ratio that does not exist. A dot on a common scale encodes
+position, which is what a rating is. The error bar matters as much as the dot, because a config with two
+hundred pairs and one with two million otherwise produce identical-looking
+numbers and only the interval says which to believe. A config with no path to the
+anchor is listed beneath the chart as **unrated** rather than drawn at a number.
+
+**A table of every config**, for admins only, after the plot: the
 exact rating to a decimal, ± SE as a number and pairs played per config, with
 the membership controls. A visitor has the interval on the plot and the rating
 in the cross table's last column, which said the same thing twice.

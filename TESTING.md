@@ -3975,7 +3975,7 @@ admin in once and the admin journeys reuse its storage state.
   configs the cross table holds every head-to-head from both sides, each
   cell's hover what the ratings predict, each cell tinted by its record as it
   shows it (`data-record`), its last column the table's rating. Signed out,
-  the cross table is the first card after the plot and there is no All
+  the cross table is the first card, the plot after it, and there is no All
   configs card. *(Covered: `e7-ratings.spec.ts`.)*
 - `E-8` A job detail page renders the pentanomial table — three rows (Won both,
   Won one, drew one, Even) with a column per player, each read from that

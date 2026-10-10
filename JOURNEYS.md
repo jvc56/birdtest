@@ -375,9 +375,7 @@ Open "dev game pairs (first divergences saved)".
   **Expect** "classic · english · standard15 — anchored at 1500", "Last fit
   <time> (membership) over N pairs from 1 job, K iterations", and a warning
   if the fit did not converge.
-- [ ] **Expect** a dot plot with ±1 standard-error bars and the anchor in
-  amber.
-- [ ] **Expect** straight after it a "Cross table": every rated config against
+- [ ] **Expect** first a "Cross table": every rated config against
   every other, best first, each cell the row's win % "±" its standard error
   over its average spread ("+6.8"), a blank diagonal, "·" where two never
   played, and the rating in the last column. Each pair of cells mirrors across
@@ -388,6 +386,8 @@ Open "dev game pairs (first divergences saved)".
   absolute level is only where the anchor was pinned. **Do** hover a cell.
   **Expect** "<row> against <column>: … The ratings predict …% (residual …
   percentage points)."
+- [ ] **Expect** after it a dot plot with ±1 standard-error bars and the
+  anchor in amber.
 - [ ] As an admin, **expect** after it an "All configs" table (Rating (WESPA
   scale), ± SE, pairs; the anchor tagged), then the Anchor card. Signed out,
   **expect** neither.
