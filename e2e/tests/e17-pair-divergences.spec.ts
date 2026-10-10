@@ -6,7 +6,7 @@ test.use({ storageState: ADMIN_STATE });
 
 /**
  * E-17: a game-pairs job made through the form keeping only where each pair
- * first diverges shows a signed-in user the two games' positions of one pair,
+ * first diverges shows anyone the two games' positions of one pair,
  * one player's at a time with a toggle between them: the same turn, the same
  * rack, each player to move in one of them, its move drawn where it goes and
  * marked in its list. The fake workers synthesize first divergences the way MAGPIE keeps

@@ -6,9 +6,8 @@ test.use({ storageState: ADMIN_STATE });
 
 /**
  * E-12: a games job made through the form with "Position Recorder"
- * ticked shows a signed-in user one saved position at a time on its board --
- * a random one, or one of a rack's -- and tells a signed-out visitor to sign
- * in. The fake workers play synthetic games, 18 to 26 turns each, whose
+ * ticked shows anyone, signed in or not, one saved position at a time on its
+ * board -- a random one, or one of a rack's. The fake workers play synthetic games, 18 to 26 turns each, whose
  * positions are real boards: tiles, both racks, and the play before.
  */
 let api: AdminApi;
@@ -61,11 +60,12 @@ test.afterAll(async () => {
   await api.dispose();
 });
 
-test('E-12: a signed-in user draws saved positions at random and searches them by rack', async ({ page, browser }) => {
+test('E-12: anyone draws saved positions at random and searches them by rack', async ({ page, browser }) => {
+  // No account is needed: a signed-out visitor sees a position too.
   const signedOut = await browser.newContext({ storageState: { cookies: [], origins: [] } });
   const visitor = await signedOut.newPage();
   await visitor.goto(`/jobs/${jobId}`);
-  await expect(visitor.getByText('Sign in to search them')).toBeVisible();
+  await expect(visitor.getByTestId('saved-position')).toBeVisible();
   await signedOut.close();
 
   await page.goto(`/jobs/${jobId}`);

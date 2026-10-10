@@ -1429,8 +1429,8 @@ async fn saved_positions_with_partners(
 
 /// The positions a games or game-pairs job captured (`capture_positions`)
 /// where the player to move held one rack, newest first, each with its ranked
-/// moves: for signed-in users, since a job that captures holds millions of
-/// them and the public already has the results feed. A rack nothing was
+/// moves. Public, like everything else a job shows: an account only makes API
+/// keys. A rack nothing was
 /// captured with -- or that no tile of the job's distribution spells -- is an
 /// empty page.
 ///
@@ -1439,7 +1439,6 @@ async fn saved_positions_with_partners(
 /// (`/positions/random`) or one of a rack's -- so the feed had no reader left.
 async fn job_positions(
     State(state): State<AppState>,
-    _user: crate::auth::CurrentUser,
     Path(id): Path<Uuid>,
     Query(query): Query<PositionsQuery>,
 ) -> AppResult<Json<super::CursorPage<serde_json::Value>>> {
@@ -1521,7 +1520,6 @@ const RANDOM_POSITION_TRIES: usize = 8;
 /// shows one.
 async fn random_position(
     State(state): State<AppState>,
-    _user: crate::auth::CurrentUser,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<Option<serde_json::Value>>> {
     use rand::Rng;

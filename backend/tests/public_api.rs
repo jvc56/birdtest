@@ -987,13 +987,13 @@ async fn a_simulated_position_shows_its_plies_and_its_inference() {
     assert_eq!(stored, 9, "three plies a move, three positions (game 1's too)");
 }
 
-/// A-PUBLIC-4b: a games job's captured positions are searchable by rack by a
-/// signed-in user -- newest first, a page at a time, each with its ranked
-/// moves -- the rack however it is typed, spelt as MAGPIE spells one (blank
-/// last), and by nobody signed out. A search names a rack; a job type that
-/// captures nothing is refused.
+/// A-PUBLIC-4b: a games job's captured positions are searchable by rack by
+/// anyone, signed in or not -- newest first, a page at a time, each with its
+/// ranked moves -- the rack however it is typed, spelt as MAGPIE spells one
+/// (blank last). A search names a rack; a job type that captures nothing is
+/// refused.
 #[tokio::test]
-async fn captured_positions_are_searchable_when_signed_in() {
+async fn captured_positions_are_searchable_by_anyone() {
     let db = TestDb::new().await;
     let state = db.state().await;
     let cfg = state.cfg.clone();
@@ -1017,9 +1017,6 @@ async fn captured_positions_are_searchable_when_signed_in() {
     }
 
     let path = format!("/api/jobs/{job}/positions");
-    let (status, _) = send(&app, get_request(&format!("{path}?rack=AABCDE?"), &[])).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED, "signed out");
-
     let user = db.user(&format!("reader{}", Uuid::new_v4().simple()), false).await;
     let headers = admin_headers(&cfg, user);
 
@@ -1068,6 +1065,9 @@ async fn captured_positions_are_searchable_when_signed_in() {
     assert_eq!(items[0]["played_move"], "8D PLAYED");
     assert_eq!(items[0]["played_move_score"], 10);
     assert_eq!(items[0]["num_moves"], 30);
+    // Signed out reads the same: an account only makes API keys.
+    let (status, signed_out) = send(&app, get_request(&format!("{path}?rack=eedcbba"), &[])).await;
+    assert_eq!((status, &signed_out), (StatusCode::OK, &later));
 
     // A rack no tile of the distribution spells finds nothing, rather than
     // failing.
@@ -1088,8 +1088,8 @@ async fn captured_positions_are_searchable_when_signed_in() {
 
 /// A-PUBLIC-4c: a random position is drawn from the tasks that have one,
 /// passing over those still being played, and a job that has captured
-/// nothing -- no task yet, or none returned -- answers `null`. Signed in only;
-/// games and pairs jobs only.
+/// nothing -- no task yet, or none returned -- answers `null`. Anyone may
+/// draw, signed in or not; games and pairs jobs only.
 #[tokio::test]
 async fn a_random_position_is_drawn_from_the_tasks_that_have_one() {
     let db = TestDb::new().await;
@@ -1098,8 +1098,8 @@ async fn a_random_position_is_drawn_from_the_tasks_that_have_one() {
     let app = birdtest::app(state);
     let job = capturing_games_job(&db).await;
     let path = format!("/api/jobs/{job}/positions/random");
-    let (status, _) = send(&app, get_request(&path, &[])).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED, "signed out");
+    let (status, body) = send(&app, get_request(&path, &[])).await;
+    assert_eq!((status, &body), (StatusCode::OK, &json!(null)), "signed out, no task yet");
     let user = db.user(&format!("reader{}", Uuid::new_v4().simple()), false).await;
     let headers = admin_headers(&cfg, user);
 
@@ -1148,6 +1148,10 @@ async fn a_random_position_is_drawn_from_the_tasks_that_have_one() {
         seen.insert(body["position"].as_str().unwrap().to_string());
     }
     assert_eq!(seen.len(), 2, "both positions drawn: {seen:?}");
+    // Signed out draws from them too.
+    let (status, body) = send(&app, get_request(&path, &[])).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["task_id"], json!(task), "signed out: {body}");
 
     let racks = opening_rack_job(&db, 3).await;
     let (status, body) =

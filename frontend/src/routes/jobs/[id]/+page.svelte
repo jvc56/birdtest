@@ -169,27 +169,13 @@
     <MatchTestCard {stats} players={config?.players.map((p) => p.name) ?? []} />
 
     {#if config?.games?.capture_positions}
-      {#if $session}
-        <SavedPositions
-          {jobId}
-          players={config.players.map((p) => p.name)}
-          paired={config.job.job_type === 'game_pairs'}
-          firstDivergence={config.games.capture_first_divergence}
-          progress={stats.games?.units_completed ?? 0}
-        />
-      {:else if $session === null}
-        <div class="card space-y-1">
-          <h2 class="text-lg font-medium">Saved positions</h2>
-          <p class="text-sm text-muted-foreground">
-            {#if config.games.capture_first_divergence}
-              This job keeps the turn where each game pair's two games first diverged.
-            {:else}
-              This job keeps the position analysed on every turn of its games.
-            {/if}
-            <a href="/login?next={encodeURIComponent(`/jobs/${jobId}`)}">Sign in</a> to search them.
-          </p>
-        </div>
-      {/if}
+      <SavedPositions
+        {jobId}
+        players={config.players.map((p) => p.name)}
+        paired={config.job.job_type === 'game_pairs'}
+        firstDivergence={config.games.capture_first_divergence}
+        progress={stats.games?.units_completed ?? 0}
+      />
     {/if}
 
     <!-- Ratings are pool-scoped and live on /ratings: a rating is a statement

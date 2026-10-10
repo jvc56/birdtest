@@ -2,9 +2,9 @@
   /**
    * The positions a games or pairs job captured (`capture_positions`), one at
    * a time on the job's board: a random one, or those where the player to
-   * move held one rack, newest first. Signed-in users only -- the routes
-   * refuse anyone else. Before the job has saved any, it asks again as the
-   * job's progress moves, so the first one appears without a reload.
+   * move held one rack, newest first. Anyone may search them, signed in or
+   * not. Before the job has saved any, it asks again as the job's progress
+   * moves, so the first one appears without a reload.
    *
    * A pairs job's position comes with its partner, the same turn of the
    * pair's other game: up to the turn a pair's games diverge they are one game

@@ -305,8 +305,8 @@ const ROUTES: &[(&str, &str, Access, &str)] = &[
     ("GET", "/api/rating-pools/:id/history", Public, ""),
     ("GET", "/api/jobs/:id/config", Public, ""),
     ("GET", "/api/jobs/:id/board", Public, ""),
-    ("GET", "/api/jobs/:id/positions", Session, ""),
-    ("GET", "/api/jobs/:id/positions/random", Session, ""),
+    ("GET", "/api/jobs/:id/positions", Public, ""),
+    ("GET", "/api/jobs/:id/positions/random", Public, ""),
     ("GET", "/api/player-configs", Public, ""),
     ("GET", "/api/player-configs/:id", Public, ""),
 ];

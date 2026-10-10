@@ -309,15 +309,10 @@ finishes within minutes.
 
 Open "dev game pairs (first divergences saved)".
 
-- [ ] Signed out, **expect** a "Saved positions" card: "This job keeps the
-  turn where each game pair's two games first diverged. Sign in to search
-  them."
-  **Do** follow **Sign in**, as `dev-contributor-1`. **Expect** to land back on
-  this job.
 - [ ] On a job just activated that has saved nothing yet, **expect** "No
   positions saved yet: one appears here as soon as the job has saved one.",
   and a position to appear by itself, without a reload, once one is saved.
-- [ ] Signed in, **expect** one turn of a game pair: "Turn T of a game pair,
+- [ ] Signed out -- no account is needed to see them -- **expect** one turn of a game pair: "Turn T of a game pair,
   where the players first chose differently", then "Showing:" and a button
   per player ("static-equity's move", "static-score's move", each with its
   colour dot), the first pressed. Under them one game: "Game 1 of the pair ·
@@ -1031,6 +1026,19 @@ another as results arrive. Ctrl-C to stop.
 curl -sN "$SITE/api/jobs/$JOB/stream"
 ```
 
+**A job's saved positions** (the seeded "(positions saved)" job): one at
+random, or those with one rack, up to 20 a page, newest first;
+`next_cursor`, when present, fetches the next page (`&cursor=…`). The board
+they are drawn on is public too.
+
+```bash
+curl -s "$SITE/api/jobs/$JOB/positions/random" \
+  | jq '{game_index, turn_number, rack, position, previous_move, best: .moves[0].move}'
+curl -s "$SITE/api/jobs/$JOB/positions?rack=aeinrst&per_page=5" \
+  | jq '.items[] | {game_index, turn_number, rack, best: .moves[0].move}'
+curl -s "$SITE/api/jobs/$JOB/board" | jq '{start, first_row: .squares[0], letters: .letters[:3]}'
+```
+
 **Player configs, rating pools, and what a contributor needs.**
 
 ```bash
@@ -1044,7 +1052,6 @@ curl -s "$SITE/api/worker/client-version"
 ```bash
 curl -s -o /dev/null -w '%{http_code}\n' "$SITE/api/me"                     # 401: not signed in
 curl -s -o /dev/null -w '%{http_code}\n' "$SITE/api/admin/player-configs"   # 401
-curl -s -o /dev/null -w '%{http_code}\n' "$SITE/api/jobs/$JOB/positions/random"  # 401: signed-in users only
 ```
 
 ### A signed-in user
@@ -1077,19 +1084,6 @@ for `contribute.txt` (`apikey <key>`): the site's own routes do not accept it.
 curl -s -b "$JAR" -H "X-CSRF-Token: $CSRF" -H 'Content-Type: application/json' \
   -d '{"label":"laptop"}' "$SITE/api/me/api-keys"
 curl -s -b "$JAR" "$SITE/api/me/api-keys"
-```
-
-**A job's saved positions** (the seeded "(positions saved)" job): one at
-random, or those with one rack, up to 20 a page, newest first;
-`next_cursor`, when present, fetches the next page (`&cursor=…`). The board
-they are drawn on is public.
-
-```bash
-curl -s -b "$JAR" "$SITE/api/jobs/$JOB/positions/random" \
-  | jq '{game_index, turn_number, rack, position, previous_move, best: .moves[0].move}'
-curl -s -b "$JAR" "$SITE/api/jobs/$JOB/positions?rack=aeinrst&per_page=5" \
-  | jq '.items[] | {game_index, turn_number, rack, best: .moves[0].move}'
-curl -s "$SITE/api/jobs/$JOB/board" | jq '{start, first_row: .squares[0], letters: .letters[:3]}'
 ```
 
 **An admin route, as a user**, is `403`:

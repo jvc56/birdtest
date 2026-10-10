@@ -3516,14 +3516,14 @@ below.
 - `A-PUBLIC-4b` A games job's captured positions (`/api/jobs/:id/positions`)
   with one rack page newest first with their ranked moves, the rack however
   it is typed -- blank first, lower case -- spelt as MAGPIE spells one; a rack
-  the distribution cannot spell is an empty page; no rack is a `400`, signed
-  out a `401`, an opening-rack job a `400`, an unknown job a `404`.
-  *(Covered: `public_api::captured_positions_are_searchable_when_signed_in`.)*
+  the distribution cannot spell is an empty page; signed out reads the same
+  as signed in; no rack is a `400`, an opening-rack job a `400`, an unknown
+  job a `404`. *(Covered: `public_api::captured_positions_are_searchable_by_anyone`.)*
 - `A-PUBLIC-4c` A random position (`/positions/random`) is drawn from the
   tasks that have one, past tasks still being played -- the first captured of
   a task comes back, which the newest-position fallback never returns -- and
-  is `null` for a job with no task, or none returned; signed out is a `401`,
-  an opening-rack job a `400`, an unknown job a `404`. *(Covered:
+  is `null` for a job with no task, or none returned; signed out draws the
+  same; an opening-rack job a `400`, an unknown job a `404`. *(Covered:
   `public_api::a_random_position_is_drawn_from_the_tasks_that_have_one`.)*
 - `A-PUBLIC-4h` `/rack-samples` draws distinct racks an opening-rack job has
   analysed: none before it has any; from a small job, ten by default, every
@@ -3994,7 +3994,7 @@ admin in once and the admin journeys reuse its storage state.
   "No worker has declined this job", showed 100, and Activate sent it
   (thirty-second audit, pass 16).
 - `E-12` A games job between two simmers made through the form with "Position Recorder" ticked
-  (and no significance test, the form's default) shows a signed-out visitor a prompt to sign in, and a signed-in user
+  (and no significance test, the form's default) shows a signed-out visitor
   one position at a time on its board: **Random position** until one follows
   a play, whose tiles are down with the play's outlined, both racks and
   scores with the player to move marked, and its ranked moves, each with its
@@ -4029,7 +4029,7 @@ admin in once and the admin journeys reuse its storage state.
 - `E-17` A game-pairs job made through the form with "Position Recorder" and
   then "Only Where Each Pair First Diverges" ticked (offered only once saving
   is) says "yes (first divergences)" in its settings and shows a
-  signed-in user a pair's two games at one turn, one player's move at a time
+  visitor a pair's two games at one turn, one player's move at a time
   on one board with a toggle between them: "Game 1 of the pair" and "Game 2
   of the pair", the same rack, each player to move in one, each with ranked
   moves; a search for that rack finds the pair once, both
