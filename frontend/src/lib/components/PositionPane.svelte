@@ -70,8 +70,10 @@
        equally, the board never under 24rem: one move list shows at a time,
        so a column fixed for the board left most of a wide screen to a table
        that needs a fraction of it. The board's own cap (Board.svelte) stops
-       it growing past what a screen can read at once. Narrower, the moves go
-       under the board. -->
+       it growing past what a screen can read at once. The moves and the
+       inference fill their column rather than leaving its right side empty,
+       and scroll inside it when they are wider. Narrower, the moves go under
+       the board. -->
   <div class="grid items-start gap-4 lg:grid-cols-[minmax(24rem,1fr)_minmax(0,1fr)]">
     <div class="min-w-0 space-y-2">
       {#if board && parsed}
@@ -88,7 +90,7 @@
       {/if}
     </div>
     <div class="min-w-0 overflow-x-auto">
-      <table class="moves table w-auto text-xs" data-testid="position-moves">
+      <table class="moves table text-xs" data-testid="position-moves">
         <thead>
           <tr>
             <th>#</th><th>Move</th><th class="text-right">Score</th><th class="text-right">Equity</th>
@@ -142,8 +144,8 @@
         <div class="mt-3 space-y-1" data-testid="position-inference">
           <p class="text-xs">{inferenceSummary(inference, position.previous_move)}.</p>
           {#if inference.leaves.length}
-            <!-- As wide as its three columns, like the moves above it. -->
-            <table class="moves table w-auto text-xs">
+            <!-- The column's width, like the moves above it. -->
+            <table class="moves table text-xs">
               <thead>
                 <tr>
                   <th title="What the opponent kept">Leave</th>
