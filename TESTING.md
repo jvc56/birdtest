@@ -4008,8 +4008,8 @@ admin in once and the admin journeys reuse its storage state.
   workers shape each position by its mover's config, as MAGPIE does); a rack search
   for that rack typed backwards in lower case shows a position holding it
   (with **Next** and **Previous** when there are more); a rack nothing has is
-  said to be. `E-12b`: at phone width the board fits the screen and nothing
-  scrolls sideways. *(Covered: `e12-saved-positions.spec.ts`, two tests; the
+  said to be. `E-12b`: at phone width the board fits the screen, nothing
+  scrolls sideways, and the rack tiles stay square. *(Covered: `e12-saved-positions.spec.ts`, two tests; the
   fake workers play synthetic games whose positions are real boards.)*
 - `E-13` An opening-rack job's page offers ten racks it has analysed under the
   search, and clicking one looks it up: a static player's, so its moves show

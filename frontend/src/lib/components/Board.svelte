@@ -77,10 +77,11 @@
   }
 </script>
 
-<div class="space-y-3">
+<!-- The racks and legend as wide as the board, not the column. -->
+<div class="max-w-2xl space-y-3">
   <svg
     viewBox="{-M} {-M} {dim * U + M} {dim * U + M}"
-    class="block h-auto w-full max-w-xl select-none"
+    class="block h-auto w-full max-w-2xl select-none"
     role="img"
     aria-label="The board: {tileCount} tiles{placed.size ? ', the previous move outlined' : ''}{ghosts.size
       ? `, ${played.map((p) => `${p.label} ${p.move}`).join(' and ')} drawn where it goes`
@@ -197,8 +198,10 @@
           <p class="truncate" title={names[seat]}>{names[seat]}</p>
         </div>
         <!-- One line, however narrow the board's column: the tiles shrink to
-             fit rather than wrap. -->
-        <div class="flex min-h-8 gap-1">
+             fit rather than wrap, and stay square as they do. At the
+             default `stretch` each tile's height was the line's while its
+             width shrank, and a narrow rack was a row of rectangles. -->
+        <div class="flex min-h-8 items-start gap-1">
           {#each rack as tile}
             {@const points = score(tile)}
             <span
@@ -264,8 +267,11 @@
     display: inline-flex;
     align-items: center;
     justify-content: center;
+    /* At most 2rem, shrinking with the rack's line; the height follows the
+       width (`aspect-ratio`), never the line's. */
     flex: 0 1 2rem;
     min-width: 0;
+    height: auto;
     aspect-ratio: 1;
     border-radius: 0.25rem;
     background: hsl(40 55% 80%);

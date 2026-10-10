@@ -145,5 +145,9 @@ test('E-12b: the board fits a phone', async ({ browser }) => {
   expect(box.x + box.width).toBeLessThanOrEqual(screen);
   const scrollWidth = await page.evaluate(() => document.documentElement.scrollWidth);
   expect(scrollWidth, 'page is wider than the screen').toBeLessThanOrEqual(screen);
+  // The rack tiles shrink to fit and stay square: stretched to the line's
+  // height while their width shrank, they were rectangles.
+  const tile = (await page.locator('[data-testid="rack"] .rack-tile').first().boundingBox())!;
+  expect(Math.abs(tile.width - tile.height), `${tile.width} x ${tile.height}`).toBeLessThan(1);
   await phone.close();
 });
