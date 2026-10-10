@@ -41,7 +41,7 @@ async function expectTableFits(page: Page, box?: Locator) {
 
 /**
  * A column header is within the screen's width -- not pushed off its right
- * edge -- wherever it is down the page: on a phone the movegens-by-type card
+ * edge -- wherever it is down the page: on a phone the site's totals card
  * stacks above the ranking and pushes it below the fold, which is not what
  * this checks.
  */
@@ -103,7 +103,7 @@ test('E-10: a visitor on a phone reads the job list, a job page and the rankings
     expect(boxes[i]!.y).toBeGreaterThan(boxes[i - 1]!.y);
   }
   // And the header's links are all on screen and reachable.
-  for (const name of ['Jobs', 'Ratings', 'Contributors', 'Users', 'Sign in']) {
+  for (const name of ['Jobs', 'Ratings', 'Contributions', 'Users', 'Sign in']) {
     const link = page.getByRole('banner').getByRole('link', { name, exact: true });
     await expect(link).toBeInViewport();
   }
@@ -143,12 +143,17 @@ test('E-10: a visitor on a phone reads the job list, a job page and the rankings
   // The contributors' ranking fits its box, the column it is ranked by on
   // screen: a pseudonym's sixteen characters pushed it out (thirty-second audit).
   // With a row in it: an empty table fits on any page.
-  await page.getByRole('banner').getByRole('link', { name: 'Contributors', exact: true }).tap();
-  await expect(page.getByRole('columnheader', { name: 'Movegens' })).toBeVisible();
+  await page.getByRole('banner').getByRole('link', { name: 'Contributions', exact: true }).tap();
+  // The ranking's own headers: the site's totals and a contributor's
+  // breakdown are tables under the same names.
+  const ranking = page.getByTestId('contributor-ranking');
+  const header = (name: string) =>
+    ranking.locator(':scope > table > thead').getByRole('columnheader', { name, exact: true });
+  await expect(header('Movegens')).toBeVisible();
   await expect(page.getByRole('cell', { name: /^Anonymous · [0-9a-f]{16}$/ }).first()).toBeVisible();
   await expectNoSidewaysScroll(page);
-  await expectTableFits(page);
-  await expectAcrossScreen(page, page.getByRole('columnheader', { name: 'Movegens' }));
+  await expectTableFits(page, ranking);
+  await expectAcrossScreen(page, header('Movegens'));
 
   // And with the widest names either ranking can hold, which the seed has not
   // registered: both lists answered as the server would with them.
@@ -184,33 +189,39 @@ test('E-10: a visitor on a phone reads the job list, a job page and the rankings
       }
     })
   );
-  // Every type at a BIGINT's widest, the site's and the contributor's.
-  const widest = { opening_rack: 9.2e18, games: 9.2e18, game_pairs: 9.2e18, leave_generation: 9.2e18 };
+  // Every type at a BIGINT's widest, the site's and the contributor's, and a
+  // century of compute and a trillion tasks beside.
+  const share = { movegens: 9.2e18, compute_seconds: 3.2e9, tasks: 999999999999 };
+  const widest = { opening_rack: share, games: share, game_pairs: share, leave_generation: share };
   await page.route(/\/api\/workers\/(user\/[^/]+\/)?movegens$/, (route) => route.fulfill({ json: widest }));
   await page.reload();
   await expect(page.getByRole('cell', { name: LONGEST })).toBeVisible();
-  await expect(page.getByTestId('site-movegens').locator('dd').first()).toHaveText('9,200,000,000,000,000,000');
+  const site = page.getByTestId('site-movegens');
+  await expect(site.locator('dd').first()).toHaveText('36,800,000,000,000,000,000');
+  await expect(site.locator('[data-figure="movegens"]')).toHaveText(Array(4).fill('9,200,000,000,000,000,000'));
   await expectNoSidewaysScroll(page);
-  await expectTableFits(page);
-  await expectAcrossScreen(page, page.getByRole('columnheader', { name: 'Movegens' }));
-  // A contributor's movegens by job type open under their row, inside the
+  // The site's table wraps inside its card rather than widening it.
+  await expectTableFits(page, site);
+  await expectTableFits(page, ranking);
+  await expectAcrossScreen(page, header('Movegens'));
+  // A contributor's work by job type opens under their row, inside the
   // ranking's box, and the page still does not scroll sideways.
   await page.getByRole('button', { name: LONGEST }).tap();
   const breakdown = page.getByTestId('contributor-movegens');
-  await expect(breakdown.locator('dd')).toHaveText(Array(4).fill('9,200,000,000,000,000,000'));
+  await expect(breakdown.locator('[data-figure="movegens"]')).toHaveText(Array(4).fill('9,200,000,000,000,000,000'));
   await expectNoSidewaysScroll(page);
-  await expectTableFits(page);
-  for (const line of await breakdown.locator('dd').all()) {
-    const box = (await line.boundingBox())!;
+  await expectTableFits(page, ranking);
+  for (const cell of await breakdown.locator('[data-figure]').all()) {
+    const box = (await cell.boundingBox())!;
     expect(box.x + box.width).toBeLessThanOrEqual(page.viewportSize()!.width);
   }
   // Ranked by another column, that column is the one shown beside the name.
   await page.getByRole('button', { name: 'Compute time' }).tap();
-  await expect(page.getByRole('columnheader', { name: 'Compute time' })).toHaveAttribute('aria-sort', 'descending');
-  await expect(page.getByRole('columnheader', { name: 'Movegens' })).toBeHidden();
+  await expect(header('Compute time')).toHaveAttribute('aria-sort', 'descending');
+  await expect(header('Movegens')).toBeHidden();
   await expectNoSidewaysScroll(page);
-  await expectTableFits(page);
-  await expectAcrossScreen(page, page.getByRole('columnheader', { name: 'Compute time' }));
+  await expectTableFits(page, ranking);
+  await expectAcrossScreen(page, header('Compute time'));
 
   await page.getByRole('banner').getByRole('link', { name: 'Users', exact: true }).tap();
   await expect(page.getByRole('cell', { name: new RegExp(`^${LONGEST}`) })).toBeVisible();

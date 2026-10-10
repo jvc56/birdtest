@@ -232,12 +232,23 @@ export interface Contributor {
 }
 
 /**
- * Move generations by the type of job they were done for: the site's
+ * One job type's share of the work: the move generations reported for it, the
+ * compute time its claims were credited with (claim to submission) and its
+ * completed tasks.
+ */
+export interface Contribution {
+  movegens: number;
+  compute_seconds: number;
+  tasks: number;
+}
+
+/**
+ * The work by the type of job it was done for: the site's
  * (`/api/workers/movegens`) or one contributor's
  * (`/api/workers/user/:id/movegens`, `/api/workers/anon/:anon_id/movegens`).
  * Every type is present, at 0 when nothing was done for it.
  */
-export type MovegensByType = Record<JobType, number>;
+export type ContributionsByType = Record<JobType, Contribution>;
 
 /** A layout square, by what it multiplies (`#` in MAGPIE's layout is a brick). */
 export type BoardSquare =
@@ -806,10 +817,10 @@ export const api = {
   users: (page = 0) => get<Page<Record<string, unknown>>>(`/api/users?page=${page}`),
   workers: (page = 0, sort: ContributorSort = 'movegens') =>
     get<Page<Contributor>>(`/api/workers?page=${page}&sort=${sort}`),
-  /** The site's movegens by job type. */
-  siteMovegens: () => get<MovegensByType>('/api/workers/movegens'),
+  /** The site's work by job type: movegens, compute time and tasks. */
+  siteContributions: () => get<ContributionsByType>('/api/workers/movegens'),
   /** One contributor's, by `contributorKey` (`user/<id>` or `anon/<pseudonym>`). */
-  contributorMovegens: (key: string) => get<MovegensByType>(`/api/workers/${key}/movegens`),
+  contributorContributions: (key: string) => get<ContributionsByType>(`/api/workers/${key}/movegens`),
 
   clientVersion: () =>
     get<{ min_magpie_version: string; download_url: string }>('/api/worker/client-version'),

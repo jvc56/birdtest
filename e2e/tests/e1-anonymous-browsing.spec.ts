@@ -53,18 +53,28 @@ test('E-1: an anonymous visitor browses the landing page, jobs, a job and the le
   const contributors = page.locator('.card', { has: page.getByRole('heading', { name: 'Contributors' }) });
   await expect(contributors.getByText(/^Anonymous · [0-9a-f]{16}$/).first()).toBeVisible();
 
-  await page.getByRole('link', { name: 'Contributors' }).click();
+  await page.getByRole('link', { name: 'Contributions' }).click();
   await expect(page).toHaveURL(/\/workers$/);
-  await expect(page.getByRole('heading', { name: 'Contributors' })).toBeVisible();
-  const leaders = page.locator('tbody tr');
+  await expect(page.getByRole('heading', { name: 'Contributions', level: 1 })).toBeVisible();
+  // The ranking's own rows and headers: the site's totals and a
+  // contributor's breakdown are tables too, under the same headers.
+  const ranking = page.getByTestId('contributor-ranking');
+  const header = (name: string) =>
+    ranking.locator(':scope > table > thead').getByRole('columnheader', { name, exact: true });
+  const leaders = ranking.locator(':scope > table > tbody > tr');
   await expect(leaders.first()).toContainText(/Anonymous · [0-9a-f]{16}/);
-  // The site's movegens by job type above the list, every type listed.
+  // The site's totals -- movegens, compute time, tasks -- then the same by
+  // job type, every type listed.
   const site = page.getByTestId('site-movegens');
-  await expect(site.locator('dt')).toHaveText([
+  await expect(site.locator('dt')).toHaveText(['Movegens', 'Compute time', 'Tasks']);
+  await expect(site.locator('dd').first()).toHaveText(/^[1-9][\d,]*$/);
+  await expect(site.getByRole('rowheader')).toHaveText([
     'Opening Rack Analysis', 'Games', 'Game Pairs', 'Leave Generation'
   ]);
-  // The seeded pairs job has results, so its type has movegens.
-  await expect(site.locator('dd').nth(2)).toHaveText(/^[1-9][\d,]*$/);
+  // The seeded pairs job has results, so its type has movegens and tasks.
+  const pairs = site.locator('tr[data-type="game_pairs"]');
+  await expect(pairs.locator('[data-figure="movegens"]')).toHaveText(/^[1-9][\d,]*$/);
+  await expect(pairs.locator('[data-figure="tasks"]')).toHaveText(/^[1-9][\d,]*$/);
   // A contributor's own, under their row when their name is chosen, and
   // folded away again. Held by name, not by place: the list reads itself
   // again every 30 seconds, and the busy workers can swap places in between.
@@ -74,22 +84,20 @@ test('E-1: an anonymous visitor browses the landing page, jobs, a job and the le
   await first.click();
   await expect(first).toHaveAttribute('aria-expanded', 'true');
   const breakdown = page.getByTestId('contributor-movegens');
-  await expect(breakdown.locator('dt')).toHaveText([
+  await expect(breakdown.getByRole('rowheader')).toHaveText([
     'Opening Rack Analysis', 'Games', 'Game Pairs', 'Leave Generation'
   ]);
   // Whichever jobs it worked on, it did some work.
-  await expect(breakdown.locator('dd').filter({ hasText: /^[1-9][\d,]*$/ }).first()).toBeVisible();
+  await expect(breakdown.locator('[data-figure="movegens"]').filter({ hasText: /^[1-9][\d,]*$/ }).first()).toBeVisible();
+  await expect(breakdown.locator('[data-figure="tasks"]').filter({ hasText: /^[1-9][\d,]*$/ }).first()).toBeVisible();
   await first.click();
   await expect(breakdown).toHaveCount(0);
   // Ranked by movegens unless another column is chosen.
-  await expect(page.getByRole('columnheader', { name: 'Movegens' })).toHaveAttribute(
-    'aria-sort',
-    'descending'
-  );
+  await expect(header('Movegens')).toHaveAttribute('aria-sort', 'descending');
   // Chosen: tasks completed, most first -- once the reordered page is in.
   // Exactly: a contributor's name is a button too.
   await page.getByRole('button', { name: 'Tasks', exact: true }).click();
-  await expect(page.getByRole('columnheader', { name: 'Tasks' })).toHaveAttribute('aria-sort', 'descending');
+  await expect(header('Tasks')).toHaveAttribute('aria-sort', 'descending');
   const counts = async () =>
     (await leaders.locator('td[data-column="tasks"]').allInnerTexts()).map((text) =>
       Number(text.replace(/,/g, ''))

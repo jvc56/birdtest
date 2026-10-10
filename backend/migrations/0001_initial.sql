@@ -558,6 +558,13 @@ CREATE TABLE jobs (
     -- takes away exactly what it gives the contributors back. A partial
     -- restore recomputes it (RUNBOOK 2.3).
     movegens        BIGINT NOT NULL DEFAULT 0 CHECK (movegens >= 0),
+    -- The compute time the job's accepted claims were credited with, every
+    -- claim's own (claim to submission, `CLAIM_COMPUTE_MS`), in whole
+    -- milliseconds: the Contributions page's site totals by job type, beside
+    -- `movegens` and `tasks_completed`. Added in the same `UPDATE jobs` as
+    -- `movegens`, from the figure the same submission credits its
+    -- contributor's `compute_ms` with, and zeroed or taken away with it.
+    compute_ms      BIGINT NOT NULL DEFAULT 0 CHECK (compute_ms >= 0),
     -- When a result was last accepted for the job, to the minute (the
     -- submission that stores one sets it at most once a minute). The job
     -- list's `stalled` flag asks "none in a day"; answered from the claims, it
@@ -1918,15 +1925,17 @@ CREATE INDEX        task_claims_completed_idx ON task_claims (completed_at DESC)
 -- one changes `state`, which the open-claims index's predicate reads, so that
 -- update was never a HOT one, and a heartbeat touches neither.
 --
--- Each carries the claim's `movegens`, so a contributor's work by job type
--- (`GET /api/workers/*/:id/movegens`) is an index-only walk of their range,
--- grouped by the job it is already ordered by, rather than a heap read per
--- claim they ever made. It is written by that same completing update, whose
--- index entries are new ones anyway.
+-- Each carries the claim's `movegens` and `claimed_at`, so a contributor's
+-- work by job type (`GET /api/workers/*/:id/movegens`) -- movegens, compute
+-- time (claim to completion) and completed tasks -- is an index-only walk of
+-- their range, grouped by the job it is already ordered by, rather than a
+-- heap read per claim they ever made. `movegens` is written by that same
+-- completing update, whose index entries are new ones anyway, and
+-- `claimed_at` never changes.
 CREATE INDEX        task_claims_user_idx      ON task_claims (claimed_by_user_id, job_id, completed_at)
-    INCLUDE (movegens) WHERE claimed_by_user_id IS NOT NULL;
+    INCLUDE (movegens, claimed_at) WHERE claimed_by_user_id IS NOT NULL;
 CREATE INDEX        task_claims_anon_idx      ON task_claims (claimed_by_anon_uuid, job_id, completed_at)
-    INCLUDE (movegens) WHERE claimed_by_anon_uuid IS NOT NULL;
+    INCLUDE (movegens, claimed_at) WHERE claimed_by_anon_uuid IS NOT NULL;
 -- There is no (job_id, state) index. The job-scoped reads of `tasks` -- the
 -- detail page's counts by state, the census -- are served by
 -- `tasks_seed_unique_idx (job_id, seed)` and the heap. The opening-rack finish

@@ -982,8 +982,8 @@ the copy, in one transaction: `scripts/ops-sql/repair-job-counters.sql`. It
 recomputes each of the job's tasks' `accepted_count` and `active_claim_count`
 from its claims (only the rows that are wrong), then each task's `state` and
 `completed_at` from those exactly as the submit path does, then the job's own
-counters -- `claims_issued`, `last_completed_at` and `movegens` from the
-claims, the dashboard's progress totals as the reads they replaced computed
+counters -- `claims_issued`, `last_completed_at`, `movegens` and
+`compute_ms` from the claims, the dashboard's progress totals as the reads they replaced computed
 them -- and
 last puts `claims_baseline` level with the jobs being served, as activation
 does (`scheduler::join_at_parity`), so the job neither owes nor is

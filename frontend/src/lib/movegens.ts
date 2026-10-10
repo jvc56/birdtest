@@ -1,30 +1,39 @@
-import type { Contributor, JobType, MovegensByType } from '$lib/api';
+import type { Contribution, ContributionsByType, Contributor, JobType } from '$lib/api';
 import { jobTypeLabel } from '$lib/format';
 
 /**
- * The job types in the order the Contributors page lists their movegens: the
+ * The job types in the order the Contributions page lists their work: the
  * order a job is created in, the one the job list's type names follow.
  */
 export const MOVEGEN_TYPES: JobType[] = ['opening_rack', 'games', 'game_pairs', 'leave_generation'];
 
-/** One line of a breakdown: the type, its label and its movegens. */
-export interface MovegensLine {
+/** One row of a breakdown: the type, its label and its work. */
+export interface ContributionLine extends Contribution {
   type: JobType;
   label: string;
-  movegens: number;
 }
 
+const NOTHING: Contribution = { movegens: 0, compute_seconds: 0, tasks: 0 };
+
 /**
- * A breakdown's lines, every type in `MOVEGEN_TYPES` order -- one the server
+ * A breakdown's rows, every type in `MOVEGEN_TYPES` order -- one the server
  * left out reads 0, so the four are always listed and always in the same
  * places, whichever a contributor worked on.
  */
-export function movegensLines(byType: Partial<MovegensByType>): MovegensLine[] {
-  return MOVEGEN_TYPES.map((type) => ({
-    type,
-    label: jobTypeLabel(type),
-    movegens: byType[type] ?? 0
-  }));
+export function contributionLines(byType: Partial<ContributionsByType>): ContributionLine[] {
+  return MOVEGEN_TYPES.map((type) => ({ type, label: jobTypeLabel(type), ...(byType[type] ?? NOTHING) }));
+}
+
+/** The rows' totals: the site's, across every job type. */
+export function contributionTotals(lines: Contribution[]): Contribution {
+  return lines.reduce(
+    (sum, line) => ({
+      movegens: sum.movegens + line.movegens,
+      compute_seconds: sum.compute_seconds + line.compute_seconds,
+      tasks: sum.tasks + line.tasks
+    }),
+    NOTHING
+  );
 }
 
 /**

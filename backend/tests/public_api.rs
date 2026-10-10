@@ -1968,17 +1968,18 @@ async fn the_api_compresses_its_json_and_never_its_event_stream() {
     assert_eq!(encoding(&idle), None);
 }
 
-/// A-PUBLIC-7a: movegens by job type. Each accepted claim's movegens are
-/// credited to its job (`jobs.movegens`, on the job's page) as well as to its
-/// contributor; the site's totals by type are the jobs', a contributor's
+/// A-PUBLIC-7a: contributions by job type -- movegens, compute time and tasks.
+/// Each accepted claim's movegens and compute time are credited to its job
+/// (`jobs.movegens`, on the job's page, and `jobs.compute_ms`) as well as to
+/// its contributor; the site's totals by type are the jobs', a contributor's
 /// breakdown is their claims', and both add up to the contributor list's
-/// column. A purge or delete takes a job's movegens out of all three, as it
-/// gives them back from the contributors' totals. A contributor is named as
+/// columns. A purge or delete takes a job's work out of all three, as it
+/// gives it back from the contributors' totals. A contributor is named as
 /// the list names them -- an account by id, an anonymous worker by pseudonym,
 /// never by the UUID that is its credential -- and anyone the list does not
 /// show is a 404.
 #[tokio::test]
-async fn movegens_are_broken_down_by_job_type() {
+async fn contributions_are_broken_down_by_job_type() {
     use std::collections::HashMap;
     let db = TestDb::new().await;
     let state = db.state().await;
@@ -2053,16 +2054,25 @@ async fn movegens_are_broken_down_by_job_type() {
         "both jobs were served: {done:?}"
     );
 
+    const TYPES: [&str; 4] = ["opening_rack", "games", "game_pairs", "leave_generation"];
     let type_of = |job: Uuid| if job == games { "games" } else { "opening_rack" };
+    // The movegens and the completed tasks by type that `rows` should come to.
     let by_type = |rows: &mut dyn Iterator<Item = &(&str, Uuid, i64)>| {
-        let mut sums = HashMap::from([
-            ("opening_rack", 0), ("games", 0), ("game_pairs", 0), ("leave_generation", 0),
-        ]);
+        let mut sums = HashMap::from(TYPES.map(|t| (t, (0, 0))));
         for (_, job, movegens) in rows {
-            *sums.get_mut(type_of(*job)).unwrap() += movegens;
+            let sum = sums.get_mut(type_of(*job)).unwrap();
+            *sum = (sum.0 + movegens, sum.1 + 1);
         }
-        json!(sums)
+        json!(sums.into_iter().map(|(t, (m, n))| (t, json!({ "movegens": m, "tasks": n }))).collect::<HashMap<_, _>>())
     };
+    // A breakdown without its compute time, which is the claims' own clock.
+    let counts = |v: &serde_json::Value| {
+        json!(TYPES
+            .map(|t| (t, json!({ "movegens": v[t]["movegens"], "tasks": v[t]["tasks"] })))
+            .into_iter()
+            .collect::<HashMap<_, _>>())
+    };
+    let compute = |v: &serde_json::Value, t: &str| v[t]["compute_seconds"].as_f64().unwrap();
     let get = |path: String| {
         let app = app.clone();
         async move { send(&app, get_request(&path, &[])).await }
@@ -2076,13 +2086,22 @@ async fn movegens_are_broken_down_by_job_type() {
             .iter()
             .map(|w| {
                 let who = if w["user_id"] == json!(user) { "user" } else { "a" };
-                (who, w["movegens"].as_i64().unwrap())
+                let figures = (
+                    w["movegens"].as_i64().unwrap(),
+                    w["tasks_completed"].as_i64().unwrap(),
+                    w["compute_seconds"].as_f64().unwrap(),
+                );
+                (who, figures)
             })
             .collect::<HashMap<_, _>>()
     };
+    // A breakdown's totals, as the list shows a contributor's.
     let total = |v: &serde_json::Value| {
-        v.as_object().unwrap().values().map(|n| n.as_i64().unwrap()).sum::<i64>()
+        TYPES.iter().fold((0, 0, 0.0), |(m, n, c), t| {
+            (m + v[t]["movegens"].as_i64().unwrap(), n + v[t]["tasks"].as_i64().unwrap(), c + compute(v, t))
+        })
     };
+    let same = |a: (i64, i64, f64), b: (i64, i64, f64)| a.0 == b.0 && a.1 == b.1 && (a.2 - b.2).abs() < 1e-6;
 
     // The job pages, the site, each contributor.
     for job in [games, racks] {
@@ -2092,20 +2111,24 @@ async fn movegens_are_broken_down_by_job_type() {
     }
     let (status, site) = get("/api/workers/movegens".to_string()).await;
     assert_eq!(status, StatusCode::OK, "{site}");
-    assert_eq!(site, by_type(&mut done.iter()));
+    assert_eq!(counts(&site), by_type(&mut done.iter()));
     let (status, mine) = get(format!("/api/workers/user/{user}/movegens")).await;
     assert_eq!(status, StatusCode::OK, "{mine}");
-    assert_eq!(mine, by_type(&mut done.iter().filter(|d| d.0 == "user")));
+    assert_eq!(counts(&mine), by_type(&mut done.iter().filter(|d| d.0 == "user")));
     let (status, theirs) = get(format!("/api/workers/anon/{pseudonym}/movegens")).await;
     assert_eq!(status, StatusCode::OK, "{theirs}");
-    assert_eq!(theirs, by_type(&mut done.iter().filter(|d| d.0 == "a")));
+    assert_eq!(counts(&theirs), by_type(&mut done.iter().filter(|d| d.0 == "a")));
+    // The compute time is the claims' own: the jobs' totals by type are the
+    // two contributors' together.
+    for t in TYPES {
+        let both = compute(&mine, t) + compute(&theirs, t);
+        assert!((compute(&site, t) - both).abs() < 1e-6, "{t}: {site} vs {mine} + {theirs}");
+    }
     let list = listed().await;
-    assert_eq!(
-        (total(&mine), total(&theirs)),
-        (list["user"], list["a"]),
-        "the breakdowns add up to the list"
-    );
-    assert_eq!(total(&site), list.values().sum::<i64>(), "and the site's to the whole list");
+    assert!(same(total(&mine), list["user"]), "the breakdown adds up to the list: {mine} vs {:?}", list["user"]);
+    assert!(same(total(&theirs), list["a"]), "the breakdown adds up to the list: {theirs} vs {:?}", list["a"]);
+    let whole = list.values().fold((0, 0, 0.0), |s, w| (s.0 + w.0, s.1 + w.1, s.2 + w.2));
+    assert!(same(total(&site), whole), "and the site's to the whole list");
 
     // Nobody the list does not show: an unknown account, an account that has
     // done nothing, the worker's own UUID (its credential), a pseudonym of
@@ -2135,7 +2158,8 @@ async fn movegens_are_broken_down_by_job_type() {
     let (_, detail) = get(format!("/api/jobs/{racks}")).await;
     assert_eq!(detail["movegens"], 0, "a purged job starts again from nothing");
     let (_, site) = get("/api/workers/movegens".to_string()).await;
-    assert_eq!(site, by_type(&mut kept.iter()));
+    assert_eq!(counts(&site), by_type(&mut kept.iter()));
+    assert_eq!(compute(&site, "opening_rack"), 0.0, "the purged job's compute time is gone: {site}");
     let list = listed().await;
     for (who, path) in [
         ("user", format!("/api/workers/user/{user}/movegens")),
@@ -2149,8 +2173,8 @@ async fn movegens_are_broken_down_by_job_type() {
             continue;
         }
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body, by_type(&mut kept.iter().filter(|d| d.0 == who)), "{who}");
-        assert_eq!(total(&body), list[who], "{who}: the breakdown still adds up to the list");
+        assert_eq!(counts(&body), by_type(&mut kept.iter().filter(|d| d.0 == who)), "{who}");
+        assert!(same(total(&body), list[who]), "{who}: the breakdown still adds up to the list");
     }
 
     // And a delete, the job's row with it: nothing is left, and nobody is
@@ -2164,14 +2188,16 @@ async fn movegens_are_broken_down_by_job_type() {
     let (status, body) = send(&app, delete).await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
     let (_, site) = get("/api/workers/movegens".to_string()).await;
-    assert_eq!(site, by_type(&mut std::iter::empty::<&(&str, Uuid, i64)>()));
+    assert_eq!(counts(&site), by_type(&mut std::iter::empty::<&(&str, Uuid, i64)>()));
+    assert!(TYPES.iter().all(|t| compute(&site, t) == 0.0), "{site}");
     let (status, _) = get(format!("/api/workers/user/{user}/movegens")).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "no longer a contributor");
 }
 
 /// A-PUBLIC-7a (cost): a contributor's breakdown is an index-only walk of
-/// their own claims -- the identity index carries each claim's movegens --
-/// not a heap read per claim they ever made.
+/// their own claims -- the identity index carries each claim's movegens and
+/// claim time beside its completion time -- not a heap read per claim they
+/// ever made.
 #[tokio::test]
 async fn a_contributors_breakdown_reads_only_their_index() {
     let db = TestDb::new().await;
@@ -2182,7 +2208,7 @@ async fn a_contributors_breakdown_reads_only_their_index() {
         sqlx::query("VACUUM task_claims").execute(&db.pool).await.unwrap();
         sqlx::query("SET LOCAL enable_seqscan = off").execute(&mut *tx).await.unwrap();
         sqlx::query("SET LOCAL enable_bitmapscan = off").execute(&mut *tx).await.unwrap();
-        let query = birdtest::routes::public::contributor_movegens_query(anonymous);
+        let query = birdtest::routes::public::contributor_contributions_query(anonymous);
         let query = query.replace("$1", &format!("'{}'", Uuid::nil()));
         let plan: Vec<String> =
             sqlx::query_scalar(&format!("EXPLAIN {query}")).fetch_all(&mut *tx).await.unwrap();

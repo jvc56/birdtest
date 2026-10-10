@@ -3515,7 +3515,7 @@ async fn purge_body(
     sqlx::query(
         "UPDATE jobs SET claims_issued = 0, games_completed = 0, racks_analyzed = 0,
                          racks_settled = 0, racks_without_consensus = 0,
-                         tasks_total = 0, tasks_completed = 0, movegens = 0,
+                         tasks_total = 0, tasks_completed = 0, movegens = 0, compute_ms = 0,
                          last_completed_at = NULL,
                          test_decided_status = NULL, test_decided_lower = NULL,
                          test_decided_upper = NULL, test_decided_units = NULL,

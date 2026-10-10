@@ -3608,18 +3608,23 @@ below.
   `public_api::tied_jobs_and_users_are_each_listed_exactly_once`,
   `worker_api::public_endpoints_name_anonymous_workers_by_pseudonym_only`; tied
   contributors were duplicated and skipped across pages.)*
-- `A-PUBLIC-7a` Movegens by job type: each accepted claim's movegens are
-  credited to its job (`jobs.movegens`, the job page's `movegens`) beside its
-  contributor; `GET /api/workers/movegens` is the jobs' totals by type, every
-  type present; a contributor's breakdown (`/api/workers/user/:id/movegens`,
-  `/api/workers/anon/:anon_id/movegens`) is their claims' by type; and both
-  add up to the contributor list's column, before and after a purge or a
-  delete takes a job's out of all three. Only a contributor the list shows is
-  answered -- an anonymous one by pseudonym, never by its UUID -- and anyone
-  else is a `404`. The breakdown is an index-only walk of the contributor's
-  own index. *(Covered: `public_api::movegens_are_broken_down_by_job_type`,
+- `A-PUBLIC-7a` Contributions by job type -- movegens, compute time and
+  tasks: each accepted claim's movegens and compute time are credited to its
+  job (`jobs.movegens`, the job page's `movegens`, and `jobs.compute_ms`)
+  beside its contributor; `GET /api/workers/movegens` is the jobs' totals by
+  type, every type present at 0 when nothing ran for it; a contributor's
+  breakdown (`/api/workers/user/:id/movegens`,
+  `/api/workers/anon/:anon_id/movegens`) is their claims' by type, its compute
+  time and tasks counted from completed claims only; the jobs' compute time
+  by type is the contributors' together; and all of them add up to the
+  contributor list's columns, before and after a purge or a delete takes a
+  job's out of all three. Only a contributor the list shows is answered -- an
+  anonymous one by pseudonym, never by its UUID -- and anyone else is a `404`.
+  The breakdown is an index-only walk of the contributor's own index, which
+  carries each claim's movegens and claim time. *(Covered:
+  `public_api::contributions_are_broken_down_by_job_type`,
   `public_api::a_contributors_breakdown_reads_only_their_index`,
-  `public::tests::movegens_are_summed_into_their_own_type`,
+  `public::tests::contributions_are_summed_into_their_own_type`,
   `admin_api::purging_and_deleting_a_job_give_back_what_it_earned`.)*
 - `A-PUBLIC-8` **A NUL in what a caller sends is a `400`.** Postgres stores no
   NUL in text and refuses the statement (SQLSTATE `22021`, or `22P05` from
@@ -3918,9 +3923,11 @@ admin in once and the admin journeys reuse its storage state.
   page — its status on a row of its own, with no description beside an
   active status and "Paused …" or "Finished …" beside any other, then its
   four headline cards (Allocation, Tasks completed, Active contributors,
-  Estimated time left) — and the contributor leaderboard, ranked by movegens and re-ranked by
-  tasks at a click, with the site's movegens by job type above it and a
-  contributor's own under their row when their name is clicked.
+  Estimated time left) — and the Contributions page: the site's totals
+  (movegens, compute time, tasks) and the same by job type, then the
+  contributor leaderboard, ranked by movegens and re-ranked by tasks at a
+  click, with a contributor's own by job type under their row when their name
+  is clicked.
   *(Covered:
   `e1-anonymous-browsing.spec.ts`.)*
 - `E-2` Register → confirm the email → log in → generate an API key → see it

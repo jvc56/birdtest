@@ -1121,10 +1121,10 @@ async fn submit_result(
     // the next began, `record_time_limit`): a completed task shows the job's
     // batch fits the limit.
     //
-    // So does the claim's `movegens`, the same figure its contributor was
-    // credited with above: the job's share of the contributors' totals, kept
-    // here rather than summed from the claims on every view, at no lock this
-    // statement did not already take.
+    // So do the claim's `movegens` and `compute_ms`, the same figures its
+    // contributor was credited with above: the job's share of the
+    // contributors' totals, kept here rather than summed from the claims on
+    // every view, at no lock this statement did not already take.
     {
         sqlx::query(
             "UPDATE jobs SET games_completed = games_completed + $2,
@@ -1133,10 +1133,11 @@ async fn submit_result(
                              racks_settled = racks_settled + $5,
                              racks_without_consensus = racks_without_consensus + $6,
                              movegens = movegens + $7,
+                             compute_ms = compute_ms + $8,
                              time_limit_streak = 0, time_limit_streak_since = now(),
                              last_completed_at = now()
              WHERE id = $1
-               AND ($2 <> 0 OR $3 <> 0 OR $4 <> 0 OR $5 <> 0 OR $6 <> 0 OR $7 <> 0
+               AND ($2 <> 0 OR $3 <> 0 OR $4 <> 0 OR $5 <> 0 OR $6 <> 0 OR $7 <> 0 OR $8 <> 0
                     OR last_completed_at IS NULL
                     OR last_completed_at < now() - interval '1 minute')",
         )
@@ -1147,6 +1148,7 @@ async fn submit_result(
         .bind(progress.racks_settled)
         .bind(progress.racks_without_consensus)
         .bind(movegens)
+        .bind(compute_ms)
         .execute(&mut *tx)
         .await?;
     }

@@ -12,7 +12,7 @@
     { href: '/jobs', label: 'Jobs' },
     { href: '/ratings', label: 'Ratings' },
     { href: '/player-configs', label: 'Players' },
-    { href: '/workers', label: 'Contributors' },
+    { href: '/workers', label: 'Contributions' },
     { href: '/users', label: 'Users' }
   ];
 

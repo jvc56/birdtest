@@ -1200,22 +1200,29 @@ one of static play.) Each order is its own pair of partial indexes, one per
 kind of identity, so every order is two index scans merged, as the list always
 was.
 
-**Movegens by job type.** The job keeps a running `jobs.movegens` too, added in
-the same `UPDATE jobs` every accepted submission already makes (last, after
-the claim, the task and the contributor's row -- so no new lock and no new
-lock order: the statement takes the job's row whatever it adds). It is the
-line under the job page's Contributors table ("N movegens for this job"), and
-summed by `job_type` over the jobs --
-one row per job, whatever the claims number -- the Contributors page's
-"Movegens by job type" (`GET /api/workers/movegens`). A purge zeroes it with
-the other job counters and a delete takes the row, exactly as each gives the
-same claims' movegens back from the contributors, so the jobs' totals and the
-contributors' always add up to the same figure. One contributor's breakdown
+**Contributions by job type.** The job keeps a running `jobs.movegens` and
+`jobs.compute_ms` too, added in the same `UPDATE jobs` every accepted
+submission already makes (last, after the claim, the task and the
+contributor's row -- so no new lock and no new lock order: the statement
+takes the job's row whatever it adds), from the figures that submission
+credits its contributor with. The movegens are the line under the job page's
+Contributors table ("N movegens for this job"). Summed by `job_type` over the
+jobs with `tasks_completed` -- one row per job, whatever the claims number,
+in one scan -- they are the Contributions page's "Site totals": the three
+figures across the site, then the same by job type (`GET
+/api/workers/movegens`, each type a `{movegens, compute_seconds, tasks}`). A
+purge zeroes them with the other job counters and a delete takes the row,
+exactly as each gives the same claims' work back from the contributors, so
+the jobs' totals and the contributors' always add up to the same figures. One contributor's breakdown
 (`GET /api/workers/user/:id/movegens`, `/api/workers/anon/:anon_id/movegens`,
 fetched when their row is unfolded and with each refresh while it is) sums
-their claims per job and groups the jobs by type: an index-only walk of their
-range of `task_claims_user_idx` / `_anon_idx`, which `INCLUDE (movegens)` for
-it, costing their own claim count and nothing else's. Only an account or a
+their claims per job -- movegens, compute time and completed tasks, the last
+two over completed claims only (a FILTER on `completed_at`, never a `state`
+the planner would read as a cue for the fleet-wide completions index) -- and
+groups the jobs by type: an index-only walk of their range of
+`task_claims_user_idx` / `_anon_idx`, which `INCLUDE (movegens, claimed_at)`
+for it, costing their own claim count and nothing else's. The page shows it
+as a small table, a row per job type under the site table's headers. Only an account or a
 pseudonym the list shows is answered (a `404` otherwise), and an anonymous
 worker by its pseudonym only, as everywhere public.
 
@@ -5962,8 +5969,8 @@ do not exist.
 | `GET` | `/api/jobs/:id/stream` | SSE stream of live stat updates for a job. Pushes an event after accepted results, coalesced to at most one per `JOB_STATS_CACHE_SECONDS` (an admin's change, a completion or a generation closing at once). |
 | `GET` | `/api/users` | List all registered user accounts with contribution stats. Paginated. |
 | `GET` | `/api/workers` | Contributor stats for all workers (anonymous and authenticated) — movegens, compute time, tasks and the last result — paginated, ranked by movegens or by `?sort=movegens\|compute\|tasks`. |
-| `GET` | `/api/workers/movegens` | The site's movegens by job type, `{opening_rack, games, game_pairs, leave_generation}`, every type present: the jobs' running totals (`jobs.movegens`) summed, which add up to the contributor list's column. |
-| `GET` | `/api/workers/user/:id/movegens` | One contributing account's movegens by job type, same shape, from its claims; a deleted account under its tombstone too. `404` for an account that is not on the contributor list. |
+| `GET` | `/api/workers/movegens` | The site's work by job type, `{opening_rack, games, game_pairs, leave_generation}`, each `{movegens, compute_seconds, tasks}`, every type present: the jobs' running totals (`jobs.movegens`, `compute_ms`, `tasks_completed`) summed, which add up to the contributor list's columns. |
+| `GET` | `/api/workers/user/:id/movegens` | One contributing account's work by job type, same shape, from its claims; a deleted account under its tombstone too. `404` for an account that is not on the contributor list. |
 | `GET` | `/api/workers/anon/:anon_id/movegens` | The same for a contributing anonymous worker, by its pseudonym (never its UUID). `404` for a pseudonym of nobody on the list. |
 | `GET` | `/api/rating-pools` | Rating pools with their conditions, member counts and last fit time. |
 | `GET` | `/api/rating-pools/:id` | One pool: its members now (`members`: config id and name, the anchor among them) and its latest fit, with run provenance, each rated config's rating with uncertainty, and the cross table (`head_to_heads`: every head-to-head from both sides, each with its pairs, win score, standard error, average spread and the score the ratings predict). The two sets can differ: a member added since the fit (or whose refit failed) has no rating yet, and one removed since is still rated. |
@@ -5993,7 +6000,7 @@ SvelteKit uses file-based routing under `frontend/src/routes/`. Each directory w
 | `/jobs` | Job list — all jobs with type, status, allocation, and completion counter. Loaded on visit rather than live: there is no job-list stream, only a per-job one. |
 | `/jobs/[id]` | Job detail — four headline cards (allocation, tasks completed, active contributors -- the identities holding a live claim, open and heartbeated within the heartbeat timeout (`JobStats.active_contributors`) -- and estimated time left; the admin page has the same), job-type-specific stats and per-worker contribution table with the job's movegens under it, then the settings cards last. Live-updated via SSE. The status card says nothing beside an active job's badge; an inactive job's says "Paused: …" (and where its significance test stands), a completed job's "Finished …: …" and why. Beside the lexicon and variant, how each player searches ("4-ply sim, 1,000 iterations vs static, by equity"); a Job settings card — the job's settings and its type's, every row, with no toggle, the significance test one row ("no" or "yes (95%)") — then a Player settings card, the players side by side (`PlayerSettingsTable`: one column per player, each name linking to its config), showing two players only the settings they differ in ("These players' settings are identical." when none) and one player its key rows (Lexicon, Leaves, Sorted By, Move Recorder, Moves Generated, Plies, Uses Inference, Uses Preendgame, Uses Endgame), with an "All settings" toggle for every row, and a JSON download (`GET /api/jobs/:id/config`). Which player rows are key is `jobSettings.ts`'s (`PLAYER_ROWS`, `keySettings`). The admin job page has the same cards. |
 | `/users` | Registered user list — all user accounts with contribution stats. |
-| `/workers` | Contributor leaderboard — all workers (anonymous and authenticated) ranked by movegens (shown as "1.2M"; the exact count on hover), or by compute time or tasks at a click on the column; on a phone only the ranked column is shown beside the name, and a "Rank by" row above the list chooses it. |
+| `/workers` | **Contributions** (the nav's and the heading's name; the URL stays) — the site's totals (movegens, compute time, tasks) and the same by job type, then the contributor leaderboard — all workers (anonymous and authenticated) ranked by movegens (shown as "1.2M"; the exact count on hover), or by compute time or tasks at a click on the column; on a phone only the ranked column is shown beside the name, and a "Rank by" row above the list chooses it. |
 | `/ratings` | Rating pool list — each pool's conditions, member count and last fit. |
 | `/player-configs` | Every player config, newest first: its name, how it searches, its lexicon and leaves. Public, like the job pages that already show players' settings. |
 | `/player-configs/[id]` | One config: a table of its key settings (its files, how moves are sorted, recorded and generated, plies, and whether it infers and solves the pre-endgame and endgame) that "All settings" grows to every setting — the job page's `PlayerSettingsTable` with one column — a JSON download, and the config it was cloned from. The job page's Settings card links each player here. |
@@ -6931,6 +6938,11 @@ CREATE TABLE jobs (
     -- a purge zeroes it and a delete takes it, as each gives the contributors
     -- theirs back. A partial restore recomputes it (RUNBOOK 2.3).
     movegens        BIGINT NOT NULL DEFAULT 0 CHECK (movegens >= 0),
+    -- The compute time the same claims were credited with, in whole
+    -- milliseconds: the Contributions page's site totals by job type, beside
+    -- `movegens` and `tasks_completed`. Added, zeroed and taken with
+    -- `movegens`.
+    compute_ms      BIGINT NOT NULL DEFAULT 0 CHECK (compute_ms >= 0),
     -- When a result was last accepted for the job, to the minute (the
     -- submission that stores one sets it at most once a minute). The job
     -- list's `stalled` flag asks "none in a day"; answered from the claims, it
@@ -8290,12 +8302,13 @@ CREATE INDEX        task_claims_completed_idx ON task_claims (completed_at DESC)
 -- column. The completion time adds nothing to a claim's updates: completing
 -- one changes `state`, which the open-claims index's predicate reads, so that
 -- update was never a HOT one, and a heartbeat touches neither.
--- Each carries the claim's `movegens`, so a contributor's work by job type is
--- an index-only walk of their range (`GET /api/workers/*/:id/movegens`).
+-- Each carries the claim's `movegens` and `claimed_at`, so a contributor's
+-- work by job type -- movegens, compute time, tasks -- is an index-only walk
+-- of their range (`GET /api/workers/*/:id/movegens`).
 CREATE INDEX        task_claims_user_idx      ON task_claims (claimed_by_user_id, job_id, completed_at)
-    INCLUDE (movegens) WHERE claimed_by_user_id IS NOT NULL;
+    INCLUDE (movegens, claimed_at) WHERE claimed_by_user_id IS NOT NULL;
 CREATE INDEX        task_claims_anon_idx      ON task_claims (claimed_by_anon_uuid, job_id, completed_at)
-    INCLUDE (movegens) WHERE claimed_by_anon_uuid IS NOT NULL;
+    INCLUDE (movegens, claimed_at) WHERE claimed_by_anon_uuid IS NOT NULL;
 -- There is no (job_id, state) index. The job-scoped reads of `tasks` -- the
 -- detail page's counts by state, the census -- are served by
 -- `tasks_seed_unique_idx (job_id, seed)` and the heap. The opening-rack finish

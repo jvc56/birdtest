@@ -97,7 +97,7 @@ Use a signed-out window for the V journeys unless one says otherwise.
 ### V-1 Find your way around
 
 - [ ] **Expect** a header with **birdtest**, **Jobs**, **Ratings**, **Players**,
-  **Contributors** and **Users**, and on the right **Sign in** and **Register**;
+  **Contributions** and **Users**, and on the right **Sign in** and **Register**;
   a footer "birdtest — crowdsourced crossword game research".
 - [ ] **Do** click each nav link. **Expect** the current one highlighted, and
   no page erroring.
@@ -422,26 +422,30 @@ Open "dev game pairs (first divergences saved)".
 - [ ] **Do** open **Users**. **Expect** "Registered users": `dev` with an
   **admin** tag and the two contributor accounts, with tasks completed and when
   they joined — and no email addresses anywhere.
-- [ ] **Do** open **Contributors**. **Expect** all four workers ranked by
+- [ ] **Do** open **Contributions** (the page is still `/workers`). **Expect**
+  the heading "Contributions" and all four workers ranked by
   movegens, most first, the column marked ↓: the two accounts by name, the
   two anonymous ones as "Anonymous · <16 characters>", never as their UUID;
   each with its movegens to the last digit ("1,234,567"), its compute time
   to the second in every unit it has ("2m 13s", "5h 20m 13s", "3d 4h 5m 6s";
   the hours on hover), tasks and last result.
-- [ ] **Expect** above the list a "Movegens by job type" card: Opening Rack
-  Analysis, Games, Game Pairs and Leave Generation, each to the last digit, 0
-  for a type nothing has run for. Together they are the list's movegens
-  column summed.
+- [ ] **Expect** above the list a "Site totals" card: three figures --
+  Movegens to the last digit, Compute time and Tasks -- each the list's column
+  summed; then a table of the same three by job type, a row each for Opening
+  Rack Analysis, Games, Game Pairs and Leave Generation, 0 for a type nothing
+  has run for.
 - [ ] **Do** click a contributor's name. **Expect** a ▸ that turns ▾ and,
-  under the row, their movegens for each of the four job types, adding up to
-  the row's movegens. **Do** click it again. **Expect** it folded away.
+  under the row, a small table with the same headers: a row per job type with
+  their movegens, compute time and tasks, adding up to the row's own. **Do**
+  click it again. **Expect** it folded away.
 - [ ] **Do** leave the page open, a contributor's row unfolded, while the
   workers run. **Expect** the counts -- the job-type totals, the rows and the
   unfolded breakdown -- to rise by themselves every 30 seconds, on the page and
   in the order chosen, and the row to stay unfolded.
 - [ ] **Do** click **Compute time**, then **Tasks**. **Expect** the list
   re-ranked by each, most first, the arrow moving with it; still all four.
-- [ ] At phone width, **expect** the job-type totals one to a line, a "Rank by"
+- [ ] At phone width, **expect** the site's three totals one to a line, its
+  table wrapping inside its card, a "Rank by"
   row of the three columns above the list and only the ranked column beside
   the name. **Do** choose **Tasks**, and unfold a contributor. **Expect** the
   tasks column in its place, the breakdown under the row, and no sideways
@@ -543,7 +547,7 @@ The four worker windows are already contributing.
 
 - [ ] **Do** Ctrl-C in worker 1's window. **Expect** "MAGPIE exited" and a
   prompt. **Do** Enter. **Expect** it contributing again under the same
-  "Anonymous · …" name on **Contributors**.
+  "Anonymous · …" name on **Contributions**.
 - [ ] **Do** give worker 2 alice's key: stop it, add `apikey <key>` to
   `.dev-workers/worker-02/contribute.txt`, and start it. **Expect** its results
   credited to alice — her tasks completed rising on **Account** and **Users**,
@@ -921,7 +925,7 @@ closes in seconds rather than never.
   gone from the list and unable to sign in.
 - [ ] **Do** delete `dev-contributor-2`. **Expect** worker 4, which runs under
   its key, refused, and its results still counted — shown as `deleted-<id>` on
-  **Contributors** and job pages.
+  **Contributions** and job pages.
 - [ ] **Do** delete `dev`. **Expect** "you cannot delete your own account".
 
 ### A-15 Ban a worker

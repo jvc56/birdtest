@@ -35,9 +35,9 @@ pub fn router() -> Router<AppState> {
         .route("/player-configs/:id", get(player_config))
         .route("/users", get(list_users))
         .route("/workers", get(list_workers))
-        .route("/workers/movegens", get(site_movegens))
-        .route("/workers/user/:id/movegens", get(user_movegens))
-        .route("/workers/anon/:anon_id/movegens", get(anon_movegens))
+        .route("/workers/movegens", get(site_contributions))
+        .route("/workers/user/:id/movegens", get(user_contributions))
+        .route("/workers/anon/:anon_id/movegens", get(anon_contributions))
 }
 
 #[derive(Deserialize)]
@@ -2089,96 +2089,121 @@ async fn worker_page(
     }))
 }
 
-/// Move generations by the type of job they were done for: the whole site's
+/// One job type's share of the work: the move generations reported for it,
+/// the compute time its claims were credited with (claim to submission, in
+/// seconds, as the contributor list shows it) and its completed tasks.
+#[derive(Debug, Default, PartialEq, Serialize)]
+pub struct Contribution {
+    pub movegens: i64,
+    pub compute_seconds: f64,
+    pub tasks: i64,
+}
+
+/// The work by the type of job it was done for: the whole site's
 /// (`/api/workers/movegens`), or one contributor's
 /// (`/api/workers/user/:id/movegens`, `/api/workers/anon/:anon_id/movegens`).
 /// Every type is always present, at 0 when nothing was done for it, so a page
-/// lists the four whatever the data.
+/// lists the four whatever the data; the totals are the four's sum.
 #[derive(Debug, Default, PartialEq, Serialize)]
-pub struct MovegensByType {
-    pub opening_rack: i64,
-    pub games: i64,
-    pub game_pairs: i64,
-    pub leave_generation: i64,
+pub struct ContributionsByType {
+    pub opening_rack: Contribution,
+    pub games: Contribution,
+    pub game_pairs: Contribution,
+    pub leave_generation: Contribution,
 }
 
-impl MovegensByType {
-    fn from_rows(rows: impl IntoIterator<Item = (JobType, i64)>) -> Self {
-        let mut by_type = MovegensByType::default();
-        for (job_type, movegens) in rows {
-            *match job_type {
+/// A row of either query: the job type, then movegens, compute
+/// milliseconds and completed tasks.
+type ContributionRow = (JobType, i64, i64, i64);
+
+impl ContributionsByType {
+    fn from_rows(rows: impl IntoIterator<Item = ContributionRow>) -> Self {
+        let mut by_type = ContributionsByType::default();
+        for (job_type, movegens, compute_ms, tasks) in rows {
+            let share = match job_type {
                 JobType::OpeningRack => &mut by_type.opening_rack,
                 JobType::Games => &mut by_type.games,
                 JobType::GamePairs => &mut by_type.game_pairs,
                 JobType::LeaveGeneration => &mut by_type.leave_generation,
-            } += movegens;
+            };
+            share.movegens += movegens;
+            share.compute_seconds += compute_ms as f64 / 1000.0;
+            share.tasks += tasks;
         }
         by_type
     }
 }
 
-/// The site's movegens by job type, from the jobs' own running totals
-/// (`jobs.movegens`): one row per job, whatever the claims number. They are
-/// credited in the transaction that credits each claim's contributor, and a
-/// purge or delete takes them away with what it gives the contributors back,
-/// so these sum to the contributor list's column -- which summing the claims
-/// would too, at a read of every claim the site ever completed per view of a
-/// page that refreshes itself.
-async fn site_movegens(State(state): State<AppState>) -> AppResult<Json<MovegensByType>> {
-    let rows = sqlx::query_as::<_, (JobType, i64)>(
-        "SELECT job_type, COALESCE(SUM(movegens), 0)::bigint FROM jobs GROUP BY job_type",
+/// The site's work by job type, from the jobs' own running totals
+/// (`jobs.movegens`, `compute_ms`, `tasks_completed`): one row per job,
+/// whatever the claims number, in one scan of a small table. They are credited
+/// in the transaction that credits each claim's contributor, and a purge or
+/// delete takes them away with what it gives the contributors back, so these
+/// sum to the contributor list's columns -- which summing the claims would
+/// too, at a read of every claim the site ever completed per view of a page
+/// that refreshes itself.
+async fn site_contributions(State(state): State<AppState>) -> AppResult<Json<ContributionsByType>> {
+    let rows = sqlx::query_as::<_, ContributionRow>(
+        "SELECT job_type, COALESCE(SUM(movegens), 0)::bigint, COALESCE(SUM(compute_ms), 0)::bigint,
+                COALESCE(SUM(tasks_completed), 0)::bigint
+         FROM jobs GROUP BY job_type",
     )
     .fetch_all(&state.read_pool)
     .await?;
-    Ok(Json(MovegensByType::from_rows(rows)))
+    Ok(Json(ContributionsByType::from_rows(rows)))
 }
 
-/// One identity's movegens by job type, the identity in `$1`: its claims summed
+/// One identity's work by job type, the identity in `$1`: its claims summed
 /// per job, through its own index (`task_claims_user_idx` / `_anon_idx`, which
-/// are ordered by job within the identity and carry each claim's `movegens`,
-/// so the walk reads no heap page it can skip), then the jobs -- one row each
-/// -- grouped by type. Public for the plan test, which holds it to that index.
+/// are ordered by job within the identity and carry each claim's `movegens`
+/// and `claimed_at` beside its `completed_at`, so the walk reads no heap page
+/// it can skip), then the jobs -- one row each -- grouped by type. Public for
+/// the plan test, which holds it to that index.
 ///
-/// No `state = 'completed'`: only a completed claim has movegens (the submit
-/// path writes them as it completes it), so every other one adds 0, and
-/// naming the state invites the fleet-wide `task_claims_completed_idx` (see
-/// `filtered_claims`). A purged or deleted job's claims are gone with it, so
-/// what it gave back to the contributor's total is out of this too.
-pub fn contributor_movegens_query(anonymous: bool) -> &'static str {
-    if anonymous {
-        "SELECT j.job_type, SUM(c.movegens)::bigint
-         FROM (SELECT job_id, SUM(movegens) AS movegens FROM task_claims
-               WHERE claimed_by_anon_uuid = $1 GROUP BY job_id) c
-         JOIN jobs j ON j.id = c.job_id
-         GROUP BY j.job_type"
-    } else {
-        "SELECT j.job_type, SUM(c.movegens)::bigint
-         FROM (SELECT job_id, SUM(movegens) AS movegens FROM task_claims
-               WHERE claimed_by_user_id = $1 GROUP BY job_id) c
-         JOIN jobs j ON j.id = c.job_id
-         GROUP BY j.job_type"
-    }
+/// No `state = 'completed'`: only a completed claim has a `completed_at` and
+/// movegens (the submit path writes both as it completes it), so a FILTER on
+/// `completed_at` counts and times exactly the completed ones, and naming the
+/// state invites the fleet-wide `task_claims_completed_idx` (see
+/// `filtered_claims`). The compute expression is the submit path's
+/// (`CLAIM_COMPUTE_MS`), which is NULL rather than 0 for an open claim, hence
+/// the FILTER rather than a plain sum. A purged or deleted job's claims are
+/// gone with it, so what it gave back to the contributor's total is out of
+/// this too.
+pub fn contributor_contributions_query(anonymous: bool) -> String {
+    let identity = if anonymous { "claimed_by_anon_uuid" } else { "claimed_by_user_id" };
+    format!(
+        "SELECT j.job_type, SUM(t.movegens)::bigint, COALESCE(SUM(t.compute_ms), 0)::bigint,
+                SUM(t.tasks)::bigint
+         FROM (SELECT c.job_id, SUM(c.movegens) AS movegens,
+                      SUM({compute}) FILTER (WHERE c.completed_at IS NOT NULL) AS compute_ms,
+                      COUNT(*) FILTER (WHERE c.completed_at IS NOT NULL) AS tasks
+               FROM task_claims c
+               WHERE c.{identity} = $1 GROUP BY c.job_id) t
+         JOIN jobs j ON j.id = t.job_id
+         GROUP BY j.job_type",
+        compute = super::worker::CLAIM_COMPUTE_MS,
+    )
 }
 
-async fn contributor_movegens(
+async fn contributor_contributions(
     state: &AppState,
     identity: Uuid,
     anonymous: bool,
-) -> AppResult<Json<MovegensByType>> {
-    let rows = sqlx::query_as::<_, (JobType, i64)>(contributor_movegens_query(anonymous))
+) -> AppResult<Json<ContributionsByType>> {
+    let rows = sqlx::query_as::<_, ContributionRow>(&contributor_contributions_query(anonymous))
         .bind(identity)
         .fetch_all(&state.read_pool)
         .await?;
-    Ok(Json(MovegensByType::from_rows(rows)))
+    Ok(Json(ContributionsByType::from_rows(rows)))
 }
 
 /// A contributing account's breakdown, by the `user_id` the contributor list
 /// gives it -- a deleted one's too, which the list shows under its tombstone.
 /// Anyone else is `404`: the list's rows are what this answers for.
-async fn user_movegens(
+async fn user_contributions(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-) -> AppResult<Json<MovegensByType>> {
+) -> AppResult<Json<ContributionsByType>> {
     let contributes: bool =
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users WHERE id = $1 AND tasks_completed > 0)")
             .bind(id)
@@ -2187,20 +2212,20 @@ async fn user_movegens(
     if !contributes {
         return Err(AppError::not_found("no such contributor"));
     }
-    contributor_movegens(&state, id, false).await
+    contributor_contributions(&state, id, false).await
 }
 
 /// A contributing anonymous worker's breakdown, by the pseudonym the
 /// contributor list shows (`anon_id`): never by its UUID, which is its
 /// credential and which no public route takes or gives.
-async fn anon_movegens(
+async fn anon_contributions(
     State(state): State<AppState>,
     Path(anon_id): Path<String>,
-) -> AppResult<Json<MovegensByType>> {
+) -> AppResult<Json<ContributionsByType>> {
     let Some(uuid) = resolve_pseudonym(&state, &anon_id).await? else {
         return Err(AppError::not_found("no such contributor"));
     };
-    contributor_movegens(&state, uuid, true).await
+    contributor_contributions(&state, uuid, true).await
 }
 
 #[cfg(test)]
@@ -2240,24 +2265,31 @@ mod tests {
         assert_eq!(merged_pages(std::iter::once("SELECT 1".to_string()), "x"), "(SELECT 1)");
     }
 
-    /// A-PUBLIC-7a: every job type has its own figure, present at 0 when
+    /// A-PUBLIC-7a: every job type has its own figures, present at 0 when
     /// nothing was done for it, and rows of one type add up.
     #[test]
-    fn movegens_are_summed_into_their_own_type() {
+    fn contributions_are_summed_into_their_own_type() {
+        let zero = serde_json::json!({ "movegens": 0, "compute_seconds": 0.0, "tasks": 0 });
         assert_eq!(
-            serde_json::to_value(MovegensByType::from_rows([])).unwrap(),
-            serde_json::json!({ "opening_rack": 0, "games": 0, "game_pairs": 0, "leave_generation": 0 })
+            serde_json::to_value(ContributionsByType::from_rows([])).unwrap(),
+            serde_json::json!({ "opening_rack": zero, "games": zero, "game_pairs": zero, "leave_generation": zero })
         );
         let rows = [
-            (JobType::GamePairs, 5),
-            (JobType::LeaveGeneration, 7),
-            (JobType::GamePairs, 11),
-            (JobType::OpeningRack, 13),
-            (JobType::Games, 17),
+            (JobType::GamePairs, 5, 1500, 1),
+            (JobType::LeaveGeneration, 7, 2000, 2),
+            (JobType::GamePairs, 11, 250, 3),
+            (JobType::OpeningRack, 13, 0, 4),
+            (JobType::Games, 17, 1000, 5),
         ];
+        let share = |movegens, compute_seconds, tasks| Contribution { movegens, compute_seconds, tasks };
         assert_eq!(
-            MovegensByType::from_rows(rows),
-            MovegensByType { opening_rack: 13, games: 17, game_pairs: 16, leave_generation: 7 }
+            ContributionsByType::from_rows(rows),
+            ContributionsByType {
+                opening_rack: share(13, 0.0, 4),
+                games: share(17, 1.0, 5),
+                game_pairs: share(16, 1.75, 4),
+                leave_generation: share(7, 2.0, 2),
+            }
         );
     }
 
