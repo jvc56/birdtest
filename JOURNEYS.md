@@ -155,9 +155,9 @@ Open "dev game pairs (first divergences saved)".
   and under it, once any of its tasks has hit the time limit, "N tasks hit the
   time limit — lower the batch size.")
 - [ ] **Expect** under it four cards, in a row on a wide screen and two by two
-  on a narrower one: Allocation, Tasks completed, Active contributors (the
-  contributors working on the job right now; 0 once no worker holds one of
-  its tasks) and Estimated time left.
+  on a narrower one: Allocation, Tasks completed, Throughput (the job's pace
+  over the last hour in its own unit, "N pairs/hour"; "—" once nothing has
+  finished in the hour) and Estimated time left.
 - [ ] **Expect** a Progress card: a bar of "pairs completed", then **Tasks**
   with Waiting to be reissued / In progress / Done counts and no explanation
   under them; then "Created by dev, <date>" and "requires MAGPIE ≥ …".

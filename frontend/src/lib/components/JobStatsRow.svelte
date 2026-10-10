@@ -1,11 +1,11 @@
 <script lang="ts">
   import type { JobStats } from '$lib/api';
-  import { duration } from '$lib/format';
+  import { duration, throughputText } from '$lib/format';
 
   /**
    * A job's four headline figures, on its public page and its admin page
-   * alike: its share of claims, how much is done, how many contributors are
-   * working on it right now, and how long the rest should take. Its status is
+   * alike: its share of claims, how much is done, how fast it is going now,
+   * and how long the rest should take at that pace. Its status is
    * a row of its own above them (JobStatusCard), with the context it needs.
    * The job's movegens are under its Contributors table.
    */
@@ -26,8 +26,8 @@
     <p class="mt-1 text-xl tabular-nums">{stats.tasks_completed.toLocaleString()}</p>
   </div>
   <div class="card">
-    <p class="text-xs uppercase text-muted-foreground">Active contributors</p>
-    <p class="mt-1 text-xl tabular-nums">{stats.active_contributors.toLocaleString()}</p>
+    <p class="text-xs uppercase text-muted-foreground">Throughput</p>
+    <p class="mt-1 text-xl tabular-nums">{throughputText(stats.throughput)}</p>
   </div>
   <div class="card">
     <p class="text-xs uppercase text-muted-foreground">Estimated time left</p>

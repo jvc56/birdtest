@@ -204,7 +204,7 @@ async fn job_detail(
 ) -> AppResult<axum::response::Response> {
     use axum::response::IntoResponse;
     let job = load_job(&state, id).await?;
-    let payload = jobstats::payload(&state.read_pool, &job, state.cfg.stats_cache, state.cfg.heartbeat_timeout).await?;
+    let payload = jobstats::payload(&state.read_pool, &job, state.cfg.stats_cache).await?;
     Ok((
         [(axum::http::header::CONTENT_TYPE, "application/json")],
         payload.to_string(),
@@ -1701,7 +1701,7 @@ async fn job_stream(
     // Subscribed before the first payload is read: a push published between
     // the two was lost, and on a quiet job nothing followed it.
     let receiver = state.sse.subscribe(id);
-    let initial = jobstats::payload(&state.read_pool, &job, state.cfg.stats_cache, state.cfg.heartbeat_timeout).await?;
+    let initial = jobstats::payload(&state.read_pool, &job, state.cfg.stats_cache).await?;
 
     let updates = tokio_stream::wrappers::BroadcastStream::new(receiver)
         .filter_map(|msg| async move { msg.ok() });

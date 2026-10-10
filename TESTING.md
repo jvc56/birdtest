@@ -977,6 +977,10 @@ Each entry's tests are the `describe` block named for its id.
   time limit — lower the batch size, or raise the limit"), "1 task" for one,
   and nothing while none has. *(Covered:
   `format.test.ts`.)*
+- `F-FMT-21` `throughputText` reads a job's pace an hour in its unit
+  ("1,240 games/hour", "8 pairs/hour"): whole units from ten up, a decimal
+  below, "1 game/hour" singular, and a dash with no recent work. *(Covered:
+  `format.test.ts`.)*
 
 ### `F-MOVEGENS-*` — `lib/movegens.ts`
 
@@ -2339,13 +2343,6 @@ permanent.
   landed mid-purge. *(Covered:
   `admin_api::purging_and_deleting_a_job_give_back_what_it_earned`,
   `admin_api::a_purge_waits_for_a_submission_in_flight_before_counting_contributions`.)*
-- `I-STATS-7e` **A job's active contributors** are the identities holding a
-  live claim on it -- open, heartbeated (or claimed, before a first heartbeat)
-  within the heartbeat timeout -- each once: one claimed and heartbeating is
-  1, the same contributor with two claims is still 1, a stale claim (by
-  heartbeat or, never heartbeated, by claim time) is 0, and a completed claim
-  or another job's is not counted. *(Covered:
-  `stats::active_contributors_are_the_identities_with_a_live_claim`.)*
 - `I-STATS-8` ETA is `None` without recent throughput rather than infinity.
   *(Covered: `stats::the_eta_is_none_without_recent_throughput`.)*
 - `I-STATS-8b` A games job's ETA is the units left at claims an hour × batch.
@@ -2356,6 +2353,12 @@ permanent.
   average read six times the real time left. *(Covered:
   `stats::a_new_jobs_eta_is_measured_since_it_was_activated`.)* (Twenty-second
   audit.)
+- `I-STATS-8d` **A job's throughput** is the rate its ETA extrapolates, an
+  hour, in its own unit: claims in the window × the batch, as games (10 a
+  batch, two claims: 20 games/hour), pairs, rack analyses, or a leave job's
+  games (`num_iterations` a task; it has a pace and no ETA). Nothing finished
+  in the last hour, or a job that is not active, has none. *(Covered:
+  `stats::throughput_is_recent_claims_times_the_batch_in_the_jobs_unit`.)*
 - `I-STATS-9` **The finish check** completes a job once its match test
   decides and at the hard cap (inconclusive), and does **not** complete below
   `min_units` even with an interval clear of an even score. There is no
@@ -3926,8 +3929,8 @@ admin in once and the admin journeys reuse its storage state.
 - `E-1` An anonymous visitor browses the landing page, job list, a job detail
   page — its status on a row of its own, with no description beside an
   active status and "Paused …" or "Finished …" beside any other, then its
-  four headline cards (Allocation, Tasks completed, Active contributors,
-  Estimated time left) — and the Contributions page: the site's totals
+  four headline cards (Allocation, Tasks completed, Throughput, Estimated
+  time left) — and the Contributions page: the site's totals
   (movegens, compute time, tasks) and the same by job type, then the
   contributor leaderboard, ranked by movegens and re-ranked by tasks at a
   click, with a contributor's own by job type under their row when their name

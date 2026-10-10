@@ -18,9 +18,6 @@ use sha2::{Digest, Sha256};
 use sqlx::{Connection, PgConnection, PgPool};
 use std::sync::Arc;
 use std::time::Duration;
-
-/// The heartbeat timeout every test's config has: the default, 300 s.
-pub const HEARTBEAT: Duration = Duration::from_secs(300);
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -202,7 +199,7 @@ impl TestDb {
             mail_outbox_dir: None,
             mail_from: "test@birdtest.local".into(),
             public_url: "http://localhost".into(),
-            heartbeat_timeout: HEARTBEAT,
+            heartbeat_timeout: Duration::from_secs(300),
             // Uncached: a test reads the stats a submission just changed.
             stats_cache: Duration::ZERO,
             s3_bucket: "birdtest-test".into(),

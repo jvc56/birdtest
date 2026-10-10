@@ -3,6 +3,7 @@ import {
   blankFields,
   computeTime,
   exactCount,
+  throughputText,
   timeLimitNotice,
   unchosenText,
   datetime,
@@ -463,6 +464,25 @@ describe('F-FMT-19 exactCount', () => {
     expect(exactCount(null)).toBe('—');
     expect(exactCount(Number.NaN)).toBe('—');
     expect(exactCount(-1)).toBe('—');
+  });
+});
+
+describe('F-FMT-21 throughputText', () => {
+  it("reads the job's pace an hour in its own unit", () => {
+    expect(throughputText({ per_hour: 1240.4, unit: 'game' })).toBe(`${(1240).toLocaleString()} games/hour`);
+    expect(throughputText({ per_hour: 8, unit: 'pair' })).toBe('8 pairs/hour');
+    expect(throughputText({ per_hour: 10.5, unit: 'rack' })).toBe('11 racks/hour');
+  });
+
+  it('keeps a decimal below ten, and one unit is singular', () => {
+    expect(throughputText({ per_hour: 2.46, unit: 'rack' })).toBe('2.5 racks/hour');
+    expect(throughputText({ per_hour: 9.96, unit: 'game' })).toBe('10 games/hour');
+    expect(throughputText({ per_hour: 1, unit: 'game' })).toBe('1 game/hour');
+  });
+
+  it('shows nothing without recent work', () => {
+    expect(throughputText(null)).toBe('—');
+    expect(throughputText({ per_hour: Number.NaN, unit: 'game' })).toBe('—');
   });
 });
 

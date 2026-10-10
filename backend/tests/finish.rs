@@ -116,7 +116,7 @@ async fn under_steady_load_the_finish_check_runs_on_every_nth_submission() {
     assert_eq!((stored.status.as_str(), stored.lower), ("player1_better", decided_lower));
     // I-STATS-9f: and the page is told why it finished -- its test, not an
     // admin and not its cap.
-    let completion = jobstats::compute(&db.pool, &row, HEARTBEAT).await.unwrap().completion.expect("completed");
+    let completion = jobstats::compute(&db.pool, &row).await.unwrap().completion.expect("completed");
     assert!(!completion.forced);
     assert_eq!(completion.reason.as_deref(), Some("player1_better"));
 }
@@ -204,7 +204,7 @@ async fn an_opening_rack_job_completes_once_its_racks_are_handed_out_and_all_acc
     .unwrap();
     assert_eq!(logged, vec![(None, Some("active".to_string()), Some("completed".to_string()))]);
     // I-STATS-9f: its racks ran out -- no verdict, no admin.
-    let completion = jobstats::compute(&db.pool, &row, HEARTBEAT).await.unwrap().completion.expect("completed");
+    let completion = jobstats::compute(&db.pool, &row).await.unwrap().completion.expect("completed");
     assert_eq!((completion.forced, completion.reason), (false, None));
 }
 
@@ -217,14 +217,14 @@ async fn a_forced_completion_is_reported_as_forced() {
     let admin = db.user("root", true).await;
     let job = db.games_job(10).await;
     let row = jobstats::load_job(&db.pool, job).await.unwrap();
-    assert!(jobstats::compute(&db.pool, &row, HEARTBEAT).await.unwrap().completion.is_none());
+    assert!(jobstats::compute(&db.pool, &row).await.unwrap().completion.is_none());
 
     let headers = admin_headers(&db.config(), admin);
     let (status, body) = send(&app, post_json(&format!("/api/admin/jobs/{job}/complete"), &headers
         .iter().map(|(k, v)| (k.as_str(), v.as_str())).collect::<Vec<_>>(), json!({}))).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let row = jobstats::load_job(&db.pool, job).await.unwrap();
-    let completion = jobstats::compute(&db.pool, &row, HEARTBEAT).await.unwrap().completion.expect("completed");
+    let completion = jobstats::compute(&db.pool, &row).await.unwrap().completion.expect("completed");
     assert_eq!((completion.forced, completion.reason), (true, None));
 }
 
@@ -606,7 +606,7 @@ async fn a_games_job_without_a_test_completes_at_its_target_once_reactivated() {
     let (db, job) = a_games_job_whose_cap_landed_while_inactive(false).await;
     let row = jobstats::load_job(&db.pool, job).await.unwrap();
     assert_eq!(row.test_decided_status, None);
-    let completion = jobstats::compute(&db.pool, &row, HEARTBEAT).await.unwrap().completion.expect("completed");
+    let completion = jobstats::compute(&db.pool, &row).await.unwrap().completion.expect("completed");
     assert!(!completion.forced);
     assert_eq!(completion.reason.as_deref(), Some("reached_target"));
 }

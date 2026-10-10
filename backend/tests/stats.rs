@@ -180,7 +180,7 @@ fn close(got: f64, want: f64) {
 
 async fn stats(db: &TestDb, job: Uuid) -> jobstats::JobStats {
     let row = jobstats::load_job(&db.pool, job).await.unwrap();
-    jobstats::compute(&db.pool, &row, HEARTBEAT).await.unwrap()
+    jobstats::compute(&db.pool, &row).await.unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -526,74 +526,6 @@ async fn contributions_are_attributed_to_each_identity_across_both_kinds() {
     assert_eq!(workers[0].username.as_deref(), Some("alice"), "still ranked");
 }
 
-/// An open claim of `job` by `owner` as the claim path leaves it, its task
-/// claimed too, last heartbeated `heartbeat_secs_ago` (None: not yet).
-async fn open_claim(db: &TestDb, job: Uuid, owner: Owner, heartbeat_secs_ago: Option<i32>) -> Uuid {
-    let (task, claim) = claim(db, job, owner, "claimed", 0).await;
-    sqlx::query("UPDATE tasks SET state = 'claimed' WHERE id = $1")
-        .bind(task)
-        .execute(&db.pool)
-        .await
-        .unwrap();
-    sqlx::query("UPDATE task_claims SET last_heartbeat_at = now() - make_interval(secs => $2) WHERE id = $1")
-        .bind(claim)
-        .bind(heartbeat_secs_ago)
-        .execute(&db.pool)
-        .await
-        .unwrap();
-    claim
-}
-
-async fn active_contributors(db: &TestDb, job: Uuid) -> i64 {
-    stats(db, job).await.active_contributors
-}
-
-/// I-STATS-7e: a job's active contributors are the identities holding a live
-/// claim on it -- open, and heartbeated (or claimed, before a first
-/// heartbeat) within the heartbeat timeout -- each once, however many tasks
-/// it holds. A finished claim, a stale one and another job's are not.
-#[tokio::test]
-async fn active_contributors_are_the_identities_with_a_live_claim() {
-    let db = TestDb::new().await;
-    let job = db.games_job(10).await;
-    let other_job = db.games_job(10).await;
-    let alice = db.user("alice", false).await;
-    let worker = anon(&db).await;
-    let silent = anon(&db).await;
-    let stale_secs = HEARTBEAT.as_secs() as i32 + 60;
-
-    assert_eq!(active_contributors(&db, job).await, 0, "nobody yet");
-    claim(&db, job, Owner::User(alice), "completed", 5).await;
-    assert_eq!(active_contributors(&db, job).await, 0, "a finished claim is not activity");
-
-    open_claim(&db, job, Owner::User(alice), Some(10)).await;
-    assert_eq!(active_contributors(&db, job).await, 1, "claimed and heartbeating");
-    open_claim(&db, job, Owner::User(alice), Some(20)).await;
-    assert_eq!(active_contributors(&db, job).await, 1, "the same contributor twice is one");
-
-    // Silent for longer than the timeout: what reclamation would lapse.
-    let stale = open_claim(&db, job, Owner::Anon(silent), Some(stale_secs)).await;
-    assert_eq!(active_contributors(&db, job).await, 1, "a stale claim is not activity");
-    // Claimed a moment ago and not heartbeated yet: active from its claim.
-    open_claim(&db, job, Owner::Anon(worker), None).await;
-    assert_eq!(active_contributors(&db, job).await, 2);
-    // Long claimed and never heartbeated: stale from its claim.
-    sqlx::query(
-        "UPDATE task_claims SET last_heartbeat_at = NULL,
-             claimed_at = now() - make_interval(secs => $2) WHERE id = $1",
-    )
-    .bind(stale)
-    .bind(stale_secs)
-    .execute(&db.pool)
-    .await
-    .unwrap();
-    assert_eq!(active_contributors(&db, job).await, 2);
-
-    open_claim(&db, other_job, Owner::Anon(silent), Some(1)).await;
-    assert_eq!(active_contributors(&db, job).await, 2, "another job's claim is not this job's");
-    assert_eq!(active_contributors(&db, other_job).await, 1);
-}
-
 /// I-STATS-8: with no task completed in the last hour there is no throughput
 /// to extrapolate, and the ETA is `None` rather than infinity -- as it is for
 /// a job that is not active. One recent completion gives a finite estimate.
@@ -661,6 +593,59 @@ async fn a_new_jobs_eta_is_measured_since_it_was_activated() {
     assert!((eta - expected).abs() < 0.01 * expected, "{eta} vs {expected}");
 }
 
+/// I-STATS-8d: a job's throughput is the rate its ETA extrapolates, an hour,
+/// in its own unit: claims times the batch, as games, pairs, rack analyses or
+/// a leave job's games. Nothing done recently, or a job not active, has none.
+#[tokio::test]
+async fn throughput_is_recent_claims_times_the_batch_in_the_jobs_unit() {
+    let db = TestDb::new().await;
+    let worker = Owner::Anon(anon(&db).await);
+    let admin = db.user("admin", true).await;
+    let throughput = |stats: jobstats::JobStats| stats.throughput.map(|t| (t.per_hour, t.unit));
+
+    let games = db.games_job(10).await;
+    assert_eq!(throughput(stats(&db, games).await), None, "nothing done at all");
+    claim(&db, games, worker, "completed", 120).await;
+    assert_eq!(throughput(stats(&db, games).await), None, "nothing done in the last hour");
+    claim(&db, games, worker, "completed", 10).await;
+    claim(&db, games, worker, "completed", 10).await;
+    // Two claims in the last hour, ten games a batch.
+    assert_eq!(throughput(stats(&db, games).await), Some((20.0, "game")));
+
+    let pairs = pairs_job(&db).await;
+    claim(&db, pairs, worker, "completed", 10).await;
+    assert_eq!(throughput(stats(&db, pairs).await), Some((8.0, "pair")));
+
+    let racks = db.bare_job("opening_rack", admin).await;
+    let solver = db.static_player("solver", admin).await;
+    sqlx::query(
+        "INSERT INTO job_opening_rack_config
+             (job_id, player_config_id, racks_per_batch, rack_size, total_racks)
+         VALUES ($1, $2, 25, 7, 100)",
+    )
+    .bind(racks)
+    .bind(solver)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    claim(&db, racks, worker, "completed", 10).await;
+    assert_eq!(throughput(stats(&db, racks).await), Some((25.0, "rack")));
+
+    // A hundred games a task; no ETA, but a pace.
+    let leaves = leave_job(&db, 2).await;
+    claim(&db, leaves, worker, "completed", 10).await;
+    let leave_stats = stats(&db, leaves).await;
+    assert_eq!(leave_stats.eta_seconds, None);
+    assert_eq!(throughput(leave_stats), Some((100.0, "game")));
+
+    sqlx::query("UPDATE jobs SET status = 'inactive', allocation = 0 WHERE id = $1")
+        .bind(games)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(throughput(stats(&db, games).await), None, "an inactive job has no pace");
+}
+
 /// I-STATS-11: the stats payload cache. A payload is served from the cache
 /// until it expires; `forget` (every admin action) makes the next read build
 /// again; and a build reads the job's row itself, so a caller's copy read
@@ -675,20 +660,20 @@ async fn the_stats_cache_follows_admin_changes() {
         serde_json::from_str::<serde_json::Value>(json).unwrap()["job"]["allocation"].clone()
     };
 
-    let first = jobstats::payload(&db.pool, &before, ttl, HEARTBEAT).await.unwrap();
+    let first = jobstats::payload(&db.pool, &before, ttl).await.unwrap();
     assert_eq!(allocation(&first), json!(50));
     sqlx::query("UPDATE jobs SET allocation = 30 WHERE id = $1").bind(job).execute(&db.pool).await.unwrap();
-    let cached = jobstats::payload(&db.pool, &before, ttl, HEARTBEAT).await.unwrap();
+    let cached = jobstats::payload(&db.pool, &before, ttl).await.unwrap();
     assert_eq!(allocation(&cached), json!(50), "served from the cache until it is forgotten");
 
     jobstats::forget(job);
     // `before` still says 50: the build reads the row, not the caller's copy.
-    let fresh = jobstats::payload(&db.pool, &before, ttl, HEARTBEAT).await.unwrap();
+    let fresh = jobstats::payload(&db.pool, &before, ttl).await.unwrap();
     assert_eq!(allocation(&fresh), json!(30));
     // A build that starts after a forget is kept, and so is what a live push
     // sends.
     jobstats::forget(job);
-    assert!(jobstats::refresh_payload(&db.pool, job, ttl, HEARTBEAT).await.unwrap().is_some());
+    assert!(jobstats::refresh_payload(&db.pool, job, ttl).await.unwrap().is_some());
 }
 
 // ---------------------------------------------------------------------------
@@ -913,7 +898,7 @@ async fn a_stats_build_takes_one_connection() {
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     acquired.store(0, std::sync::atomic::Ordering::SeqCst);
 
-    birdtest::jobstats::refresh_payload(&pool, job, std::time::Duration::ZERO, HEARTBEAT).await.unwrap();
+    birdtest::jobstats::refresh_payload(&pool, job, std::time::Duration::ZERO).await.unwrap();
     assert_eq!(acquired.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
@@ -939,7 +924,7 @@ async fn viewers_waiting_on_a_failed_build_are_answered_together() {
         .map(|_| {
             let (pool, job) = (pool.clone(), job.clone());
             tokio::spawn(async move {
-                birdtest::jobstats::payload(&pool, &job, std::time::Duration::from_secs(10), HEARTBEAT).await
+                birdtest::jobstats::payload(&pool, &job, std::time::Duration::from_secs(10)).await
             })
         })
         .collect();

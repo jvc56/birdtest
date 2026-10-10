@@ -32,11 +32,10 @@ pub struct JobStats {
     /// The move generations the job's accepted claims reported: the work done
     /// for it, whatever the machines (`jobs.movegens`).
     pub movegens: i64,
-    /// The contributors holding a live claim on the job right now: an open
-    /// claim whose worker has heartbeated (or claimed) within the heartbeat
-    /// timeout, the clock reclamation uses. Each identity once, however many
-    /// tasks it holds.
-    pub active_contributors: i64,
+    /// How fast the job is going: the rate [`Self::eta_seconds`] extrapolates,
+    /// in the job's own unit. `None` exactly when there is no recent work to
+    /// measure -- the job is not active, or nothing finished in the window.
+    pub throughput: Option<Throughput>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub games: Option<GameStats>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -62,6 +61,16 @@ pub struct JobStats {
 /// How a job was completed, from its `job.completed` audit row: a job page
 /// said only "completed", and a pairs job stopped by its test and one stopped
 /// at its cap read the same.
+/// A job's recent pace: units finished an hour, over the last hour or since
+/// the job was activated if that is more recent.
+#[derive(Debug, Serialize)]
+pub struct Throughput {
+    pub per_hour: f64,
+    /// What a task is made of: "game" for games and leave-generation jobs,
+    /// "pair" for game pairs, "rack" for opening racks (each rack analysis).
+    pub unit: &'static str,
+}
+
 #[derive(Debug, Serialize)]
 pub struct Completion {
     pub at: chrono::DateTime<chrono::Utc>,
@@ -248,16 +257,14 @@ const SLOW_STATS_THRESHOLD: std::time::Duration = std::time::Duration::from_secs
 
 /// The job's stats as JSON, no older than `max_age`: from the last build
 /// when it is recent enough, built (and kept) otherwise. See
-/// `Config::stats_cache`. `heartbeat_timeout` is `Config::heartbeat_timeout`,
-/// what makes a claim's contributor active.
+/// `Config::stats_cache`.
 pub async fn payload(
     pool: &PgPool,
     job: &Job,
     max_age: std::time::Duration,
-    heartbeat_timeout: std::time::Duration,
 ) -> AppResult<std::sync::Arc<str>> {
     if max_age.is_zero() {
-        return Ok(build_payload(pool, job.id, max_age, heartbeat_timeout).await?.0);
+        return Ok(build_payload(pool, job.id, max_age).await?.0);
     }
     if let Some(cached) = cached_payload(job.id, max_age, None) {
         return Ok(cached);
@@ -283,7 +290,7 @@ pub async fn payload(
         Some(cached) => Ok(cached),
         None if failed_since(job.id, asked) => Err(busy()),
         None => {
-            let built = build_payload(pool, job.id, max_age, heartbeat_timeout).await.map(|(json, _)| json);
+            let built = build_payload(pool, job.id, max_age).await.map(|(json, _)| json);
             if built.is_err() {
                 FAILED.lock().expect("stats cache poisoned").insert(job.id, std::time::Instant::now());
             }
@@ -327,9 +334,8 @@ pub async fn refresh_payload(
     pool: &PgPool,
     job_id: Uuid,
     max_age: std::time::Duration,
-    heartbeat_timeout: std::time::Duration,
 ) -> AppResult<Option<std::sync::Arc<str>>> {
-    let (json, kept) = build_payload(pool, job_id, max_age, heartbeat_timeout).await?;
+    let (json, kept) = build_payload(pool, job_id, max_age).await?;
     Ok((kept || max_age.is_zero()).then_some(json))
 }
 
@@ -370,7 +376,6 @@ async fn build_payload(
     pool: &PgPool,
     job_id: Uuid,
     max_age: std::time::Duration,
-    heartbeat_timeout: std::time::Duration,
 ) -> AppResult<(std::sync::Arc<str>, bool)> {
     // Freshness runs from when the build *started* -- what it read -- and a
     // build replaces only an entry that started before it: two builds
@@ -378,7 +383,7 @@ async fn build_payload(
     let started = std::time::Instant::now();
     let mut conn = pool.acquire().await?;
     let job = load_job_on(&mut conn, job_id).await?;
-    let stats = compute_on(&mut conn, &job, heartbeat_timeout).await?;
+    let stats = compute_on(&mut conn, &job).await?;
     drop(conn);
     let json: std::sync::Arc<str> = serde_json::to_string(&stats)
         .map_err(|e| crate::error::AppError::internal(format!("serializing job stats failed: {e}")))?
@@ -449,21 +454,17 @@ fn cached_payload(
         .map(|entry| entry.json.clone())
 }
 
-pub async fn compute(pool: &PgPool, job: &Job, heartbeat_timeout: std::time::Duration) -> AppResult<JobStats> {
-    compute_on(&mut *pool.acquire().await?, job, heartbeat_timeout).await
+pub async fn compute(pool: &PgPool, job: &Job) -> AppResult<JobStats> {
+    compute_on(&mut *pool.acquire().await?, job).await
 }
 
 /// [`compute`] on one connection, for a build: taken from the pool for each
 /// of its statements, a build on a saturated pool waited out the acquire
 /// timeout once per statement and answered in tens of seconds, where one wait
 /// makes it a quick `503` (the audit's pass 10).
-async fn compute_on(
-    conn: &mut PgConnection,
-    job: &Job,
-    heartbeat_timeout: std::time::Duration,
-) -> AppResult<JobStats> {
+async fn compute_on(conn: &mut PgConnection, job: &Job) -> AppResult<JobStats> {
     let started = std::time::Instant::now();
-    let stats = compute_inner(conn, job, heartbeat_timeout).await;
+    let stats = compute_inner(conn, job).await;
     let elapsed = started.elapsed();
     if elapsed >= SLOW_STATS_THRESHOLD {
         tracing::warn!(
@@ -474,11 +475,7 @@ async fn compute_on(
     stats
 }
 
-async fn compute_inner(
-    conn: &mut PgConnection,
-    job: &Job,
-    heartbeat_timeout: std::time::Duration,
-) -> AppResult<JobStats> {
+async fn compute_inner(conn: &mut PgConnection, job: &Job) -> AppResult<JobStats> {
     let counts = sqlx::query(
         "SELECT
              COUNT(*)                                            AS total,
@@ -518,9 +515,8 @@ async fn compute_inner(
     let tasks_total: i64 = counts.get("total");
     let tasks_completed: i64 = counts.get("completed");
 
-    let eta_seconds = estimate_eta(&mut *conn, job, &games, tasks_total, tasks_completed).await?;
+    let (throughput, eta_seconds) = estimate_pace(&mut *conn, job, &games).await?;
     let (workers, other_workers) = worker_contributions_on(&mut *conn, job.id).await?;
-    let active_contributors = active_contributors_on(&mut *conn, job.id, heartbeat_timeout).await?;
 
     let completion = if job.status == crate::models::job::JobStatus::Completed {
         sqlx::query_as::<_, (chrono::DateTime<chrono::Utc>, bool, Option<String>)>(
@@ -558,7 +554,7 @@ async fn compute_inner(
         tasks_available: counts.get("available"),
         tasks_claimed: counts.get("claimed"),
         movegens: job.movegens,
-        active_contributors,
+        throughput,
         games,
         opening_racks,
         leave_generation,
@@ -937,31 +933,6 @@ pub async fn worker_contributions(
     worker_contributions_on(&mut *pool.acquire().await?, job_id).await
 }
 
-/// The distinct identities holding a live claim on the job: open, and
-/// heartbeated (or, before its first heartbeat, claimed) within
-/// `heartbeat_timeout` -- the clock reclamation lapses claims by, so "active"
-/// means here what it means to the scheduler. A dead worker's claim stays
-/// open until the next claim reclaims it, which is why the clock is read
-/// rather than the state alone. Through the job's claimed tasks and their open
-/// claims (`task_claims_open_idx`), which is the job's work in flight.
-async fn active_contributors_on(
-    conn: &mut PgConnection,
-    job_id: Uuid,
-    heartbeat_timeout: std::time::Duration,
-) -> AppResult<i64> {
-    Ok(sqlx::query_scalar(
-        "SELECT COUNT(DISTINCT COALESCE(c.claimed_by_user_id, c.claimed_by_anon_uuid))
-         FROM tasks t
-         JOIN task_claims c ON c.task_id = t.id AND c.state = 'claimed'
-         WHERE t.job_id = $1 AND t.state = 'claimed'
-           AND COALESCE(c.last_heartbeat_at, c.claimed_at) > now() - make_interval(secs => $2)",
-    )
-    .bind(job_id)
-    .bind(heartbeat_timeout.as_secs_f64())
-    .fetch_one(&mut *conn)
-    .await?)
-}
-
 async fn worker_contributions_on(
     conn: &mut PgConnection,
     job_id: Uuid,
@@ -1022,19 +993,17 @@ async fn worker_contributions_on(
     ))
 }
 
-/// Throughput over the last hour, extrapolated to whatever is left. For games
-/// and pairs jobs "what's left" is the distance to `max_units`: the target of
-/// a job without a test, and a ceiling for one with it -- that job may well
-/// stop earlier when the test decides.
-async fn estimate_eta(
+/// Throughput over the last hour, and extrapolated to whatever is left. For
+/// games and pairs jobs "what's left" is the distance to `max_units`: the
+/// target of a job without a test, and a ceiling for one with it -- that job
+/// may well stop earlier when the test decides.
+async fn estimate_pace(
     conn: &mut PgConnection,
     job: &Job,
     games: &Option<GameStats>,
-    tasks_total: i64,
-    tasks_completed: i64,
-) -> AppResult<Option<f64>> {
+) -> AppResult<(Option<Throughput>, Option<f64>)> {
     if job.status != crate::models::job::JobStatus::Active {
-        return Ok(None);
+        return Ok((None, None));
     }
 
     // The last hour, or since the job was activated if that is more recent:
@@ -1070,56 +1039,71 @@ async fn estimate_eta(
     .await?;
 
     if recent == 0 {
-        return Ok(None);
+        return Ok((None, None));
     }
-    let per_second = recent as f64 / window_seconds.max(60.0);
+    let claims_per_second = recent as f64 / window_seconds.max(60.0);
+    // A task has one slot, and its units count once: the job's units a second
+    // are its claims a second times the units in a claim's batch.
+    let pace = |unit: &'static str, per_claim: i32| {
+        let per_second = claims_per_second * f64::from(per_claim.max(1));
+        (Throughput { per_hour: per_second * 3600.0, unit }, per_second)
+    };
 
-    // Tasks are made on demand, so `tasks_total - tasks_completed` is only what
+    // Tasks are made on demand, so the job's tasks left undone are only what
     // is in flight: a 3.2-million-rack job 1% done read "three minutes left".
-    // An opening-rack job counts the analyses it still wants instead, at the
-    // rate racks have been analysed; a leave job's remaining work is
-    // generations whose size depends on the draws, so it has no estimate.
-    if job.job_type == crate::models::job::JobType::LeaveGeneration {
-        return Ok(None);
-    }
-    if job.job_type == crate::models::job::JobType::OpeningRack {
-        let (total_racks, racks_per_batch, min_results): (i64, i32, i32) = sqlx::query_as(
-            "SELECT total_racks, racks_per_batch, min_results_per_rack
-             FROM job_opening_rack_config WHERE job_id = $1",
-        )
-        .bind(job.id)
-        .fetch_one(&mut *conn)
-        .await?;
-        // Racks not yet analysed want at least their fewest analyses each;
-        // racks analysed and not yet settled at least one more. A consensus
-        // that is slow to come makes this an underestimate.
-        let unanalysed = (total_racks - job.racks_analyzed).max(0) as f64;
-        let unsettled = (job.racks_analyzed - job.racks_settled).max(0) as f64;
-        let remaining = unanalysed * f64::from(min_results.max(1)) + unsettled;
-        let racks_per_second = per_second * f64::from(racks_per_batch.max(1));
-        return Ok(Some(remaining / racks_per_second));
-    }
-
-    if let Some(stats) = games {
-        let done = stats.units_completed as f64;
-        let target = stats.max_units as f64;
-        if done >= target {
-            return Ok(Some(0.0));
+    // Each type counts what it still wants in its own unit instead.
+    match job.job_type {
+        JobType::OpeningRack => {
+            let (total_racks, racks_per_batch, min_results): (i64, i32, i32) = sqlx::query_as(
+                "SELECT total_racks, racks_per_batch, min_results_per_rack
+                 FROM job_opening_rack_config WHERE job_id = $1",
+            )
+            .bind(job.id)
+            .fetch_one(&mut *conn)
+            .await?;
+            let (throughput, per_second) = pace("rack", racks_per_batch);
+            // Racks not yet analysed want at least their fewest analyses each;
+            // racks analysed and not yet settled at least one more. A consensus
+            // that is slow to come makes this an underestimate.
+            let unanalysed = (total_racks - job.racks_analyzed).max(0) as f64;
+            let unsettled = (job.racks_analyzed - job.racks_settled).max(0) as f64;
+            let remaining = unanalysed * f64::from(min_results.max(1)) + unsettled;
+            Ok((Some(throughput), Some(remaining / per_second)))
         }
-        // Units per claim from the job's batch size: a task has one slot, and
-        // its units count once.
-        let per_batch: i32 = if job.job_type == crate::models::job::JobType::GamePairs {
-            sqlx::query_scalar("SELECT pairs_per_batch FROM job_game_pair_config WHERE job_id = $1")
-        } else {
-            sqlx::query_scalar("SELECT games_per_batch FROM job_game_config WHERE job_id = $1")
+        // Its remaining work is generations whose size depends on the draws,
+        // so it has a pace and no estimate.
+        JobType::LeaveGeneration => {
+            let num_iterations: i32 =
+                sqlx::query_scalar("SELECT num_iterations FROM job_leave_config WHERE job_id = $1")
+                    .bind(job.id)
+                    .fetch_one(&mut *conn)
+                    .await?;
+            Ok((Some(pace("game", num_iterations).0), None))
         }
-        .bind(job.id)
-        .fetch_one(&mut *conn)
-        .await?;
-        let units_per_second = per_second * f64::from(per_batch.max(1));
-        return Ok(Some((target - done) / units_per_second));
+        JobType::Games | JobType::GamePairs => {
+            let (unit, per_batch): (&'static str, i32) = if job.job_type == JobType::GamePairs {
+                (
+                    "pair",
+                    sqlx::query_scalar("SELECT pairs_per_batch FROM job_game_pair_config WHERE job_id = $1")
+                        .bind(job.id)
+                        .fetch_one(&mut *conn)
+                        .await?,
+                )
+            } else {
+                (
+                    "game",
+                    sqlx::query_scalar("SELECT games_per_batch FROM job_game_config WHERE job_id = $1")
+                        .bind(job.id)
+                        .fetch_one(&mut *conn)
+                        .await?,
+                )
+            };
+            let (throughput, per_second) = pace(unit, per_batch);
+            let eta = games.as_ref().map(|stats| {
+                let left = stats.max_units as f64 - stats.units_completed as f64;
+                (left / per_second).max(0.0)
+            });
+            Ok((Some(throughput), eta))
+        }
     }
-
-    let remaining = (tasks_total - tasks_completed).max(0) as f64;
-    Ok(Some(remaining / per_second))
 }

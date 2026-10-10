@@ -435,10 +435,11 @@ export interface JobStats {
   /** The move generations the job's accepted claims reported: the work done for it. */
   movegens: number;
   /**
-   * The contributors holding a live claim on the job: open, and heartbeated
-   * within the heartbeat timeout. Each once, however many tasks it holds.
+   * Units finished an hour, over the last hour (or since activation): the
+   * rate `eta_seconds` extrapolates. Null when the job is not active or
+   * nothing finished recently.
    */
-  active_contributors: number;
+  throughput: { per_hour: number; unit: 'game' | 'pair' | 'rack' } | null;
   games?: GameStats;
   opening_racks?: {
     racks_analyzed: number;
