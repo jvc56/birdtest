@@ -421,6 +421,11 @@ export interface JobStats {
   tasks_claimed: number;
   /** The move generations the job's accepted claims reported: the work done for it. */
   movegens: number;
+  /**
+   * The contributors holding a live claim on the job: open, and heartbeated
+   * within the heartbeat timeout. Each once, however many tasks it holds.
+   */
+  active_contributors: number;
   games?: GameStats;
   opening_racks?: {
     racks_analyzed: number;

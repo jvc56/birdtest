@@ -308,7 +308,7 @@ async fn analysed_racks_are_counted_as_they_arrive() {
 
     let job_row = birdtest::jobstats::load_job(&db.pool, job).await.unwrap();
     assert_eq!(job_row.racks_analyzed, 4);
-    let stats = birdtest::jobstats::compute(&db.pool, &job_row).await.unwrap();
+    let stats = birdtest::jobstats::compute(&db.pool, &job_row, HEARTBEAT).await.unwrap();
     let racks = stats.opening_racks.expect("an opening-rack job reports rack stats");
     assert_eq!(racks.racks_analyzed, 4, "four racks were analysed, two by each worker");
 

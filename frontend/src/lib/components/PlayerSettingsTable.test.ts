@@ -23,43 +23,41 @@ const base: PlayerSettings = {
 // They differ in a key row (Sorted By) and in one only "All settings" lists (Word Info Table).
 const other: PlayerSettings = { ...base, role: 'player 2', id: 'p2', name: 'static-score', sort_strategy: 'score', use_wit: true };
 
-/** The `data-setting` ids in the `<tbody>` with this test id, in order; null when it is not rendered. */
-function block(html: string, testid: string): string[] | null {
-  const match = new RegExp(`<tbody[^>]*data-testid="${testid}"[^>]*>([\\s\\S]*?)</tbody>`).exec(html);
+/** The `data-setting` ids of the rows listed, in order; null when no table is rendered. */
+function rows(html: string): string[] | null {
+  const match = /<tbody[^>]*data-testid="setting-rows"[^>]*>([\s\S]*?)<\/tbody>/.exec(html);
   return match ? [...match[1].matchAll(/data-setting="([^"]+)"/g)].map((m) => m[1]) : null;
 }
 
-describe('F-SET-2 the player settings table reads differences first', () => {
-  it('puts the rows the players differ in in a block of their own, the shared ones folded', () => {
-    const html = render({ players: [base, other] });
-    expect(block(html, 'setting-differences')).toEqual(['sort_strategy', 'use_wit']);
-    expect(html).toContain('Differences (2)');
-    expect(block(html, 'shared-settings')).toBeNull();
-    // The key rows they share: Lexicon, Leaves, Move Recorder, Moves Generated,
-    // Plies, Uses Inference, Uses Preendgame, Uses Endgame.
-    expect(html).toContain('Show 8 shared settings');
-    expect(html).not.toContain('in bold');
+describe('F-SET-2 the player settings table lists differences, key rows or every setting', () => {
+  it('lists only what two players differ in, key or not, as ordinary rows', () => {
+    const html = render({ players: [base, other], mode: 'differences' });
+    expect(rows(html)).toEqual(['sort_strategy', 'use_wit']);
+    // No group header, no tint, no fold: the rows are the table.
+    expect(html).not.toContain('Differences (');
+    expect(html).not.toContain('bg-warning');
+    expect(html).not.toContain('shared setting');
     // Each player headed by the colour its moves are drawn in.
     expect(html.match(/data-testid="player-color"/g)).toHaveLength(2);
   });
 
-  it('opens the shared rows when every setting is asked for', () => {
-    const html = render({ players: [base, other], all: true });
-    expect(block(html, 'setting-differences')).toEqual(['sort_strategy', 'use_wit']);
-    const shared = block(html, 'shared-settings')!;
-    expect(shared).toEqual(expect.arrayContaining(['lexicon', 'movegen_margin', 'use_wordmap']));
-    expect(shared).not.toContain('sort_strategy');
-    expect(html).toContain('Hide shared settings');
+  it('lists every setting, the differing ones among them in order, when all are asked for', () => {
+    const listed = rows(render({ players: [base, other], mode: 'all' }))!;
+    expect(listed).toEqual(expect.arrayContaining(['lexicon', 'sort_strategy', 'use_wit', 'movegen_margin', 'use_wordmap']));
+    expect(listed[0]).toBe('lexicon');
   });
 
-  it('shows one player, or two alike, open with no differences block', () => {
-    for (const players of [[{ ...base, role: undefined }], [base, { ...base, role: 'player 2' }]]) {
-      const html = render({ players });
-      expect(block(html, 'setting-differences')).toBeNull();
-      expect(block(html, 'shared-settings')![0]).toBe('lexicon');
-      expect(html).not.toContain('shared setting');
-    }
+  it('says two players alike are identical rather than show an empty table', () => {
+    const html = render({ players: [base, { ...base, role: 'player 2' }], mode: 'differences' });
+    expect(rows(html)).toBeNull();
+    expect(html).toContain('settings are identical');
+  });
+
+  it('lists one player\'s key rows, with no colour', () => {
+    const html = render({ players: [{ ...base, role: undefined }], mode: 'key' });
+    expect(rows(html)![0]).toBe('lexicon');
+    expect(rows(html)).not.toContain('movegen_margin');
     // A config read on its own has no colour: nothing is drawn in it.
-    expect(render({ players: [{ ...base, role: undefined }] })).not.toContain('player-color');
+    expect(html).not.toContain('player-color');
   });
 });

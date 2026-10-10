@@ -46,7 +46,7 @@ test('E-1: an anonymous visitor browses the landing page, jobs, a job and the le
     await expect(page.getByTestId('job-status-context')).toContainText(/Paused|Finished/);
   }
   await expect(page.locator('.grid > .card > p:first-child')).toHaveText([
-    'Allocation', 'Tasks completed', 'Movegens', 'Estimated time left'
+    'Allocation', 'Tasks completed', 'Active contributors', 'Estimated time left'
   ]);
   // Anonymous workers are shown by pseudonym, never by the UUID that is
   // their credential.

@@ -1454,9 +1454,10 @@ impl TestRequest {
     }
 }
 
-/// IGP: all of a task's threads on one game's simulation at a time, which is
-/// what makes a simulation bounded by iterations reproducible. PGP, a game a
-/// thread, is the job's to ask for.
+/// Intra-game parallelism (`igp`): all of a task's threads on one game's
+/// simulation at a time, which is what makes a simulation bounded by
+/// iterations reproducible. Per-game parallelism (`pgp`), a game a thread, is
+/// the job's to ask for.
 fn default_threading_mode() -> String {
     "igp".to_string()
 }

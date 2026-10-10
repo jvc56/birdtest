@@ -4,7 +4,7 @@
   import { api, type JobStats, type RackLookupRow } from '$lib/api';
   import { subscribeToJob } from '$lib/sse';
   import { session } from '$lib/auth';
-  import { datetime, jobTypeLabel, jobTitle } from '$lib/format';
+  import { datetime, exactCount, jobTypeLabel, jobTitle } from '$lib/format';
   import JobStatusCard from '$lib/components/JobStatusCard.svelte';
   import JobStatsRow from '$lib/components/JobStatsRow.svelte';
   import TaskCounts from '$lib/components/TaskCounts.svelte';
@@ -158,10 +158,6 @@
           · requires MAGPIE ≥ {stats.job.min_magpie_version}{/if}
       </p>
     </div>
-
-    {#if config}
-      <JobSettings {config} />
-    {/if}
 
     {#if stats.games}
       <MatchScore games={stats.games} players={config?.players.map((p) => p.name) ?? []} />
@@ -378,6 +374,16 @@
           and {stats.other_workers.toLocaleString()} more
         </p>
       {/if}
+      <p class="mt-2 text-sm text-muted-foreground" data-testid="job-movegens">
+        <span class="break-all tabular-nums text-foreground">{exactCount(stats.movegens)}</span> movegens
+        for this job
+      </p>
     </div>
+
+    <!-- The settings last: what the job is doing comes before how it was
+         set up. -->
+    {#if config}
+      <JobSettings {config} />
+    {/if}
   </div>
 {/if}

@@ -884,8 +884,8 @@ Each entry's tests are the `describe` block named for its id.
   Position Recorder as yes, no or "yes (first divergences)"; an
   opening-rack job's minimum and maximum analyses per rack and its consensus
   share, "—" at a maximum of 1; a leave job's generations and each one's
-  target; then sim cutoff, a games or pairs job's Threading, "IGP (threads
-  within a game)" or "PGP (games in parallel)", the test's minimum, batch
+  target; then sim cutoff, a games or pairs job's Threading, "Intra-game parallelism (all threads on one game)"
+  or "Per-game parallelism (one game per thread)", the test's minimum, batch
   sizes, the oldest MAGPIE); a job without a test shows none of the test's settings but its
   "no", and a leave job has no sim cutoff and no lexicon or wordmap row of
   its own. Every label is in Title Case, and every job type capitalised. A
@@ -915,15 +915,14 @@ Each entry's tests are the `describe` block named for its id.
   apart by it. A player's search in a few words leaves out what the job never reads
   (an opening-rack player's inference, the solving where the job never
   reaches the end of a game). *(Covered: `jobSettings.test.ts`.)*
-- `F-SET-2` The player settings table reads differences first
-  (`settingBlocks`, `PlayerSettingsTable.svelte`): every setting two players
-  differ in -- key or not -- in a block of its own at the top, "Differences
-  (N)", then the rows they share (the key rows, or every row with "All
-  settings"), folded behind "Show N shared settings" while there are
-  differences and open with "All settings"; one player, or two alike, has no
-  block and every row open; each of two players headed by its colour.
-  *(Covered: `jobSettings.test.ts`, and `PlayerSettingsTable.test.ts`, which
-  renders the component to HTML.)*
+- `F-SET-2` The player settings table lists, by its mode
+  (`differingSettings`, `settingsFor`, `PlayerSettingsTable.svelte`), the
+  settings two players differ in -- key or not -- as ordinary rows, with no
+  heading, tint or fold; the key rows; or every row. Two players alike, asked
+  for their differences, say "These players' settings are identical." rather
+  than show an empty table; one player lists its key rows with no colour; each
+  of two players is headed by its colour. *(Covered: `jobSettings.test.ts`,
+  and `PlayerSettingsTable.test.ts`, which renders the component to HTML.)*
 - `F-FMT-12` `completionText` says how a job finished: a match test that
   decided, with the confidence, the units and player 1's interval ("its
   significance test found player 1 better at 95% confidence after 1,200
@@ -2337,6 +2336,13 @@ permanent.
   landed mid-purge. *(Covered:
   `admin_api::purging_and_deleting_a_job_give_back_what_it_earned`,
   `admin_api::a_purge_waits_for_a_submission_in_flight_before_counting_contributions`.)*
+- `I-STATS-7e` **A job's active contributors** are the identities holding a
+  live claim on it -- open, heartbeated (or claimed, before a first heartbeat)
+  within the heartbeat timeout -- each once: one claimed and heartbeating is
+  1, the same contributor with two claims is still 1, a stale claim (by
+  heartbeat or, never heartbeated, by claim time) is 0, and a completed claim
+  or another job's is not counted. *(Covered:
+  `stats::active_contributors_are_the_identities_with_a_live_claim`.)*
 - `I-STATS-8` ETA is `None` without recent throughput rather than infinity.
   *(Covered: `stats::the_eta_is_none_without_recent_throughput`.)*
 - `I-STATS-8b` A games job's ETA is the units left at claims an hour × batch.
@@ -3909,8 +3915,8 @@ admin in once and the admin journeys reuse its storage state.
 - `E-1` An anonymous visitor browses the landing page, job list, a job detail
   page — its status on a row of its own, with no description beside an
   active status and "Paused …" or "Finished …" beside any other, then its
-  four headline cards (Allocation, Tasks completed, Movegens, Estimated time
-  left) — and the contributor leaderboard, ranked by movegens and re-ranked by
+  four headline cards (Allocation, Tasks completed, Active contributors,
+  Estimated time left) — and the contributor leaderboard, ranked by movegens and re-ranked by
   tasks at a click, with the site's movegens by job type above it and a
   contributor's own under their row when their name is clicked.
   *(Covered:

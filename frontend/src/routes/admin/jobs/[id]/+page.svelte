@@ -11,7 +11,7 @@
     type JobStats
   } from '$lib/api';
   import { subscribeToJob } from '$lib/sse';
-  import { exportSummary, jobTitle, jobTypeLabel } from '$lib/format';
+  import { exactCount, exportSummary, jobTitle, jobTypeLabel } from '$lib/format';
   import type { JobConfig } from '$lib/jobSettings';
   import JobStatusCard from '$lib/components/JobStatusCard.svelte';
   import JobStatsRow from '$lib/components/JobStatsRow.svelte';
@@ -587,9 +587,6 @@
         }}
       />
     {/if}
-    {#if config}
-      <JobSettings {config} />
-    {/if}
     {#if stats.games}
       <MatchScore games={stats.games} players={config?.players.map((p) => p.name) ?? []} />
     {/if}
@@ -634,6 +631,15 @@
     <div class="card">
       <h2 class="mb-3 text-lg font-medium">Contributors</h2>
       <WorkerTable workers={stats.workers} />
+      <p class="mt-2 text-sm text-muted-foreground" data-testid="job-movegens">
+        <span class="break-all tabular-nums text-foreground">{exactCount(stats.movegens)}</span> movegens
+        for this job
+      </p>
     </div>
+
+    <!-- The settings last, as on the public page. -->
+    {#if config}
+      <JobSettings {config} />
+    {/if}
   </div>
 {/if}

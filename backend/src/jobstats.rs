@@ -32,6 +32,11 @@ pub struct JobStats {
     /// The move generations the job's accepted claims reported: the work done
     /// for it, whatever the machines (`jobs.movegens`).
     pub movegens: i64,
+    /// The contributors holding a live claim on the job right now: an open
+    /// claim whose worker has heartbeated (or claimed) within the heartbeat
+    /// timeout, the clock reclamation uses. Each identity once, however many
+    /// tasks it holds.
+    pub active_contributors: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub games: Option<GameStats>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -241,14 +246,16 @@ const SLOW_STATS_THRESHOLD: std::time::Duration = std::time::Duration::from_secs
 
 /// The job's stats as JSON, no older than `max_age`: from the last build
 /// when it is recent enough, built (and kept) otherwise. See
-/// `Config::stats_cache`.
+/// `Config::stats_cache`. `heartbeat_timeout` is `Config::heartbeat_timeout`,
+/// what makes a claim's contributor active.
 pub async fn payload(
     pool: &PgPool,
     job: &Job,
     max_age: std::time::Duration,
+    heartbeat_timeout: std::time::Duration,
 ) -> AppResult<std::sync::Arc<str>> {
     if max_age.is_zero() {
-        return Ok(build_payload(pool, job.id, max_age).await?.0);
+        return Ok(build_payload(pool, job.id, max_age, heartbeat_timeout).await?.0);
     }
     if let Some(cached) = cached_payload(job.id, max_age, None) {
         return Ok(cached);
@@ -274,7 +281,7 @@ pub async fn payload(
         Some(cached) => Ok(cached),
         None if failed_since(job.id, asked) => Err(busy()),
         None => {
-            let built = build_payload(pool, job.id, max_age).await.map(|(json, _)| json);
+            let built = build_payload(pool, job.id, max_age, heartbeat_timeout).await.map(|(json, _)| json);
             if built.is_err() {
                 FAILED.lock().expect("stats cache poisoned").insert(job.id, std::time::Instant::now());
             }
@@ -318,8 +325,9 @@ pub async fn refresh_payload(
     pool: &PgPool,
     job_id: Uuid,
     max_age: std::time::Duration,
+    heartbeat_timeout: std::time::Duration,
 ) -> AppResult<Option<std::sync::Arc<str>>> {
-    let (json, kept) = build_payload(pool, job_id, max_age).await?;
+    let (json, kept) = build_payload(pool, job_id, max_age, heartbeat_timeout).await?;
     Ok((kept || max_age.is_zero()).then_some(json))
 }
 
@@ -360,6 +368,7 @@ async fn build_payload(
     pool: &PgPool,
     job_id: Uuid,
     max_age: std::time::Duration,
+    heartbeat_timeout: std::time::Duration,
 ) -> AppResult<(std::sync::Arc<str>, bool)> {
     // Freshness runs from when the build *started* -- what it read -- and a
     // build replaces only an entry that started before it: two builds
@@ -367,7 +376,7 @@ async fn build_payload(
     let started = std::time::Instant::now();
     let mut conn = pool.acquire().await?;
     let job = load_job_on(&mut conn, job_id).await?;
-    let stats = compute_on(&mut conn, &job).await?;
+    let stats = compute_on(&mut conn, &job, heartbeat_timeout).await?;
     drop(conn);
     let json: std::sync::Arc<str> = serde_json::to_string(&stats)
         .map_err(|e| crate::error::AppError::internal(format!("serializing job stats failed: {e}")))?
@@ -438,17 +447,21 @@ fn cached_payload(
         .map(|entry| entry.json.clone())
 }
 
-pub async fn compute(pool: &PgPool, job: &Job) -> AppResult<JobStats> {
-    compute_on(&mut *pool.acquire().await?, job).await
+pub async fn compute(pool: &PgPool, job: &Job, heartbeat_timeout: std::time::Duration) -> AppResult<JobStats> {
+    compute_on(&mut *pool.acquire().await?, job, heartbeat_timeout).await
 }
 
 /// [`compute`] on one connection, for a build: taken from the pool for each
 /// of its statements, a build on a saturated pool waited out the acquire
 /// timeout once per statement and answered in tens of seconds, where one wait
 /// makes it a quick `503` (the audit's pass 10).
-async fn compute_on(conn: &mut PgConnection, job: &Job) -> AppResult<JobStats> {
+async fn compute_on(
+    conn: &mut PgConnection,
+    job: &Job,
+    heartbeat_timeout: std::time::Duration,
+) -> AppResult<JobStats> {
     let started = std::time::Instant::now();
-    let stats = compute_inner(conn, job).await;
+    let stats = compute_inner(conn, job, heartbeat_timeout).await;
     let elapsed = started.elapsed();
     if elapsed >= SLOW_STATS_THRESHOLD {
         tracing::warn!(
@@ -459,7 +472,11 @@ async fn compute_on(conn: &mut PgConnection, job: &Job) -> AppResult<JobStats> {
     stats
 }
 
-async fn compute_inner(conn: &mut PgConnection, job: &Job) -> AppResult<JobStats> {
+async fn compute_inner(
+    conn: &mut PgConnection,
+    job: &Job,
+    heartbeat_timeout: std::time::Duration,
+) -> AppResult<JobStats> {
     let counts = sqlx::query(
         "SELECT
              COUNT(*)                                            AS total,
@@ -501,6 +518,7 @@ async fn compute_inner(conn: &mut PgConnection, job: &Job) -> AppResult<JobStats
 
     let eta_seconds = estimate_eta(&mut *conn, job, &games, tasks_total, tasks_completed).await?;
     let (workers, other_workers) = worker_contributions_on(&mut *conn, job.id).await?;
+    let active_contributors = active_contributors_on(&mut *conn, job.id, heartbeat_timeout).await?;
 
     let completion = if job.status == crate::models::job::JobStatus::Completed {
         sqlx::query_as::<_, (chrono::DateTime<chrono::Utc>, bool, Option<String>)>(
@@ -537,6 +555,7 @@ async fn compute_inner(conn: &mut PgConnection, job: &Job) -> AppResult<JobStats
         tasks_available: counts.get("available"),
         tasks_claimed: counts.get("claimed"),
         movegens: job.movegens,
+        active_contributors,
         games,
         opening_racks,
         leave_generation,
@@ -913,6 +932,31 @@ pub async fn worker_contributions(
     job_id: Uuid,
 ) -> AppResult<(Vec<WorkerContribution>, i64)> {
     worker_contributions_on(&mut *pool.acquire().await?, job_id).await
+}
+
+/// The distinct identities holding a live claim on the job: open, and
+/// heartbeated (or, before its first heartbeat, claimed) within
+/// `heartbeat_timeout` -- the clock reclamation lapses claims by, so "active"
+/// means here what it means to the scheduler. A dead worker's claim stays
+/// open until the next claim reclaims it, which is why the clock is read
+/// rather than the state alone. Through the job's claimed tasks and their open
+/// claims (`task_claims_open_idx`), which is the job's work in flight.
+async fn active_contributors_on(
+    conn: &mut PgConnection,
+    job_id: Uuid,
+    heartbeat_timeout: std::time::Duration,
+) -> AppResult<i64> {
+    Ok(sqlx::query_scalar(
+        "SELECT COUNT(DISTINCT COALESCE(c.claimed_by_user_id, c.claimed_by_anon_uuid))
+         FROM tasks t
+         JOIN task_claims c ON c.task_id = t.id AND c.state = 'claimed'
+         WHERE t.job_id = $1 AND t.state = 'claimed'
+           AND COALESCE(c.last_heartbeat_at, c.claimed_at) > now() - make_interval(secs => $2)",
+    )
+    .bind(job_id)
+    .bind(heartbeat_timeout.as_secs_f64())
+    .fetch_one(&mut *conn)
+    .await?)
 }
 
 async fn worker_contributions_on(

@@ -3,17 +3,22 @@
    * What a job runs with, as two cards: the job's own settings and its
    * type's, every one of them, in one ordered list, then its players' -- one
    * column for a single player (an opening-rack or leave job's), two side by
-   * side for a games or pairs job, what they differ in first and what they
-   * share folded under it, those the job never reads muted. The players'
-   * card shows their key rows and has an "All settings" toggle for the rest.
-   * Public, like the rest of the page.
+   * side for a games or pairs job, those the job never reads muted. Two
+   * players' card shows only the settings they differ in, with an "All
+   * settings" toggle for every one; one player's shows its key rows, with the
+   * same toggle. Public, like the rest of the page.
    */
-  import { jobSettings, unusedPlayerSettings, type JobConfig } from '$lib/jobSettings';
+  import { jobSettings, unusedPlayerSettings, type JobConfig, type SettingsMode } from '$lib/jobSettings';
   import PlayerSettingsTable from './PlayerSettingsTable.svelte';
 
   export let config: JobConfig;
 
   let allPlayers = false;
+
+  // One player differs from nothing: it reads its key rows instead.
+  $: paired = config.players.length > 1;
+  let mode: SettingsMode;
+  $: mode = allPlayers ? 'all' : paired ? 'differences' : 'key';
 
   $: rows = jobSettings(config);
 </script>
@@ -43,16 +48,12 @@
       <button
         type="button"
         class="btn-secondary"
-        aria-expanded={allPlayers}
+        aria-pressed={allPlayers}
         on:click={() => (allPlayers = !allPlayers)}
       >
-        {allPlayers ? 'Key settings only' : 'All settings'}
+        {allPlayers ? (paired ? 'Different settings only' : 'Key settings only') : 'All settings'}
       </button>
     </div>
-    <PlayerSettingsTable
-      players={config.players}
-      all={allPlayers}
-      unused={unusedPlayerSettings(config)}
-    />
+    <PlayerSettingsTable players={config.players} {mode} unused={unusedPlayerSettings(config)} />
   </div>
 {/if}

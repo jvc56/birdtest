@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { jobSettings, keySettings, playerRows, playersLine, playerSummary, settingBlocks, show, unusedPlayerSettings, type JobConfig, type PlayerSettings } from './jobSettings';
+import { jobSettings, keySettings, playerRows, playersLine, playerSummary, differingSettings, settingsFor, show, unusedPlayerSettings, type JobConfig, type PlayerSettings } from './jobSettings';
 
 const staticPlayer: PlayerSettings = {
   role: 'player 1', id: 'p1', name: 'static-NWL23', lexicon: 'NWL23', leaves: 'NWL23', win_pct: null,
@@ -116,8 +116,8 @@ describe('F-SET-1 job settings', () => {
   it("names a games or pairs job's threading as the form does", () => {
     const value = (threading_mode: 'igp' | 'pgp') =>
       byLabel(jobSettings({ ...config, games: { ...config.games!, threading_mode } }), 'Threading').value;
-    expect(value('igp')).toBe('IGP (threads within a game)');
-    expect(value('pgp')).toBe('PGP (games in parallel)');
+    expect(value('igp')).toBe('Intra-game parallelism (all threads on one game)');
+    expect(value('pgp')).toBe('Per-game parallelism (one game per thread)');
     expect(labels(jobSettings(opening))).not.toContain('Threading');
   });
 
@@ -257,30 +257,24 @@ describe('F-SET-1 job settings', () => {
     expect(byLabel(rows, 'Lexicon').differs).toBe(false);
   });
 
-  it('reads differences first: every setting the players differ in, then the rest asked for', () => {
+  it('lists every setting the players differ in, key or not, and nothing else', () => {
     // A difference outside the key rows (Stopping %, Time Limit) is one too:
-    // folded behind "All settings" it was missed.
-    const { differences, shared } = settingBlocks(config.players, false, unusedPlayerSettings(config));
+    // listed only under "All settings" it was missed.
+    const differences = differingSettings(config.players, unusedPlayerSettings(config));
     expect(labels(differences)).toEqual(labels(playerRows(config.players, unusedPlayerSettings(config)).filter((r) => r.differs)));
     expect(labels(differences)).toEqual(expect.arrayContaining(['Plies', 'Uses Inference', 'Stopping %']));
     expect(differences.every((r) => r.differs)).toBe(true);
-    // Shared: the key rows the players agree on, in order, and nothing else.
-    expect(labels(shared)).toEqual(['Lexicon', 'Leaves', 'Sorted By', 'Move Recorder', 'Moves Generated', 'Uses Preendgame', 'Uses Endgame']);
-    // Every setting asked for: the shared rows grow, the differences do not.
-    const every = settingBlocks(config.players, true, unusedPlayerSettings(config));
-    expect(every.differences).toEqual(differences);
-    expect(labels(every.shared)).toEqual(expect.arrayContaining(['Movegen Margin', 'Wordmap']));
-    expect(every.shared.some((r) => r.differs)).toBe(false);
+    expect(settingsFor(config.players, 'differences', unusedPlayerSettings(config))).toEqual(differences);
+    // The other modes are the key rows and every row.
+    expect(settingsFor(config.players, 'key')).toEqual(keySettings(config.players));
+    expect(settingsFor(config.players, 'all')).toEqual(playerRows(config.players));
     // A setting the job never reads is never a difference.
-    const margins = settingBlocks([staticPlayer, { ...staticPlayer, movegen_margin: 9 }], true, unusedPlayerSettings(config));
-    expect(labels(margins.differences)).toEqual([]);
-    expect(byLabel(margins.shared, 'Movegen Margin').unused).toBe(true);
+    expect(labels(differingSettings([staticPlayer, { ...staticPlayer, movegen_margin: 9 }], unusedPlayerSettings(config)))).toEqual([]);
   });
 
-  it('shares everything with one player, or two alike', () => {
-    expect(settingBlocks([staticPlayer], false)).toEqual({ differences: [], shared: keySettings([staticPlayer]) });
-    expect(settingBlocks([staticPlayer], true).shared).toEqual(playerRows([staticPlayer]));
-    expect(settingBlocks([staticPlayer, { ...staticPlayer, role: 'player 2' }], false).differences).toEqual([]);
+  it('finds no difference in one player, or two alike', () => {
+    expect(differingSettings([staticPlayer])).toEqual([]);
+    expect(differingSettings([staticPlayer, { ...staticPlayer, role: 'player 2' }])).toEqual([]);
   });
 
   it('shows how a player solves the end of the game, where the job reaches it', () => {
