@@ -188,7 +188,7 @@ and `U-ARCHIVE-11` reads the process's own `/proc/self/status` for its peak memo
 ### Covered before the list
 
 `stats::sprt` (since replaced by `stats::match_test`), `stats::bradley_terry`, `version`, `compat`, `backups`,
-`derived`, `magpie`, `clientip`, `routes::admin`'s settings validation, and the
+`derived`, `magpie`, `clientip`, `routes::admin`'s time-limit validation, and the
 first rules of `jobs::plausibility` and the `inputdata` archive walk had tests
 before the entries below were written; the entries were what was missing, and
 each now names its tests. Every group has since grown (see the status table).
@@ -972,9 +972,10 @@ Each entry's tests are the `describe` block named for its id.
 - `F-FMT-19` `exactCount` reads a contributor's movegens to the last digit,
   grouped ("1,234,567,890"), and a dash for anything that is not a count.
   *(Covered: `format.test.ts`.)*
-- `F-FMT-20` `timeLimitNotice` says how many of a job's tasks hit the time
-  limit and names the cure ("3 tasks hit the time limit — lower the batch
-  size"), "1 task" for one, and nothing while none has. *(Covered:
+- `F-FMT-20` `timeLimitNotice` says how many of a job's tasks hit the job's
+  own time limit, names the limit and the cures ("3 tasks hit this job's 30m
+  time limit — lower the batch size, or raise the limit"), "1 task" for one,
+  and nothing while none has. *(Covered:
   `format.test.ts`.)*
 
 ### `F-MOVEGENS-*` — `lib/movegens.ts`
@@ -3114,9 +3115,10 @@ below.
   (Thirty-third audit, pass 1.)
 - `A-WORKER-23` Every assignment names its job (`job_name`: its name, or its
   type and the start of its id, never empty) and states the time limit its
-  claim was given (`max_task_seconds`): the settings' at the claim, which the
-  claim's `deadline_at` is its claim time plus. A change to the setting moves
-  later claims' limits and not an earlier one's. *(Covered:
+  claim was given (`max_task_seconds`): its job's at the claim, which the
+  claim's `deadline_at` is its claim time plus. A change to the job's limit
+  moves later claims' limits and not an earlier one's, and two jobs with
+  different limits, claimed from in one run, give each claim its own job's. *(Covered:
   `worker_routes::an_assignment_names_its_job_and_states_the_limit_it_was_claimed_under`;
   the field names by `C-11`.)*
 - `A-WORKER-24` A claim past its deadline and the minute's grace lapses at the
@@ -3365,16 +3367,18 @@ below.
   goes through while the purge waits. (A delete keeps the same order.)
   *(Covered: `admin_api::a_purge_waiting_on_a_rating_fit_holds_up_no_submissions`.)*
   (The test predates the entry, and cited `A-ADMIN-20`; thirty-third audit.)
-- `A-ADMIN-30` The task time limit is an admin setting (`GET`/`PUT
-  /api/admin/settings`): 3600 by default with nobody named as having changed
-  it, refused on its field below 600 or above 86,400 (and by the column's
-  CHECK, so a test moves a claim's deadline rather than the limit; 600 itself
-  accepted), and each change audited
-  once (`settings.changed`, "max_task_seconds 3600 -> 1800", the admin as
-  actor) -- a change to what it already is writes nothing; the claims made
-  after a change are given it. *(Covered:
-  `admin_routes::the_task_time_limit_is_an_admin_setting_and_each_change_is_audited`;
-  that only an admin may, by `A-AUTHZ`.)*
+- `A-ADMIN-30` The task time limit is each job's: 3600 unless its creation
+  names another (shown in its settings, `/api/jobs/:id/config`), changed by
+  `PATCH /api/admin/jobs/:id/time-limit`, refused on its field below 600 or
+  above 86,400 at creation and after (and by the column's CHECK, so a test
+  moves a claim's deadline rather than the limit; 600 itself accepted), an
+  unknown job a `404`, and each change audited once (`job.time_limit_changed`,
+  "max_task_seconds 3600 -> 1800", the admin as actor, the job as target) --
+  a change to what it already is writes nothing; another job's limit is its
+  own; the claims made after a change are given it. *(Covered:
+  `admin_routes::the_task_time_limit_is_each_jobs_and_each_change_is_audited`,
+  `audit::every_destructive_admin_action_writes_exactly_its_record`; that only
+  an admin may, by `A-AUTHZ`.)*
 - `A-ADMIN-31` A games or pairs job's `threading_mode` is `igp` unless the
   request says `pgp`, anything else a `400` on the field; its settings show
   it, and its tasks' requests carry it, beside the job's name. *(Covered:
@@ -3999,7 +4003,9 @@ admin in once and the admin journeys reuse its storage state.
   did not say: the data gaps it read apart, the job's own allocation,
   read-only with a link to `/admin/allocation` and no Activate or Deactivate
   (the allocation is set only there), and the failed reads tried again and
-  their error cleared. And `E-11b`: a read
+  their error cleared; then the job's task time limit, 3600, changed to 1800
+  in the Controls card and shown so in its Job settings ("30m (1,800
+  seconds)"). And `E-11b`: a read
   started before a live payload does not land over it — a slow retry put back
   the status the stream had moved past, on a job that sends nothing more. And
   `E-11c`: a job deleted while its page is open (by another admin) is said to

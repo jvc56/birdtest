@@ -56,16 +56,16 @@ export function computeTime(seconds: number | null): string {
 }
 
 /**
- * What a job page says of its tasks that hit the time limit: workers stop a
- * task at the limit and hand it back (or the server takes it back a minute
- * later), so a job whose batch is too big for it
- * makes no progress, and the cure is the admin's -- a smaller batch. `null`
- * while none has.
+ * What a job page says of its tasks that hit the job's time limit
+ * (`limitSeconds`): workers stop a task at the limit and hand it back (or the
+ * server takes it back a minute later), so a job whose batch is too big for
+ * it makes no progress, and the cure is the admin's -- a smaller batch, or a
+ * longer limit for this job. `null` while none has.
  */
-export function timeLimitNotice(declines: number): string | null {
+export function timeLimitNotice(declines: number, limitSeconds: number): string | null {
   if (!(declines > 0)) return null;
   const tasks = declines === 1 ? '1 task' : `${declines.toLocaleString()} tasks`;
-  return `${tasks} hit the time limit — lower the batch size`;
+  return `${tasks} hit this job's ${computeTime(limitSeconds)} time limit — lower the batch size, or raise the limit`;
 }
 
 /**

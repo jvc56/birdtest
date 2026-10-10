@@ -73,6 +73,17 @@ test('E-11: an admin job page whose first read fails shows only what the server 
   expect(gapReads).toBeGreaterThanOrEqual(3);
   expect(jobReads).toBeGreaterThanOrEqual(2);
   await expect(page.getByText(/Could not load all of this job/)).toBeHidden();
+
+  // The job's own task time limit, an hour until it is changed here; the
+  // job's settings then show the new one.
+  const limit = page.getByTestId('job-time-limit').getByLabel('Task Time Limit (Seconds)');
+  await expect(limit).toHaveValue('3600');
+  await limit.fill('1800');
+  await page.getByTestId('job-time-limit').getByRole('button', { name: 'Save' }).click();
+  await expect(page.getByText(/Claims made from now on are given the new limit/)).toBeVisible();
+  await expect(page.getByTestId('job-settings').getByRole('row', { name: /Task Time Limit/ })).toContainText(
+    '30m (1,800 seconds)'
+  );
   await api.dispose();
 });
 

@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
   import { api, errorText, type InputData, type JobType, type PlayerConfig } from '$lib/api';
-  import { blankFields, jobTypeLabel, leavePlayerConflict, parseTargetRackCounts, targetsText, unchosenText } from '$lib/format';
+  import { blankFields, computeTime, jobTypeLabel, leavePlayerConflict, parseTargetRackCounts, targetsText, unchosenText } from '$lib/format';
   import { consensusFields, consensusProblem as checkConsensus } from '$lib/consensus';
   import { confidenceProblem as checkConfidence } from '$lib/matchTest';
   import { matchups as matchupsOf, matchupsAllowed, matchupSummary } from '$lib/roundRobin';
@@ -29,6 +29,14 @@
   // writes in when the form leaves them as they are.
   let bingoBonus = 50;
   let simCutoff = 0.005;
+  // The longest one of the job's tasks may run: an hour unless changed, here
+  // or later on the job's Manage page. Ten minutes to a day, as the server
+  // holds it.
+  const MIN_TASK_SECONDS = 600;
+  const MAX_TASK_SECONDS = 86_400;
+  let maxTaskSeconds = 3600;
+  $: taskLimitValid =
+    Number.isInteger(maxTaskSeconds) && maxTaskSeconds >= MIN_TASK_SECONDS && maxTaskSeconds <= MAX_TASK_SECONDS;
 
   $: letterdists = files.filter((f) => f.role === 'letterdist');
   $: layouts = files.filter((f) => f.role === 'layout');
@@ -143,6 +151,7 @@
       letterdist_id: letterdistId,
       layout_id: layoutId,
       bingo_bonus: bingoBonus,
+      max_task_seconds: maxTaskSeconds,
       // A leave job's bot never simulates, so it states no cutoff: the server
       // refuses one.
       ...(jobType === 'leave_generation' ? {} : { sim_cutoff: simCutoff }),
@@ -301,6 +310,34 @@
       <p class="mt-1 text-xs text-muted-foreground">
         Server-wide floor: {serverFloor || '—'}. Workers below this are never offered the job;
         raise it per job when the work needs a newer MAGPIE.
+      </p>
+    </div>
+    <div>
+      <label class="label" for="max-task-seconds">Task Time Limit (Seconds)</label>
+      <input
+        id="max-task-seconds"
+        type="number"
+        min={MIN_TASK_SECONDS}
+        max={MAX_TASK_SECONDS}
+        step="1"
+        required
+        class="input"
+        bind:value={maxTaskSeconds}
+      />
+      <p class="mt-1 text-xs text-muted-foreground">
+        {#if taskLimitValid}
+          {computeTime(maxTaskSeconds)}.
+        {:else}
+          <span class="field-error"
+            >A whole number of seconds from {MIN_TASK_SECONDS} to {MAX_TASK_SECONDS.toLocaleString()} (ten
+            minutes to a day).</span
+          >
+        {/if}
+        A worker stops a task that runs this long and hands it back, and a claim that runs a minute
+        past it is taken back whether or not its worker still answers. Three tasks in a row that hit
+        it with none completed between set the job aside, since its batch is too big for the limit.
+        Ten minutes at the least: a worker's first task of a job may spend a few of them building
+        data it cannot stop part-way. It can be changed on the job's page later.
       </p>
     </div>
   </div>

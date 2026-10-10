@@ -60,6 +60,9 @@ pub struct Job {
     pub min_magpie_major: i32,
     pub min_magpie_minor: i32,
     pub min_magpie_patch: i32,
+    /// The longest one of the job's tasks may run, 600 to 86,400 seconds:
+    /// each claim's deadline is its claim time plus this as it stood then.
+    pub max_task_seconds: i32,
     /// Every claim ever issued for this job; the scheduler's deficit
     /// numerator. See `scheduler::candidate_jobs`.
     pub claims_issued: i64,

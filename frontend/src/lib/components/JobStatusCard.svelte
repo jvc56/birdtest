@@ -17,7 +17,7 @@
 
   $: status = stats.job.status;
   $: test = stats.games?.test && status !== 'completed' ? testState(status, stats.games) : null;
-  $: timeLimit = timeLimitNotice(stats.job.time_limit_declines);
+  $: timeLimit = timeLimitNotice(stats.job.time_limit_declines, stats.job.max_task_seconds);
 </script>
 
 <div class="card flex flex-wrap items-baseline gap-x-4 gap-y-1" data-testid="job-status">

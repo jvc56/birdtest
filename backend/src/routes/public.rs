@@ -242,6 +242,8 @@ struct JobSettings {
     bingo_bonus: i32,
     sim_cutoff: f64,
     min_magpie_version: String,
+    /// The longest one of the job's tasks may run, in seconds.
+    max_task_seconds: i32,
 }
 
 #[derive(Serialize)]
@@ -504,6 +506,7 @@ async fn job_config(
             bingo_bonus: job.bingo_bonus,
             sim_cutoff: job.sim_cutoff,
             min_magpie_version: job.min_magpie_version().to_string(),
+            max_task_seconds: job.max_task_seconds,
         },
         games,
         opening_racks,

@@ -420,6 +420,8 @@ export interface JobStats {
      * the deadline while their worker was alive.
      */
     time_limit_declines: number;
+    /** The job's task time limit, in seconds, which those tasks hit. */
+    max_task_seconds: number;
     /**
      * Why the server switched the job off, while it is off: three of its tasks
      * in a row hit the time limit. Null for a job an admin switched off.
@@ -591,18 +593,6 @@ export interface FleetVersion {
   claims: number;
 }
 
-/** The settings an admin changes at run time (`/admin/settings`). */
-export interface Settings {
-  /**
-   * The longest a task may run, in seconds (60 to 86,400). Every claim is
-   * given the limit as it stands then; a worker stops a task at it and hands
-   * it back.
-   */
-  max_task_seconds: number;
-  /** Who changed them last; null until anyone has. */
-  updated_by: string | null;
-  updated_at: string;
-}
 
 /** One run of scripts/backup.sh, as recorded in the `backups` table. */
 export interface BackupRun {
@@ -870,9 +860,6 @@ export const api = {
     get<JobDerivedFile[]>(`/api/admin/jobs/${id}/derived-data`),
   fleet: () => get<FleetVersion[]>('/api/admin/fleet'),
   backups: () => get<BackupStatus>('/api/admin/backups'),
-  settings: () => get<Settings>('/api/admin/settings'),
-  /** Applies to the claims made from now on; one that changes nothing writes nothing. */
-  updateSettings: (body: { max_task_seconds: number }) => put<Settings>('/api/admin/settings', body),
   derivedData: () => get<DerivedData[]>('/api/admin/derived-data'),
   retryDerivedData: (row: DerivedData) =>
     post<void>('/api/admin/derived-data/retry', {
@@ -928,6 +915,15 @@ export const api = {
       unsettled_racks: number;
       reopened: boolean;
     }>(`/api/admin/jobs/${id}/consensus`, body),
+  /**
+   * A job's task time limit, in seconds (600 to 86,400). The claims made from
+   * now on are given it; every claim already made keeps its deadline. One that
+   * changes nothing writes nothing.
+   */
+  updateTimeLimit: (id: string, maxTaskSeconds: number) =>
+    patch<{ max_task_seconds: number }>(`/api/admin/jobs/${id}/time-limit`, {
+      max_task_seconds: maxTaskSeconds
+    }),
   purgeJob: (id: string) => post<{ tasks_reset: number }>(`/api/admin/jobs/${id}/purge`),
   deleteJob: (id: string) => del<void>(`/api/admin/jobs/${id}`),
   deleteUser: (id: string) => del<void>(`/api/admin/users/${id}`),

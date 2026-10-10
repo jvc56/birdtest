@@ -442,6 +442,21 @@ CREATE TABLE jobs (
     min_magpie_major INT NOT NULL DEFAULT 0 CHECK (min_magpie_major >= 0),
     min_magpie_minor INT NOT NULL DEFAULT 1 CHECK (min_magpie_minor >= 0),
     min_magpie_patch INT NOT NULL DEFAULT 1 CHECK (min_magpie_patch >= 0),
+    -- The longest one of the job's tasks may run, set at creation (an hour
+    -- unless the admin says otherwise) and changed on the job's Manage page.
+    -- Every claim is given it (the assignment's `max_task_seconds`) and keeps
+    -- its own deadline, claim time plus this as it stood then, so a change
+    -- applies to claims made after it. A claim past its deadline and a
+    -- minute's grace is reclaimed even while its worker heartbeats, and its
+    -- result refused (`task_claims.deadline_at`). Ten minutes at the least, a
+    -- day at the most. The floor is not the shortest batch worth a claim but
+    -- the first claim on a machine: it may build the job's rack info table
+    -- first, a minute to three that cannot be stopped part-way (and is kept
+    -- for every task after it), so a limit near that would stop the task
+    -- that paid for it, every time, on every new machine. The API refuses
+    -- what this refuses (`routes::admin`); a test that wants a claim past its
+    -- deadline moves the claim's `deadline_at`, not this.
+    max_task_seconds INT NOT NULL DEFAULT 3600 CHECK (max_task_seconds BETWEEN 600 AND 86400),
     -- Every claim ever issued for this job, abandoned and declined ones
     -- included: the deficit the scheduler orders on. Kept as a counter rather
     -- than counted, because counting task_claims on every claim request costs
@@ -487,7 +502,7 @@ CREATE TABLE jobs (
     test_decided_lower  DOUBLE PRECISION,
     test_decided_upper  DOUBLE PRECISION,
     test_decided_units  BIGINT,
-    -- Tasks of this job that hit the time limit (`settings.max_task_seconds`):
+    -- Tasks of this job that hit the time limit (`max_task_seconds`):
     -- those a worker stopped and handed back, declining them `time_limit`,
     -- and those whose claim the server took back at the deadline while the
     -- worker still heartbeat (`task_claims.overrun`, counted once the job's
@@ -1014,8 +1029,8 @@ CREATE TABLE task_claims (
     claimed_by_user_id   UUID REFERENCES users(id),
     claimed_by_anon_uuid UUID REFERENCES anonymous_workers(uuid),
     claimed_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
-    -- When the task must be done by: `claimed_at` plus `settings.max_task_seconds`
-    -- as it stood when the claim was made, which the assignment told the
+    -- When the task must be done by: `claimed_at` plus its job's
+    -- `max_task_seconds` as it stood when the claim was made, which the assignment told the
     -- worker. Past it and a minute's grace the claim lapses whether or not its
     -- worker still heartbeats, and a result for it is refused: a task whose
     -- one unit outlasts the limit (a deep-sim game pair) would otherwise hold
@@ -1839,32 +1854,6 @@ CREATE TABLE backups (
 -- for the most recent successful one.
 CREATE INDEX backups_finished_idx ON backups (finished_at DESC);
 
--- Settings an admin changes at run time (`/admin/settings`), as one row. The
--- deployment's own settings are environment variables, which take a deploy
--- to change; these take effect at the next claim.
-CREATE TABLE settings (
-    -- Always TRUE: the primary key and its check are what make it one row.
-    id                BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (id),
-    -- The longest a task may run. Every claim is given it (the assignment's
-    -- `max_task_seconds`) and keeps its own deadline, claim time plus this as
-    -- it stood then, so a change applies to claims made after it. A claim
-    -- past its deadline and a minute's grace is reclaimed even while its
-    -- worker heartbeats, and its result refused (`task_claims.deadline_at`).
-    -- Ten minutes at the least, a day at the most. The floor is not the
-    -- shortest batch worth a claim but the first claim on a machine: it may
-    -- build the job's rack info table first, a minute to three that cannot
-    -- be stopped part-way (and is kept for every task after it), so a limit
-    -- near that would stop the task that paid for it, every time, on every
-    -- new machine. The API refuses what this refuses (`routes::admin`); a
-    -- test that wants a claim past its deadline moves the claim's
-    -- `deadline_at`, not this.
-    max_task_seconds  INT NOT NULL DEFAULT 3600 CHECK (max_task_seconds BETWEEN 600 AND 86400),
-    -- Who changed them last, and when; NULL until anyone has. SET NULL, like
-    -- jobs.created_by: the settings outlive the admin.
-    updated_by        UUID REFERENCES users(id) ON DELETE SET NULL,
-    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-INSERT INTO settings DEFAULT VALUES;
 
 -- Audit log
 

@@ -1352,10 +1352,11 @@ async fn claim_state(db: &TestDb, token: &Value) -> String {
 }
 
 /// A-WORKER-23: every assignment names its job and states the time limit the
-/// claim was given, which is the settings' as they stood at the claim: the
-/// claim's deadline is its claim time plus that, and a change to the setting
-/// moves later claims' and not an earlier one's. A job created without a name
-/// is named for its type and id, never "".
+/// claim was given, which is its job's as it stood at the claim: the claim's
+/// deadline is its claim time plus that, a change to the job's limit moves
+/// later claims' and not an earlier one's, and two jobs with different limits
+/// give each claim its own job's. A job created without a name is named for
+/// its type and id, never "".
 #[tokio::test]
 async fn an_assignment_names_its_job_and_states_the_limit_it_was_claimed_under() {
     let db = TestDb::new().await;
@@ -1368,7 +1369,11 @@ async fn an_assignment_names_its_job_and_states_the_limit_it_was_claimed_under()
     assert_eq!(first["max_task_seconds"], json!(3600), "the default: {first}");
     assert_eq!(claim_limit(&db, &first["claim_token"]).await, 3600);
 
-    sqlx::query("UPDATE settings SET max_task_seconds = 900").execute(&db.pool).await.unwrap();
+    sqlx::query("UPDATE jobs SET max_task_seconds = 900 WHERE id = $1")
+        .bind(job)
+        .execute(&db.pool)
+        .await
+        .unwrap();
     sqlx::query("UPDATE jobs SET name = 'NWL23 static mirror' WHERE id = $1")
         .bind(job)
         .execute(&db.pool)
@@ -1378,9 +1383,30 @@ async fn an_assignment_names_its_job_and_states_the_limit_it_was_claimed_under()
     let (status, second) = claim_as(&app, &worker).await;
     assert_eq!(status, StatusCode::OK, "{second}");
     assert_eq!(second["job_name"], "NWL23 static mirror", "{second}");
-    assert_eq!(second["max_task_seconds"], json!(900), "the setting at the claim: {second}");
+    assert_eq!(second["max_task_seconds"], json!(900), "the job's limit at the claim: {second}");
     assert_eq!(claim_limit(&db, &second["claim_token"]).await, 900);
     assert_eq!(claim_limit(&db, &first["claim_token"]).await, 3600, "an earlier claim keeps its own");
+
+    // A second job with a limit of its own, claimed from in the same run:
+    // each claim is given its own job's limit, not the other's.
+    let other = db.games_job(2).await;
+    sqlx::query("UPDATE jobs SET max_task_seconds = 1200 WHERE id = $1")
+        .bind(other)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let mut claimed_from = std::collections::HashSet::new();
+    for _ in 0..8 {
+        let worker = registered_worker(&db).await;
+        let (status, assignment) = claim_as(&app, &worker).await;
+        assert_eq!(status, StatusCode::OK, "{assignment}");
+        let from: Uuid = assignment["job_id"].as_str().unwrap().parse().unwrap();
+        let want = if from == other { 1200 } else { 900 };
+        assert_eq!(assignment["max_task_seconds"], json!(want), "{assignment}");
+        assert_eq!(claim_limit(&db, &assignment["claim_token"]).await, want);
+        claimed_from.insert(from);
+    }
+    assert_eq!(claimed_from, [job, other].into(), "both jobs were claimed from");
 }
 
 /// A-WORKER-24: a claim past its deadline and the minute's grace lapses at the

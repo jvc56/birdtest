@@ -24,6 +24,7 @@ pub fn router() -> Router<AppState> {
         .route("/jobs/allocations", put(set_allocations))
         .route("/jobs/:id/complete", post(complete_job))
         .route("/jobs/:id/consensus", patch(update_consensus))
+        .route("/jobs/:id/time-limit", patch(update_time_limit))
         .route("/jobs/:id/purge", post(purge_job))
         .route("/jobs/:id", delete(delete_job))
         .route("/users/:id", delete(delete_user))
@@ -51,96 +52,94 @@ pub fn router() -> Router<AppState> {
         .route("/derived-data/retry", post(retry_derived_data))
         .route("/backups", get(backups))
         .route("/fleet", get(fleet))
-        .route("/settings", get(get_settings).put(put_settings))
 }
 
 // ---------------------------------------------------------------------------
-// Settings
+// A job's task time limit
 // ---------------------------------------------------------------------------
 
-/// The longest and shortest task time limit an admin may set: the column's
-/// CHECK, which a test cannot get under either (one that wants a claim past
-/// its deadline moves the claim's `deadline_at`). Ten minutes, because a
-/// task's first claim on a machine may build the job's rack info table
-/// first -- a minute to three, which cannot be stopped part-way and is kept
-/// for every task after it -- and a limit near that would stop that task,
-/// every time, on every new machine. Over a day a lost claim held its task
-/// for that long.
+/// The longest and shortest task time limit an admin may give a job: the
+/// column's CHECK (`jobs.max_task_seconds`), which a test cannot get under
+/// either (one that wants a claim past its deadline moves the claim's
+/// `deadline_at`). Ten minutes, because a task's first claim on a machine may
+/// build the job's rack info table first -- a minute to three, which cannot
+/// be stopped part-way and is kept for every task after it -- and a limit
+/// near that would stop that task, every time, on every new machine. Over a
+/// day a lost claim held its task for that long.
 const MIN_TASK_SECONDS: i32 = 600;
 const MAX_TASK_SECONDS: i32 = 86_400;
+/// A new job's limit when its body names none: an hour, the column's own
+/// default.
+const DEFAULT_TASK_SECONDS: i32 = 3600;
 
-#[derive(Serialize, sqlx::FromRow)]
-struct SettingsView {
-    max_task_seconds: i32,
-    /// The admin who changed them last, by name; `None` until anyone has, or
-    /// once that account is gone.
-    updated_by: Option<String>,
-    updated_at: chrono::DateTime<chrono::Utc>,
+/// What a time limit outside those bounds is told, on its field; `None` for
+/// one inside them.
+fn time_limit_problem(seconds: i32) -> Option<String> {
+    (!(MIN_TASK_SECONDS..=MAX_TASK_SECONDS).contains(&seconds)).then(|| {
+        format!("must be between {MIN_TASK_SECONDS} and {MAX_TASK_SECONDS} (ten minutes to a day)")
+    })
 }
 
 #[derive(Deserialize)]
-struct SettingsBody {
+struct TimeLimitBody {
     max_task_seconds: i32,
 }
 
-async fn read_settings(conn: &mut sqlx::PgConnection) -> AppResult<SettingsView> {
-    Ok(sqlx::query_as::<_, SettingsView>(
-        "SELECT s.max_task_seconds, u.username AS updated_by, s.updated_at
-         FROM settings s LEFT JOIN users u ON u.id = s.updated_by",
-    )
-    .fetch_one(conn)
-    .await?)
+/// A job's time limit as it now stands. It applies to the claims made from
+/// now on: every claim already made keeps the deadline it was given.
+#[derive(Serialize)]
+struct TimeLimitView {
+    max_task_seconds: i32,
 }
 
-/// The settings an admin changes at run time, as they stand.
-async fn get_settings(State(state): State<AppState>, _admin: AdminUser) -> AppResult<Json<SettingsView>> {
-    let mut conn = state.pool.acquire().await?;
-    Ok(Json(read_settings(&mut conn).await?))
-}
-
-/// Changes the settings. The time limit applies to claims made from now on:
-/// every claim keeps the deadline it was given (`task_claims.deadline_at`),
-/// which its worker was told. One `settings.changed` audit row, from what to
-/// what; a request that changes nothing is a `200` that writes nothing.
-async fn put_settings(
+/// Changes a job's task time limit, any job type and any status. The limit
+/// applies to claims made from now on: every claim keeps the deadline it was
+/// given (`task_claims.deadline_at`), which its worker was told, so a running
+/// task is neither cut short nor given longer. One `job.time_limit_changed`
+/// audit row, from what to what; a request that changes nothing is a `200`
+/// that writes nothing. Under the job's row lock, which the claim path's
+/// `UPDATE jobs` takes too, so a claim reads the limit before or after the
+/// change, never half of it.
+async fn update_time_limit(
     State(state): State<AppState>,
     admin: AdminUser,
+    Path(id): Path<Uuid>,
     method: Method,
     headers: HeaderMap,
     jar: CookieJar,
-    ApiJson(body): ApiJson<SettingsBody>,
-) -> AppResult<Json<SettingsView>> {
+    ApiJson(body): ApiJson<TimeLimitBody>,
+) -> AppResult<Json<TimeLimitView>> {
     csrf::verify(&method, &headers, &jar)?;
-    if !(MIN_TASK_SECONDS..=MAX_TASK_SECONDS).contains(&body.max_task_seconds) {
-        return Err(AppError::bad_request("settings are invalid").with_field(
-            "max_task_seconds",
-            format!("must be between {MIN_TASK_SECONDS} and {MAX_TASK_SECONDS} (ten minutes to a day)"),
-        ));
+    if let Some(problem) = time_limit_problem(body.max_task_seconds) {
+        return Err(AppError::bad_request("the time limit is invalid").with_field("max_task_seconds", problem));
     }
     let mut tx = state.pool.begin().await?;
-    let before: i32 = sqlx::query_scalar("SELECT max_task_seconds FROM settings FOR UPDATE")
-        .fetch_one(&mut *tx)
-        .await?;
+    let before: i32 = sqlx::query_scalar("SELECT max_task_seconds FROM jobs WHERE id = $1 FOR UPDATE")
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| AppError::not_found("no such job"))?;
     if before != body.max_task_seconds {
-        sqlx::query("UPDATE settings SET max_task_seconds = $1, updated_by = $2, updated_at = now()")
+        sqlx::query("UPDATE jobs SET max_task_seconds = $2 WHERE id = $1")
+            .bind(id)
             .bind(body.max_task_seconds)
-            .bind(admin.0.id)
             .execute(&mut *tx)
             .await?;
         audit::log_detail(
             &mut tx,
-            "settings.changed",
+            "job.time_limit_changed",
             admin.0.id,
-            "settings",
-            "max_task_seconds".to_string(),
-            None,
+            "job",
+            id.to_string(),
+            Some(id),
             format!("max_task_seconds {before} -> {}", body.max_task_seconds),
         )
         .await?;
     }
-    let view = read_settings(&mut tx).await?;
     tx.commit().await?;
-    Ok(Json(view))
+    // The job's page shows its limit: read again, not from before the change.
+    crate::jobstats::forget(id);
+    Ok(Json(TimeLimitView { max_task_seconds: body.max_task_seconds }))
 }
 
 // ---------------------------------------------------------------------------
@@ -1320,6 +1319,12 @@ struct CreateJobBody {
     bingo_bonus: Option<i32>,
     #[serde(default)]
     sim_cutoff: Option<f64>,
+    /// The longest one of the job's tasks may run, in seconds
+    /// ([`MIN_TASK_SECONDS`] to [`MAX_TASK_SECONDS`]); the column's default,
+    /// an hour, when the body leaves it out. Changed later with
+    /// `PATCH /api/admin/jobs/:id/time-limit`.
+    #[serde(default)]
+    max_task_seconds: Option<i32>,
     #[serde(flatten)]
     config: JobTypeConfig,
 }
@@ -1664,8 +1669,9 @@ async fn insert_job(
         "INSERT INTO jobs
              (job_type, variant, letterdist_id, layout_id,
               min_magpie_major, min_magpie_minor, min_magpie_patch, bingo_bonus,
-              sim_cutoff, created_by, name, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, clock_timestamp()) RETURNING *",
+              sim_cutoff, created_by, name, created_at, max_task_seconds)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, clock_timestamp(), $12)
+         RETURNING *",
     )
     // `clock_timestamp()`, not the column's `now()`: a round robin's jobs are
     // inserted in one transaction, where `now()` is one instant, and every
@@ -1686,6 +1692,7 @@ async fn insert_job(
     .bind(body.sim_cutoff.unwrap_or(crate::magpie_defaults::SIM_CUTOFF))
     .bind(admin.0.id)
     .bind(&plan.name)
+    .bind(body.max_task_seconds.unwrap_or(DEFAULT_TASK_SECONDS))
     .fetch_one(&mut *tx)
     .await?;
 
@@ -1879,6 +1886,9 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
             "bingo_bonus",
             format!("must be between 0 and {MAX_BINGO_BONUS}"),
         );
+    }
+    if let Some(problem) = body.max_task_seconds.and_then(time_limit_problem) {
+        err = err.with_field("max_task_seconds", problem);
     }
     if let Some(cutoff) = body.sim_cutoff {
         // The range MAGPIE's -cutoff accepts, and the column's CHECK.

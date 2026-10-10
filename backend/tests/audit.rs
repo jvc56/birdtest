@@ -384,6 +384,15 @@ async fn every_destructive_admin_action_writes_exactly_its_record() {
             )],
         ),
         (
+            "PATCH",
+            format!("/api/admin/jobs/{racks}/time-limit"),
+            Some(json!({ "max_task_seconds": 1800 })),
+            vec![census(
+                "job.time_limit_changed", "job", racks.to_string(), Some(racks),
+                "max_task_seconds 3600 -> 1800",
+            )],
+        ),
+        (
             "DELETE",
             format!("/api/admin/users/{victim}"),
             None,

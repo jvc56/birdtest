@@ -11,7 +11,7 @@
     type JobStats
   } from '$lib/api';
   import { subscribeToJob } from '$lib/sse';
-  import { exactCount, exportSummary, jobTitle, jobTypeLabel } from '$lib/format';
+  import { computeTime, exactCount, exportSummary, jobTitle, jobTypeLabel } from '$lib/format';
   import type { JobConfig } from '$lib/jobSettings';
   import JobStatusCard from '$lib/components/JobStatusCard.svelte';
   import JobStatsRow from '$lib/components/JobStatsRow.svelte';
@@ -58,6 +58,23 @@
   let busy = false;
   let error = '';
   let notice = '';
+  // The job's task time limit as typed, following the job's own until it is
+  // edited: a reload or a live payload with a new limit puts that in the box.
+  let timeLimit = 3600;
+  let timeLimitShown: number | null = null;
+  $: if (stats && stats.job.max_task_seconds !== timeLimitShown) {
+    timeLimitShown = stats.job.max_task_seconds;
+    timeLimit = timeLimitShown;
+  }
+  $: timeLimitValid = Number.isInteger(timeLimit) && timeLimit >= 600 && timeLimit <= 86_400;
+
+  function saveTimeLimit() {
+    run(async () => {
+      await api.updateTimeLimit(jobId, timeLimit);
+      // The Job settings card shows it too.
+      config = await api.jobConfig(jobId);
+    }, 'Saved. Claims made from now on are given the new limit; those already made keep their deadlines.');
+  }
   let rebuild: ArtifactRebuild[] | null = null;
   let jobExport: JobExport | null = null;
   // An export started here that no read has shown yet: the button stays off
@@ -397,6 +414,35 @@
         {/if}
         · <a href="/admin/allocation">change it on the Allocation page</a>
       </p>
+      <form class="flex flex-wrap items-end gap-3" on:submit|preventDefault={saveTimeLimit} data-testid="job-time-limit">
+        <div>
+          <label class="label" for="time-limit">Task Time Limit (Seconds)</label>
+          <input
+            id="time-limit"
+            type="number"
+            min="600"
+            max="86400"
+            step="1"
+            required
+            class="input w-40"
+            bind:value={timeLimit}
+          />
+        </div>
+        <button
+          class="btn-secondary"
+          disabled={busy || gone || !timeLimitValid || timeLimit === stats.job.max_task_seconds}
+        >
+          Save
+        </button>
+        <p class="basis-full text-xs text-muted-foreground">
+          {#if timeLimitValid}{computeTime(timeLimit)}.{:else}<span class="field-error"
+              >A whole number of seconds from 600 to 86,400 (ten minutes to a day).</span
+            >{/if}
+          A worker stops one of this job's tasks that runs this long and hands it back.
+          {stats.job.time_limit_declines.toLocaleString()} of its tasks have hit the limit so far. A change
+          applies to the claims made from now on; those already made keep their deadlines.
+        </p>
+      </form>
       <div class="flex flex-wrap items-end gap-3">
         <!-- A completed job is final: the server refuses a second completion (409). -->
         <button

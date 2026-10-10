@@ -624,7 +624,8 @@ async fn decline_task(
 /// time it was handed back it took a share of the fleet for nothing, for
 /// ever. Set aside, it waits for the admin: a job's batch is fixed when it is
 /// created, so the cure is a new job with a smaller batch, or a longer limit
-/// (`/admin/settings`) and an allocation again, which starts the run afresh.
+/// (the job's own, `PATCH /api/admin/jobs/:id/time-limit`) and an allocation
+/// again, which starts the run afresh.
 ///
 /// The run is in order of when each happened. A decline is counted as it
 /// arrives. An overrun is counted later than it happened -- reclamation marks
@@ -695,8 +696,8 @@ pub(crate) async fn record_time_limit(
     let reason = format!(
         "{streak} tasks in a row hit the {} time limit with none completed between: \
          a task's batch is more than a worker finishes in that time. Lower the batch \
-         size (in a new job), or raise the limit on Settings, and give it an \
-         allocation again.",
+         size (in a new job), or raise the job's time limit on its Manage page, and \
+         give it an allocation again.",
         limit_text(max_task_seconds)
     );
     let set_aside = sqlx::query(

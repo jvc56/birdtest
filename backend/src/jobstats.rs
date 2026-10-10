@@ -92,6 +92,8 @@ pub struct JobSummary {
     /// at the deadline with their worker alive: the page says how many, since
     /// the cure is a smaller batch.
     pub time_limit_declines: i64,
+    /// The job's task time limit, in seconds, which those tasks hit.
+    pub max_task_seconds: i32,
     /// Why the server switched the job off, while it is off: its tasks kept
     /// hitting the time limit. `None` for a job an admin switched off.
     pub set_aside_reason: Option<String>,
@@ -546,6 +548,7 @@ async fn compute_inner(
             lexicon,
             variant,
             time_limit_declines: job.time_limit_declines,
+            max_task_seconds: job.max_task_seconds,
             set_aside_reason: (job.status == crate::models::job::JobStatus::Inactive)
                 .then(|| job.set_aside_reason.clone())
                 .flatten(),

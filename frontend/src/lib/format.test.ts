@@ -474,13 +474,14 @@ describe('F-FMT-18 targetsText', () => {
 });
 
 describe('F-FMT-20 timeLimitNotice', () => {
-  it('counts the tasks that hit the limit and names the cure', () => {
-    expect(timeLimitNotice(1)).toBe('1 task hit the time limit — lower the batch size');
-    expect(timeLimitNotice(3)).toBe('3 tasks hit the time limit — lower the batch size');
-    expect(timeLimitNotice(1234)).toBe(`${(1234).toLocaleString()} tasks hit the time limit — lower the batch size`);
+  it("counts the tasks that hit the job's own limit and names the cures", () => {
+    const cure = 'lower the batch size, or raise the limit';
+    expect(timeLimitNotice(1, 3600)).toBe(`1 task hit this job's 1h time limit — ${cure}`);
+    expect(timeLimitNotice(3, 1800)).toBe(`3 tasks hit this job's 30m time limit — ${cure}`);
+    expect(timeLimitNotice(1234, 600)).toBe(`${(1234).toLocaleString()} tasks hit this job's 10m time limit — ${cure}`);
   });
 
   it('says nothing while none has', () => {
-    expect(timeLimitNotice(0)).toBeNull();
+    expect(timeLimitNotice(0, 3600)).toBeNull();
   });
 });

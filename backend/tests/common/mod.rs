@@ -573,6 +573,14 @@ pub fn put_json(path: &str, headers: &[(&str, &str)], body: serde_json::Value) -
     builder.body(Body::from(body.to_string())).unwrap()
 }
 
+pub fn patch_json(path: &str, headers: &[(&str, &str)], body: serde_json::Value) -> Request<Body> {
+    let mut builder = Request::patch(path).header("content-type", "application/json");
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    builder.body(Body::from(body.to_string())).unwrap()
+}
+
 /// Sets one job's allocation, the only way a job is activated (above 0%) or
 /// deactivated (0%). Answers `{ "jobs": [the job] }`.
 pub fn allocate(job: Uuid, allocation: i32, headers: &[(&str, &str)]) -> Request<Body> {

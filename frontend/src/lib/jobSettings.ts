@@ -5,7 +5,7 @@
  * ordered list; its players' are another table, side by side.
  */
 import type { JobType } from '$lib/api';
-import { jobTypeLabel, targetsText } from '$lib/format';
+import { computeTime, jobTypeLabel, targetsText } from '$lib/format';
 
 export interface PlayerSettings {
   /** Its part in a job ("player 1"); absent for a config read on its own. */
@@ -67,6 +67,8 @@ export interface JobConfig {
     bingo_bonus: number;
     sim_cutoff: number;
     min_magpie_version: string;
+    /** The longest one of the job's tasks may run, in seconds. */
+    max_task_seconds: number;
   };
   games?: {
     unit: 'game' | 'pair';
@@ -169,7 +171,7 @@ const setting = (id: string, label: string, value: string): JobSetting => ({ id,
  * whether it records positions, an opening-rack job's analyses per rack and
  * the agreement that settles a rack, a leave job's generations and each one's
  * target. Then the simulation cutoff, a games or pairs job's threading, the
- * test's minimum, batch sizes and the oldest MAGPIE. A leave job's lexicon and wordmap are its player's, and shown
+ * test's minimum, batch sizes, the task time limit and the oldest MAGPIE. A leave job's lexicon and wordmap are its player's, and shown
  * with it; it has no sim cutoff row, since it never simulates.
  */
 export function jobSettings(c: JobConfig): JobSetting[] {
@@ -224,8 +226,14 @@ export function jobSettings(c: JobConfig): JobSetting[] {
   if (l) rows.push(setting('num_iterations', 'Games Per Task', show(l.num_iterations)));
   if (o) rows.push(setting('racks_per_batch', 'Racks Per Task', show(o.racks_per_batch)));
   if (l) rows.push(setting('racks_per_task', 'Racks Per Task', show(l.racks_per_task)));
+  rows.push(setting('max_task_seconds', 'Task Time Limit', timeLimitText(c.job.max_task_seconds)));
   rows.push(setting('min_magpie_version', 'Oldest MAGPIE', show(c.job.min_magpie_version)));
   return rows;
+}
+
+/** A job's task time limit, in its units and in the seconds it was set in: "1h (3,600 seconds)". */
+export function timeLimitText(seconds: number): string {
+  return `${computeTime(seconds)} (${seconds.toLocaleString()} seconds)`;
 }
 
 /** A games or pairs job's threading, spelt out as the job form names it. */

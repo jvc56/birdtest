@@ -948,16 +948,16 @@ closes in seconds rather than never.
   recorded." in red: nothing backs up a local stack.
 - [ ] **Do** **Audit log**. **Expect** everything done above, newest first:
   `job.created`, `job.activated`, `job.deactivated`, `job.completed`,
-  `job.consensus_changed`, `job.purged`, `job.deleted`, `job.export_started`,
+  `job.consensus_changed`, `job.time_limit_changed`, `job.purged`, `job.deleted`, `job.export_started`,
   `input_data.import_staged`, `input_data.import_confirmed`,
   `input_data.import_nothing_new`,
   `rating_pool.created`, `rating_pool.member_added`, `user.deleted`,
-  `worker.banned`, `worker.unbanned`, `settings.changed`, `job.set_aside` and
+  `worker.banned`, `worker.unbanned`, `job.set_aside` and
   more.
 - [ ] **Do** filter by action `job.activated`, then by target type `job`.
   **Expect** only those, and paging to keep the filter.
 
-### A-17 Settings and the task time limit
+### A-17 A job's task time limit
 
 Needs a MAGPIE that stops a task at the assignment's `max_task_seconds` and
 declines it `time_limit` (from the pin after this change). An older one runs
@@ -965,28 +965,35 @@ on, and the server takes the claim back a minute past its deadline instead,
 which -- the worker still heartbeating -- counts the same, at the job's next
 claim. A claim whose worker had stopped heartbeating counts toward nothing.
 
-- [ ] **Do** **Settings**. **Expect** Task Time Limit (Seconds) 3600, "1h",
-  "Never changed: these are the defaults.", and **Save** disabled until the
-  value changes.
-- [ ] **Do** type 599. **Expect** "A whole number of seconds from 600 to 86,400
-  (ten minutes to a day)." and **Save** disabled; sent anyway, the server
-  refuses it on the field.
-- [ ] **Do** set 600 and **Save**. **Expect** "Saved. Claims made from now on
-  are given the new limit." and "Last changed by dev, <now>". The audit log
-  has `settings.changed` ("max_task_seconds 3600 -> 600").
+- [ ] **Expect** no **Settings** in the admin menu: there is no site-wide
+  limit, and the `/admin/settings` page is gone.
+- [ ] **Do** open **Create job**. **Expect** Task Time Limit (Seconds) 3600
+  beside Oldest MAGPIE, with "1h." under it. **Do** type 599. **Expect** "A
+  whole number of seconds from 600 to 86,400 (ten minutes to a day)." and the
+  form refusing to submit; sent anyway, the server refuses it on the field.
 - [ ] **Do** create a **Games** job of A-4's simmer against itself, with a
-  batch big enough that a task takes longer than ten minutes, and give it an
-  allocation.
+  batch big enough that a task takes longer than ten minutes, and a limit of
+  600. **Expect** its Job settings to say Task Time Limit "10m (600
+  seconds)".
+- [ ] **Do** open its Manage page. **Expect** Task Time Limit (Seconds) 600 in
+  the Controls card, **Save** disabled until the value changes. **Do** set
+  700 and **Save**. **Expect** "Saved. Claims made from now on are given the
+  new limit; those already made keep their deadlines.", its Job settings
+  saying "11m 40s (700 seconds)", and `job.time_limit_changed` in the audit
+  log ("max_task_seconds 600 -> 700"). **Do** set it back to 600.
+- [ ] **Do** give it an allocation.
   **Expect** each task MAGPIE claims to stop at ten minutes, and the job's
-  page to say "1 task hit the time limit — lower the batch size." and then
-  more. **Expect**, after the third in a row, the job inactive at 0%, its
+  page to say "1 task hit this job's 10m time limit — lower the batch size, or
+  raise the limit." and then more. **Expect**, after the third in a row, the job inactive at 0%, its
   Status card reading "Set aside by the server: 3 tasks in a row hit the
   10-minute time limit with none completed between: …", and `job.set_aside`
   in the audit log ("N% -> 0%: …").
 - [ ] **Do** give it an allocation again. **Expect** it active, the reason gone
   and the count of tasks that hit the limit still shown; three more in a row
   set it aside again.
-- [ ] **Do** set the limit back to 3600.
+- [ ] **Do** raise its limit to 3600 on its Manage page. **Expect** the
+  claims made from then on given an hour (the assignment's
+  `max_task_seconds`), and those already running keeping their ten minutes.
 
 ---
 
@@ -1170,13 +1177,14 @@ curl -s -b "$JAR" "$SITE/api/admin/backups"
 curl -s -b "$JAR" "$SITE/api/admin/audit-log?action=job.activated&per_page=5"
 ```
 
-**The task time limit.** Read it, and set it: 600 to 86,400 seconds, or a
-`400` on `max_task_seconds`. Claims made after the change are given it.
+**A job's task time limit.** Read it with the job's settings, and set it: 600
+to 86,400 seconds, or a `400` on `max_task_seconds`. The job's claims made
+after the change are given it.
 
 ```bash
-curl -s -b "$JAR" "$SITE/api/admin/settings"
-curl -s -b "$JAR" -H "X-CSRF-Token: $CSRF" -H 'Content-Type: application/json' -X PUT \
-  -d '{"max_task_seconds":1800}' "$SITE/api/admin/settings"
+curl -s "$SITE/api/jobs/$JOB/config" | jq '.job.max_task_seconds'
+curl -s -b "$JAR" -H "X-CSRF-Token: $CSRF" -H 'Content-Type: application/json' -X PATCH \
+  -d '{"max_task_seconds":1800}' "$SITE/api/admin/jobs/$JOB/time-limit"
 ```
 
 **Export a completed job.** Start it (`202`), poll until `state` is `ready`,

@@ -40,6 +40,10 @@ impl Admin {
         send(&self.app, put_json(path, &self.refs(), body)).await
     }
 
+    async fn patch(&self, path: &str, body: Value) -> (StatusCode, Value) {
+        send(&self.app, patch_json(path, &self.refs(), body)).await
+    }
+
     async fn get(&self, path: &str) -> (StatusCode, Value) {
         send(&self.app, get_request(path, &self.headers)).await
     }
@@ -872,50 +876,81 @@ async fn the_audit_log_pages_and_filters_by_job() {
 
 // --- A-ADMIN-30, 31 ----------------------------------------------------------
 
-/// A-ADMIN-30: the task time limit is the admin's to set, from ten minutes to
-/// a day: read with who set it last, refused on its field outside that range
-/// (and by the column's CHECK, so nothing gets under it another way),
-/// and each change audited once (`settings.changed`, from what to what) -- a
-/// change to what it already is writes nothing. The claims made after a
-/// change are given it.
+/// A-ADMIN-30: the task time limit is each job's, from ten minutes to a day:
+/// an hour unless its creation names another, shown in its settings, changed
+/// on its own (`PATCH .../time-limit`), refused on its field outside that
+/// range at creation and after (and by the column's CHECK, so nothing gets
+/// under it another way), and each change audited once
+/// (`job.time_limit_changed`, from what to what) -- a change to what it
+/// already is writes nothing. Claims made after a change are given it;
+/// another job's are not.
 #[tokio::test]
-async fn the_task_time_limit_is_an_admin_setting_and_each_change_is_audited() {
+async fn the_task_time_limit_is_each_jobs_and_each_change_is_audited() {
     let db = TestDb::new().await;
     let admin = Admin::new(&db).await;
-    let changes = "SELECT COUNT(*) FROM audit_log WHERE action = 'settings.changed'";
+    let changes = "SELECT COUNT(*) FROM audit_log WHERE action = 'job.time_limit_changed'";
+    let files = files(&db).await;
+    let limit = |job: &str| {
+        let job = job.to_string();
+        let admin = &admin;
+        async move { admin.get(&format!("/api/jobs/{job}/config")).await.1["job"]["max_task_seconds"].clone() }
+    };
 
-    let (status, settings) = admin.get("/api/admin/settings").await;
-    assert_eq!(status, StatusCode::OK, "{settings}");
-    assert_eq!(settings["max_task_seconds"], json!(3600), "{settings}");
-    assert!(settings["updated_by"].is_null(), "nobody has changed them: {settings}");
+    let job = api_games_job(&admin, &files).await;
+    assert_eq!(limit(&job).await, json!(3600), "an hour unless the job says otherwise");
 
+    // Created with a limit of its own, and refused one out of range.
+    let player = created_config(&admin, static_config(&format!("p{}", Uuid::new_v4().simple()), &files)).await;
+    let mut body = games_job_body(&files, &player["id"], &player["id"]);
+    for refused in [0, 599, 86_401] {
+        body["max_task_seconds"] = json!(refused);
+        let (status, answer) = admin.post("/api/admin/jobs", body.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}: {answer}");
+        assert!(
+            answer["fields"].as_array().unwrap().iter().any(|f| f["field"] == "max_task_seconds"),
+            "{refused}: {answer}"
+        );
+    }
+    body["max_task_seconds"] = json!(7200);
+    let (status, answer) = admin.post("/api/admin/jobs", body).await;
+    assert_eq!(status, StatusCode::CREATED, "{answer}");
+    let other = answer["jobs"][0]["id"].as_str().unwrap().to_string();
+    assert_eq!(limit(&other).await, json!(7200));
+
+    let path = format!("/api/admin/jobs/{job}/time-limit");
     for refused in [0, 60, 599, 86_401] {
-        let (status, body) = admin.put("/api/admin/settings", json!({ "max_task_seconds": refused })).await;
+        let (status, body) = admin.patch(&path, json!({ "max_task_seconds": refused })).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}: {body}");
         assert_eq!(body["fields"][0]["field"], "max_task_seconds", "{refused}: {body}");
     }
     assert_eq!(count(&db, changes).await, 0);
-    let checked = sqlx::query("UPDATE settings SET max_task_seconds = 599").execute(&db.pool).await;
+    let checked = sqlx::query("UPDATE jobs SET max_task_seconds = 599 WHERE id = $1::uuid")
+        .bind(&job)
+        .execute(&db.pool)
+        .await;
     assert!(checked.is_err(), "the column refuses what the API does");
+    let (status, _) = admin
+        .patch(&format!("/api/admin/jobs/{}/time-limit", Uuid::new_v4()), json!({ "max_task_seconds": 1800 }))
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 
-    let (status, settings) = admin.put("/api/admin/settings", json!({ "max_task_seconds": 1800 })).await;
-    assert_eq!(status, StatusCode::OK, "{settings}");
-    assert_eq!((&settings["max_task_seconds"], &settings["updated_by"]), (&json!(1800), &json!("root")));
-    let (actor, reason): (Uuid, String) =
-        sqlx::query_as("SELECT actor_user_id, reason FROM audit_log WHERE action = 'settings.changed'")
-            .fetch_one(&db.pool)
-            .await
-            .unwrap();
-    assert_eq!((actor, reason.as_str()), (admin.id, "max_task_seconds 3600 -> 1800"));
+    let (status, changed) = admin.patch(&path, json!({ "max_task_seconds": 1800 })).await;
+    assert_eq!((status, &changed), (StatusCode::OK, &json!({ "max_task_seconds": 1800 })));
+    let (actor, target, reason): (Uuid, String, String) = sqlx::query_as(
+        "SELECT actor_user_id, target_id, reason FROM audit_log WHERE action = 'job.time_limit_changed'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!((actor, target.as_str(), reason.as_str()), (admin.id, job.as_str(), "max_task_seconds 3600 -> 1800"));
 
-    let (status, _) = admin.put("/api/admin/settings", json!({ "max_task_seconds": 1800 })).await;
+    let (status, _) = admin.patch(&path, json!({ "max_task_seconds": 1800 })).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(count(&db, changes).await, 1, "an unchanged setting is not a change");
-    let (_, settings) = admin.get("/api/admin/settings").await;
-    assert_eq!(settings["max_task_seconds"], json!(1800), "{settings}");
+    assert_eq!(count(&db, changes).await, 1, "an unchanged limit is not a change");
+    assert_eq!(limit(&job).await, json!(1800));
+    assert_eq!(limit(&other).await, json!(7200), "another job's limit is its own");
 
-    let files = files(&db).await;
-    let job = api_games_job(&admin, &files).await;
+    // The claims made after the change are given it.
     let (status, body) = admin.put("/api/admin/jobs/allocations", json!({ "allocations": [{ "job_id": job, "allocation": 50 }] })).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let (status, assignment) = claim(&admin.app, &[], "1.0.0", &[]).await;
@@ -923,8 +958,8 @@ async fn the_task_time_limit_is_an_admin_setting_and_each_change_is_audited() {
     assert_eq!(assignment["max_task_seconds"], json!(1800), "{assignment}");
 
     // The floor itself is a limit an admin may set.
-    let (status, settings) = admin.put("/api/admin/settings", json!({ "max_task_seconds": 600 })).await;
-    assert_eq!((status, &settings["max_task_seconds"]), (StatusCode::OK, &json!(600)), "{settings}");
+    let (status, changed) = admin.patch(&path, json!({ "max_task_seconds": 600 })).await;
+    assert_eq!((status, &changed["max_task_seconds"]), (StatusCode::OK, &json!(600)), "{changed}");
 }
 
 /// A-ADMIN-31: a games or pairs job states how MAGPIE spends its threads,

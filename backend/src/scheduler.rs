@@ -1350,16 +1350,18 @@ async fn issue_claim(
     }
 
     let claim_token = Uuid::new_v4();
-    // The deadline is set from the limit as it stands now, in the statement
-    // that writes the claim, and the limit read back from it is the one the
-    // assignment states: the two cannot disagree, whatever an admin changes
-    // meanwhile. A change applies to the claims made after it.
+    // The deadline is set from the job's limit as it stands now, in the
+    // statement that writes the claim, and the limit read back from it is the
+    // one the assignment states: the two cannot disagree, whatever an admin
+    // changes meanwhile. A change applies to the claims made after it. Read
+    // from the job's row here, not from `job`, which was read before the
+    // dispatch lock; the row lock is the `UPDATE jobs` below, as before.
     let max_task_seconds: i32 = sqlx::query_scalar(
         "INSERT INTO task_claims
              (task_id, job_id, claim_token, claimed_by_user_id, claimed_by_anon_uuid,
               magpie_version, deadline_at)
-         SELECT $1, $6, $2, $3, $4, $5, now() + make_interval(secs => s.max_task_seconds)
-         FROM settings s
+         SELECT $1, $6, $2, $3, $4, $5, now() + make_interval(secs => j.max_task_seconds)
+         FROM jobs j WHERE j.id = $6
          RETURNING EXTRACT(EPOCH FROM deadline_at - claimed_at)::int",
     )
     .bind(task_id)

@@ -28,7 +28,8 @@ const simPlayer: PlayerSettings = {
 const config: JobConfig = {
   job: {
     id: 'j', name: 'n', job_type: 'game_pairs', variant: 'classic', letter_distribution: 'english',
-    layout: 'standard15', bingo_bonus: 50, sim_cutoff: 0, min_magpie_version: '0.1.1'
+    layout: 'standard15', bingo_bonus: 50, sim_cutoff: 0, min_magpie_version: '0.1.1',
+    max_task_seconds: 3600
   },
   games: {
     unit: 'pair', per_batch: 1, test_enabled: true, min_units: 100, max_units: 5000,
@@ -86,8 +87,12 @@ describe('F-SET-1 job settings', () => {
     expect(labels(rows)).toEqual([
       'Type', 'Variant', 'Letter Distribution', 'Board', 'Bingo Bonus', 'Maximum Pairs',
       'Significance Test', 'Position Recorder', 'Sim Cutoff', 'Threading', 'Minimum Pairs',
-      'Pairs Per Task', 'Oldest MAGPIE'
+      'Pairs Per Task', 'Task Time Limit', 'Oldest MAGPIE'
     ]);
+    // The job's own limit, in its units and the seconds it was set in.
+    expect(byLabel(rows, 'Task Time Limit').value).toBe(`1h (${(3600).toLocaleString()} seconds)`);
+    const shorter = jobSettings({ ...config, job: { ...config.job, max_task_seconds: 1800 } });
+    expect(byLabel(shorter, 'Task Time Limit').value).toBe(`30m (${(1800).toLocaleString()} seconds)`);
     expect(rows[0].value).toBe('Game Pairs');
     // The test and its confidence in one row.
     expect(byLabel(rows, 'Significance Test').value).toBe('yes (95%)');
@@ -131,7 +136,8 @@ describe('F-SET-1 job settings', () => {
   it("lists an opening-rack job's analyses per rack, and a leave job's generations and no sim cutoff", () => {
     expect(labels(jobSettings(opening))).toEqual([
       'Type', 'Variant', 'Letter Distribution', 'Board', 'Bingo Bonus', 'Minimum Analyses Per Rack',
-      'Maximum Analyses Per Rack', 'Consensus %', 'Sim Cutoff', 'Racks Per Task', 'Oldest MAGPIE'
+      'Maximum Analyses Per Rack', 'Consensus %', 'Sim Cutoff', 'Racks Per Task', 'Task Time Limit',
+      'Oldest MAGPIE'
     ]);
     const value = (label: string, o: Partial<NonNullable<JobConfig['opening_racks']>> = {}) =>
       byLabel(jobSettings({ ...opening, opening_racks: { ...opening.opening_racks!, ...o } }), label).value;
@@ -143,7 +149,7 @@ describe('F-SET-1 job settings', () => {
     const rows = jobSettings(leave);
     expect(labels(rows)).toEqual([
       'Type', 'Variant', 'Letter Distribution', 'Board', 'Bingo Bonus', 'Generations', 'Target Per Rack',
-      'Games Per Task', 'Racks Per Task', 'Oldest MAGPIE'
+      'Games Per Task', 'Racks Per Task', 'Task Time Limit', 'Oldest MAGPIE'
     ]);
     expect(byLabel(rows, 'Target Per Rack').value).toBe(`100 → 200 → ${(5000).toLocaleString()}`);
     // The lexicon and wordmap are the player's rows, not the job's.
