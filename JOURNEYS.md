@@ -813,7 +813,8 @@ while those run).
   **Save 2 changes**. **Save**. **Expect** "Saved: 2 jobs changed.", the games
   job inactive at 0% and "tester cap" at its new share, and in the audit log
   `job.deactivated` ("25% -> 0%") and `job.allocation_changed` ("25% -> 50%").
-- [ ] **Do** **Share equally**. **Expect** 100% split among the jobs above 0%.
+- [ ] **Do** **Share equally**. **Expect** 100% split among the jobs above 0% and
+  the ones marked new.
 - [ ] **Do** create a game-pairs job with **Oldest MAGPIE** `9.9.9`, and
   make it the only active one. **Expect** every worker told its MAGPIE is too
   old and stopping. Set it to 0% and restart the workers.

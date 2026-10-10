@@ -11,6 +11,7 @@
   import { onMount } from 'svelte';
   import { page } from '$app/stores';
   import { api, errorText, type JobListItem, type JobStatus } from '$lib/api';
+  import { equalShares } from '$lib/allocation';
   import { jobTitle, jobTypeLabel } from '$lib/format';
   import JobStatusBadge from '$lib/components/JobStatusBadge.svelte';
 
@@ -60,20 +61,9 @@
   });
   $: changed = jobs.filter((job) => Number(values[job.id]) !== current(job));
 
-  /** Every job's share, the same whole number each, the rest to the first. */
+  /** The running and new jobs' share, the same whole number each. */
   function shareEqually() {
-    const running = jobs.filter((job) => Number(values[job.id]) > 0);
-    const among = running.length ? running : jobs;
-    if (!among.length) return;
-    const each = Math.floor(100 / among.length);
-    let left = 100 - each * among.length;
-    const next = { ...values };
-    for (const job of jobs) next[job.id] = 0;
-    for (const job of among) {
-      next[job.id] = each + (left > 0 ? 1 : 0);
-      if (left > 0) left -= 1;
-    }
-    values = next;
+    values = equalShares(listed.map((job) => job.id), values, fresh);
   }
 
   async function save() {
@@ -175,7 +165,8 @@
         <p class="field-error">Every allocation must be a whole number from 0 to 100.</p>
       {/if}
       <p class="text-xs text-muted-foreground">
-        "Share equally" splits 100% among the jobs set above 0% (all of them when none is).
+        "Share equally" splits 100% among the jobs set above 0% and the new ones (all of them
+        when there are none).
         Jobs you leave unchanged are not sent.
       </p>
     </form>

@@ -153,6 +153,7 @@ incidentally by higher tiers.
 | `lib/ratingPool.ts` | 1F | Covered (`F-RATE-*`) |
 | `lib/importWatch.ts`, `lib/poller.ts` | 1F | Covered (`F-IMPORT-*`, `F-POLL-*`) |
 | `lib/roundRobin.ts` | 1F | Covered (`F-RR-*`) |
+| `lib/allocation.ts` | 1F | Covered (`F-ALLOC-*`) |
 | `lib/movegens.ts` | 1F | Covered (`F-MOVEGENS-*`) |
 | Chart maths | 1F | Covered (`F-CHART-*`). The arithmetic moved out of the components into `lib/charts/*.ts` so it could be tested; the `.svelte` files that draw it are exercised only by tier 5 |
 | Every page under `routes/` | 5 | Partial — the eighteen journeys (E-10 visits `/users`). `/admin/backups`, `/admin/derived-data`, `/admin/fleet` and `/admin/users` are in none of them (`/admin/allocation` is E-4's); their endpoints are tier 3 |
@@ -1000,6 +1001,14 @@ Each entry's tests are the `describe` block named for its id.
 - `F-RR-2` `matchupSummary` reads "4 configs → 6 jobs", "1 config → 1
   self-play job", and why none or more than twelve cannot be sent;
   `matchupsAllowed` is one to twelve. *(Covered: `roundRobin.test.ts`.)*
+
+### `F-ALLOC-*` — `lib/allocation.ts`
+
+- `F-ALLOC-1` `equalShares` ("Share equally") splits 100% in whole numbers,
+  the remainder a point each to the first, among the jobs above 0% **and the
+  jobs just created** -- a round robin at 0% beside a job at 100% gets its
+  share, where it once changed nothing -- every other job at 0%, and every job
+  when none is chosen. *(Covered: `allocation.test.ts`.)*
 
 ### `F-CONS-*` — `lib/consensus.ts`
 
