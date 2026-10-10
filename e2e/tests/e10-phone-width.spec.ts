@@ -28,7 +28,7 @@ async function expectNoSidewaysScroll(page: Page) {
 /**
  * A table's box is no wider than itself: the table wraps rather than scrolls,
  * so the column a list is ranked by stays in view. The page's first table
- * card unless given one.
+ * card unless given one -- or any box, a stacked list's.
  */
 async function expectTableFits(page: Page, box?: Locator) {
   const table = box ?? page.locator('.card', { has: page.locator('table') }).first();
@@ -37,6 +37,19 @@ async function expectTableFits(page: Page, box?: Locator) {
     clientWidth: el.clientWidth
   }));
   expect(scrollWidth, 'the ranking is wider than its box').toBeLessThanOrEqual(clientWidth);
+}
+
+/**
+ * A column header is within the screen's width -- not pushed off its right
+ * edge -- wherever it is down the page: on a phone the site's totals card
+ * stacks above the ranking and pushes it below the fold, which is not what
+ * this checks.
+ */
+async function expectAcrossScreen(page: Page, header: Locator) {
+  await expect(header).toBeVisible();
+  const box = (await header.boundingBox())!;
+  expect(box.x, 'the column starts off the screen').toBeGreaterThanOrEqual(0);
+  expect(box.x + box.width, 'the column runs off the screen').toBeLessThanOrEqual(page.viewportSize()!.width);
 }
 
 /**
@@ -52,6 +65,22 @@ test('E-10: a visitor on a phone reads the job list, a job page and the rankings
   await page.goto('/');
   await expect(page.getByRole('heading', { name: 'Crowdsourced Crossword Game Research' })).toBeVisible();
   await expectNoSidewaysScroll(page);
+  // The header is two rows: the sign-in links share the brand's, and the
+  // page's links have the second. A third row of its own pushed the heading
+  // half a screen down.
+  const banner = page.getByRole('banner');
+  const brand = (await banner.getByRole('link', { name: 'birdtest', exact: true }).boundingBox())!;
+  const signIn = (await banner.getByRole('link', { name: 'Sign in', exact: true }).boundingBox())!;
+  expect(Math.abs(signIn.y + signIn.height / 2 - (brand.y + brand.height / 2))).toBeLessThan(brand.height);
+  // contribute.txt's settings stack on a phone, every description on screen:
+  // as a table, the last column ran off the side.
+  const contributeSettings = page.getByTestId('contribute-settings');
+  await expect(contributeSettings.getByText('idlewait', { exact: true })).toBeVisible();
+  await expectTableFits(page, contributeSettings);
+  for (const description of await contributeSettings.locator('dd').all()) {
+    const box = (await description.boundingBox())!;
+    expect(box.x + box.width).toBeLessThanOrEqual(page.viewportSize()!.width);
+  }
 
   await page.getByRole('link', { name: 'Browse jobs' }).tap();
   await expect(page).toHaveURL(/\/jobs$/);
@@ -59,14 +88,14 @@ test('E-10: a visitor on a phone reads the job list, a job page and the rankings
   await expectNoSidewaysScroll(page);
 
   await page.locator(`a[href="/jobs/${job.id}"]`).tap();
-  await expect(page.getByRole('heading', { name: 'Game Pairs' })).toBeVisible();
+  await expect(page.getByRole('heading', { level: 1, name: job.name, exact: true })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Significance Test' })).toBeVisible();
   await expectNoSidewaysScroll(page);
 
-  // The three headline figures stack in one column rather than squeezing
-  // three across: each is as wide as the one above it and sits below it.
+  // The four headline figures stack in one column rather than squeezing
+  // across: each is as wide as the one above it and sits below it.
   const cards = page.locator('.grid > .card');
-  await expect(cards).toHaveCount(3);
+  await expect(cards).toHaveCount(4);
   const boxes = await Promise.all((await cards.all()).map((card) => card.boundingBox()));
   for (let i = 1; i < boxes.length; i++) {
     expect(boxes[i]!.x).toBeCloseTo(boxes[0]!.x, 0);
@@ -74,7 +103,7 @@ test('E-10: a visitor on a phone reads the job list, a job page and the rankings
     expect(boxes[i]!.y).toBeGreaterThan(boxes[i - 1]!.y);
   }
   // And the header's links are all on screen and reachable.
-  for (const name of ['Jobs', 'Ratings', 'Contributors', 'Users', 'Sign in']) {
+  for (const name of ['Jobs', 'Ratings', 'Contributions', 'Users', 'Sign in']) {
     const link = page.getByRole('banner').getByRole('link', { name, exact: true });
     await expect(link).toBeInViewport();
   }
@@ -114,12 +143,17 @@ test('E-10: a visitor on a phone reads the job list, a job page and the rankings
   // The contributors' ranking fits its box, the column it is ranked by on
   // screen: a pseudonym's sixteen characters pushed it out (thirty-second audit).
   // With a row in it: an empty table fits on any page.
-  await page.getByRole('banner').getByRole('link', { name: 'Contributors', exact: true }).tap();
-  await expect(page.getByRole('columnheader', { name: 'Movegens' })).toBeVisible();
+  await page.getByRole('banner').getByRole('link', { name: 'Contributions', exact: true }).tap();
+  // The ranking's own headers: the site's totals and a contributor's
+  // breakdown are tables under the same names.
+  const ranking = page.getByTestId('contributor-ranking');
+  const header = (name: string) =>
+    ranking.locator(':scope > table > thead').getByRole('columnheader', { name, exact: true });
+  await expect(header('Movegens')).toBeVisible();
   await expect(page.getByRole('cell', { name: /^Anonymous · [0-9a-f]{16}$/ }).first()).toBeVisible();
   await expectNoSidewaysScroll(page);
-  await expectTableFits(page);
-  await expect(page.getByRole('columnheader', { name: 'Movegens' })).toBeInViewport();
+  await expectTableFits(page, ranking);
+  await expectAcrossScreen(page, header('Movegens'));
 
   // And with the widest names either ranking can hold, which the seed has not
   // registered: both lists answered as the server would with them.
@@ -129,8 +163,8 @@ test('E-10: a visitor on a phone reads the job list, a job page and the rankings
       json: {
         items: [
           // Longer than any fleet will run: every column at its widest.
-          { user_id: null, username: LONGEST, anon_id: null, compute_seconds: 9.9e10,
-            movegens: 9.2e18, tasks_completed: 123456789012, last_seen_at: now },
+          { user_id: '00000000-0000-4000-8000-000000000001', username: LONGEST, anon_id: null,
+            compute_seconds: 9.9e10, movegens: 9.2e18, tasks_completed: 123456789012, last_seen_at: now },
           { user_id: null, username: TOMBSTONE, anon_id: null, compute_seconds: 1,
             movegens: 1, tasks_completed: 1, last_seen_at: now },
           { user_id: null, username: null, anon_id: 'f'.repeat(16), compute_seconds: 1,
@@ -155,22 +189,128 @@ test('E-10: a visitor on a phone reads the job list, a job page and the rankings
       }
     })
   );
+  // Every type at a BIGINT's widest, the site's and the contributor's, and a
+  // century of compute and a trillion tasks beside.
+  const share = { movegens: 9.2e18, compute_seconds: 3.2e9, tasks: 999999999999 };
+  const widest = { opening_rack: share, games: share, game_pairs: share, leave_generation: share };
+  await page.route(/\/api\/workers\/(user\/[^/]+\/)?movegens$/, (route) => route.fulfill({ json: widest }));
   await page.reload();
   await expect(page.getByRole('cell', { name: LONGEST })).toBeVisible();
+  const site = page.getByTestId('site-movegens');
+  await expect(site.locator('dd').first()).toHaveText('36,800,000,000,000,000,000');
+  await expect(site.locator('[data-figure="movegens"]')).toHaveText(Array(4).fill('9,200,000,000,000,000,000'));
   await expectNoSidewaysScroll(page);
-  await expectTableFits(page);
-  await expect(page.getByRole('columnheader', { name: 'Movegens' })).toBeInViewport();
+  // The site's table wraps inside its card rather than widening it.
+  await expectTableFits(page, site);
+  await expectTableFits(page, ranking);
+  await expectAcrossScreen(page, header('Movegens'));
+  // A contributor's work by job type opens under their row, inside the
+  // ranking's box, and the page still does not scroll sideways.
+  await page.getByRole('button', { name: LONGEST }).tap();
+  const breakdown = page.getByTestId('contributor-movegens');
+  await expect(breakdown.locator('[data-figure="movegens"]')).toHaveText(Array(4).fill('9,200,000,000,000,000,000'));
+  await expectNoSidewaysScroll(page);
+  await expectTableFits(page, ranking);
+  for (const cell of await breakdown.locator('[data-figure]').all()) {
+    const box = (await cell.boundingBox())!;
+    expect(box.x + box.width).toBeLessThanOrEqual(page.viewportSize()!.width);
+  }
   // Ranked by another column, that column is the one shown beside the name.
   await page.getByRole('button', { name: 'Compute time' }).tap();
-  await expect(page.getByRole('columnheader', { name: 'Compute time' })).toHaveAttribute('aria-sort', 'descending');
-  await expect(page.getByRole('columnheader', { name: 'Movegens' })).toBeHidden();
+  await expect(header('Compute time')).toHaveAttribute('aria-sort', 'descending');
+  await expect(header('Movegens')).toBeHidden();
   await expectNoSidewaysScroll(page);
-  await expectTableFits(page);
-  await expect(page.getByRole('columnheader', { name: 'Compute time' })).toBeInViewport();
+  await expectTableFits(page, ranking);
+  await expectAcrossScreen(page, header('Compute time'));
 
   await page.getByRole('banner').getByRole('link', { name: 'Users', exact: true }).tap();
   await expect(page.getByRole('cell', { name: new RegExp(`^${LONGEST}`) })).toBeVisible();
   await expectNoSidewaysScroll(page);
   await expectTableFits(page);
-  await expect(page.getByRole('columnheader', { name: 'Tasks completed' })).toBeInViewport();
+  await expectAcrossScreen(page, page.getByRole('columnheader', { name: 'Tasks completed' }));
+});
+
+/**
+ * E-10b: a rating pool's cross table at phone width. Six configs with long
+ * names make it several screens wide: it scrolls sideways inside its card
+ * while the page does not, and the config names, in a sticky first column,
+ * stay in view as it does. The pool is served from a route: what is under
+ * test is the layout, not a fit.
+ */
+test('E-10b: a rating pool cross table scrolls inside its card on a phone', async ({ page }) => {
+  const ids = Array.from({ length: 6 }, (_, i) => `00000000-0000-4000-8000-00000000000${i}`);
+  const name = (i: number) => `simmer-CSW24-${i + 1}ply-equity-${'x'.repeat(12)}`;
+  const ratings = ids.map((id, i) => ({
+    player_config_id: id,
+    name: name(i),
+    rating: 2000 - 60 * i,
+    stderr: i === 0 ? 0 : 25,
+    pairs_played: 500,
+    connected_to_anchor: true,
+    is_anchor: i === 0
+  }));
+  // Every head-to-head from both sides, the better config scoring 3 points a
+  // rung more.
+  const head_to_heads = ids.flatMap((row, i) =>
+    ids
+      .map((col, j) => ({ col, j }))
+      .filter(({ j }) => j !== i)
+      .map(({ col, j }) => ({
+        row,
+        col,
+        pairs: 100,
+        actual: 0.5 + 0.03 * (j - i),
+        predicted: 0.5 + 0.025 * (j - i),
+        stderr: 0.03,
+        spread: 4.5 * (j - i)
+      }))
+  );
+  await page.route(/\/api\/rating-pools\/[^/?]+$/, (route) =>
+    route.fulfill({
+      json: {
+        id: 'pool',
+        name: 'phone pool',
+        variant: 'classic',
+        letter_distribution: 'english',
+        layout: 'standard15',
+        anchor_player_config_id: ids[0],
+        anchor_rating: 2000,
+        members: ratings.map((r) => ({ player_config_id: r.player_config_id, name: r.name })),
+        run: {
+          id: 'run',
+          computed_at: new Date().toISOString(),
+          trigger: 'evidence',
+          iterations: 5,
+          converged: true,
+          pairs_used: 1500,
+          jobs_used: 15
+        },
+        ratings,
+        head_to_heads
+      }
+    })
+  );
+
+  await page.goto('/ratings/00000000-0000-4000-8000-0000000000aa');
+  const cross = page.getByTestId('cross-table');
+  await expect(cross.locator('tbody tr')).toHaveCount(6);
+  await expectNoSidewaysScroll(page);
+
+  // The table's own box scrolls: it is wider than the box that holds it.
+  const box = cross.locator('xpath=..');
+  const { scrollWidth, clientWidth } = await box.evaluate((el) => ({
+    scrollWidth: el.scrollWidth,
+    clientWidth: el.clientWidth
+  }));
+  expect(scrollWidth, 'the cross table fits a phone, so this proves nothing').toBeGreaterThan(clientWidth);
+
+  // Scrolled to its far end -- the ratings column -- the names are still there.
+  await cross.scrollIntoViewIfNeeded();
+  await box.evaluate((el) => (el.scrollLeft = el.scrollWidth));
+  const firstName = cross.locator('tbody th').first();
+  await expect(firstName).toBeInViewport();
+  await expect(cross.locator('tbody tr').first().locator('td').last()).toBeInViewport();
+  const [nameBox, scrolled] = [(await firstName.boundingBox())!, (await box.boundingBox())!];
+  expect(Math.abs(nameBox.x - scrolled.x)).toBeLessThan(2);
+  await expectNoSidewaysScroll(page);
 });

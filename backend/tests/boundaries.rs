@@ -677,7 +677,7 @@ async fn a_decline_list_is_cut_to_its_cap_and_each_field_to_its_bound() {
 async fn two_inactive_jobs(db: &TestDb) -> (Uuid, Uuid) {
     let first = db.games_job(2).await;
     let second = db.games_job(2).await;
-    sqlx::query("UPDATE jobs SET status = 'inactive', allocation = NULL")
+    sqlx::query("UPDATE jobs SET status = 'inactive', allocation = 0")
         .execute(&db.pool)
         .await
         .unwrap();
@@ -692,7 +692,7 @@ async fn active_allocations(db: &TestDb) -> Vec<(Uuid, i32)> {
 }
 
 /// A-ADMIN-4 (allocation cap): with 60% already active, activating another job
-/// at 50% is a 409 naming the 40% of headroom, and changes nothing; 40%
+/// at 50% is a 409 naming what the other jobs hold, and changes nothing; 40%
 /// itself -- exactly 100% in total -- is accepted.
 #[tokio::test]
 async fn an_activation_past_100_percent_is_refused_naming_the_headroom() {
@@ -707,24 +707,18 @@ async fn an_activation_past_100_percent_is_refused_naming_the_headroom() {
     let app = birdtest::app(state.clone());
     let headers = admin_headers(&state.cfg, db.user("root", true).await);
     let headers = borrow(&headers);
-    let activate = |allocation: i32| {
-        post_json(
-            &format!("/api/admin/jobs/{newcomer}/activate"),
-            &headers,
-            json!({ "allocation": allocation }),
-        )
-    };
 
-    let (status, body) = send(&app, activate(50)).await;
+    let (status, body) = send(&app, allocate(newcomer, 50, &headers)).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["code"], "conflict", "{body}");
     assert_eq!(
         body["message"],
-        "the other active jobs already allocate 60% — 40% is the most this job can take"
+        "the active jobs would allocate 110% between them; the most is 100% \
+         (the jobs not named here already allocate 60%)"
     );
     assert_eq!(active_allocations(&db).await, vec![(running, 60)], "nothing changed");
 
-    let (status, body) = send(&app, activate(40)).await;
+    let (status, body) = send(&app, allocate(newcomer, 40, &headers)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let mut expected = vec![(running, 60), (newcomer, 40)];
     expected.sort();
@@ -746,12 +740,7 @@ async fn two_concurrent_activations_cannot_exceed_100_percent() {
     let app = birdtest::app(state.clone());
     let headers = admin_headers(&state.cfg, db.user("root", true).await);
     let headers = borrow(&headers);
-    let activate = |job: Uuid| {
-        send(
-            &app,
-            post_json(&format!("/api/admin/jobs/{job}/activate"), &headers, json!({ "allocation": 60 })),
-        )
-    };
+    let activate = |job: Uuid| send(&app, allocate(job, 60, &headers));
 
     let mut blocker = db.pool.begin().await.unwrap();
     sqlx::query("SELECT pg_advisory_xact_lock(hashtext('birdtest.activate'))")
@@ -770,7 +759,8 @@ async fn two_concurrent_activations_cannot_exceed_100_percent() {
     let refused = if a.0 == StatusCode::CONFLICT { &a.1 } else { &b.1 };
     assert_eq!(
         refused["message"],
-        "the other active jobs already allocate 60% — 40% is the most this job can take"
+        "the active jobs would allocate 120% between them; the most is 100% \
+         (the jobs not named here already allocate 60%)"
     );
     let active = active_allocations(&db).await;
     assert_eq!(active.len(), 1, "exactly one went live: {active:?}");

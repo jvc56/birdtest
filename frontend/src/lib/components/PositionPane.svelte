@@ -44,7 +44,7 @@
 <div class="min-w-0 space-y-3" data-testid="saved-position" data-game-index={position.game_index}>
   {#if heading}
     <h3 class="text-sm font-medium" data-testid="position-heading">
-      {heading}{#if mover}<span class="font-normal text-muted-foreground"> · {mover} to move</span>{/if}
+      {heading}{#if mover}<span class="font-normal text-muted-foreground">{` · ${mover} to move`}</span>{/if}
     </h3>
   {/if}
   <p class="text-sm">
@@ -66,11 +66,15 @@
       <span data-testid="position-analysis">{ANALYSIS[position.analysis]}</span></span
     >
   </p>
-  <!-- On a wide screen the board has a column of a fixed width, so it is the
-       same size whatever position it shows, and the moves start right beside
-       it, in what is left -- room for every column of a simulated position's
-       list. Narrower, the moves go under the board. -->
-  <div class="grid gap-4 xl:grid-cols-[27rem_minmax(0,1fr)]">
+  <!-- From a laptop's width up, the board and the moves share the pane
+       equally, the board never under 24rem: one move list shows at a time,
+       so a column fixed for the board left most of a wide screen to a table
+       that needs a fraction of it. The board's own cap (Board.svelte) stops
+       it growing past what a screen can read at once. The moves and the
+       inference fill their column rather than leaving its right side empty,
+       and scroll inside it when they are wider. Narrower, the moves go under
+       the board. -->
+  <div class="grid items-start gap-4 lg:grid-cols-[minmax(24rem,1fr)_minmax(0,1fr)]">
     <div class="min-w-0 space-y-2">
       {#if board && parsed}
         <Board
@@ -86,7 +90,7 @@
       {/if}
     </div>
     <div class="min-w-0 overflow-x-auto">
-      <table class="moves table w-auto text-xs" data-testid="position-moves">
+      <table class="moves table text-xs" data-testid="position-moves">
         <thead>
           <tr>
             <th>#</th><th>Move</th><th class="text-right">Score</th><th class="text-right">Equity</th>
@@ -140,7 +144,8 @@
         <div class="mt-3 space-y-1" data-testid="position-inference">
           <p class="text-xs">{inferenceSummary(inference, position.previous_move)}.</p>
           {#if inference.leaves.length}
-            <table class="moves table w-full text-xs">
+            <!-- The column's width, like the moves above it. -->
+            <table class="moves table text-xs">
               <thead>
                 <tr>
                   <th title="What the opponent kept">Leave</th>

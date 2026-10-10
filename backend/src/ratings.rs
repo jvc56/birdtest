@@ -13,6 +13,8 @@
 
 use crate::error::{AppError, AppResult};
 use crate::stats::bradley_terry::{self, Matrix};
+use crate::stats::outcomes::{Pentanomial, Sample};
+use serde::Serialize;
 use sqlx::{PgConnection, PgPool, Row};
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -62,24 +64,141 @@ async fn load_pool(conn: &mut PgConnection, pool_id: Uuid) -> AppResult<Pool> {
     })
 }
 
+/// What a fit reads: the members (by name), the matrix the ratings are fitted
+/// to, how much evidence went in, and each head-to-head's evidence for the
+/// cross table, keyed by `(i, j)` with `i < j`.
+struct Evidence {
+    members: Vec<Uuid>,
+    matrix: Matrix,
+    pairs_used: u64,
+    jobs_used: i32,
+    head_to_heads: HashMap<(usize, usize), HeadToHeadEvidence>,
+}
+
+/// One head-to-head's evidence for the cross table, from the side of its
+/// lower-indexed config: the pentanomial summed over every job between the
+/// two, a job that seats them the other way round flipped (bucket `k` to
+/// `4 − k`), and the spread `game_results` reports for the same rows.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct HeadToHeadEvidence {
+    pub pentanomial: Pentanomial,
+    /// Games behind `spread_sum`: `game_results.games`, summed.
+    pub games: i64,
+    /// Σ games · (this side's mean score − the other side's), over the same
+    /// rows.
+    pub spread_sum: f64,
+}
+
+impl HeadToHeadEvidence {
+    /// Adds one job's results, given from its player 1's side: `flipped` when
+    /// player 1 is this head-to-head's other config.
+    pub fn add(&mut self, pentanomial: [u64; 5], games: i64, spread_sum: f64, flipped: bool) {
+        for (bucket, count) in pentanomial.into_iter().enumerate() {
+            let at = if flipped { 4 - bucket } else { bucket };
+            self.pentanomial.counts[at] += count;
+        }
+        self.games += games;
+        self.spread_sum += if flipped { -spread_sum } else { spread_sum };
+    }
+
+    /// This side's score per game, `(W + ½D) / games`, and its standard
+    /// error.
+    ///
+    /// The error is the pair's, not the game's. A pair is the independent
+    /// unit -- its two games share a seed -- and scores `x = k/4` for bucket
+    /// `k`, the mean of its two games' scores, so it is already per game.
+    /// Over `N` pairs with counts `c_k` and mean `m`:
+    ///
+    /// ```text
+    /// s² = Σ c_k·(k/4)² / N − m²      SE = √(s² / N)
+    /// ```
+    ///
+    /// the plug-in variance the match test uses (`outcomes::Sample`), shown
+    /// ×100 as percentage points of win %. Counting games instead,
+    /// `√(m(1 − m) / 2N)`, would treat a pair's two games as independent,
+    /// which is what pairing exists to undo: pairs that played identically
+    /// all score ½ and narrow the error, as they should.
+    pub fn score_and_stderr(&self) -> (f64, f64) {
+        let sample = Sample::from_pentanomial(&self.pentanomial);
+        if sample.n == 0 {
+            return (0.5, f64::INFINITY);
+        }
+        (sample.mean, (sample.variance.max(0.0) / sample.n as f64).sqrt())
+    }
+
+    /// This side's average spread per game: `Σ games·(p1_mean − p2_mean) /
+    /// Σ games`, each job's from this side.
+    pub fn spread(&self) -> f64 {
+        if self.games <= 0 {
+            return 0.0;
+        }
+        self.spread_sum / self.games as f64
+    }
+}
+
+/// One cell of a pool's cross table, from the row config's side, as a fit
+/// stores it with its run (`rating_run_residuals`) and the pool's page reads
+/// it. A fit stores each head-to-head once; [`CrossCell::mirrored`] is the
+/// other side's view of the same games.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct CrossCell {
+    pub row: Uuid,
+    pub col: Uuid,
+    pub pairs: f64,
+    /// The row config's score per game, `(W + ½D) / games`.
+    pub actual: f64,
+    /// What the fit's ratings predict `actual` to be; the gap is the model's
+    /// residual, where a non-transitive pool shows.
+    pub predicted: f64,
+    /// The standard error of `actual` ([`HeadToHeadEvidence::score_and_stderr`]).
+    pub stderr: f64,
+    /// The row config's average spread per game.
+    pub spread: f64,
+}
+
+impl CrossCell {
+    /// The same games from the column config's side: the score and the
+    /// prediction complemented, the spread negated, the error unchanged.
+    pub fn mirrored(&self) -> Self {
+        Self {
+            row: self.col,
+            col: self.row,
+            pairs: self.pairs,
+            actual: 1.0 - self.actual,
+            predicted: 1.0 - self.predicted,
+            stderr: self.stderr,
+            spread: -self.spread,
+        }
+    }
+}
+
+/// Every stored cell and its mirror, so each ordered `(row, col)` of the
+/// cross table with games in it has its cell, ordered by row then column.
+pub fn both_sides(cells: &[CrossCell]) -> Vec<CrossCell> {
+    let mut out: Vec<CrossCell> = cells.iter().flat_map(|c| [*c, c.mirrored()]).collect();
+    out.sort_by_key(|c| (c.row, c.col));
+    out
+}
+
 /// Every head-to-head in a pool, summed from the pentanomial.
 ///
 /// The **pair** is the unit, not the game: the two games of a pair share a
 /// seed, so counting them as two independent observations would overstate how
 /// much evidence there is. A pair contributes one observation worth its
 /// half-point score over four, which puts the score on the same per-game scale
-/// the Elo formula expects while keeping the sample size honest.
+/// the fit's logistic expects while keeping the sample size honest.
 ///
 /// Only `game_pairs` jobs matching the pool's `(variant, letterdist, layout)`
 /// scope count, and only where **both** configs are pool members. Plain `games`
 /// jobs are excluded on purpose: `-gp` plays both orderings of every seed, so a
 /// pair is side-balanced by construction, while an unpaired job is not, and
-/// going first is worth real Elo. Pooling unbalanced results would bias every
-/// rating in the direction of whoever happened to start more often.
-async fn build_matrix(
-    conn: &mut PgConnection,
-    pool_id: Uuid,
-) -> AppResult<(Vec<Uuid>, Matrix, u64, i32)> {
+/// going first is worth real rating points. Pooling unbalanced results would
+/// bias every rating in the direction of whoever happened to start more often.
+///
+/// The cross table's evidence comes from the same rows in the same grouped
+/// scan -- each job's spread, games-weighted, beside its pentanomial -- so the
+/// table always describes the evidence the ratings were fitted to.
+async fn build_matrix(conn: &mut PgConnection, pool_id: Uuid) -> AppResult<Evidence> {
     let members = sqlx::query_scalar::<_, Uuid>(
         "SELECT m.player_config_id
          FROM rating_pool_members m
@@ -119,7 +238,8 @@ async fn build_matrix(
          ),
          -- One result per task: a task has one slot.
          job_results AS (
-             SELECT r.job_id, r.pent_0, r.pent_1, r.pent_2, r.pent_3, r.pent_4
+             SELECT r.job_id, r.pent_0, r.pent_1, r.pent_2, r.pent_3, r.pent_4,
+                    r.games, r.p1_score_mean, r.p2_score_mean
              FROM eligible_jobs e
              JOIN game_results r ON r.job_id = e.job_id
              WHERE r.pent_0 IS NOT NULL
@@ -129,7 +249,10 @@ async fn build_matrix(
                 COALESCE(SUM(f.pent_1), 0)::bigint AS pent_1,
                 COALESCE(SUM(f.pent_2), 0)::bigint AS pent_2,
                 COALESCE(SUM(f.pent_3), 0)::bigint AS pent_3,
-                COALESCE(SUM(f.pent_4), 0)::bigint AS pent_4
+                COALESCE(SUM(f.pent_4), 0)::bigint AS pent_4,
+                COALESCE(SUM(f.games), 0)::bigint AS games,
+                COALESCE(SUM(f.games * (f.p1_score_mean - f.p2_score_mean)), 0)::float8
+                    AS spread_sum
          FROM job_results f
          JOIN eligible_jobs e ON e.job_id = f.job_id
          GROUP BY e.p1, e.p2, f.job_id",
@@ -140,6 +263,7 @@ async fn build_matrix(
 
     let mut total_pairs: u64 = 0;
     let mut jobs = std::collections::HashSet::new();
+    let mut head_to_heads: HashMap<(usize, usize), HeadToHeadEvidence> = HashMap::new();
     for row in &rows {
         let p1: Uuid = row.get("p1");
         let p2: Uuid = row.get("p2");
@@ -151,12 +275,14 @@ async fn build_matrix(
         if i == j {
             continue;
         }
+        let mut pentanomial = [0u64; 5];
         let mut pairs = 0.0;
         let mut score_p1 = 0.0;
-        for bucket in 0..5 {
-            let count = row.get::<i64, _>(format!("pent_{bucket}").as_str()) as f64;
-            pairs += count;
-            score_p1 += count * (bucket as f64 / 4.0);
+        for (bucket, slot) in pentanomial.iter_mut().enumerate() {
+            let count = row.get::<i64, _>(format!("pent_{bucket}").as_str());
+            *slot = count.max(0) as u64;
+            pairs += count as f64;
+            score_p1 += count as f64 * (bucket as f64 / 4.0);
         }
         if pairs <= 0.0 {
             continue;
@@ -164,9 +290,21 @@ async fn build_matrix(
         total_pairs += pairs as u64;
         jobs.insert(row.get::<Uuid, _>("job_id"));
         matrix.add(i, j, pairs, score_p1);
+        head_to_heads.entry((i.min(j), i.max(j))).or_default().add(
+            pentanomial,
+            row.get("games"),
+            row.get("spread_sum"),
+            i > j,
+        );
     }
 
-    Ok((members, matrix, total_pairs, jobs.len() as i32))
+    Ok(Evidence {
+        members,
+        matrix,
+        pairs_used: total_pairs,
+        jobs_used: jobs.len() as i32,
+        head_to_heads,
+    })
 }
 
 /// The advisory-lock namespace for rating fits, distinct from dispatch's.
@@ -337,7 +475,8 @@ async fn fit_within(
         }
     }
 
-    let (members, matrix, pairs_used, jobs_used) = build_matrix(&mut *tx, pool_id).await?;
+    let Evidence { members, matrix, pairs_used, jobs_used, head_to_heads } =
+        build_matrix(&mut *tx, pool_id).await?;
 
     if only_if_evidence_changed {
         // The evidence is the pairs *and* who is in the pool. Compared on the
@@ -434,9 +573,13 @@ async fn fit_within(
         .await?;
     }
 
-    // Stored with the run rather than recomputed when the pool is viewed: a
-    // view then costs a read instead of a rebuild of the evidence matrix, and
-    // the residuals describe the evidence this fit actually used.
+    // The cross table -- each head-to-head's score, its error, its spread and
+    // what the ratings predict -- stored with the run rather than computed
+    // when the pool is viewed. Built here it costs nothing: the same grouped
+    // scan the fit needs already read it. Built on a view it was that scan
+    // again on every load of a public, unauthenticated page (see
+    // `rating_run_residuals`), and it would describe evidence that has moved
+    // on from the ratings beside it.
     let residuals = fit.residuals(&matrix);
     if !residuals.is_empty() {
         let mut rows = Vec::with_capacity(residuals.len());
@@ -444,18 +587,26 @@ async fn fit_within(
         let mut pairs = Vec::with_capacity(residuals.len());
         let mut actual = Vec::with_capacity(residuals.len());
         let mut predicted = Vec::with_capacity(residuals.len());
+        let mut stderr = Vec::with_capacity(residuals.len());
+        let mut spread = Vec::with_capacity(residuals.len());
         for residual in &residuals {
+            // `residuals` walks `i < j`, the evidence's own key order.
+            let evidence =
+                head_to_heads.get(&(residual.i, residual.j)).copied().unwrap_or_default();
             rows.push(members[residual.i]);
             cols.push(members[residual.j]);
             pairs.push(residual.games);
             actual.push(residual.actual);
             predicted.push(residual.predicted);
+            stderr.push(evidence.score_and_stderr().1);
+            spread.push(evidence.spread());
         }
         sqlx::query(
             "INSERT INTO rating_run_residuals
-                 (run_id, row_player_config_id, col_player_config_id, pairs, actual, predicted)
+                 (run_id, row_player_config_id, col_player_config_id, pairs, actual, predicted,
+                  stderr, spread)
              SELECT $1, * FROM UNNEST($2::uuid[], $3::uuid[], $4::float8[], $5::float8[],
-                                      $6::float8[])",
+                                      $6::float8[], $7::float8[], $8::float8[])",
         )
         .bind(run_id)
         .bind(&rows)
@@ -463,6 +614,8 @@ async fn fit_within(
         .bind(&pairs)
         .bind(&actual)
         .bind(&predicted)
+        .bind(&stderr)
+        .bind(&spread)
         .execute(&mut *tx)
         .await?;
     }
@@ -574,5 +727,101 @@ pub async fn thin_old_runs(db: &PgPool) -> AppResult<u64> {
         if batch < THIN_BATCH as u64 {
             return Ok(deleted);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn close(got: f64, want: f64) {
+        assert!((got - want).abs() < 1e-12, "{got} != {want}");
+    }
+
+    /// U-RATE-1: a head-to-head's two jobs, one with each config as player 1,
+    /// summed from the first config's side. A seats first in a job of 16
+    /// pairs (pentanomial [1, 3, 7, 3, 2], 32 games, A 10 points a game ahead)
+    /// and second in one of 4 ([2, 1, 1, 0, 0] for B, 8 games, B 6 ahead),
+    /// which from A's side is [0, 0, 1, 1, 2] and 6 behind.
+    ///
+    /// Summed, [1, 3, 8, 4, 4] over N = 20 pairs: a mean of 47/80 = 0.5875,
+    /// a second moment of 27/64, a variance of 27/64 − (47/80)² = 491/6400,
+    /// and a standard error of √(491/6400 / 20) = √(491/128000) =
+    /// 0.0619349457091874…; the spread is (32·10 − 8·6) / 40 = 6.8.
+    #[test]
+    fn a_head_to_head_sums_both_seatings_from_one_side() {
+        let mut a_side = HeadToHeadEvidence::default();
+        a_side.add([1, 3, 7, 3, 2], 32, 32.0 * 10.0, false);
+        a_side.add([2, 1, 1, 0, 0], 8, 8.0 * 6.0, true);
+        assert_eq!(a_side.pentanomial.counts, [1, 3, 8, 4, 4]);
+        let (score, stderr) = a_side.score_and_stderr();
+        close(score, 47.0 / 80.0);
+        close(stderr, 0.061_934_945_709_187_48);
+        close(stderr, (491.0f64 / 128_000.0).sqrt());
+        close(a_side.spread(), 6.8);
+
+        // Which is (W + ½D) / games over the same forty games: A's
+        // half-points, 47 of the 80 they hold.
+        assert_eq!(a_side.pentanomial.half_points(), 47);
+
+        // Built from B's side, it is the mirror image: the same error, the
+        // score complemented, the spread negated.
+        let mut b_side = HeadToHeadEvidence::default();
+        b_side.add([1, 3, 7, 3, 2], 32, 32.0 * 10.0, true);
+        b_side.add([2, 1, 1, 0, 0], 8, 8.0 * 6.0, false);
+        let (b_score, b_stderr) = b_side.score_and_stderr();
+        close(b_score, 1.0 - score);
+        close(b_stderr, stderr);
+        close(b_side.spread(), -6.8);
+    }
+
+    /// U-RATE-2: the error is the pairs', not the games'. Twenty pairs that
+    /// all split say the two are level and nothing else, so the error is 0,
+    /// where counting the forty games as independent coin flips would give
+    /// √(¼ / 40) ≈ 7.9 points of win %.
+    #[test]
+    fn identical_pairs_narrow_the_error_rather_than_widen_it() {
+        let mut level = HeadToHeadEvidence::default();
+        level.add([0, 0, 20, 0, 0], 40, 0.0, false);
+        assert_eq!(level.score_and_stderr(), (0.5, 0.0));
+        assert_eq!(level.spread(), 0.0);
+        // Nothing played: no score to speak of, and no finite error.
+        assert_eq!(HeadToHeadEvidence::default().score_and_stderr(), (0.5, f64::INFINITY));
+    }
+
+    /// U-RATE-3: the page's cross table has each head-to-head from both
+    /// sides, the second the first's mirror, ordered by row then column.
+    #[test]
+    fn a_stored_cell_is_served_from_both_sides() {
+        let (a, b, c) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
+        let ab = CrossCell {
+            row: a,
+            col: b,
+            pairs: 20.0,
+            actual: 0.5875,
+            predicted: 0.56,
+            stderr: 0.0619,
+            spread: 6.8,
+        };
+        let bc = CrossCell {
+            row: b,
+            col: c,
+            pairs: 4.0,
+            actual: 0.25,
+            predicted: 0.3,
+            stderr: 0.1,
+            spread: -12.5,
+        };
+        let cells = both_sides(&[bc, ab]);
+        let order: Vec<(Uuid, Uuid)> = cells.iter().map(|c| (c.row, c.col)).collect();
+        assert_eq!(order, [(a, b), (b, a), (b, c), (c, b)]);
+        let ba = cells[1];
+        assert_eq!((ba.pairs, ba.stderr), (20.0, 0.0619));
+        close(ba.actual, 1.0 - 0.5875);
+        close(ba.predicted, 1.0 - 0.56);
+        assert_eq!(ba.spread, -6.8);
+        let back = ba.mirrored();
+        assert_eq!((back.row, back.col, back.spread), (a, b, 6.8), "mirrored twice is the cell");
+        close(back.actual, ab.actual);
     }
 }

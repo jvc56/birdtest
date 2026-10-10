@@ -6,9 +6,8 @@ test.use({ storageState: ADMIN_STATE });
 
 /**
  * E-12: a games job made through the form with "Position Recorder"
- * ticked shows a signed-in user one saved position at a time on its board --
- * a random one, or one of a rack's -- and tells a signed-out visitor to sign
- * in. The fake workers play synthetic games, 18 to 26 turns each, whose
+ * ticked shows anyone, signed in or not, one saved position at a time on its
+ * board -- a random one, or one of a rack's. The fake workers play synthetic games, 18 to 26 turns each, whose
  * positions are real boards: tiles, both racks, and the play before.
  */
 let api: AdminApi;
@@ -35,8 +34,10 @@ test.beforeAll(async ({ browser, playwright }) => {
   const layout = form.getByLabel('Board', { exact: true });
   const board = layout.locator('option', { hasText: `standard15 (${SEEDED_DATA},` });
   await layout.selectOption((await board.getAttribute('value'))!);
-  await form.getByLabel('Player 1').selectOption({ label: a });
-  await form.getByLabel('Player 2').selectOption({ label: b });
+  // Two players ticked: one job between them.
+  await form.getByLabel(a, { exact: true }).check();
+  await form.getByLabel(b, { exact: true }).check();
+  await expect(form.getByTestId('matchups')).toContainText('2 configs → 1 job');
   await form.getByLabel('Games Per Task').fill('2');
   // No match test, the form's default: the job plays its four games and stops.
   await expect(form.getByLabel('Significance Test')).not.toBeChecked();
@@ -44,10 +45,11 @@ test.beforeAll(async ({ browser, playwright }) => {
   await form.getByLabel('Games To Play').fill('4');
   await form.getByLabel('Position Recorder').check();
   await form.getByRole('button', { name: 'Create job' }).click();
-  await expect(form).toHaveURL(/\/admin\/jobs\/[0-9a-f-]{36}$/);
-  jobId = form.url().split('/').pop()!;
+  // A games or pairs job is started from the allocation page, which marks it new.
+  await expect(form).toHaveURL(/\/admin\/allocation\?new=[0-9a-f-]{36}$/);
+  jobId = new URL(form.url()).searchParams.get('new')!;
   await admin.close();
-  await api.post(`/api/admin/jobs/${jobId}/activate`, { allocation: 10 });
+  await api.allocate(jobId, 10);
 
   const request = await playwright.request.newContext({ baseURL: env.baseURL });
   await waitUntilSettled(request, jobId);
@@ -58,11 +60,12 @@ test.afterAll(async () => {
   await api.dispose();
 });
 
-test('E-12: a signed-in user draws saved positions at random and searches them by rack', async ({ page, browser }) => {
+test('E-12: anyone draws saved positions at random and searches them by rack', async ({ page, browser }) => {
+  // No account is needed: a signed-out visitor sees a position too.
   const signedOut = await browser.newContext({ storageState: { cookies: [], origins: [] } });
   const visitor = await signedOut.newPage();
   await visitor.goto(`/jobs/${jobId}`);
-  await expect(visitor.getByText('Sign in to search them')).toBeVisible();
+  await expect(visitor.getByTestId('saved-position')).toBeVisible();
   await signedOut.close();
 
   await page.goto(`/jobs/${jobId}`);
@@ -142,5 +145,9 @@ test('E-12b: the board fits a phone', async ({ browser }) => {
   expect(box.x + box.width).toBeLessThanOrEqual(screen);
   const scrollWidth = await page.evaluate(() => document.documentElement.scrollWidth);
   expect(scrollWidth, 'page is wider than the screen').toBeLessThanOrEqual(screen);
+  // The rack tiles shrink to fit and stay square: stretched to the line's
+  // height while their width shrank, they were rectangles.
+  const tile = (await page.locator('[data-testid="rack"] .rack-tile').first().boundingBox())!;
+  expect(Math.abs(tile.width - tile.height), `${tile.width} x ${tile.height}`).toBeLessThan(1);
   await phone.close();
 });

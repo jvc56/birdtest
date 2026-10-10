@@ -29,6 +29,13 @@ pub struct JobStats {
     pub tasks_completed: i64,
     pub tasks_available: i64,
     pub tasks_claimed: i64,
+    /// The move generations the job's accepted claims reported: the work done
+    /// for it, whatever the machines (`jobs.movegens`).
+    pub movegens: i64,
+    /// How fast the job is going: the rate [`Self::eta_seconds`] extrapolates,
+    /// in the job's own unit. `None` exactly when there is no recent work to
+    /// measure -- the job is not active, or nothing finished in the window.
+    pub throughput: Option<Throughput>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub games: Option<GameStats>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -54,6 +61,16 @@ pub struct JobStats {
 /// How a job was completed, from its `job.completed` audit row: a job page
 /// said only "completed", and a pairs job stopped by its test and one stopped
 /// at its cap read the same.
+/// A job's recent pace: units finished an hour, over the last hour or since
+/// the job was activated if that is more recent.
+#[derive(Debug, Serialize)]
+pub struct Throughput {
+    pub per_hour: f64,
+    /// What a task is made of: "game" for games and leave-generation jobs,
+    /// "pair" for game pairs, "rack" for opening racks (each rack analysis).
+    pub unit: &'static str,
+}
+
 #[derive(Debug, Serialize)]
 pub struct Completion {
     pub at: chrono::DateTime<chrono::Utc>,
@@ -74,12 +91,21 @@ pub struct JobSummary {
     pub name: String,
     pub job_type: JobType,
     pub status: String,
-    pub allocation: Option<i32>,
+    pub allocation: i32,
     pub min_magpie_version: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub created_by: Option<String>,
     pub lexicon: Option<String>,
     pub variant: Option<String>,
+    /// Tasks that hit the time limit, stopped and handed back or taken back
+    /// at the deadline with their worker alive: the page says how many, since
+    /// the cure is a smaller batch.
+    pub time_limit_declines: i64,
+    /// The job's task time limit, in seconds, which those tasks hit.
+    pub max_task_seconds: i32,
+    /// Why the server switched the job off, while it is off: its tasks kept
+    /// hitting the time limit. `None` for a job an admin switched off.
+    pub set_aside_reason: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -489,7 +515,7 @@ async fn compute_inner(conn: &mut PgConnection, job: &Job) -> AppResult<JobStats
     let tasks_total: i64 = counts.get("total");
     let tasks_completed: i64 = counts.get("completed");
 
-    let eta_seconds = estimate_eta(&mut *conn, job, &games, tasks_total, tasks_completed).await?;
+    let (throughput, eta_seconds) = estimate_pace(&mut *conn, job, &games).await?;
     let (workers, other_workers) = worker_contributions_on(&mut *conn, job.id).await?;
 
     let completion = if job.status == crate::models::job::JobStatus::Completed {
@@ -517,11 +543,18 @@ async fn compute_inner(conn: &mut PgConnection, job: &Job) -> AppResult<JobStats
             created_by,
             lexicon,
             variant,
+            time_limit_declines: job.time_limit_declines,
+            max_task_seconds: job.max_task_seconds,
+            set_aside_reason: (job.status == crate::models::job::JobStatus::Inactive)
+                .then(|| job.set_aside_reason.clone())
+                .flatten(),
         },
         tasks_total,
         tasks_completed,
         tasks_available: counts.get("available"),
         tasks_claimed: counts.get("claimed"),
+        movegens: job.movegens,
+        throughput,
         games,
         opening_racks,
         leave_generation,
@@ -960,19 +993,17 @@ async fn worker_contributions_on(
     ))
 }
 
-/// Throughput over the last hour, extrapolated to whatever is left. For games
-/// and pairs jobs "what's left" is the distance to `max_units`: the target of
-/// a job without a test, and a ceiling for one with it -- that job may well
-/// stop earlier when the test decides.
-async fn estimate_eta(
+/// Throughput over the last hour, and extrapolated to whatever is left. For
+/// games and pairs jobs "what's left" is the distance to `max_units`: the
+/// target of a job without a test, and a ceiling for one with it -- that job
+/// may well stop earlier when the test decides.
+async fn estimate_pace(
     conn: &mut PgConnection,
     job: &Job,
     games: &Option<GameStats>,
-    tasks_total: i64,
-    tasks_completed: i64,
-) -> AppResult<Option<f64>> {
+) -> AppResult<(Option<Throughput>, Option<f64>)> {
     if job.status != crate::models::job::JobStatus::Active {
-        return Ok(None);
+        return Ok((None, None));
     }
 
     // The last hour, or since the job was activated if that is more recent:
@@ -1008,56 +1039,71 @@ async fn estimate_eta(
     .await?;
 
     if recent == 0 {
-        return Ok(None);
+        return Ok((None, None));
     }
-    let per_second = recent as f64 / window_seconds.max(60.0);
+    let claims_per_second = recent as f64 / window_seconds.max(60.0);
+    // A task has one slot, and its units count once: the job's units a second
+    // are its claims a second times the units in a claim's batch.
+    let pace = |unit: &'static str, per_claim: i32| {
+        let per_second = claims_per_second * f64::from(per_claim.max(1));
+        (Throughput { per_hour: per_second * 3600.0, unit }, per_second)
+    };
 
-    // Tasks are made on demand, so `tasks_total - tasks_completed` is only what
+    // Tasks are made on demand, so the job's tasks left undone are only what
     // is in flight: a 3.2-million-rack job 1% done read "three minutes left".
-    // An opening-rack job counts the analyses it still wants instead, at the
-    // rate racks have been analysed; a leave job's remaining work is
-    // generations whose size depends on the draws, so it has no estimate.
-    if job.job_type == crate::models::job::JobType::LeaveGeneration {
-        return Ok(None);
-    }
-    if job.job_type == crate::models::job::JobType::OpeningRack {
-        let (total_racks, racks_per_batch, min_results): (i64, i32, i32) = sqlx::query_as(
-            "SELECT total_racks, racks_per_batch, min_results_per_rack
-             FROM job_opening_rack_config WHERE job_id = $1",
-        )
-        .bind(job.id)
-        .fetch_one(&mut *conn)
-        .await?;
-        // Racks not yet analysed want at least their fewest analyses each;
-        // racks analysed and not yet settled at least one more. A consensus
-        // that is slow to come makes this an underestimate.
-        let unanalysed = (total_racks - job.racks_analyzed).max(0) as f64;
-        let unsettled = (job.racks_analyzed - job.racks_settled).max(0) as f64;
-        let remaining = unanalysed * f64::from(min_results.max(1)) + unsettled;
-        let racks_per_second = per_second * f64::from(racks_per_batch.max(1));
-        return Ok(Some(remaining / racks_per_second));
-    }
-
-    if let Some(stats) = games {
-        let done = stats.units_completed as f64;
-        let target = stats.max_units as f64;
-        if done >= target {
-            return Ok(Some(0.0));
+    // Each type counts what it still wants in its own unit instead.
+    match job.job_type {
+        JobType::OpeningRack => {
+            let (total_racks, racks_per_batch, min_results): (i64, i32, i32) = sqlx::query_as(
+                "SELECT total_racks, racks_per_batch, min_results_per_rack
+                 FROM job_opening_rack_config WHERE job_id = $1",
+            )
+            .bind(job.id)
+            .fetch_one(&mut *conn)
+            .await?;
+            let (throughput, per_second) = pace("rack", racks_per_batch);
+            // Racks not yet analysed want at least their fewest analyses each;
+            // racks analysed and not yet settled at least one more. A consensus
+            // that is slow to come makes this an underestimate.
+            let unanalysed = (total_racks - job.racks_analyzed).max(0) as f64;
+            let unsettled = (job.racks_analyzed - job.racks_settled).max(0) as f64;
+            let remaining = unanalysed * f64::from(min_results.max(1)) + unsettled;
+            Ok((Some(throughput), Some(remaining / per_second)))
         }
-        // Units per claim from the job's batch size: a task has one slot, and
-        // its units count once.
-        let per_batch: i32 = if job.job_type == crate::models::job::JobType::GamePairs {
-            sqlx::query_scalar("SELECT pairs_per_batch FROM job_game_pair_config WHERE job_id = $1")
-        } else {
-            sqlx::query_scalar("SELECT games_per_batch FROM job_game_config WHERE job_id = $1")
+        // Its remaining work is generations whose size depends on the draws,
+        // so it has a pace and no estimate.
+        JobType::LeaveGeneration => {
+            let num_iterations: i32 =
+                sqlx::query_scalar("SELECT num_iterations FROM job_leave_config WHERE job_id = $1")
+                    .bind(job.id)
+                    .fetch_one(&mut *conn)
+                    .await?;
+            Ok((Some(pace("game", num_iterations).0), None))
         }
-        .bind(job.id)
-        .fetch_one(&mut *conn)
-        .await?;
-        let units_per_second = per_second * f64::from(per_batch.max(1));
-        return Ok(Some((target - done) / units_per_second));
+        JobType::Games | JobType::GamePairs => {
+            let (unit, per_batch): (&'static str, i32) = if job.job_type == JobType::GamePairs {
+                (
+                    "pair",
+                    sqlx::query_scalar("SELECT pairs_per_batch FROM job_game_pair_config WHERE job_id = $1")
+                        .bind(job.id)
+                        .fetch_one(&mut *conn)
+                        .await?,
+                )
+            } else {
+                (
+                    "game",
+                    sqlx::query_scalar("SELECT games_per_batch FROM job_game_config WHERE job_id = $1")
+                        .bind(job.id)
+                        .fetch_one(&mut *conn)
+                        .await?,
+                )
+            };
+            let (throughput, per_second) = pace(unit, per_batch);
+            let eta = games.as_ref().map(|stats| {
+                let left = stats.max_units as f64 - stats.units_completed as f64;
+                (left / per_second).max(0.0)
+            });
+            Ok((Some(throughput), eta))
+        }
     }
-
-    let remaining = (tasks_total - tasks_completed).max(0) as f64;
-    Ok(Some(remaining / per_second))
 }

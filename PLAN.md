@@ -17,21 +17,21 @@ Jobs are long-running research goals defined and managed by admins. The followin
 - **Run game pairs** — same as games but run as matched pairs (same seed, players swapped) to reduce variance.
 - **Leave generation**
 
-Each job has a **percentage allocation**, and nothing else decides who gets work: every claim goes to the active job furthest behind its share (measured from when the job last joined the jobs on offer, not over its whole life — see [Workflow](#workflow), step 2), and the active jobs may allocate at most 100% between them (enforced at the application layer, not via a DB constraint, and serialized so two concurrent activations cannot jointly exceed it). There is no priority. A job that should get nothing for now is set to **0%**, which is exactly what the inactive state means, and a job that should get everything is the only one above 0% — so allocation alone expresses every ordering an admin needs, without a second axis to keep coherent with it. Jobs and their allocations are managed by admins only.
+Each job has a **percentage allocation**, and nothing else decides who gets work: every claim goes to the active job furthest behind its share (measured from when the job last joined the jobs on offer, not over its whole life — see [Workflow](#workflow), step 2), and the active jobs may allocate at most 100% between them (enforced at the application layer, not via a DB constraint, and serialized so two concurrent allocation changes cannot jointly exceed it). There is no priority. A job that should get nothing for now is set to **0%**, which *is* the inactive state, and a job that should get everything is the only one above 0% — so allocation alone expresses every ordering an admin needs, without a second axis to keep coherent with it. Jobs and their allocations are managed by admins only.
 
 #### Job Lifecycle Controls
 
-Jobs are created by admins in the **inactive** state and only start receiving work once explicitly activated. The following states are supported:
+Jobs are created by admins **inactive at 0%** and only start receiving work once given an allocation. **The allocation is the only on/off switch**: for a job that is not completed, `active` exactly when its allocation is above 0% (the `jobs_allocation_is_status` check in `0001`, with `allocation NOT NULL DEFAULT 0`). The following states are supported:
 
-- **active** — workers are assigned tasks from this job normally.
-- **inactive** — the job exists and retains all its tasks and results, but workers are not assigned tasks from it. Admins can reactivate it at any time. An active job at **0% allocation** is in the same position — offered to nobody — so the two are interchangeable ways of parking a job; the state is what records that an admin switched it off, and 0% is what an admin sets while rebalancing the others.
-- **completed** — all tasks have been completed, either automatically when the finish condition is met or manually by an admin.
+- **active** — above 0%; workers are assigned tasks from this job normally.
+- **inactive** — at 0%; the job exists and retains all its tasks and results, but workers are not assigned tasks from it. Giving it an allocation again reactivates it. The server switches a job off itself in one case, the same way: three of its tasks in a row hit the [time limit](#task-time-limit), and the job is *set aside*, inactive at 0% with the reason on its page. There used to be a separate activate and deactivate besides the allocation, and with them an active job at 0% — offered to nobody while every page called it running — and an inactive job that remembered a share; they are gone, and deactivated now just means 0%.
+- **completed** — all tasks have been completed, either automatically when the finish condition is met or manually by an admin. A completed job holds **0%**: every completion, the server's or an admin's, writes the allocation to 0 with the status, so its share goes back to the fleet and nothing of it is remembered.
 
-Jobs are created in the **inactive** state. Allocation is not set at creation time — it is supplied by the admin when they activate the job. This keeps the allocation budget coherent: an admin reviews the full set of active jobs, decides the new job's share, and activates it with a specific percentage in a single action.
+Allocation is not set at creation time. The admin sets it on **`/admin/allocation`** (`PUT /api/admin/jobs/allocations`, the only endpoint that activates or deactivates a job), which shows every active and inactive job together and checks the shares as a whole. This keeps the allocation budget coherent: an admin reviews the full set of active jobs, decides the new job's share, and activates it — moving shares from other jobs in the same save if need be. The admin job page shows the job's allocation read-only, with a link there. A games or game-pairs request naming several player configs creates a **round robin** — a job per pairing, all inactive at 0% ([Admin API semantics](#admin-api-semantics)) — and the form lands on `/admin/allocation` with them marked, to be started together.
 
-Admins can deactivate, reactivate, purge, force-complete, or delete a job at any time. **Purge deletes tasks outright** rather than returning them to `available`: every job type generates its tasks on demand, so a purged job regenerates them from the start of its space at the next claim. Leaving the rows behind would advance the seed cursor past work that was never done. Purging also rebuilds the generation-0 zeroed KLV a leave-generation job needs before it can dispatch; the generation-1 rack universe it deleted is seeded again by the first claim, as every generation's is. It takes the job's **merge lock** before anything else — a merge of a leave job's staged results takes the staged rows and then the per-rack rows, a purge deletes them the other way round, and run together the two deadlocked, with the purge the likelier victim: a `500` and nothing deleted (`leave_gen::lock_merges`; it is first in the lock order everywhere, because nothing takes it while holding another lock). Then the job's dispatch lock, the same one every claim takes: a claim in flight has already read the seed cursor and is about to insert its task, which the purge's deletes cannot see, so without the lock the purge finishes and the claim then commits a task into the job it just emptied. It then waits out every open claim's in-flight submission before taking the job's row, which is the order every submission locks in (claim, then task, then job): taken the other way round, a submission arriving mid-purge deadlocked against it, and one that committed between the purge counting contributions and deleting claims was never handed back. Delete takes the same three locks for the same reasons.
+Admins can set a job's allocation (activating or deactivating it), purge, force-complete, or delete a job at any time. **Purge deletes tasks outright** rather than returning them to `available`: every job type generates its tasks on demand, so a purged job regenerates them from the start of its space at the next claim. Leaving the rows behind would advance the seed cursor past work that was never done. Purging also rebuilds the generation-0 zeroed KLV a leave-generation job needs before it can dispatch; the generation-1 rack universe it deleted is seeded again by the first claim, as every generation's is. It takes the job's **merge lock** before anything else — a merge of a leave job's staged results takes the staged rows and then the per-rack rows, a purge deletes them the other way round, and run together the two deadlocked, with the purge the likelier victim: a `500` and nothing deleted (`leave_gen::lock_merges`; it is first in the lock order everywhere, because nothing takes it while holding another lock). Then the job's dispatch lock, the same one every claim takes: a claim in flight has already read the seed cursor and is about to insert its task, which the purge's deletes cannot see, so without the lock the purge finishes and the claim then commits a task into the job it just emptied. It then waits out every open claim's in-flight submission before taking the job's row, which is the order every submission locks in (claim, then task, then job): taken the other way round, a submission arriving mid-purge deadlocked against it, and one that committed between the purge counting contributions and deleting claims was never handed back. Delete takes the same three locks for the same reasons.
 
-A completed job cannot be reactivated, and for the same reason cannot be deactivated: deactivate-then-activate would otherwise restart it. Force-completion is unconditional. (An opening-rack job is the exception: a [consensus edit](#opening-rack-consensus) that unsettles its racks reopens it, force-completed or not.) **A purge returns a completed job to inactive**, and leaves an active or inactive job's state alone: a purged job has nothing left to be complete about, and one left `completed` was an empty job nothing could ever run again — where the purge is meant to start it over.
+A completed job cannot be given an allocation, not even 0%: setting it inactive and then raising it would otherwise restart it. Force-completion is unconditional, and sets the allocation to 0 as every completion does. (An opening-rack job is the exception: a [consensus edit](#opening-rack-consensus) that unsettles its racks reopens it, force-completed or not — inactive at 0%, for the admin to give it an allocation.) **A purge leaves every job inactive at 0%**, as a new one is: a completed job has nothing left to be complete about, and one left `completed` was an empty job nothing could ever run again — where the purge is meant to start it over; an active one stops too, so the emptied job takes no claims until the admin gives it an allocation again, which joins it at parity as any activation does.
 
 **While a purge or delete runs, claims skip the job** (and while an opening-rack job's [consensus edit](#opening-rack-consensus) runs, which holds the same locks) without asking the database (`jobs::DispatchHolds`, an in-process set; the service is a single instance), and nothing else waits on what it holds: a heartbeat skips a locked claim (`FOR UPDATE SKIP LOCKED`), reclamation skips one, a submission or decline for one of the job's claims is answered `503` with `Retry-After` at once (and any other submission waits at most five seconds for its claim's row, `lock_timeout`), and a worker request's `last_seen_at`/`last_used_at` touch skips a locked identity row. What the job's contributors earned is counted before the claims go and given back as the purge's last statement, so their rows are held for milliseconds — given back first, as the eleventh audit left it, every contributor's row was held for the whole purge and every request those identities made waited on it, stalling the fleet the same way through a different table. A purge that ends without committing (the request dropped at the load balancer's timeout, a deadlock) spares the job's claims from reclamation for a heartbeat timeout afterwards: their heartbeats were skipped while it held them, not missed. A consensus edit spares them however it ends, since they outlive it.
 
@@ -70,6 +70,20 @@ A job used to state a `redundancy` X, and each task waited for X independent res
 
 Individual claims are rows in `task_claims`. When a claim's heartbeat times out, that claim row is flipped to `abandoned`, `active_claim_count` is decremented, and the task returns to **available**. Reclamation is lazy — it runs at the moment the next task is requested and the job is a candidate, not via a background process — **and a process reclaims nothing until it has been up for the heartbeat timeout itself** (`scheduler::reclaim_lapsed`). A heartbeat can only arrive at a server that is there to receive it: after an outage longer than the timeout, every open claim in the fleet looks that old however alive its worker, and the first claim request after the restart abandoned all of them — every task in flight handed out again, every result being computed answered `accepted: false`. A live worker's heartbeat arrives within thirty seconds of the server's return, so a claim still silent a full timeout after startup is reclaimed as before; what it costs is that a worker which really did die during the outage is noticed up to one timeout later. A job nobody asks for work from — one that is inactive, completed, or parked at 0% — therefore keeps a lapsed claim on its books until something reclaims it: activation above 0% makes it a candidate again, and starting an [export](#exports) reclaims the job's lapsed claims first, since a completed job is never claimed from again.
 
+#### Task time limit
+
+A task may run for at most its job's **`max_task_seconds`** — one hour unless the job's creation names another, ten minutes to a day, changed on the job's admin page (`PATCH /api/admin/jobs/:id/time-limit`) and read from the job's row at each claim. There is no site-wide limit: a deep-sim pairs job and a static opening-rack job need different ones, and one setting for both was always wrong for one of them. Every assignment states it (`max_task_seconds`) beside the job's name (`job_name`, never empty: a job created without one is named for its type and id), and every claim stores its own deadline, `task_claims.deadline_at` = claim time plus the limit as it stood then, so a change applies to the claims made after it. A heartbeat is not enough to keep a task: a job whose one unit outlasts any machine — a game pair of deep simmers — had its tasks held for as long as their workers lived, and handed out again when they gave up. The floor is ten minutes, not one, because a task's first claim on a machine may build the job's rack info table first — a minute to three, which cannot be stopped part-way and is kept for every task after it — and a limit near that would stop that task every time on every new machine. The column's CHECK holds the same floor as the API, so nothing gets under it; a test that wants a claim past its deadline moves the claim's `deadline_at` and `claimed_at` back instead.
+
+- **The worker stops at the limit.** MAGPIE stops a task that reaches `max_task_seconds` by its usual stop path, hands it back unfinished and declines it `time_limit`. The decline releases the claim at once, like any other, and is counted against the job (`jobs.time_limit_declines`): the job's page says "N tasks hit this job's 1h time limit — lower the batch size, or raise the limit". A `time_limit` decline is a task the worker could run, so it does not undo the job's settling, as `task_failed` does not.
+- **The server stops waiting a minute later** (`scheduler::DEADLINE_GRACE`). Reclamation lapses a claim past its deadline and the grace whether or not its worker still heartbeats — a build that ignores the limit, a solve hung but heartbeating — in the same statement that lapses a silent one, so the two can never both release one claim. A result for such a claim is answered `accepted: false`, as a lapsed claim's is, whether or not reclamation got to it first (a job nobody claims from is never swept, KL-1), and the claim is released in that transaction, its task back out at once. Neither happens while the process is in its startup grace, nor while a job's claims are in the grace after a purge or delete let go of them without committing (`scheduler::deadlines_enforced`): those are the spells in which a worker could not reach its claim — an outage, a purge's `503`s — and a result that could not land sooner is not late by its worker's doing.
+- **A lapse with the worker alive is an overrun.** A solve or a build that overruns MAGPIE's stop declines only after the claim has lapsed, and that decline is a `404`; a build that ignores the limit never declines. Either way the task hit the limit, and a job whose tasks always do would be handed out for ever. So reclamation, lapsing a claim at its deadline, marks it an overrun (`task_claims.overrun = 'pending'`) when its worker was alive when it lapsed: its last heartbeat within the heartbeat timeout of the deadline and grace, however late the sweep comes round. One whose worker had gone silent by then is what a dead worker leaves, and is not marked. A result refused past its deadline marks its claim too — that worker is plainly alive. An overrun counts toward setting the job aside as a `time_limit` decline does.
+- **Three in a row set the job aside.** `jobs.time_limit_streak` counts the job's `time_limit` declines and overruns since a task of it was last completed; every accepted result zeroes it (in the `UPDATE jobs` every submission already makes). `jobs.time_limit_declines`, the page's "N tasks hit the time limit", counts both. The third in a row sets the job aside: inactive at 0% in one write, as `set_allocations` leaves a job at 0%, so `jobs_allocation_is_status` holds; a `job.set_aside` audit row with no actor, from its share ("50% -> 0%: …"); and the reason on the job (`jobs.set_aside_reason`), which its page shows in place of "Paused". Three rather than one: one is a slow machine or an unlucky batch, and a declined task goes to another worker (a worker is not handed back a task it declined within the hour); three with nothing completed between is a batch too big for the limit. A job's batch is fixed at its creation, so the cure is a new job with a smaller batch, or a longer limit — and an allocation, which clears the reason and starts the run afresh. A purge zeroes all three columns, and deletes the claims an uncounted overrun is marked on.
+- **Overruns are counted lazily, in order.** Reclamation runs over every candidate job in one statement on the claim path, and taking their rows there would serialize every claim behind it, so it only marks an overrun. It is counted (`pending` → `counted`, `worker::record_time_limit`) by whoever next holds the job's row for it: the job's next claim (`scheduler::count_overruns`, after reclamation and before anything is handed out), a `time_limit` decline, or a result refused past its deadline. Counted late, an overrun joins the run only if its deadline came after the run began — `jobs.time_limit_streak_since`, set by every accepted result and by the allocation that puts an inactive job back — and otherwise counts toward the total alone: an overrun from before a completion is not part of the run that completion ended. A job the claim's count sets aside is dropped from that claim's candidates, so the claim that found it is handed another job's task, or none.
+- **What a claim pays.** One statement per claim request, asking which candidate jobs have an uncounted overrun, through `task_claims_overrun_idx` — a partial index on `job_id` holding only `pending` overruns, each from the reclamation that marks it to its job's next claim, decline or late result: all but always empty, and never more than the claims that were in flight. Only a job that has one pays more: a short transaction of its own under the job's dispatch lock (`try_lock_job_dispatch`'s bounded wait; a job a purge or delete holds, or whose lock does not come, is left to the next claim), and a failure is logged, not fatal.
+- **Lock order.** The decline holds its claim (`FOR UPDATE`, under the five-second claim lock wait, and answered `503` while a purge or delete holds the job, as before), then its task (`release_claim`), then the job's row (`record_time_limit`): claim, then task, then job, the order every submission and purge takes. The deadline's refusal of a result takes the same three, its claim, task and job. Counting overruns takes the job's row and then the job's `pending` claims — the job's row first, by every caller, so two counts queue on the row rather than lock the same claims in two orders. Nothing else locks an abandoned claim (a submission, a decline, a heartbeat and reclamation take only open ones) but a purge or a delete, which holds the job's dispatch lock throughout — the claim path's count takes that lock first, and a decline or a refusal holds an open claim the purge waits out before it takes the job's row. Reclamation still skips a locked claim, deadline or not, and takes no job's row.
+
+A fleet on a MAGPIE that honours the limit declines `time_limit`; a fleet that ignores it, or a task that overruns the stop, is taken back a minute past the deadline and counted as an overrun; either way three in a row set the job aside. Only a worker that was silent when its claim lapsed counts toward nothing.
+
 #### Task Generation
 
 Every job type generates its tasks **on demand**: the next task request is generated, inserted and claimed in one transaction at claim time. A task whose claim lapsed or was declined returns to `available` and is re-dispatched before anything new is generated. There is no pre-populated strategy (see [Creation Strategies](#creation-strategies)).
@@ -81,8 +95,8 @@ Every job type generates its tasks **on demand**: the next task request is gener
 1. The worker sends a **task claim** to the server — a minimal message identifying itself and signaling it is ready for work.
 2. The system selects the active job **most behind its configured allocation share** — specifically, among active jobs with an allocation above 0%, the one with the lowest ratio of `(claims_issued - claims_baseline) / allocation`, where `jobs.claims_issued` counts every claim ever issued for that job, **including abandoned and declined ones** — a claim consumed real dispatch capacity at the moment it was issued regardless of what happened to it afterward, so the count only ever goes up (a purge, which deletes the claims it counts, resets it). It is a counter rather than a `COUNT(*)` over `task_claims` because selection runs on every claim request, and a count grows with each job's whole history. Excluding abandoned claims would let a job with flaky or slow workers accumulate a disproportionate share by having its timeouts discounted, and would make the count non-monotonic — the opposite of what the deficit-based scheduler needs. Ties are broken by job creation order (oldest first). This is a deterministic deficit-based selection; no randomness is involved.
 
-   **A job's share is measured from when it joined, not from when it was created.** `jobs.claims_baseline` is reset — on activation, which is also how an allocation is changed, and on a purge — so that the job's ratio equals the **lowest ratio among the other jobs being served** (`scheduler::join_at_parity`), and it takes its share from then on. *Being served* means a claim issued within the heartbeat timeout of the most recent claim of any other job on offer — `jobs.last_claimed_at`, which rides the `UPDATE jobs` every claim already makes — measured from the latest claim rather than from now, so after a quiet spell (a deployment gap, a quiet night) the jobs that were being served when the fleet stopped still set the pace; with no other job ever claimed, the highest ratio on offer, or zero. Joining is then **settled**: for an hour after it joined (`scheduler::JOIN_SETTLE`, from `jobs.activated_at`, which every join sets), each claim of the job lifts it level with the lowest of the claiming worker's other candidates — the ones it just passed over included — less one claim of that job and one of this one, the slack the turn check allows (`scheduler::issue_claim`, `pace_for`). A worker that declines the job because it cannot run it at all (`missing_data`, `magpie_version`, `unknown_job_type`, `derived_mismatch`) undoes the settling its claim gave (`scheduler::unsettle`): the server cannot filter a data gap, so every worker without the job's data is issued one claim of it, and that claim had settled a job only a minority could run at the majority's pace — past the minority's own lagging job, where the minority never reached it (none of 400 claims). Two more rules keep a job with nothing to hand out from banking debt: **a job passed over for want of a task is lifted to where the job the worker claims stood before its claim** (`scheduler::lift_passed_over`, after the claim commits, skipping a row somebody holds) — a games job whose every game is in flight, a generation being built, a dispatch hold (a seeding, a purge) — and **a job not served for a heartbeat timeout rejoins at parity on its first claim back, which starts its settling** (`scheduler::issue_claim`) — one whose MAGPIE floor was above the fleet's, whose data was not out. Every one of these only ever raises a job's ratio. The reason for the two steps is that a fleet split by capability — a release rolling out, data some workers lack — has no single pace: each class of workers runs its jobs at its own rate, and a job only some can run lags the rest for as long as the split lasts. That lag is the scheduler working (the minority's job gets all of the minority), but it means no one join point is right. What each single point did (the thirty-second audit, passes 19 and 20): level with the lowest of *every* job on offer, a newcomer was level with a job nobody could run and took twelve of the next twelve claims; level with the *leader*, a newcomer only the lagging class could run starved behind that class's job — none of the next 1,000 claims; bounding every job's lag behind the job just claimed to make up for that scrambled the jobs that lagged together (two at 45% split 978 : 22) and made a concurrent burst to a small job permanent (64 to 87 claims where 30 is fair); and level with the lowest *served*, a newcomer everyone could run was level with a job only a minority could run and took the majority's claims until it had caught theirs — the majority job's first claim came 331st, and an allocation changed from 20% to 19% did the same. Settled against the next candidate only, a job that paused for one claim let a newcomer be settled past it; and settling forgave the payback of a concurrent burst (307 to 324 claims where 30 is fair) until claims were checked for their turn. Joined at the lowest served, a job is below no class's pace, so it is never starved; settled, the first claim from each class that runs faster puts it level with that class's jobs, so it takes nothing over; and a structural lag is never lifted, because within the class that runs it a lagging job keeps pace. The limits of the hour and of the lift are KL-89. This is start-time fair queuing's rule — a flow that (re)joins starts at the current virtual time, of the workers that will serve it, and a flow with nothing to send earns no credit — and it is what makes "no starvation" true. Measured over a job's whole life, as it was, every change to the set of jobs was a takeover: a job activated beside one that had issued two million claims had a ratio of zero, so it was first in every candidate list until it had issued two million of its own, and the older job — at the same 50% — got *nothing* for as long as that took. A purge (which zeroes `claims_issued`), a reactivation after a week switched off, and an allocation raised from 10% to 50% (which cuts the ratio to a fifth) all did the same. With the baseline, the shares an admin sets are the shares the fleet sees from that moment, selection is still one deterministic statement, and the long-run ratios still converge on the allocations, because every job's numerator counts from the same point in the fleet's history. The baseline can be negative (a job with no claims joining a busy fleet is credited the claims that put it level).
-3. Expired claims for the candidate jobs are lazily reclaimed, in one statement: each timed-out `task_claims` row is flipped to `abandoned`, `active_claim_count` is decremented, and their tasks return to `available`. A claim somebody holds locked — a submission, a decline, a purge — is skipped rather than waited on (`FOR UPDATE SKIP LOCKED`): it is not lapsed in any sense that matters, and the next claim request reclaims it if it still needs to be.
+   **A job's share is measured from when it joined, not from when it was created.** `jobs.claims_baseline` is reset — on an allocation change, which is also how a job is activated (a purge zeroes it with the job left inactive, to rejoin when activated again) — so that the job's ratio equals the **lowest ratio among the other jobs being served** (`scheduler::join_at_parity`), and it takes its share from then on. *Being served* means a claim issued within the heartbeat timeout of the most recent claim of any other job on offer — `jobs.last_claimed_at`, which rides the `UPDATE jobs` every claim already makes — measured from the latest claim rather than from now, so after a quiet spell (a deployment gap, a quiet night) the jobs that were being served when the fleet stopped still set the pace; with no other job ever claimed, the highest ratio on offer, or zero. Joining is then **settled**: for an hour after it joined (`scheduler::JOIN_SETTLE`, from `jobs.activated_at`, which every join sets), each claim of the job lifts it level with the lowest of the claiming worker's other candidates — the ones it just passed over included — less one claim of that job and one of this one, the slack the turn check allows (`scheduler::issue_claim`, `pace_for`). A worker that declines the job because it cannot run it at all (`missing_data`, `magpie_version`, `unknown_job_type`, `derived_mismatch`) undoes the settling its claim gave (`scheduler::unsettle`): the server cannot filter a data gap, so every worker without the job's data is issued one claim of it, and that claim had settled a job only a minority could run at the majority's pace — past the minority's own lagging job, where the minority never reached it (none of 400 claims). Two more rules keep a job with nothing to hand out from banking debt: **a job passed over for want of a task is lifted to where the job the worker claims stood before its claim** (`scheduler::lift_passed_over`, after the claim commits, skipping a row somebody holds) — a games job whose every game is in flight, a generation being built, a dispatch hold (a seeding, a purge) — and **a job not served for a heartbeat timeout rejoins at parity on its first claim back, which starts its settling** (`scheduler::issue_claim`) — one whose MAGPIE floor was above the fleet's, whose data was not out. Every one of these only ever raises a job's ratio. The reason for the two steps is that a fleet split by capability — a release rolling out, data some workers lack — has no single pace: each class of workers runs its jobs at its own rate, and a job only some can run lags the rest for as long as the split lasts. That lag is the scheduler working (the minority's job gets all of the minority), but it means no one join point is right. What each single point did (the thirty-second audit, passes 19 and 20): level with the lowest of *every* job on offer, a newcomer was level with a job nobody could run and took twelve of the next twelve claims; level with the *leader*, a newcomer only the lagging class could run starved behind that class's job — none of the next 1,000 claims; bounding every job's lag behind the job just claimed to make up for that scrambled the jobs that lagged together (two at 45% split 978 : 22) and made a concurrent burst to a small job permanent (64 to 87 claims where 30 is fair); and level with the lowest *served*, a newcomer everyone could run was level with a job only a minority could run and took the majority's claims until it had caught theirs — the majority job's first claim came 331st, and an allocation changed from 20% to 19% did the same. Settled against the next candidate only, a job that paused for one claim let a newcomer be settled past it; and settling forgave the payback of a concurrent burst (307 to 324 claims where 30 is fair) until claims were checked for their turn. Joined at the lowest served, a job is below no class's pace, so it is never starved; settled, the first claim from each class that runs faster puts it level with that class's jobs, so it takes nothing over; and a structural lag is never lifted, because within the class that runs it a lagging job keeps pace. The limits of the hour and of the lift are KL-89. This is start-time fair queuing's rule — a flow that (re)joins starts at the current virtual time, of the workers that will serve it, and a flow with nothing to send earns no credit — and it is what makes "no starvation" true. Measured over a job's whole life, as it was, every change to the set of jobs was a takeover: a job activated beside one that had issued two million claims had a ratio of zero, so it was first in every candidate list until it had issued two million of its own, and the older job — at the same 50% — got *nothing* for as long as that took. A purge (which zeroes `claims_issued`), a reactivation after a week switched off, and an allocation raised from 10% to 50% (which cuts the ratio to a fifth) all did the same. With the baseline, the shares an admin sets are the shares the fleet sees from that moment, selection is still one deterministic statement, and the long-run ratios still converge on the allocations, because every job's numerator counts from the same point in the fleet's history. The baseline can be negative (a job with no claims joining a busy fleet is credited the claims that put it level).
+3. Expired claims for the candidate jobs are lazily reclaimed, in one statement: each timed-out `task_claims` row — silent for the heartbeat timeout, or past its [deadline](#task-time-limit) and a minute's grace however recently it heartbeat — is flipped to `abandoned`, `active_claim_count` is decremented, and their tasks return to `available`. A claim somebody holds locked — a submission, a decline, a purge — is skipped rather than waited on (`FOR UPDATE SKIP LOCKED`): it is not lapsed in any sense that matters, and the next claim request reclaims it if it still needs to be. One lapsed at its deadline with its worker alive is marked an overrun, and the overruns not yet counted against the candidate jobs are counted then; a job they set aside is not a candidate for this claim ([Task time limit](#task-time-limit)).
 4. The system acquires the next task (one being re-dispatched, or else one generated on demand), inserts a `task_claims` row, increments `active_claim_count`, and issues a claim token (UUID) to the worker.
 5. The server responds with the **task request** for that job type.
 6. The worker performs the task and submits a **task response** along with the claim token.
@@ -217,8 +231,8 @@ rack analysis and positions captured during games.
 `games` and `game_pairs` jobs can keep the position analyses their workers
 produce while playing, by setting `capture_positions`. A worker analyses a
 position on every turn regardless; this decides whether those are recorded
-rather than discarded, turning a job run to settle an Elo question into a corpus
-of analysed positions as well.
+rather than discarded, turning a job run to settle which player is stronger
+into a corpus of analysed positions as well.
 
 A `game_pairs` job can keep less: with `capture_first_divergence` as well, only
 each pair's **first divergence**. A pair's two games share their tiles and swap
@@ -452,7 +466,7 @@ Why this method, and the choices in it:
   the chance of ever naming a winner between them is at most about α, split
   between the two sides. Simulated, checked after every batch of 50 pairs from
   500 to 10,000, equal players got a winner in at most α + 2% of runs, and a
-  player scoring 53.5% per game (about +24 Elo) was found better in at least
+  player scoring 53.5% per game was found better in at least
   90% of them (TESTING.md, `U-STATS-3b`).
 - **It needs only stored sums.** n, μ̂ and σ̂² come from the stored counts at
   any moment, in any order, so it is recomputed on every read, as the SPRT
@@ -490,12 +504,14 @@ running for ever. Before anything is played the mean is ½ and the interval
 every score. The status is one of `running`, `player1_better`,
 `player2_better`, `inconclusive`.
 
-**Elo is for display.** `elo(s) = −400·log10(1/s − 1)` is applied to μ̂ and to
-both bounds, clamped at ±1000 where a bound reaches 0 or 1. A pair's `i/4` is
-player 1's per-game score, so the Elo is per game for both job types. The job
-page's Significance Test card says it in one sentence ("static-equity scores 53.1% per
-game (95% interval 51.2% to 55.0%).") over a bar of the interval around 50%;
-the Elo figures are in the API, and the card shows none.
+**No rating scale.** The result is player 1's per-game score and its interval
+(a pair's `i/4` is a per-game score, so both job types read alike), and
+nothing on a rating scale is derived from it: the Elo figures the API once
+carried beside them are gone, so no number on a job's page can be mistaken for
+a pool's rating, whose scale is WESPA's ([The scale is
+WESPA's](#the-scale-is-wespas)). The job page's Significance Test card says it in
+one sentence ("static-equity scores 53.1% per game (95% interval 51.2% to
+55.0%).") over a bar of the interval around 50%.
 
 #### The pentanomial, and why pairs are the unit
 
@@ -522,10 +538,10 @@ exactly at even and both views land on the same side of it, but it destroys the
 magnitude and with it the test's purpose. Take 20,000 games split 9,950-10,050,
 of which only 100 diverged and one player took 99 of them:
 
-| Sample | Score rate | Implied difference |
+| Sample | Score rate | Below even |
 |---|---|---|
-| Every pair (10,000 of them) | 0.4975 | about **-1.7 Elo** |
-| The 50 divergent pairs alone | 0.01 | about **-800 Elo** |
+| Every pair (10,000 of them) | 0.4975 | **0.25** percentage points |
+| The 50 divergent pairs alone | 0.01 | **49** percentage points |
 
 Same games. A test fed the second number decides almost immediately, on a
 hundredth of the evidence, whatever confidence it is asked for, and reports
@@ -546,8 +562,8 @@ system is read while dispatching, claiming, validating or completing a task, and
 no job decision reads a rating. The coupling runs one way: a fit reads finished
 `game_results` and writes a snapshot. The match test stays where it belongs,
 on the job config tables — it is a per-job **stopping rule**, not a
-measurement, and the Elo it shows is one comparison's score rather than
-anyone's rating.
+measurement, and the score it shows is one comparison's rather than anyone's
+rating.
 
 Everything below lives in four `rating_*` tables and one module. See
 the [Schema](#schema-1) ("Ratings") for the tables and [Two things the fit has to
@@ -575,9 +591,11 @@ Ratings are **displayed on the ratings pages and nowhere else**:
 - `/ratings` (`GET /api/rating-pools`) — every pool with its conditions,
   member count and the time of its last fit.
 - `/ratings/[id]` (`GET /api/rating-pools/:id`) — the pool's **newest run**:
-  each member's rating with its standard error as a dot plot and a table, the
+  each member's rating with its standard error as a dot plot (and, for an
+  admin, a table), the
   run's provenance (trigger, iterations, convergence, evidence consumed), and
-  the residual table showing where the fit disagrees with the games. A config
+  the [cross table](#the-cross-table) of every head-to-head, whose hover shows
+  where the fit disagrees with the games. A config
   with no path of games to the anchor is listed as unrated rather than drawn.
   Admin membership controls appear inline here for admins, with the anchor
   (config and rating) and a Delete button. They work from the pool's members,
@@ -613,6 +631,51 @@ the filter buys nothing while costing path dependence, and the question "should
 a bot's rating be fixed once it is established?" has no good answer because
 *establishing* one incrementally is the wrong move to begin with.
 
+#### Why not WESPA's Glicko
+
+WESPA rates people with Glicko, and a word game's own system is the obvious one
+to borrow. It was weighed and is **not implemented**. Beyond the drift
+above, which a fixed config does not have:
+
+- **Order matters.** Glicko updates one rating period at a time, so the same
+  results in a different order give different ratings. Results arrive in
+  whatever order volunteers finish them, and purges and reruns would reshuffle
+  ratings. Bradley-Terry uses all the evidence at once and does not care about
+  order.
+- **The uncertainty never shrinks.** WESPA's RD floor (50 to 75 by band) is
+  there to keep human ratings responsive. For a bot with 100,000 games it means
+  the rating keeps moving as if it were uncertain by ±50, where Bradley-Terry's
+  standard error shrinks with the evidence.
+- **Periods would be arbitrary.** There are no tournaments. Any choice of
+  period (a day, a batch, a job) is arbitrary and changes the numbers.
+- **The calibration is for humans.** Newcomer seeding (five virtual games at
+  1500), an initial RD of 300 and the RD bands are calibrated to WESPA's human
+  population. Bot ratings would land in bands that depend on where the anchor
+  sits.
+- **Game pairs lose their advantage.** Glicko's updates are per game; feeding
+  it pairs throws away the variance reduction game pairs exist for.
+
+The same reasoning is in `stats/bradley_terry.rs`'s module doc. What is taken
+from WESPA is its scale, below.
+
+#### The scale is WESPA's
+
+A rating gap Δ predicts a score of `1 / (1 + e^(−Δ/250))`: 250 points per
+logit (`bradley_terry::POINTS_PER_LOGIT`), WESPA's k. WESPA's Glicko predicts
+`1 / (1 + e^(−gΔ/250))` between two players, with g about 0.95 to 0.99 between
+established ones, so a gap in birdtest predicts the win % the same gap does
+between two established WESPA players, to within about 1 to 5%: 100 points is
+59.9%, and a 75% score is 250·ln 3 ≈ 275 points. (Until October 2026 the fit
+used Elo's 400/ln 10 ≈ 174 points per logit, on which 100 points was 64.0%.)
+Standard errors, the residuals' predicted scores and the convergence test all
+use the same constant; the priors are in log-strength units and do not.
+
+What the scale cannot match is the **absolute level**. Bot-against-bot results
+say nothing about strength against people, so a number is only as meaningful
+as the anchor's: the default 2000 reads as a strong club player's, and an admin
+can pin a pool's anchor anywhere. The ratings page says so under its table,
+and labels the column "Rating (WESPA scale)".
+
 What birdtest actually has is a static tournament: N configs and a matrix of
 pairwise results. The right tool is a **batch maximum-likelihood fit** over the
 whole matrix at once — Bradley-Terry, solved by Newton's method,
@@ -630,13 +693,13 @@ Three properties follow, and they are the reasons for the choice:
   No other rating is ever frozen.
 
 The fit is Newton's method on the log-strengths, with a backtracking line
-search, no step moving any config more than about 1,400 Elo, a small step
+search, no step moving any config more than 2,000 points, a small step
 taken whole, and damping if rounding makes the curvature fail to factor. The
 objective, the likelihood plus the prior below, is strictly concave, so it has
 one answer; each step solves for every config at once through the full
 curvature, which is what a group of configs that moves together needs. (Without the step bound, clean sweeps that
-contradict the rest of a pool could throw one config thousands of Elo away in a
-single step, where every head-to-head it has saturates and the fit stalls; the
+contradict the rest of a pool could throw one config thousands of points away in
+a single step, where every head-to-head it has saturates and the fit stalls; the
 thirty-second audit's adversarial check found that.) Minorization-maximization, which the fit used until the thirty-second
 audit, updated one config at a time and crept toward such a group's answer,
 stopping at its iteration cap short of it (KL-74). A step is a Cholesky
@@ -658,12 +721,54 @@ score versus model-predicted score for each head-to-head — say exactly where t
 model is lying. A rock-paper-scissors triangle shows up as three large,
 sign-flipped residuals and as ratings that collapse toward each other. An
 incremental filter cannot show this at all; it just oscillates quietly. The
-ratings page therefore carries the scalar rating as the headline and the residual
-table beside it, and says so when the residuals are large enough that the
-ranking should not be read as one: three or more head-to-heads at least five
+ratings page therefore carries the scalar rating as the headline and the cross
+table beside it -- each cell's hover gives what the ratings predict, and a cell
+they predict badly is amber -- and says so when the residuals are large enough
+that the ranking should not be read as one: three or more head-to-heads at least five
 points off *and* at least three standard errors from zero on the pairs behind
 them (`charts/residuals.ts`). Without the second condition a young pool — a few
 pairs per head-to-head — showed the warning on sampling noise alone.
+
+#### The cross table
+
+First on the pool page, above the ratings, every head-to-head is laid out as a
+cross table:
+an n × n matrix of the configs the latest fit rated, best first (then any with
+no chain of games to the anchor), with each config's rating in the rightmost
+column. A cell is the row config's record against the column's, from the
+row's side:
+
+- **Win %**, (W + ½D) / games — the pentanomial's half-points over its games,
+  the score the fit itself reads.
+- **± its standard error**, from the pairs, not the games. A pair is the
+  independent unit and scores `k/4` for bucket `k`, the mean of its two games'
+  scores and so already per game; over the head-to-head's summed pentanomial
+  (`N` pairs, mean `m`), `s² = Σ c_k·(k/4)² / N − m²` and the error is
+  `√(s²/N)`, shown in percentage points. Counting the games as independent
+  (`√(m(1−m)/2N)`) would undo what pairing buys: pairs that played identically
+  all score ½ and narrow the error, as they should.
+- **Average spread**, `Σ games·(p1_mean − p2_mean) / Σ games` over the same
+  `game_results` rows, from the row's side.
+
+The evidence is exactly the fit's: the same pool-scoped `game_pairs` jobs
+between two members, summed per pair of configs whichever seats them (a job
+with the configs the other way round is flipped, bucket `k` to `4 − k` and the
+spread negated). A cell's mirror across the diagonal is the same games: 100 −
+the win %, the same error, −the spread. The residual is folded into each
+cell's hover — what the ratings predict, and how far off — and a cell they
+predict badly on enough pairs that it is not chance is amber; three or more
+raise the warning above.
+
+**Stored per run, not computed on request.** The cells come from the grouped
+scan `build_matrix` already makes for the fit (each job's games and
+games-weighted spread beside its pentanomial), so a fit stores them in
+`rating_run_residuals` with its ratings at no extra read: the head-to-head's
+`stderr` and `spread` beside its `actual` and `predicted`, once per
+head-to-head, mirrored by the API (`ratings::both_sides`). Computing them on
+request would be that scan again on every view of a public page — the cost
+the residuals were moved into the run to escape — and could show evidence that
+has moved on from the ratings beside it. On a phone the table scrolls
+sideways inside its card, the config names held in a sticky first column.
 
 #### What counts as evidence
 
@@ -672,8 +777,8 @@ configs in the pool.
 
 Plain `games` jobs are excluded deliberately. `-gp` plays both orderings of every
 seed, so a pair is **side-balanced by construction**; an unpaired job is not, and
-going first in a word game is worth real Elo. Pooling unbalanced results would
-bias every rating toward whoever happened to start more often. Including them
+going first in a word game is worth real rating points. Pooling unbalanced
+results would bias every rating toward whoever happened to start more often. Including them
 would require an explicit side-advantage term in the model, which is not worth
 the complexity while every rating-relevant job is paired anyway.
 
@@ -717,27 +822,27 @@ listed the pool before the delete skips it without logging a failure.
   bot's first job looks like — and undefined for a config with no games. So
   every config, the anchor included, plays virtual drawn games against a
   virtual config at the pool's *centre*, the plain mean of every rating, on a
-  logistic twice as wide as real games' (about 350 Elo against 174): two for a
-  config with no games, fading with its real ones as `2 / (1 + g/200)` but
+  logistic twice as wide as real games' (500 points a logit against 250): two
+  for a config with no games, fading with its real ones as `2 / (1 + g/200)` but
   never below a fifth, since the prior is for the barely played. That
   keeps every rating finite and the objective strictly concave: one answer,
   continuous in the scores, and conceding a point lowers a config against its
   opponent (its own rating, too, all but about once in 500 fuzzed cases, by
-  under an Elo). The
+  under a point and a half). The
   pull is toward the pool's centre, not the anchor, so a field or group far
   from the anchor is not dragged back to it; and it joins configs only through
   the centre, never to each other. Its cost is a pull that levels off at a
   constant per config, however far a config is from the centre, and adds up
-  along a thin chain: a 12-rung ladder, each rung 100 Elo above the last and
-  played only against it over 100 pairs, has its top some 40 Elo low, about a
+  along a thin chain: a 12-rung ladder, each rung 144 points above the last and
+  played only against it over 100 pairs, has its top some 60 points low, about a
   third of its error (KL-79). The wider scale and the fade are what keep that
   small: left whole on well played configs, the pulls held a strong tier joined
-  to the rest by one job some 345 Elo low, nearly four errors. The
+  to the rest by one job some 500 points low, nearly four errors. The
   thirty-second audit tried six other priors, and each pulled some shape of
   pool where the evidence was fine: two draws per config against the anchor, a field or thinly linked group
-  far from it (a 30-member group 200 Elo low, KL-74); two per config spread
+  far from it (a 30-member group 290 points low, KL-74); two per config spread
   over its opponents, a config over a gauntlet of lightly played ones; draws
-  only where the maximum likelihood diverges, a 200-Elo jump when a newcomer
+  only where the maximum likelihood diverges, a 290-point jump when a newcomer
   conceded a quarter point; Firth's penalty, which is not concave, two answers
   for a config between far-apart opponents; the centre prior left whole, a
   thinly joined strong tier held nearly four errors low; and a centre fitted as
@@ -752,14 +857,14 @@ listed the pool before the delete skips it without logging a failure.
 Standard errors come from the inverse of the full Fisher information over the
 anchor's component, counting each paired game as one trial, so a config's
 error includes the uncertainty of every link between it and the anchor: a
-group joined to the anchor by one 300-pair job carries that job's ±28 Elo,
-where the diagonal the fit used until the thirty-second audit showed ±2 (KL-74).
+group joined to the anchor by one 300-pair job carries that job's ±40 points,
+where the diagonal the fit used until the thirty-second audit showed ±3 (KL-74).
 Each error is also widened by how far the prior holds that config from where
 its games alone would put it — one Newton step on the games from the answer,
 `I⁻¹ · ∇prior`, taken one and a half times since one step underestimates a
 pull that has saturated — added to its variance. The prior's pulls add up
 across a group joined to the rest thinly, which no weighting of it removes
-(KL-79): two tiers of lightly played configs 600 to 800 Elo apart, joined by
+(KL-79): two tiers of lightly played configs 860 to 1,150 points apart, joined by
 one small job, put the upper one about two of the games' errors low, its 95%
 interval covering the truth 30 to 65% of the time; with the pull in its error,
 95 to 100%. Two further approximations remain, and both widen the errors. Counting a pair (two games,
@@ -966,16 +1071,17 @@ Shows all jobs with: job type, status, allocation, and a completion counter (tas
 
 - Job metadata: type, status, config summary, created by, created at.
 - Completion progress.
+- **Tasks that hit the time limit**: "N tasks hit this job's 1h time limit — lower the batch size, or raise the limit" beside the status, once any has; and for a job the server set aside for them, why, in place of "Paused" ([Task time limit](#task-time-limit)).
 - **Per-worker contribution table**: worker identity (username, or an anonymous worker's pseudonym — never its UUID, which is its credential), tasks completed for this job and the compute time those claims were held (on a wide screen). Sorted by tasks completed descending.
 
 #### Job Detail Page — By Job Type
 
 **Games / Game pairs**
 
-- A **Significance Test** card, for a job that runs the test (one without has none, and `games.test` is `null`): a status badge (`running`, `player 1 better`, `player 2 better`, `inconclusive`, or paused or undecided from the job's own status), one sentence — "static-equity scores 53.1% per game (95% interval 51.2% to 55.0%)." (nothing in Elo) and, once decided, which player is better at that confidence — a bar of the interval on a scale of player 1's score with 50% marked, and a folded explanation with the job's own confidence.
+- A **Significance Test** card, for a job that runs the test (one without has none, and `games.test` is `null`): a status badge (`running`, `player 1 better`, `player 2 better`, `inconclusive`, or paused or undecided from the job's own status), one sentence — "static-equity scores 53.1% per game (95% interval 51.2% to 55.0%)." (nothing on a rating scale) and, once decided, which player is better at that confidence — a bar of the interval on a scale of player 1's score with 50% marked, and a folded explanation with the job's own confidence.
 - The pentanomial (game pairs only), in the Significance Test card: the pair outcomes the test is computed from, as three rows (won both, won one and drew one, even) with a column per player and each count's share of the pairs (`lib/charts/pentanomial.ts` `PAIR_OUTCOMES`). Ratings are not here — they are pool-scoped and live on the [ratings page](#the-ratings-page).
 - A **match score** card, after the settings and before the Significance Test card: a table with a column per player and a row each for wins, losses, draws, average score per game and average spread, the better figure of each row green and the worse red (`MatchScore.svelte`, `lib/matchScore.ts`). A pairs job has a second table beside it, **Games that diverged**, over only the games of the pairs whose two games did not play identically (`games.divergent`). It counts games for a pairs job too. For a job without a test it is the job's result. The averages are the batches' `p1_score_mean` / `p2_score_mean` weighted by their games, over every result of the job (one per task; `jobstats::SCORE_MEANS`).
-- **Saved positions**, for a job with `capture_positions` set: one captured position at a time, drawn on the job's own board (`Board.svelte`) — its premium squares from the layout, the tiles with their letters and scores (a blank in lower case, scoring nothing), both racks and scores with the player to move marked, and the tiles the move before it placed outlined — beside its ranked moves — each with its win percentage, how often the simulation played it out (**Iters**), and its first two plies' average score and bingo percentage (P1-S, P1-BP, P2-S, P2-BP, P1 the reply) when it was simulated, and a solved move's depth as **Solved Plies** — and its CGP as text. A simulated position past turn 0 whose player inferred the opponent's leave first (its previous move not a pass) shows that inference under the moves: "Inferred from MOVE: N possible leaves, average equity E", and up to ten of the leaves the opponent most likely kept, with their draws and equity. **Random position** draws another (`GET /api/jobs/:id/positions/random`); a rack search shows that rack's positions newest first, one at a time with **Next** and **Previous** (`GET /api/jobs/:id/positions?rack=`). On a game-pairs job each position comes with its `partner`, the same turn of the pair's other game, and one of the two is drawn at a time ("Game 1 of the pair", "Game 2 of the pair"), with a toggle between them naming each game's player to move ("static-equity's move"); a rack both games hold finds the pair once. A job keeping only first divergences (`capture_first_divergence`) shows exactly the turn each pair's players first chose differently. There is no list of the newest positions: a job that captures holds millions, and one at a time on a board is what the section is for. The CGP and the move notation are read by `lib/cgp.ts` as MAGPIE writes them (`game_get_cgp_string`, `move_get_string`: `8G HUH` across, `E9 (E)RUVIM` down, letters played through in parentheses, `[L·L]` for a multi-letter tile); a position it cannot read is shown as text. The board scales to its box, so a phone shows it whole. On an `xl` screen the pane is a grid of `27rem minmax(0,1fr)`: the board has a fixed column, so it is the same size whatever position it shows, and the moves start right beside it, every cell on one line with tight padding (as in the opening-rack lookup's table); narrower, the moves go under the board. Signed-in users only; a signed-out visitor is told to sign in. The public has the results feed. Clicking a ranked move to preview it on the board is a follow-up.
+- **Saved positions**, for a job with `capture_positions` set: one captured position at a time, drawn on the job's own board (`Board.svelte`) — its premium squares from the layout, the tiles with their letters and scores (a blank in lower case, scoring nothing), both racks and scores with the player to move marked, and the tiles the move before it placed outlined — beside its ranked moves — each with its win percentage, how often the simulation played it out (**Iters**), and its first two plies' average score and bingo percentage (P1-S, P1-BP, P2-S, P2-BP, P1 the reply) when it was simulated, and a solved move's depth as **Solved Plies** — and its CGP as text. A simulated position past turn 0 whose player inferred the opponent's leave first (its previous move not a pass) shows that inference under the moves: "Inferred from MOVE: N possible leaves, average equity E", and up to ten of the leaves the opponent most likely kept, with their draws and equity. **Random position** draws another (`GET /api/jobs/:id/positions/random`); a rack search shows that rack's positions newest first, one at a time with **Next** and **Previous** (`GET /api/jobs/:id/positions?rack=`). On a game-pairs job each position comes with its `partner`, the same turn of the pair's other game, and one of the two is drawn at a time ("Game 1 of the pair", "Game 2 of the pair"), with a toggle between them naming each game's player to move ("static-equity's move"); a rack both games hold finds the pair once. A job keeping only first divergences (`capture_first_divergence`) shows exactly the turn each pair's players first chose differently. There is no list of the newest positions: a job that captures holds millions, and one at a time on a board is what the section is for. The CGP and the move notation are read by `lib/cgp.ts` as MAGPIE writes them (`game_get_cgp_string`, `move_get_string`: `8G HUH` across, `E9 (E)RUVIM` down, letters played through in parentheses, `[L·L]` for a multi-letter tile); a position it cannot read is shown as text. The board scales to its box, so a phone shows it whole. From an `lg` screen up the pane is a grid of `minmax(24rem,1fr) minmax(0,1fr)`: the board and the moves share it equally, the board never under 24rem and never over 42rem (`max-w-2xl`), and the moves start right beside it and fill the rest of the row, every cell on one line with tight padding (as in the opening-rack lookup's table), the inference's leaves as wide as the moves above them; narrower, the moves go under the board. The rack tiles stay square, shrinking to fit one line rather than deforming. Anyone may see them, signed in or not: an account only makes API keys. Clicking a ranked move to preview it on the board is a follow-up.
 
 **Opening rack analysis**
 
@@ -1012,14 +1118,14 @@ JobStats {
   job:               { id, name, job_type, status, allocation,
                        min_magpie_version, created_at, created_by, lexicon, variant }
   tasks_total, tasks_completed, tasks_available, tasks_claimed
+  movegens           // jobs.movegens: every accepted claim's, summed
   games?:            { unit: "game" | "pair", wins, losses, draws,
                        units_completed, pentanomial?, divergent_pairs?,
                        divergent?: { wins, losses, draws, p1_score_mean, p2_score_mean,
                                      spread_mean },   // pairs: the games that diverged
                        min_units, max_units,
                        p1_score_mean, p2_score_mean, spread_mean,   // null before any game
-                       test: { mean, lower, upper, elo, elo_lower, elo_upper,
-                               confidence_pct, status } | null,
+                       test: { mean, lower, upper, confidence_pct, status } | null,
                        decided?: { status, lower, upper, units } }
   opening_racks?:    { racks_analyzed, racks_settled, racks_without_consensus, racks_total }
   leave_generation?: { current_generation, generation_count,
@@ -1094,6 +1200,32 @@ said little about the work, and a games batch of deep sims counted the same as
 one of static play.) Each order is its own pair of partial indexes, one per
 kind of identity, so every order is two index scans merged, as the list always
 was.
+
+**Contributions by job type.** The job keeps a running `jobs.movegens` and
+`jobs.compute_ms` too, added in the same `UPDATE jobs` every accepted
+submission already makes (last, after the claim, the task and the
+contributor's row -- so no new lock and no new lock order: the statement
+takes the job's row whatever it adds), from the figures that submission
+credits its contributor with. The movegens are the line under the job page's
+Contributors table ("N movegens for this job"). Summed by `job_type` over the
+jobs with `tasks_completed` -- one row per job, whatever the claims number,
+in one scan -- they are the Contributions page's "Site totals": the three
+figures across the site, then the same by job type (`GET
+/api/workers/movegens`, each type a `{movegens, compute_seconds, tasks}`). A
+purge zeroes them with the other job counters and a delete takes the row,
+exactly as each gives the same claims' work back from the contributors, so
+the jobs' totals and the contributors' always add up to the same figures. One contributor's breakdown
+(`GET /api/workers/user/:id/movegens`, `/api/workers/anon/:anon_id/movegens`,
+fetched when their row is unfolded and with each refresh while it is) sums
+their claims per job -- movegens, compute time and completed tasks, the last
+two over completed claims only (a FILTER on `completed_at`, never a `state`
+the planner would read as a cue for the fleet-wide completions index) -- and
+groups the jobs by type: an index-only walk of their range of
+`task_claims_user_idx` / `_anon_idx`, which `INCLUDE (movegens, claimed_at)`
+for it, costing their own claim count and nothing else's. The page shows it
+as a small table, a row per job type under the site table's headers. Only an account or a
+pseudonym the list shows is answered (a `404` otherwise), and an anonymous
+worker by its pseudonym only, as everywhere public.
 
 With the two opening-rack aggregates removed, `opening_racks` is now those two
 counters and nothing else: two single-row reads, constant time at any job size.
@@ -1612,7 +1744,7 @@ What the numbers settled:
 
 **Claim tokens**: Each claim issues a UUID token. Workers must submit this token with their results. Stale tokens (from timed-out claims) are silently rejected.
 
-**ECS with Fargate**: Two containers share a single ECS task definition — one running the Axum backend, one running an Nginx container serving the SvelteKit static build. The frontend will be split out to S3 + CloudFront in a later phase.
+**ECS with Fargate**: Two ECS services, each with its own task definition and image variable — the Axum backend, and an Nginx container serving the SvelteKit static build. The load balancer sends `/api/*` and `/health` to the backend's target group and everything else to the frontend's. The backend's service is a single instance that stops its task before starting the next (see `desired_count`); the frontend's is stateless and rolls (100%/200%), so a release that changes only the pages has no gap, and `scripts/deploy.sh` redeploys only the services whose sources a commit changed. (Until October 2026 the two containers shared one task, and every deploy, a page change included, stopped the backend.)
 
 **Database migrations**: `sqlx migrate run` executes at container startup before the server accepts connections. No separate migration runner needed.
 
@@ -1684,10 +1816,11 @@ what the workers are checked against.
 | Anonymous workers identified by UUID | Enables per-worker contribution tracking and result filtering without requiring account creation |
 | No pre-aggregation for dashboard v1, except measured exceptions | Simple stats don't require it; avoids premature optimization. Measurement (Dashboard, "What these reads cost") found the reads that grew with history badly enough to matter, and only those are kept as running totals: four on `jobs` and a contribution counter per identity |
 | AWS throughout | Learning goals; avoids future migration pain; production-grade from day one |
-| Batch Bradley-Terry instead of incremental Elo/Glicko | Player configs have fixed strength, so there is no drift for a sequential filter to track; a batch fit is order-independent and makes add/remove a refit rather than an unwind |
+| Batch Bradley-Terry instead of incremental Elo/Glicko | Player configs have fixed strength, so there is no drift for a sequential filter to track; a batch fit is order-independent and makes add/remove a refit rather than an unwind. WESPA's Glicko in particular would add arbitrary rating periods, an RD floor that never lets a bot's rating settle, human calibration and per-game updates that waste game pairs ([Why not WESPA's Glicko](#why-not-wespas-glicko)) |
+| Ratings on WESPA's scale, 250 points per logit | A rating gap predicts the win % the same gap does between established WESPA players; the absolute level stays the anchor's, since bot games say nothing about strength against people |
 | Named `player_configs` table | Reusable across jobs; maps directly to MAGPIE per-player arguments (`-r1`/`-r2`, `-s1`/`-s2`, etc.); **immutable once created** — no update endpoint exists; deletion only if no job references the config |
 | Frontend dark mode only | Single theme simplifies the component library configuration; no light/dark toggle in v1 |
-| Deficit-based job selection, measured from when a job joins | Deterministic; guarantees long-run allocation accuracy — as a share of claims, not of worker time (KL-88) — regardless of claim timing; no randomness means reproducible behavior. No starvation of any job above 0% — which holds because a job's deficit is measured from a baseline reset to parity on activation, allocation change and purge (`claims_baseline`), not over its lifetime, and a job with nothing to hand out is lifted to parity rather than banking debt (`scheduler::lift_passed_over`, `issue_claim`): a lifetime deficit let a newly activated job take every claim until it had issued as many as the oldest job beside it |
+| Deficit-based job selection, measured from when a job joins | Deterministic; guarantees long-run allocation accuracy — as a share of claims, not of worker time (KL-88) — regardless of claim timing; no randomness means reproducible behavior. No starvation of any job above 0% — which holds because a job's deficit is measured from a baseline reset to parity on activation and allocation change (`claims_baseline`; a purged job rejoins when activated again), not over its lifetime, and a job with nothing to hand out is lifted to parity rather than banking debt (`scheduler::lift_passed_over`, `issue_claim`): a lifetime deficit let a newly activated job take every claim until it had issued as many as the oldest job beside it |
 | Seed gap of batch size | Keeps task seeds unique and ordered, `next_seed = MAX(seed) + batch_size`; a batch's games are drawn from a stream seeded with its task's seed, so no two tasks share them |
 | Ratings pooled across jobs, scoped by (variant, letterdist, layout) | A rating is only comparable under fixed conditions, but it is not a property of one job; pooling is what lets a config's whole record produce one number |
 | Only paired jobs feed ratings | `-gp` swaps seats on every seed, so a pair is side-balanced; unpaired games would need an explicit side-advantage term to avoid biasing every rating |
@@ -1696,7 +1829,7 @@ what the workers are checked against.
 | API keys active/inactive toggle | Lets contributors rotate or temporarily suspend a key without losing it; only active keys accepted for auth |
 | Account deletion is app-layer, not CASCADE | The account is anonymized in place, its contributions kept, and its keys, codes and tokens deleted; a cascade would delete what the account did, and the census row it writes first must outlive it |
 | Match test evaluated inline on the submission path, debounced | No background sweep needed; a debounced check is late, never wrong (see Statistical Result Evaluation) |
-| Two containers per ECS task | Axum backend + Nginx for SvelteKit static files; cleaner than co-mingling in one process |
+| Two ECS services, backend and frontend | Axum backend + Nginx for SvelteKit static files, each with its own task definition and image: cleaner than co-mingling in one process, and the stateless frontend rolls without a gap while the single-instance backend is left alone |
 
 ---
 
@@ -2491,7 +2624,7 @@ The core of birdtest is the task claim endpoint — the sequence that runs every
 
    **Each candidate is checked for its turn when its claim holds the job's dispatch lock** (`scheduler::try_claim_from_job`): its ratio, as committed then, must not be more than one of that job's claims past any of the worker's other candidates still in play. Claims arriving together read the same list and all land on its first job; for a job at 1% each is a whole ratio unit, and 32 concurrent claims put it 32 units ahead, paid back only slowly and forgiven by anything that lifts a job that lags. A claim that is not the job's turn goes on to the next candidate, and one that finds every job with work outrun reads the list again, up to eight times; the eighth takes the first job with work without checking it against jobs that are not busy, so an `Idle` while work exists is left only to a busy job and a last-round race (with equal jobs and 32 workers claiming together, eight checked rounds told 67 to 166 claims of 1,920 there was nothing). A job whose dispatch lock is busy past its two seconds is not tried again in the request — waited on every round, it held each claim 16 s and ended it `Idle` — but stays a rival in every round, with a ratio unit of slack rather than one of its claims: a 1% job's claim is a whole unit, the largest there is, so a 50% job beside a busy one can still take fifty claims, and a 1% job beside a busy 99% one takes one or two (the check is on the ratio before the claim). Dropped as a rival, the busy 99% job let the 1% job take every claim of the spell, and its settling forgave them (49 where 30 is fair). And a job found busy is settled a ratio unit short for ten minutes (`BUSY_MEMORY`): the lead the jobs beside it took while it was busy — a unit at most — is owed back, and settled all the way it was forgiven, a unit more each spell (a 10% job took 400 of 2,400 claims over twenty spells beside a settling 90% one, where 240 is fair); not settled at all, a newcomer found busy once took the majority's claims in a split fleet (their job's first came 331st). The check is a lookup, but made holding the job's dispatch lock, so it queues behind the claims on it. The one claim of slack is what concurrency needs — with none only the lowest job could be claimed, and a fleet claiming together went idle a third of the time — and it is the rival's claim, so a 99% job can run a 1% claim ahead and the 1% job a hundredth.
 
-3. **Lazy reclamation**: Before acquiring a task, any claimed tasks whose `last_heartbeat_at` (or `claimed_at`, if no heartbeat has been received yet) exceeds the heartbeat timeout are returned to `available`. One statement covers every candidate job rather than one per job: no index on `task_claims` leads with the job, so the planner reaches expired claims through the partial index on open claims — one entry per claim in flight across the fleet — and filters by job afterwards. Per job, a claim request paid that scan once per candidate for a set of rows that does not depend on the job at all. Skipped entirely while the process is younger than the heartbeat timeout — see [Task States](#task-states) for why a restarted server has to hear from the fleet before it judges it.
+3. **Lazy reclamation**: Before acquiring a task, any claimed tasks whose `last_heartbeat_at` (or `claimed_at`, if no heartbeat has been received yet) exceeds the heartbeat timeout, or whose claim is a minute past its `deadline_at` ([Task time limit](#task-time-limit)), are returned to `available`. One statement covers every candidate job rather than one per job: no index on `task_claims` leads with the job, so the planner reaches expired claims through the partial index on open claims — one entry per claim in flight across the fleet — and filters by job afterwards. Per job, a claim request paid that scan once per candidate for a set of rows that does not depend on the job at all. Skipped entirely while the process is younger than the heartbeat timeout — see [Task States](#task-states) for why a restarted server has to hear from the fleet before it judges it.
 
 4. **Task acquisition** — strategy-dependent:
    - **Re-dispatch first**, under the job's dispatch lock like everything else here: `SELECT ... FOR UPDATE SKIP LOCKED` on the job's `available` tasks — a lapsed or declined claim's task — **excluding, outside leave generation, a task this worker declined in the last hour**, so a task that fails everywhere is not handed straight back to each worker that just failed it (`registry::next_available`). An `available` task has no live or completed claim — that would make it `claimed` or `completed` — so there is no slot of the worker's own to exclude.
@@ -3087,12 +3220,14 @@ agreed or at the most. `racks_settled` and `racks_without_consensus` are reset
 from the rows. Raising the settings unsettles racks; lowering them settles
 racks. Then the job follows:
 
-- **Completed, with racks now unsettled: it reopens.** Under the activation
-  lock, it goes back to `active` at its allocation (joining at parity, its
-  derived data requested, `job.activated`) if the other active jobs leave room
-  for it, and to `inactive` otherwise, or with no allocation (`job.deactivated`,
-  and the response says why). Either way its final exports become snapshots
-  ([Exports](#exports)).
+- **Completed, with racks now unsettled: it reopens, inactive at 0%**
+  (`job.deactivated`, from `completed`). A completed job holds 0% and keeps
+  nothing of its old share, and the fleet may have been given to other jobs
+  since, so it waits for the admin to give it an allocation on
+  `/admin/allocation` -- which joins it at parity and requests its derived
+  data, as any activation does. (It used to come back active at its old
+  allocation when the other jobs left room, and inactive otherwise.) Its final
+  exports become snapshots ([Exports](#exports)).
 - **Completed, with every rack still settled:** it stays completed, and its
   final exports still become snapshots, since the standings their lines carry
   were restated ([Exports](#exports)).
@@ -3179,11 +3314,11 @@ Each task represents one batch of games (`games_per_batch` from the job config) 
 At claim time (all in one transaction):
 1. Compute next seed: `SELECT COALESCE(MAX(seed) + $games_per_batch, 1) FROM tasks WHERE job_id = $job_id`. This yields seed 1 for the first task, then `1 + games_per_batch`, `1 + 2*games_per_batch`, etc. This read and the insert in step 2 run under the job's dispatch lock (see [The claim loop in full](#the-claim-loop-in-full)), so no two claims compute the same seed; the unique seed index is a backstop, and a violation would re-run selection.
 2. `INSERT INTO tasks (job_id, seed, state) VALUES ($job_id, $next_seed, 'available') RETURNING id`; the claim in step 4 moves it to `claimed` in the same transaction, through the counter update every claim uses.
-3. `INSERT INTO game_requests (task_id, variant, letter_distribution, board_layout, seed, num_games, capture_positions, player1_config_id, player2_config_id)` — denormalize the job's settings so the worker receives a self-contained request. Each player config carries its own lexicon.
+3. `INSERT INTO game_requests (task_id, variant, letter_distribution, board_layout, seed, num_games, capture_positions, player1_config_id, player2_config_id)` — denormalize the job's settings so the worker receives a self-contained request. Each player config carries its own lexicon. The job's `threading_mode` is not repeated per task: the request takes it from the job's config, which never changes.
 
    The seed crosses the wire to the worker as a **decimal string**, not a JSON number. It is a full `uint64`, and JSON numbers are doubles, so any client using a conventional JSON library would silently lose precision above 2^53. It is stored as a signed `BIGINT` and reinterpreted at the application layer as before.
-4. `INSERT INTO task_claims (task_id, claim_token, state, claimed_by_...)`.
-5. Return the request + claim token to the worker.
+4. `INSERT INTO task_claims (task_id, claim_token, state, claimed_by_..., deadline_at)`, the deadline from the job's own `jobs.max_task_seconds` in the same statement.
+5. Return the request + claim token to the worker, with the job's name and the claim's time limit.
 
 Match-test and finish-condition checks run during result submission, not at claim time.
 
@@ -3310,7 +3445,8 @@ What is left unsolved is that a merge still rewrites most of a 432 MB relation a
 A worker playing a game already analyzes a position on every turn: it generates
 candidate moves, ranks them, and picks one. Those analyses used to be discarded.
 With `capture_positions` set on a `games` or `game_pairs` job they are kept, so a
-job run to settle an Elo question also produces a corpus of analyzed positions.
+job run to settle which player is stronger also produces a corpus of analyzed
+positions.
 
 #### What is capturable, and what it costs
 
@@ -3375,8 +3511,8 @@ rather than a worst case:
 | `max_pairs = 40,000` | 1,800,000 | 18,000,000 |
 | `max_games = 400,000` | 9,000,000 | 90,000,000 |
 
-Turning capture on roughly doubles the storage a job produces per unit of Elo
-information, and does so in the largest table in the schema. That is why it is off
+Turning capture on roughly doubles the storage a job produces per unit of
+strength information, and does so in the largest table in the schema. That is why it is off
 by default.
 
 **`games_per_batch` becomes the memory and payload control.** With no per-task cap,
@@ -4238,7 +4374,8 @@ a new MAGPIE setting has a table it visibly is not in.
 | Plies, candidate plays, iterations, minimum play iterations, stopping condition, time limit, threshold, sampling rule, inference and its margin, utility weights (`-pl*`, `-np*`, `-i*`, `-mi*`, `-sc*`, `-tl*`, `-th*`, `-sa*`, `-si*`, `-im*`, `-uwin*`, `-uspread*`, `-uspreadscale*`) | Yes | `num_plies` and `num_plays` required of every player, the rest of every simmer; all reset to MAGPIE's defaults first. An opening-rack task copies the player's into the run-wide settings `impl_move_gen` and `impl_sim` read, and forces inference off (there is no previous play, and `game_history` is whatever the contributor last loaded). A time limit must be 0 |
 | Bingo bonus (`-bb`), simulation cutoff (`-cutoff`) | Yes | Required at the top of every request (the cutoff where the job can simulate) |
 | Movegen margin (`-mmargin`) | Yes, for an opening-rack static analysis with an `equity` recorder; games, game pairs and leave generation never read it — autoplay generates with margin 0 | Required per player; reset before every task, and applied only by the opening-rack executor, from its one player |
-| Multi-threading mode (`-mtmode`), small plays (`-sp`), heat map | Yes / yes / no | No request field; reset before every task |
+| Multi-threading mode (`-mtmode`) | For a simmer: `igp` gives one game's simulation every thread, which makes an iteration-bounded simulation reproducible; `pgp` plays games in parallel | The job's `threading_mode` (`igp` by default, or `pgp`), stated on every games and pairs request. Opening-rack and leave requests state none |
+| Small plays (`-sp`), heat map | Yes / no | No request field; reset before every task |
 | Seed (`-seed`) | Yes | Required on every request: a games batch steps from it, rack `i` is analysed from `seed + i`, a leave task plays from it |
 | Game pairs (`-gp`) | Yes | From the request for games; a leave task does not reset it and does not need to — `autoplay_leave_gen` never creates a second game runner and forces the divergent report off |
 | PlayChooser (`-pc1`/`-pc2`) | Yes — a different move-selection algorithm | No request field; reset to off (`-1`) before every task |
@@ -4668,6 +4805,8 @@ MAGPIE's defaults fixes it).
 {
   "claim_token": "6f3d7198-178a-47c8-9ccc-6aa6995a5a9c",
   "job_id": "4c7b64ad-8e5e-4db7-aeb0-afc44ee1ebf5",
+  "job_name": "NWL23 4-ply simmer vs static",
+  "max_task_seconds": 3600,
   "min_magpie_version": "1.4.0",
   "worker_uuid": "6f3d7198-178a-47c8-9ccc-6aa6995a5a9c",
   "expected_data": {
@@ -4688,6 +4827,18 @@ message it prints when something does not match. No entry states a size, here or
 `derived`: the client reads none (the thirty-third audit removed a `bytes` key that
 every entry carried and nothing on the worker side read). A `leave_generation` task carries
 exactly three entries: `kwg`, `letterdist`, `layout`.
+
+`job_name` and `max_task_seconds` are always present. `job_name` is what the
+worker calls the job when it says what it is running: the admin's name for it,
+or for a job created without one its type and the start of its id
+(`games job 1d4a7f60`), never empty. `max_task_seconds` is how long the worker
+may run this task, a whole number of seconds from 600 to 86,400: its job's
+limit as it stood when this claim was made, from which the claim's deadline was set. A
+worker that reaches it stops the task, hands it back unfinished and declines it
+`time_limit`; a minute past the deadline the claim lapses whatever the worker
+does, and a result for it is answered `accepted: false` — either counted
+against the job as a task that hit the limit, as the decline is, if the worker
+was still alive (see [Task time limit](#task-time-limit)).
 
 `min_magpie_version` is always present. `worker_uuid` is present **only** when the
 request carried no identity at all and the server just minted one; the client
@@ -4722,7 +4873,7 @@ the worker applies both rather than whatever its own settings last loaded.
   "variant": "classic", "letter_distribution": "english", "board_layout": "standard15",
   "seed": "1", "num_games": 10,
   "capture_positions": false, "capture_first_divergence": false,
-  "bingo_bonus": 50, "sim_cutoff": 0.005,
+  "bingo_bonus": 50, "sim_cutoff": 0.005, "threading_mode": "igp",
   "player1": { }, "player2": { } }
 
 { "job_type": "game_pairs", "...": "as games; num_games counts pairs",
@@ -4774,6 +4925,13 @@ filled still produce coverage the server uses. The target belongs to the server,
 which owns the running per-rack totals across every task in the generation and
 decides on its own when the generation closes.
 
+`threading_mode` is on every games and pairs request, and on no other: `igp`
+gives all of the task's threads to one game's simulation at a time, which makes
+a simulation bounded by iterations reproducible, and `pgp` plays the batch's
+games in parallel, a thread each. It is the job's (`threading_mode` on its
+config row, `igp` unless the job was created with `pgp`), and changes nothing
+for static players.
+
 `seed` is a **decimal string** on every request, because it is a `uint64` and
 JSON numbers are doubles. Every task states one: games and pairs play their
 batch from it, an opening-rack task analyses rack `i` from `seed + i`, and a
@@ -4800,7 +4958,9 @@ fetched afresh, so a repair is noticed — and goes on with other jobs meanwhile
 `data_out_of_date` shutdown answering a claim that named such a job is waited
 out, not obeyed; a `magpie_too_old` or `unsupported_build` one is obeyed at once) —
 or `task_failed` — the worker ran the task and could
-not produce a result the server accepted;
+not produce a result the server accepted — or `time_limit` — the worker stopped
+the task at the assignment's `max_task_seconds`, unfinished (the body is the
+token and the reason, `missing` left out);
 `missing` is present for `missing_data` and `derived_mismatch`, where `actual`
 is the digest of what the worker built. `actual: null` means the file was not
 found at all, and a hex string means it was found with different content.
@@ -4814,7 +4974,10 @@ as a failure either — a file built here that does not match sets the job aside
 for the run, the server's KLV for a while, doubling (above); `task_failed`, for
 a task that failed or a result refused, counts as one, five in a row ending
 its run (a task handed back because the worker is stopping is sent as
-`task_failed` too, and counts as nothing). Outside leave generation, the server does not offer a worker a task
+`task_failed` too, and counts as nothing). `time_limit` is counted against the
+job, not the worker: three in a row with no task of the job completed between
+— declines, and claims lapsed at their deadline with the worker alive, alike —
+set the job aside ([Task time limit](#task-time-limit)). Outside leave generation, the server does not offer a worker a task
 it declined within the hour (counted from the claim's last heartbeat); a
 declined leave task is reissued as it stands.
 
@@ -4826,8 +4989,9 @@ declined leave task is reissued as it stands.
 
 `{ "claim_token": "...", "movegens": 123456, "result": { } }` → `200` with
 `{"accepted": true}`, or `{"accepted": false}` when the claim had already lapsed
-or the result was already accepted — which is **not an error**: the work was
-reassigned or is done. `400` when the result does not satisfy its shape, or
+— its heartbeats stopped, or it is a minute past its deadline — or the result
+was already accepted — which is **not an error**: the work was reassigned or
+is done. `400` when the result does not satisfy its shape, or
 `movegens` is missing, not a whole number from 0 to `i64::MAX`, or more than a
 million per millisecond the claim was held; `413` over 64 MiB. `movegens` is
 the move generations MAGPIE performed for the task, on every thread, which its
@@ -5427,9 +5591,11 @@ insert).
 |---|---|
 | `user.registered` | Registration |
 | `task.declined` | A worker declining, with the reason in `reason` |
-| `job.created` / `job.activated` / `job.deactivated` / `job.completed` | Admin job lifecycle; `job.completed` also for a job the server completes (its stopping rule: the match test, its last generation), with no actor and the verdict in `reason` (`player1_better`, `player2_better`, `inconclusive`) — or `reached_target` for a games or pairs job without a test |
-| `job.allocation_changed` | A job's allocation changed through `PUT /api/admin/jobs/allocations`, from what to what in `reason` ("20% -> 35%", `none` for a job that never had one); beside it `job.activated` or `job.deactivated` when the status changed too |
-| `job.consensus_changed` | An opening-rack job's consensus settings changed, the changes and the racks left unsettled in `reason` ("min 1 -> 2, max 1 -> 3; 4 racks unsettled"); beside it `job.activated` or `job.deactivated` when the change reopened a completed job |
+| `job.created` / `job.activated` / `job.deactivated` / `job.completed` | Admin job lifecycle; an activation or deactivation (an allocation change that switched the job on or off) carries the allocation from what to what in `reason` ("0% -> 40%"); `job.completed` also for a job the server completes (its stopping rule: the match test, its last generation), with no actor and the verdict in `reason` (`player1_better`, `player2_better`, `inconclusive`) — or `reached_target` for a games or pairs job without a test |
+| `job.set_aside` | The server switching a job off because three of its tasks in a row hit the time limit with none completed between — `time_limit` declines and overruns alike (`worker::record_time_limit`): no actor, `active` -> `inactive`, and in `reason` the allocation it moved from and why ("50% -> 0%: 3 tasks in a row hit the 1-hour time limit …"), which the job's `set_aside_reason` repeats for its page |
+| `job.time_limit_changed` | An admin changing a job's task time limit (`PATCH /api/admin/jobs/:id/time-limit`), from what to what in `reason` ("max_task_seconds 3600 -> 1800"); a change to what it already is writes none |
+| `job.allocation_changed` | An active job's allocation changed to another above 0% through `PUT /api/admin/jobs/allocations`, from what to what in `reason` ("20% -> 35%"); a change to or from 0% is its `job.activated` / `job.deactivated` row instead |
+| `job.consensus_changed` | An opening-rack job's consensus settings changed, the changes and the racks left unsettled in `reason` ("min 1 -> 2, max 1 -> 3; 4 racks unsettled"); beside it `job.deactivated` (from `completed`) when the change reopened a completed job |
 | `job.purged` / `job.purged.census` | Purge |
 | `job.deleted` / `job.deleted.census` | Delete |
 | `user.deleted` / `user.deleted.census` | Account deletion |
@@ -5473,7 +5639,7 @@ log exists to keep.
 |---|---|---|
 | `GET` | `/api/worker/client-version` | The oldest MAGPIE a client may contribute with (`MIN_MAGPIE_VERSION`) and where to get it, for the admin new-job form and for humans; no worker calls it (MAGPIE learns the floor from a claim's shutdown directive). Not a self-update: MAGPIE is a compiled binary and the client cannot replace itself. |
 | `POST` | `/api/worker/task` | Send a task claim. The body is **required** and carries `magpie_version`, `board_dim` and `rack_size` (each required) and `unsupported_jobs` (optional, empty when omitted). Returns a task assignment, a `shutdown` directive, or `204`. |
-| `POST` | `/api/worker/decline` | "I claimed this and cannot do it." Releases the claim immediately rather than waiting out the heartbeat timeout, and records the gap. |
+| `POST` | `/api/worker/decline` | "I claimed this and cannot do it" -- or, `time_limit`, "I stopped it at the limit". Releases the claim immediately rather than waiting out the heartbeat timeout, and records the gap. |
 | `POST` | `/api/worker/heartbeat` | Keep-alive ping for a claimed task. Updates `last_heartbeat_at`. |
 | `POST` | `/api/worker/result` | Submit the result for a claimed task. Requires the claim token. |
 | `GET` | `/api/worker/artifact?key=<artifact-key>` | Download a stored artifact — in v1, a generation's combined KLV for a leave-generation task. Proxied through the server so contributors never need AWS credentials; only keys the server itself minted are reachable. |
@@ -5506,7 +5672,7 @@ The full request and response shapes are in [The Worker API Contract](#the-worke
 
 All Admin API endpoints require the requesting user to have `is_admin = TRUE`. A non-admin session is rejected with `403 Forbidden`; a request with no session — worker credentials or not — gets `401`.
 
-Every action on a job below — activate, deactivate, complete, allocations, consensus, purge, delete, export, merge-progress and rebuild-artifacts — answers `409` while a purge, delete or consensus change of that job is running ([Editing the consensus](#opening-rack-consensus)): each holds the job off the fleet, and an action that waited on it would hold a pool connection until it finished.
+Every action on a job below — allocations, complete, consensus, purge, delete, export, merge-progress and rebuild-artifacts — answers `409` while a purge, delete or consensus change of that job is running ([Editing the consensus](#opening-rack-consensus)): each holds the job off the fleet, and an action that waited on it would hold a pool connection until it finished.
 
 | Method | Path | Description |
 |---|---|---|
@@ -5514,13 +5680,12 @@ Every action on a job below — activate, deactivate, complete, allocations, con
 | `POST` | `/api/admin/player-configs` | Create a new player configuration, named as a job is (at most 100 characters, one line, stored trimmed). Refuses what MAGPIE would refuse or cut short: more than 25 plies (`MAX_PLIES`), more than 10 recorded plies (what a captured position keeps), more than 200,000 plays generated (MAGPIE allocates every one up front, and a static player ranking every opening play needs up to some 64,000) or 32,767 recorded (a stored rank is a `SMALLINT`), a margin that is negative, not finite or past MAGPIE's largest equity (2,147,483.645), as well as non-positive counts. |
 | `GET` | `/api/admin/player-configs/:id` | Get a single player configuration. |
 | `DELETE` | `/api/admin/player-configs/:id` | Delete a player configuration. Rejected if any job, rating pool, rating history or clone references it. |
-| `POST` | `/api/admin/jobs` | Create a new job, with an optional `name` (at most 100 characters, one line; the form asks for it) shown first wherever jobs are listed and as the job page's title. Created in the `inactive` state — see `.../activate` to set its allocation and start dispatching work. Refuses a board layout that is not 15×15 (the fleet's MAGPIE builds are 15×15 -- a claim from any other is answered `unsupported_build` -- so every worker would fail every task) and a match-test confidence outside (50, 100) (at 100% the interval never closes). |
-| `POST` | `/api/admin/jobs/:id/deactivate` | Set a job to inactive. Workers will no longer be assigned tasks from it. Refused (`409`) for a completed job. Audited (`job.deactivated`); that row is the record of who and when, and the job row keeps no `deactivated_at` beside it. |
-| `POST` | `/api/admin/jobs/:id/activate` | Activate an inactive job. Body: `{ "allocation": int }`. Sets allocation and transitions status to active. |
-| `PUT` | `/api/admin/jobs/allocations` | Set several jobs' allocations at once. Body: `{ "allocations": [{ "job_id": uuid, "allocation": int }] }`. Checked as a whole -- the active jobs must sum to at most 100% as the request leaves them -- under the activation lock, every named row locked in id order first. Above 0% a job is active (activated if it was not); 0% leaves it inactive (deactivated if it was active, its last allocation kept). A completed job, a job named twice or an allocation outside 0–100 refuses the whole request. Audited per job: `job.allocation_changed` (from what to what), and `job.activated` / `job.deactivated` for a status change. The `/admin/allocation` page sends it. |
-| `PATCH` | `/api/admin/jobs/:id/consensus` | Change an opening-rack job's consensus settings. Body: any of `{ "min_results_per_rack", "max_results_per_rack", "consensus_pct" }`; only those sent change. Refuses (`400`) what creation refuses, and any other job type. Restates every rack, then reopens a completed job left with unsettled racks (active if its allocation fits, inactive otherwise) and completes an active one left with none. Answers `{ job, config, unsettled_racks, reopened, reopened_inactive_reason }`. `409` while a purge, delete or another consensus change of the job is running. Audited as `job.consensus_changed`. See [Editing the consensus](#opening-rack-consensus). |
-| `POST` | `/api/admin/jobs/:id/complete` | Force-complete a job immediately, regardless of task progress. Refused (`409`) for a job that is already completed. |
-| `POST` | `/api/admin/jobs/:id/purge` | Delete every claim, result, leave-gen progress and staged-result row, selection cursor, artifact row and task for a job, reset its dispatch counter and rejoin it at parity with the other jobs (`claims_baseline`), then re-seed its initial state. Ratings are untouched: they belong to rating pools, and the sweep refits a pool whose evidence changed. Returns `{ tasks_reset }`. Writes a census of what it destroyed to the audit log first. `409` while a purge, delete or consensus change of the job is already running: each runs to completion on a task of its own, so a second click stacked a second behind the first's locks. |
+| `POST` | `/api/admin/jobs` | Create a new job, with an optional `name` (at most 100 characters, one line; the form asks for it) shown first wherever jobs are listed and as the job page's title. An optional `max_task_seconds`, 600 to 86,400 (a `400` on the field otherwise), is the job's task time limit; left out, an hour. A games or pairs job names its players as `player_config_ids`: one is self-play, n ≥ 2 (at most 12, none twice) a round robin of C(n, 2) jobs named "{name}: A vs B", created all or none. A games or pairs job may state `threading_mode`, `igp` (the default) or `pgp`, which every task's request carries (see [Task Request Types](#task-request-types)); anything else is a `400` on the field. Answers `201` with `{ "jobs": [...] }`, each created job as stored. Created inactive at 0% — `PUT /api/admin/jobs/allocations` sets its allocation and starts dispatching work. Refuses a board layout that is not 15×15 (the fleet's MAGPIE builds are 15×15 -- a claim from any other is answered `unsupported_build` -- so every worker would fail every task) and a match-test confidence outside (50, 100) (at 100% the interval never closes). |
+| `PUT` | `/api/admin/jobs/allocations` | Set several jobs' allocations at once. Body: `{ "allocations": [{ "job_id": uuid, "allocation": int }] }`. Checked as a whole -- the active jobs must sum to at most 100% as the request leaves them -- under the activation lock, every named row locked in id order first. The only way an admin activates or deactivates a job: above 0% a job is active (activated if it was not), and a job the server set aside for its time-limit declines starts a new run of them, its reason cleared; 0% leaves it inactive at 0% (deactivated if it was active). A completed job (even at 0%), a job named twice or an allocation outside 0–100 refuses the whole request. Audited once per job that changes, from what to what in `reason`: `job.activated` / `job.deactivated` for a job switched on or off, `job.allocation_changed` for an active job's new share. Answers `{ "jobs": [...] }`, the named jobs as they now stand. The `/admin/allocation` page sends it. |
+| `PATCH` | `/api/admin/jobs/:id/consensus` | Change an opening-rack job's consensus settings. Body: any of `{ "min_results_per_rack", "max_results_per_rack", "consensus_pct" }`; only those sent change. Refuses (`400`) what creation refuses, and any other job type. Restates every rack, then reopens a completed job left with unsettled racks (inactive at 0%, for the admin to give an allocation) and completes an active one left with none. Answers `{ job, config, unsettled_racks, reopened }`. `409` while a purge, delete or another consensus change of the job is running. Audited as `job.consensus_changed`. See [Editing the consensus](#opening-rack-consensus). |
+| `PATCH` | `/api/admin/jobs/:id/time-limit` | Change a job's task time limit, any type and any status: `{ "max_task_seconds": int }`, 600 to 86,400 (ten minutes to a day — a first claim may build a rack info table that cannot be stopped; anything else is a `400` on the field, and the column's CHECK refuses it too). The limit applies to the job's claims made after the change; every claim keeps the deadline it was given. Audited as `job.time_limit_changed`, from what to what; a change to what it already is writes nothing. Answers `{ max_task_seconds }`. The job's admin page sends it. |
+| `POST` | `/api/admin/jobs/:id/complete` | Force-complete a job immediately, regardless of task progress, at 0% as every completed job is. Refused (`409`) for a job that is already completed. |
+| `POST` | `/api/admin/jobs/:id/purge` | Delete every claim, result, leave-gen progress and staged-result row, selection cursor, artifact row and task for a job, reset its dispatch counter and baseline and leave it inactive at 0% whatever it was (an allocation change rejoins it at parity), then re-seed its initial state. Ratings are untouched: they belong to rating pools, and the sweep refits a pool whose evidence changed. Returns `{ tasks_reset }`. Writes a census of what it destroyed to the audit log first. `409` while a purge, delete or consensus change of the job is already running: each runs to completion on a task of its own, so a second click stacked a second behind the first's locks. |
 | `DELETE` | `/api/admin/jobs/:id` | Delete a job and all its tasks. `409` while a purge, delete or consensus change of it is running, as above. |
 | `DELETE` | `/api/admin/users/:id` | Delete a user account: anonymize it in place, keeping its claims and records so no donated compute is lost (see Admin API semantics). |
 | `POST` | `/api/admin/workers/ban` | Ban a worker by user ID or anonymous UUID. One ban per identity: a second is `409`, so that unban means what it says. The reason is at most 1,000 characters and holds no NUL (`400`). |
@@ -5700,30 +5865,57 @@ Beyond role matching, creation enforces seven rules the schema cannot express:
   `expected_data`, so a worker is not turned away for lacking files no task
   reads.
 
-The response is `{ job }`. Creation writes no rows up front for any job type: no
-tasks, and no leave-generation rack universe, which the first claim seeds as it
-does every generation's.
+**Round robins.** A games or game-pairs request names its players as
+`player_config_ids`, a list, rather than a player 1 and a player 2. One config
+is a self-play job, under the name as given. **n ≥ 2 configs are a round
+robin**: C(n, 2) jobs, every pairing once, each seated in the order the configs
+were listed (player 1 the earlier) and named "{name}: A vs B" — or "A vs B" with
+no name — after the configs' names; two configs are the one job between them,
+named the same way. The seat matters little (a pair swaps seats within itself,
+and a games batch is even, so each player moves first in half of every task's
+games), but a fixed rule keeps "A vs B" A's player-1 side wherever it is shown.
+At most twelve configs (66 jobs), none named twice — a config twice would pair
+with itself mid-round-robin, and self-play is asked for by naming it alone —
+each refused on `player_config_ids`. **All or nothing:** every pairing is
+checked first (the win% model, the files MAGPIE loads by name, the capture
+settings: everything above that concerns two players), and a refusal names its
+pairing ("sim-a vs sim-other: player configs disagree on the win% model"); then
+every job is inserted in one transaction, so a check only the insert can make
+(two files under one name, a wordmap for too many blanks) refuses the lot. A
+name that its pairing would push past 100 characters is refused on `name`.
+Every job is created inactive at 0%: the form then goes to `/admin/allocation`
+with the new jobs marked and listed first, where they are started, and their
+rows are stamped `clock_timestamp()` so lists ordered by creation show the
+pairings in order.
+
+The response is `{ jobs }`, every job the request made as stored: one, or one
+per pairing. Creation writes no rows up front for any job type: no tasks, and
+no leave-generation rack universe, which the first claim seeds as it does
+every generation's.
 
 Job creation also writes the zeroed KLV that generation 1 starts from (stored as
 generation 0), **after** the transaction
 commits rather than inside it: it is a multi-megabyte build and an object-store
 write, and holding a transaction open across it would be wrong.
 
-**Activating a job** sets its allocation and requires that the active jobs
-still sum to at most 100% — checked here rather than as a database constraint,
-because the intermediate states an admin passes through while rebalancing would
-violate a constraint even when the end state is fine. The error names how much
-room is left. An allocation of 0 is accepted and means what inactive means: the
-job is offered to nobody until it is raised. Activation also resets the job's
-`claims_baseline`, so it joins level with the lowest among the jobs being served rather than
-with a lifetime deficit to work off at the others' expense — and since
-activating an active job is how its allocation is changed, a changed share
-takes effect from that moment rather than being applied retroactively to every
-claim the job ever issued. A completed job cannot be
-reactivated. Activations are serialized with an advisory lock, so two at once
-cannot jointly exceed 100%. Activating a leave-generation job whose generation-0 KLV was never
+**Setting allocations** (`PUT /api/admin/jobs/allocations`, the only way a
+job is activated or deactivated) requires that the active jobs sum to at most
+100% as the request leaves them — checked here rather than as a database
+constraint, because the intermediate states an admin passes through while
+rebalancing would violate a constraint even when the end state is fine. The
+error names the total and what the jobs not named already hold. An allocation
+of 0 leaves the job inactive at 0%: offered to nobody until it is raised.
+Every change above 0% also resets the job's `claims_baseline`, so it joins
+level with the lowest among the jobs being served rather than with a lifetime
+deficit to work off at the others' expense — and a changed share takes effect
+from that moment rather than being applied retroactively to every claim the
+job ever issued. A completed job cannot be given an allocation. Allocation
+changes are serialized with an advisory lock, so two at once cannot jointly
+exceed 100%. Activating a leave-generation job whose generation-0 KLV was never
 written — creation writes it after committing, so an object-store failure there
-leaves the job without one — builds it first.
+leaves the job without one — builds it first, and activating any job requests
+its derived files under the deployment's builder, which may have moved since
+creation.
 
 **Deleting a user** anonymizes the account rather than removing it. Personal
 data and credentials go: the username becomes `deleted-<id>`, the email
@@ -5770,14 +5962,18 @@ do not exist.
 | `GET` | `/api/player-configs/:id` | One player config, in the same shape. |
 | `GET` | `/api/jobs/:id` | Job detail, configuration, and aggregate statistics; for a completed job, how it was completed (`completion`: when, whether an admin forced it, and the server's reason — the match test's verdict (`player1_better`, `player2_better`, `inconclusive`), `reached_target` for a games or pairs job without a test, `last generation built`, or none when an opening-rack job's racks ran out). |
 | `GET` | `/api/jobs/:id/results` | Task records for a job, paginated by cursor (`?cursor=`; see [Pagination](#pagination)). `?worker=` filters to one contributor by username or anonymous pseudonym (`anon_id`), resolved to an identity before the job is read; a name that is nobody's is an empty page. `?rack=` is opening-rack jobs only and switches to a single-rack lookup, in one page: every analysis of the rack numbered, each ranked move with its win percentage (`null` for a static analysis) and its first two plies' statistics (`plies`, `[]` for a static one). The analyses' lists share 32,767 moves (what one analysis can record) between them, each cut to its best `32,767 / analyses`: a rack analysed once is listed whole, and a consensus job's hundred analyses of 32,767 moves are not 3.3 million rows from a public route. |
+| `GET` | `/api/jobs/:id/rack-samples` | Up to `?n=` (10 unless given, at most 50) distinct racks an opening-rack job has analysed, drawn at random, public: what the job page offers as "Analysed racks to try". A job of at most 1,000 analyses is read whole and sampled exactly; a larger one is probed — a rack drawn uniformly from the job's rack space, then the first analysed rack at or after it in `position_analysis_records_job_rack_idx (job_id, rack)`, wrapping — four probes a rack asked for, duplicates dropped, never `ORDER BY random()`. Another job type is a `400`. |
 | `GET` | `/api/jobs/:id/positions` | **Signed in.** A games or game-pairs job's captured positions where the player to move held `?rack=` (required), newest first, at most 20 a page by cursor, each with its CGP, game, turn, rack, previous move and ranked moves (each with its win percentage and at most its first two plies' statistics), and its `inference` (`null` when it has none). The rack may be typed in any case and order, a multi-letter tile bracketed or not; it is spelt as MAGPIE spells one (the job's machine-letter order, blanks last) before the lookup, so a rack with a tile the job's distribution lacks finds nothing. No rack, or another job type, is a `400`. |
 | `GET` | `/api/jobs/:id/positions/random` | **Signed in.** One of a games or game-pairs job's captured positions at random, in the same shape, or `null` before it has any. Drawn through two index probes — a random seed's next task (`tasks_seed_unique_idx`), then a random turn of that task (`position_analysis_records_in_game_idx`) — never `ORDER BY random()` over millions of rows; a task with no positions yet is passed over, and after eight such draws the job's newest position is taken. Another job type is a `400`. |
 | `GET` | `/api/jobs/:id/board` | What a position is drawn on, public: the job's layout parsed (`start` as `[row, column]`, `squares` row by row — `normal`, `double_letter` … `quadruple_word`, `brick`) and every letter of its distribution in machine-letter order with its blank's spelling and its score. Read from the bytes the job pins, by the same parsers job creation checks them with. |
 | `GET` | `/api/jobs/:id/stream` | SSE stream of live stat updates for a job. Pushes an event after accepted results, coalesced to at most one per `JOB_STATS_CACHE_SECONDS` (an admin's change, a completion or a generation closing at once). |
 | `GET` | `/api/users` | List all registered user accounts with contribution stats. Paginated. |
 | `GET` | `/api/workers` | Contributor stats for all workers (anonymous and authenticated) — movegens, compute time, tasks and the last result — paginated, ranked by movegens or by `?sort=movegens\|compute\|tasks`. |
+| `GET` | `/api/workers/movegens` | The site's work by job type, `{opening_rack, games, game_pairs, leave_generation}`, each `{movegens, compute_seconds, tasks}`, every type present: the jobs' running totals (`jobs.movegens`, `compute_ms`, `tasks_completed`) summed, which add up to the contributor list's columns. |
+| `GET` | `/api/workers/user/:id/movegens` | One contributing account's work by job type, same shape, from its claims; a deleted account under its tombstone too. `404` for an account that is not on the contributor list. |
+| `GET` | `/api/workers/anon/:anon_id/movegens` | The same for a contributing anonymous worker, by its pseudonym (never its UUID). `404` for a pseudonym of nobody on the list. |
 | `GET` | `/api/rating-pools` | Rating pools with their conditions, member counts and last fit time. |
-| `GET` | `/api/rating-pools/:id` | One pool: its members now (`members`: config id and name, the anchor among them) and its latest fit, with run provenance, each rated config's rating with uncertainty, and the residuals. The two sets can differ: a member added since the fit (or whose refit failed) has no rating yet, and one removed since is still rated. |
+| `GET` | `/api/rating-pools/:id` | One pool: its members now (`members`: config id and name, the anchor among them) and its latest fit, with run provenance, each rated config's rating with uncertainty, and the cross table (`head_to_heads`: every head-to-head from both sides, each with its pairs, win score, standard error, average spread and the score the ratings predict). The two sets can differ: a member added since the fit (or whose refit failed) has no rating yet, and one removed since is still rated. |
 | `GET` | `/api/rating-pools/:id/history` | Stored runs' ratings, oldest first, thinned to at most 500 runs evenly spaced over the pool's history, for the six current members rated highest in the newest run. No page draws it now. |
 
 **Rack lookup** canonicalizes the query before matching: uppercased, whitespace
@@ -5802,13 +5998,13 @@ SvelteKit uses file-based routing under `frontend/src/routes/`. Each directory w
 |---|---|
 | `/` | Landing page — brief description of birdtest, links to the job list and the worker setup guide. |
 | `/jobs` | Job list — all jobs with type, status, allocation, and completion counter. Loaded on visit rather than live: there is no job-list stream, only a per-job one. |
-| `/jobs/[id]` | Job detail — four headline cards (status, allocation, tasks completed, estimated time left; the admin page has the same), job-type-specific stats and per-worker contribution table. Live-updated via SSE. The status card says nothing beside an active job's badge; an inactive job's says "Paused: …" (and where its significance test stands), a completed job's "Finished …: …" and why. Beside the lexicon and variant, how each player searches ("4-ply sim, 1,000 iterations vs static, by equity"); a Job settings card — the job's settings and its type's, every row, with no toggle, the significance test one row ("no" or "yes (95%)") — then a Player settings card, the players side by side (`PlayerSettingsTable`: one column per player, those they differ in bold, each name linking to its config), showing their key rows (Lexicon, Leaves, Sorted By, Move Recorder, Moves Generated, Plies, Uses Inference, Uses Preendgame, Uses Endgame, for every player) with an "All settings" toggle for the rest, and a JSON download (`GET /api/jobs/:id/config`). Which player rows are key is `jobSettings.ts`'s (`PLAYER_ROWS`, `keySettings`). The admin job page has the same cards. |
+| `/jobs/[id]` | Job detail — four headline cards (allocation, tasks completed, throughput -- units finished an hour over the last hour or since activation, in the job's own unit: games, pairs, rack analyses, or a leave job's games (`JobStats.throughput`), the rate the ETA extrapolates -- and estimated time left; the admin page has the same), job-type-specific stats and per-worker contribution table with the job's movegens under it, then the settings cards last. Live-updated via SSE. The status card says nothing beside an active job's badge; an inactive job's says "Paused: …" (and where its significance test stands), a completed job's "Finished …: …" and why. Beside the lexicon and variant, how each player searches ("4-ply sim, 1,000 iterations vs static, by equity"); a Job settings card — the job's settings and its type's, every row, with no toggle, the significance test one row ("no" or "yes (95%)") — then a Player settings card, the players side by side (`PlayerSettingsTable`: one column per player, each name linking to its config), showing two players only the settings they differ in ("These players' settings are identical." when none) and one player its key rows (Lexicon, Leaves, Sorted By, Move Recorder, Moves Generated, Plies, Uses Inference, Uses Preendgame, Uses Endgame), with an "All settings" toggle for every row, and a JSON download (`GET /api/jobs/:id/config`). Which player rows are key is `jobSettings.ts`'s (`PLAYER_ROWS`, `keySettings`). The admin job page has the same cards. |
 | `/users` | Registered user list — all user accounts with contribution stats. |
-| `/workers` | Contributor leaderboard — all workers (anonymous and authenticated) ranked by movegens (shown as "1.2M"; the exact count on hover), or by compute time or tasks at a click on the column; on a phone only the ranked column is shown beside the name, and a "Rank by" row above the list chooses it. |
+| `/workers` | **Contributions** (the nav's and the heading's name; the URL stays) — the site's totals (movegens, compute time, tasks) and the same by job type, then the contributor leaderboard — all workers (anonymous and authenticated) ranked by movegens (shown as "1.2M"; the exact count on hover), or by compute time or tasks at a click on the column; on a phone only the ranked column is shown beside the name, and a "Rank by" row above the list chooses it. |
 | `/ratings` | Rating pool list — each pool's conditions, member count and last fit. |
 | `/player-configs` | Every player config, newest first: its name, how it searches, its lexicon and leaves. Public, like the job pages that already show players' settings. |
 | `/player-configs/[id]` | One config: a table of its key settings (its files, how moves are sorted, recorded and generated, plies, and whether it infers and solves the pre-endgame and endgame) that "All settings" grows to every setting — the job page's `PlayerSettingsTable` with one column — a JSON download, and the config it was cloned from. The job page's Settings card links each player here. |
-| `/ratings/[id]` | [The ratings page](#the-ratings-page) — ratings with uncertainty, and residuals (no history chart: `GET /api/rating-pools/:id/history` serves API callers). Admin controls for membership appear inline for admins. |
+| `/ratings/[id]` | [The ratings page](#the-ratings-page) — ratings with uncertainty, and the cross table with its residuals (no history chart: `GET /api/rating-pools/:id/history` serves API callers). Admin controls for membership appear inline for admins. |
 
 ### Auth Routes
 
@@ -5836,9 +6032,9 @@ Protected by a layout guard (`/admin/+layout.svelte`) that requires `is_admin = 
 | Route | Page |
 |---|---|
 | `/admin` | Admin overview — redirects to `/jobs`, the job list; a job's page links ("Manage") to its admin page, `/admin/jobs/:id`. There is no `/admin/jobs` list; `/admin/jobs/new` creates a job. |
-| `/admin/allocation` | Every active and inactive job with its allocation, set together and saved in one request (`PUT /api/admin/jobs/allocations`): a running total that turns red above 100% and holds the save, "Share equally", and only the jobs changed are sent. |
-| `/admin/jobs/new` | Create job form — job type selector, then type-specific config fields; a games or pairs job can be set to save the positions it plays (`capture_positions`), which caps its batch at 1,000 games or 500 pairs, and a pairs job saving them to keep only where each pair first diverges (`capture_first_divergence`). The letter distribution and board layout start empty ("Choose…") and must be picked, here and on the rating-pool form: the first of each imported is no default worth having. A games or pairs job's **Significance Test** checkbox, ticked, shows its **Confidence %** (95) and minimum; an opening-rack job's consensus is three fields, Minimum and Maximum Analyses Per Rack and Consensus %. Every field is named as the settings tables name it, in Title Case. |
-| `/admin/jobs/[id]` | Admin job view — the public page's four headline cards (status, allocation, tasks completed, ETA), the job's progress, its settings, match score and Significance Test cards as the public page has them, for an opening-rack job a Consensus card that changes its consensus settings (`PATCH .../consensus`), contributors and data gaps (what workers declined it for) plus controls: activate, deactivate, force-complete, purge, delete (the last three ask first: none can be taken back), an artifact check and "merge progress now" for leave generation, and the export panel — a completed job's final export or a snapshot of a running one; start, poll, download. |
+| `/admin/allocation` | Every active and inactive job with its allocation, set together and saved in one request (`PUT /api/admin/jobs/allocations`): a running total that turns red above 100% and holds the save, "Share equally" (among the jobs above 0% and those the creation form just made, `?new=`), and only the jobs changed are sent. |
+| `/admin/jobs/new` | Create job form — job type selector, then type-specific config fields; a games or pairs job's players are a checklist — one ticked is a self-play job, several a [round robin](#admin-api-semantics) of a job per pairing, seated in the order ticked — with a live preview of the matchups ("4 configs → 6 jobs" and each job's name), and creating one goes to `/admin/allocation` with the new jobs marked, where they are started (any other job type goes to its own page); a games or pairs job can be set to save the positions it plays (`capture_positions`), which caps its batch at 1,000 games or 500 pairs, and a pairs job saving them to keep only where each pair first diverges (`capture_first_divergence`); a games or pairs job's **Threading** is "Intra-game parallelism (all threads on one game)" (`igp`, the default: every thread on one game's simulation, which makes an iteration-bounded simulation reproducible) or "Per-game parallelism (one game per thread)" (`pgp`), which matters only when a player simulates. The letter distribution and board layout start empty ("Choose…") and must be picked, here and on the rating-pool form: the first of each imported is no default worth having. A games or pairs job's **Significance Test** checkbox, ticked, shows its **Confidence %** (95) and minimum; an opening-rack job's consensus is three fields, Minimum and Maximum Analyses Per Rack and Consensus %. Every job type has a **Task Time Limit (Seconds)** beside Oldest MAGPIE, 3600 until changed, saying how long that is ("1h") and what reaching it does. Every field is named as the settings tables name it, in Title Case. |
+| `/admin/jobs/[id]` | Admin job view — the public page's four headline cards, a Controls card with the job's **Task Time Limit (Seconds)** and its Save (`PATCH .../time-limit`: claims already made keep their deadlines), the job's progress, its settings, match score and Significance Test cards as the public page has them, for an opening-rack job a Consensus card that changes its consensus settings (`PATCH .../consensus`), contributors and data gaps (what workers declined it for) plus the job's allocation, read-only with a link to `/admin/allocation` (the only place a job is switched on or off), and controls: force-complete, purge, delete (each asks first: none can be taken back), an artifact check and "merge progress now" for leave generation, and the export panel — a completed job's final export or a snapshot of a running one; start, poll, download. |
 | `/admin/player-configs` | Player config list — name, recorder type, sort strategy, sim parameters. |
 | `/admin/player-configs/new` | Create player config form, each field named as the settings tables name it with its MAGPIE argument beside it ("Move Recorder (-r)", "Sorted By (-s)"). No number box on either form has spinner arrows. |
 | `/admin/rating-pools/new` | Create rating pool form — name, variant, letter distribution, board layout, anchor config and rating, and optionally the other members to add once it exists. Linked from `/ratings` for an admin; membership is managed on the pool's page after that. |
@@ -5857,23 +6053,36 @@ Protected by a layout guard (`/admin/+layout.svelte`) that requires `is_admin = 
 `/ratings/[id]` is where a pool's fit is read. Three panels, each answering a
 different question, and the design choices in them are load-bearing:
 
-**Ratings, as a dot plot with error bars.** Deliberately not a bar chart: a bar
-encodes magnitude from zero, and Elo has no meaningful zero — the scale is
-anchored wherever the pool's anchor was pinned, so bar length would imply a ratio
-that does not exist. A dot on a common scale encodes position, which is what a
-rating is. The error bar matters as much as the dot, because a config with two
+**The cross table**, first: the results themselves, before the ratings that
+summarise them. Every rated config against every
+other: win %, its standard error and the average spread, the rating last ([The
+cross table](#the-cross-table)). A cell's background is its record as the cell
+shows it -- green over 50.0%, red under, none at 50.0% (`recordSide`: the
+rounded figure, never the float, so the colour cannot disagree with the
+number). Under it one line saying that a gap means what it does between WESPA
+players and the absolute level only where the anchor was pinned ([The scale is
+WESPA's](#the-scale-is-wespas)). Its hover carries what the ratings predict, so this
+is the panel that makes non-transitivity visible instead of letting it quietly
+distort the ranking: a cell the ratings predict badly has amber text (on its
+record's tint: it can be both), and when enough
+head-to-heads are badly mispredicted the page says outright that the ratings
+should be read as a summary rather than a ranking. It replaced a separate
+residual table, listed largest disagreement first, which said the same about
+the model in a list nobody could read against the results.
+
+**Ratings, as a dot plot with error bars**, under the cross table. Deliberately not a bar chart: a bar
+encodes magnitude from zero, and a rating has no meaningful zero — only gaps
+mean anything, and the level is wherever the pool's anchor was pinned — so bar
+length would imply a ratio that does not exist. A dot on a common scale encodes
+position, which is what a rating is. The error bar matters as much as the dot, because a config with two
 hundred pairs and one with two million otherwise produce identical-looking
 numbers and only the interval says which to believe. A config with no path to the
 anchor is listed beneath the chart as **unrated** rather than drawn at a number.
 
-**A table of every config**, since the chart caps what it draws and the table
-must not. This is also the accessible view of the same data.
-
-**Where the model disagrees with the games.** The residual table: actual score
-versus predicted, per head-to-head, largest disagreement first. This is the panel
-that makes non-transitivity visible instead of letting it quietly distort the
-ranking, and when enough head-to-heads are badly mispredicted the page says
-outright that the ratings should be read as a summary rather than a ranking.
+**A table of every config**, for admins only, after the plot: the
+exact rating to a decimal, ± SE as a number and pairs played per config, with
+the membership controls. A visitor has the interval on the plot and the rating
+in the cross table's last column, which said the same thing twice.
 
 Admin controls live inline on this page rather than under `/admin`, because
 adding or removing a config is an act whose consequence — every other rating
@@ -6022,7 +6231,8 @@ birdtest/
 ├── frontend/                       # SvelteKit app
 │   ├── Dockerfile                  # static build served by Nginx — the same artifact ECS runs
 │   ├── docker/default.conf.template # SPA fallback + /api proxy (SSE needs proxy_buffering off); the
-│   │                               # backend's address filled in at start (BACKEND_UPSTREAM)
+│   │                               # backend's address filled in at start (BACKEND_UPSTREAM).
+│   │                               # The proxy is compose's: in production the ALB routes /api
 │   ├── package.json
 │   ├── svelte.config.js
 │   ├── vite.config.ts
@@ -6046,13 +6256,14 @@ birdtest/
 │       │   ├── matchScore.ts       # the match score's rows
 │       │   ├── matchTest.ts        # the significance test card's interval and sentence
 │       │   ├── consensus.ts        # an opening-rack job's consensus settings and standing
+│       │   ├── roundRobin.ts       # a games or pairs request's matchups, previewed as the server makes them
 │       │   ├── jobSettings.ts      # a job's and a player config's settings tables
 │       │   ├── charts/             # pentanomial.ts (the pair-outcome table), ratingDotPlot.ts,
 │       │   │                       # residuals.ts, labels.ts: the arithmetic behind the charts
 │       │   └── components/         # shared UI components
 │       │       ├── JobStatusBadge.svelte
 │       │       ├── JobStatusCard.svelte  # where a job stands, a row above the headline figures
-│       │       ├── JobStatsRow.svelte    # the three headline figures
+│       │       ├── JobStatsRow.svelte    # the four headline figures
 │       │       ├── JobSettings.svelte    # a job's settings and its players'
 │       │       ├── PlayerSettingsTable.svelte # player configs' settings, a column per player
 │       │       ├── TaskCounts.svelte     # a job's tasks by state
@@ -6066,8 +6277,7 @@ birdtest/
 │       │       ├── WorkerTable.svelte
 │       │       ├── Pagination.svelte
 │       │       ├── ProgressBar.svelte
-│       │       ├── RatingDotPlot.svelte  # ratings with error bars (not a bar chart: Elo has no zero)
-│       │       ├── ResidualMatrix.svelte # actual vs predicted per head-to-head
+│       │       ├── RatingDotPlot.svelte  # ratings with error bars (not a bar chart: a rating has no zero)
 │       │       └── PlayerCompareTable.svelte # two players side by side, higher green
 │       └── routes/
 │           ├── +layout.svelte      # global layout (nav bar, footer)
@@ -6566,16 +6776,19 @@ CREATE TABLE jobs (
     -- a job created without one (through the API; the form asks for it).
     name       TEXT NOT NULL DEFAULT '' CHECK (char_length(name) <= 100),
     job_type   job_type NOT NULL,
-    -- NULL until the job is first activated; set by the admin at activation
-    -- time. Every active job's share of the fleet: the scheduler hands each
-    -- claim to the active job furthest behind
+    -- Every active job's share of the fleet: the scheduler hands each claim
+    -- to the active job furthest behind
     -- `(claims_issued - claims_baseline) / allocation`, and the active jobs
-    -- may allocate at most 100% between them. There is
-    -- no priority: a job that should get nothing for now is set to 0%, which
-    -- is exactly what `inactive` means, and a job that should get everything
-    -- is the only one above 0%.
-    allocation INT CHECK (allocation BETWEEN 0 AND 100),
-    -- Jobs start inactive; admin activates with an allocation percentage.
+    -- may allocate at most 100% between them. There is no priority: a job
+    -- that should get nothing for now is at 0%, and a job that should get
+    -- everything is the only one above 0%.
+    allocation INT NOT NULL DEFAULT 0 CHECK (allocation BETWEEN 0 AND 100),
+    -- Jobs start inactive at 0%. The allocation is the only switch: setting
+    -- one above 0% activates a job and setting it to 0% deactivates it, so
+    -- `inactive` and 0% are one state rather than two that could disagree --
+    -- an active job at 0% was on offer to nobody while every page called it
+    -- running. A completed job is not active, so it holds 0% too: nothing
+    -- of its old share is kept to come back to (see `jobs_allocation_is_status`).
     status     job_status NOT NULL DEFAULT 'inactive',
     -- SET NULL if the creating admin's account is deleted.
     created_by           UUID REFERENCES users(id) ON DELETE SET NULL,
@@ -6613,6 +6826,13 @@ CREATE TABLE jobs (
     min_magpie_major INT NOT NULL DEFAULT 0 CHECK (min_magpie_major >= 0),
     min_magpie_minor INT NOT NULL DEFAULT 1 CHECK (min_magpie_minor >= 0),
     min_magpie_patch INT NOT NULL DEFAULT 1 CHECK (min_magpie_patch >= 0),
+    -- The longest one of the job's tasks may run: an hour unless the job's
+    -- creation names another, changed on its admin page. Every claim keeps
+    -- its own deadline, claim time plus this as it stood then. Ten minutes at
+    -- the least -- a first claim on a machine may build a rack info table that
+    -- cannot be stopped -- and a day at the most; the API refuses what this
+    -- refuses.
+    max_task_seconds INT NOT NULL DEFAULT 3600 CHECK (max_task_seconds BETWEEN 600 AND 86400),
     -- Every claim ever issued for this job, abandoned and declined ones
     -- included: the deficit the scheduler orders on. Kept as a counter rather
     -- than counted, because counting task_claims on every claim request costs
@@ -6621,7 +6841,8 @@ CREATE TABLE jobs (
     claims_issued   BIGINT NOT NULL DEFAULT 0 CHECK (claims_issued >= 0),
     -- Where this job's share is measured *from*. The scheduler orders on
     -- `(claims_issued - claims_baseline) / allocation`, and the baseline is
-    -- reset -- on activation, on an allocation change, on a purge -- so that
+    -- reset -- on activation and on an allocation change (a purge leaves the
+    -- job inactive, to be reset when it is activated again) -- so that
     -- the job's ratio equals the lowest ratio among the other jobs being
     -- served (see `last_claimed_at` below): it joins at parity and takes its
     -- share from then on.
@@ -6657,6 +6878,33 @@ CREATE TABLE jobs (
     test_decided_lower  DOUBLE PRECISION,
     test_decided_upper  DOUBLE PRECISION,
     test_decided_units  BIGINT,
+    -- Tasks of this job that hit the time limit (`max_task_seconds`):
+    -- those a worker stopped and handed back, declining them `time_limit`,
+    -- and those whose claim the server took back at the deadline while the
+    -- worker still heartbeat (`task_claims.overrun`, counted once the job's
+    -- row is next taken). The job page says how many, since the cure is a
+    -- smaller batch. And how many of those came in a row with no task of the
+    -- job completed between, which an accepted result zeroes: at three the
+    -- job is set aside -- inactive at 0%, with `set_aside_reason` saying why
+    -- -- since a job whose one unit always outlasts the limit would otherwise
+    -- be handed out, run for the limit and handed back for ever. Giving it an
+    -- allocation again starts the run afresh and clears the reason; a purge
+    -- zeroes all three.
+    time_limit_declines BIGINT NOT NULL DEFAULT 0 CHECK (time_limit_declines >= 0),
+    time_limit_streak   INT NOT NULL DEFAULT 0 CHECK (time_limit_streak >= 0),
+    -- When the run `time_limit_streak` counts began: the last accepted result,
+    -- or the allocation that put the job back; NULL for a job whose run has
+    -- not been broken. An overrun is counted after the fact, so whether it is
+    -- part of the run is a question of when it happened -- its deadline --
+    -- not of when it was counted: one that overran before the completion or
+    -- the allocation that ended its run counts toward the total alone.
+    time_limit_streak_since TIMESTAMPTZ,
+    -- Why the server switched the job off, when it did; read only while the
+    -- job is inactive.
+    set_aside_reason    TEXT,
+    -- The invariant above, for every status: active exactly when above 0%,
+    -- which holds an inactive or completed job at 0%.
+    CONSTRAINT jobs_allocation_is_status CHECK ((status = 'active') = (allocation > 0)),
     CONSTRAINT jobs_test_decided_together CHECK (
         (test_decided_status IS NULL) = (test_decided_lower IS NULL)
         AND (test_decided_status IS NULL) = (test_decided_upper IS NULL)
@@ -6692,6 +6940,16 @@ CREATE TABLE jobs (
     -- partial restore recomputes them (RUNBOOK 2.3).
     tasks_total     BIGINT NOT NULL DEFAULT 0 CHECK (tasks_total >= 0),
     tasks_completed BIGINT NOT NULL DEFAULT 0 CHECK (tasks_completed >= 0),
+    -- The move generations the job's accepted claims reported, added in the
+    -- same submission and `UPDATE jobs` that credit the claim's contributor;
+    -- a purge zeroes it and a delete takes it, as each gives the contributors
+    -- theirs back. A partial restore recomputes it (RUNBOOK 2.3).
+    movegens        BIGINT NOT NULL DEFAULT 0 CHECK (movegens >= 0),
+    -- The compute time the same claims were credited with, in whole
+    -- milliseconds: the Contributions page's site totals by job type, beside
+    -- `movegens` and `tasks_completed`. Added, zeroed and taken with
+    -- `movegens`.
+    compute_ms      BIGINT NOT NULL DEFAULT 0 CHECK (compute_ms >= 0),
     -- When a result was last accepted for the job, to the minute (the
     -- submission that stores one sets it at most once a minute). The job
     -- list's `stalled` flag asks "none in a day"; answered from the claims, it
@@ -6921,6 +7179,12 @@ CREATE TABLE job_game_config (
     -- recorded. Off by default: at ~22.5 turns a game it roughly doubles the
     -- rows a job produces.
     capture_positions   BOOLEAN NOT NULL DEFAULT FALSE,
+    -- How MAGPIE spends its threads on a task (MULTI_THREADING_MODE): 'igp'
+    -- gives them all to one game at a time, inside its simulation, which makes
+    -- an iteration-bounded simulation reproducible; 'pgp' plays games in
+    -- parallel, a thread each. Matters only when a player simulates; a job of
+    -- static players runs alike in either. Stated on every request.
+    threading_mode      TEXT NOT NULL DEFAULT 'igp' CHECK (threading_mode IN ('igp', 'pgp')),
     -- What `validate_job_body` requires, held here too for a row written any
     -- other way (a script, a fixture, a restore). The stopping rule reads the
     -- counts as unsigned: a negative max_games was a cap no job reached, so it
@@ -6955,6 +7219,8 @@ CREATE TABLE job_game_pair_config (
     -- are the same game; after it they are two different ones, and the turn
     -- itself is where the players disagree.
     capture_first_divergence BOOLEAN NOT NULL DEFAULT FALSE,
+    -- As on job_game_config.
+    threading_mode      TEXT NOT NULL DEFAULT 'igp' CHECK (threading_mode IN ('igp', 'pgp')),
     CONSTRAINT job_game_pair_config_divergence_needs_capture
         CHECK (capture_positions OR NOT capture_first_divergence),
     -- As job_game_config_counts, in pairs.
@@ -7113,6 +7379,11 @@ CREATE INDEX tasks_queue_idx   ON tasks (job_id, created_at) WHERE state = 'avai
 -- this", the other is a claim that lapsed. Only the first is diagnostic.
 CREATE TYPE claim_state AS ENUM ('claimed', 'completed', 'abandoned', 'declined');
 
+-- An abandoned claim that ran past its deadline with its worker alive
+-- (`task_claims.overrun`): `pending` until it is counted against its job,
+-- then `counted`.
+CREATE TYPE claim_overrun AS ENUM ('pending', 'counted');
+
 CREATE TABLE task_claims (
     id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     task_id              UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -7128,6 +7399,29 @@ CREATE TABLE task_claims (
     claimed_by_user_id   UUID REFERENCES users(id),
     claimed_by_anon_uuid UUID REFERENCES anonymous_workers(uuid),
     claimed_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- When the task must be done by: `claimed_at` plus its job's `max_task_seconds`
+    -- as it stood when the claim was made, which the assignment told the
+    -- worker. Past it and a minute's grace the claim lapses whether or not its
+    -- worker still heartbeats, and a result for it is refused: a task whose
+    -- one unit outlasts the limit (a deep-sim game pair) would otherwise hold
+    -- its slot for as long as its worker lived. The claim path always sets
+    -- it; the default, the limit's own default, is for a row written any
+    -- other way (a script, a test's fixture).
+    deadline_at          TIMESTAMPTZ NOT NULL DEFAULT now() + interval '1 hour',
+    -- Set on a claim taken back past its deadline while its worker was still
+    -- alive: reclamation found it heartbeating within the heartbeat timeout
+    -- of the moment it lapsed (deadline plus grace), or the worker submitted
+    -- a result for it too late. NULL for every other claim -- a lapse whose
+    -- worker had gone silent is what a dead worker leaves, and says nothing
+    -- about the job. Such a claim is a task that hit the time limit as surely
+    -- as a `time_limit` decline: a solve or a build that overruns MAGPIE's
+    -- stop declines after the claim has lapsed, and that decline is a `404`.
+    -- Counted against the job (`jobs.time_limit_declines`, `time_limit_streak`)
+    -- by whoever next holds the job's row for it -- the job's next claim,
+    -- a decline or a late result -- since reclamation runs over many jobs in
+    -- one statement on the claim path and takes no job's row: `pending` until
+    -- then, `counted` after.
+    overrun              claim_overrun,
     last_heartbeat_at    TIMESTAMPTZ,
     completed_at         TIMESTAMPTZ,
     -- The move generations this claim's accepted result reported (the
@@ -7146,7 +7440,7 @@ CREATE TABLE task_claims (
 )
 -- Room on each page for a claim's heartbeats. A heartbeat changes only
 -- `last_heartbeat_at`, which no index covers, so it can be a HOT update -- an
--- in-page rewrite that touches none of this table's eight indexes -- but only
+-- in-page rewrite that touches none of this table's nine indexes -- but only
 -- if the row's page has space, and claims are appended, so at the default
 -- fillfactor of 100 a claim's first heartbeat found its page full and wrote a
 -- new entry into every index: two a minute for every claim in flight.
@@ -7401,7 +7695,7 @@ CREATE TABLE leave_selection_cursors (
 -- Opening rack jobs write one per rack. Games and game-pairs jobs write one per
 -- turn when `capture_positions` is on: a worker analyses a position on every
 -- turn anyway, and keeping those makes a job a corpus of analysed positions as
--- well as an Elo measurement.
+-- well as a measurement of strength.
 --
 -- The request that produced these is job-type-specific -- opening_rack_requests
 -- or game_requests -- but what comes back is a position analysis either way,
@@ -7853,9 +8147,10 @@ CREATE TABLE player_config_ratings (
     run_id           UUID NOT NULL REFERENCES rating_runs(id) ON DELETE CASCADE,
     player_config_id UUID NOT NULL REFERENCES player_configs(id),
     rating           DOUBLE PRECISION NOT NULL,
-    -- Approximate Elo standard error. Wide bars are the honest signal that a
-    -- config has barely played, or has only played opponents far from its own
-    -- strength; the page shows them next to the rating for that reason.
+    -- Approximate standard error, in rating points. Wide bars are the honest
+    -- signal that a config has barely played, or has only played opponents
+    -- far from its own strength; the page shows them next to the rating for
+    -- that reason.
     stderr           DOUBLE PRECISION NOT NULL,
     pairs_played     BIGINT NOT NULL,
     -- FALSE when no chain of games connects this config to the pool's anchor.
@@ -7867,12 +8162,14 @@ CREATE TABLE player_config_ratings (
     PRIMARY KEY (run_id, player_config_id)
 );
 
--- The residuals of one fit: for every head-to-head with games in it, the score
--- the fit's ratings predict against the score that happened. Stored with the
--- run rather than recomputed on each view of the pool, which rebuilt the
--- pool's evidence matrix -- a grouped scan over every paired result it counts
--- -- on every public page view. Stored, they also describe the evidence this
--- fit used, not evidence that has moved on since.
+-- The cross table of one fit, and its residuals: for every head-to-head with
+-- games in it, once (the row is the config whose name sorts first), the score
+-- that happened, its standard error and the average spread, beside the score
+-- the fit's ratings predict. The page mirrors each row for the other side.
+-- Stored with the run rather than recomputed on each view of the pool, which
+-- rebuilt the pool's evidence matrix -- a grouped scan over every paired
+-- result it counts -- on every public page view. Stored, they also describe
+-- the evidence this fit used, not evidence that has moved on since.
 CREATE TABLE rating_run_residuals (
     run_id               UUID NOT NULL REFERENCES rating_runs(id) ON DELETE CASCADE,
     row_player_config_id UUID NOT NULL REFERENCES player_configs(id),
@@ -7880,6 +8177,12 @@ CREATE TABLE rating_run_residuals (
     pairs                DOUBLE PRECISION NOT NULL,
     actual               DOUBLE PRECISION NOT NULL,  -- the row config's score rate
     predicted            DOUBLE PRECISION NOT NULL,
+    -- The standard error of `actual`, from the pairs' score variance in the
+    -- summed pentanomial (ratings::HeadToHeadEvidence::score_and_stderr).
+    stderr               DOUBLE PRECISION NOT NULL,
+    -- The row config's average spread per game: Σ games·(its mean score − the
+    -- other's) / Σ games over the same game_results rows.
+    spread               DOUBLE PRECISION NOT NULL,
     PRIMARY KEY (run_id, row_player_config_id, col_player_config_id)
 );
 
@@ -7921,6 +8224,7 @@ CREATE TABLE backups (
 -- for the most recent successful one.
 CREATE INDEX backups_finished_idx ON backups (finished_at DESC);
 
+
 -- Audit log
 
 -- No foreign keys, deliberately. The log is append-only and has to outlive
@@ -7949,10 +8253,17 @@ CREATE TABLE audit_log (
 CREATE UNIQUE INDEX task_claims_token_idx     ON task_claims (claim_token);
 CREATE INDEX        task_claims_task_idx      ON task_claims (task_id);
 CREATE INDEX        task_claims_open_idx      ON task_claims (task_id) WHERE state = 'claimed';
+-- Overruns not yet counted against their job (`task_claims.overrun`). Every
+-- claim request asks which of its candidate jobs have one, and this is what
+-- keeps that cheap: an entry lives from the reclamation that records it to
+-- the job's next claim, decline or late result, so the index is all but
+-- always empty -- a probe, not a scan of the job's claims.
+CREATE INDEX        task_claims_overrun_idx   ON task_claims (job_id) WHERE overrun = 'pending';
 -- Completed claims by time. The ETA (`jobstats::estimate_eta`, on every
 -- detail view and live push) asks "how many of this job's claims completed
 -- in the last hour" (the job list's `stalled` flag reads
--- `jobs.last_completed_at` instead), and no index on task_claims leads with the job, so
+-- `jobs.last_completed_at` instead), and no index on task_claims leads with the job (but
+-- the overruns', which holds next to nothing), so
 -- the alternative plan walks every task of the job and every claim of each
 -- -- the job's whole history, for a question about its last hour. Through
 -- this index the scan is bounded by the fleet's recent completions instead,
@@ -7972,10 +8283,13 @@ CREATE INDEX        task_claims_completed_idx ON task_claims (completed_at DESC)
 -- column. The completion time adds nothing to a claim's updates: completing
 -- one changes `state`, which the open-claims index's predicate reads, so that
 -- update was never a HOT one, and a heartbeat touches neither.
+-- Each carries the claim's `movegens` and `claimed_at`, so a contributor's
+-- work by job type -- movegens, compute time, tasks -- is an index-only walk
+-- of their range (`GET /api/workers/*/:id/movegens`).
 CREATE INDEX        task_claims_user_idx      ON task_claims (claimed_by_user_id, job_id, completed_at)
-    WHERE claimed_by_user_id IS NOT NULL;
+    INCLUDE (movegens, claimed_at) WHERE claimed_by_user_id IS NOT NULL;
 CREATE INDEX        task_claims_anon_idx      ON task_claims (claimed_by_anon_uuid, job_id, completed_at)
-    WHERE claimed_by_anon_uuid IS NOT NULL;
+    INCLUDE (movegens, claimed_at) WHERE claimed_by_anon_uuid IS NOT NULL;
 -- There is no (job_id, state) index. The job-scoped reads of `tasks` -- the
 -- detail page's counts by state, the census -- are served by
 -- `tasks_seed_unique_idx (job_id, seed)` and the heap. The opening-rack finish
@@ -8076,7 +8390,10 @@ says so in its implemented option, rather than being removed.
   harmless to the match test, which has already decided, and to ratings, which refit on
   it, and `tasks_claimed` is a display figure. Refusing late submissions throws
   away real results. A periodic sweep is the background process the lazy
-  design exists to avoid.
+  design exists to avoid. The one late result refused whether or not its claim
+  was reclaimed is one past the claim's own deadline and grace
+  ([Task time limit](#task-time-limit)): that is a task run past the limit
+  its worker was given, not a worker that went quiet.
 
 **KL-2. A poison task blocks a games or pairs job at its cap.**
 - **Context:** No task is generated past `max_games`/`max_pairs`, so a job at its
@@ -9884,8 +10201,6 @@ says so in its implemented option, rather than being removed.
     tree, so nothing ties a pushed image to a commit CI passed.
   - The dev compose file publishes Postgres, MinIO and the backend on every
     interface, with committed credentials.
-  - The pages are served uncompressed (nginx's gzip is off; the bundle is
-    about 524 KB).
   - The task roles' trust policies carry no `aws:SourceAccount` or
     `aws:SourceArn` condition, which AWS recommends for Scheduler and S3; the
     derived-file builder is given `SESSION_SIGNING_KEY` only because the
@@ -10508,8 +10823,8 @@ and the ceiling reached (RDS-EVENT-0224, `failure`).
 It also carries the site being down (`infra/ecs.tf`): no healthy backend or
 frontend target behind the load balancer for ten minutes. Nothing else would
 report a crash-looping task, a health check that never passes, or a rollback
-onto a schema its image refuses. Ten minutes, not one, because the service
-keeps no healthy task through a deploy, and migrations run inside the health
+onto a schema its image refuses. Ten minutes, not one, because the backend's
+service keeps no healthy task through a deploy, and migrations run inside the health
 check's grace. The alarms exist only while `desired_count` is above 0, so a
 first apply or RUNBOOK §5's first step does not page. The apply that raises
 it does, once: it creates the alarms before the task is healthy, and with no
@@ -10517,7 +10832,7 @@ data yet they start in ALARM, then clear (README's first deploy says to expect
 it).
 
 It carries a deploy the circuit breaker rolled back, too (`infra/ecs.tf`,
-`-deploy-failed`: ECS's `SERVICE_DEPLOYMENT_FAILED` for the web service). The
+`-deploy-failed`: ECS's `SERVICE_DEPLOYMENT_FAILED` for either service). The
 `-down` alarms rarely see one, since three failed launches usually end inside
 their ten minutes with the old revision healthy again, and `apply` does not
 wait. Yet a rollback is not over when the site is back: Terraform's state still
@@ -10653,7 +10968,13 @@ and update `_sqlx_migrations` to the current checksum; or `pg_restore --data-onl
 into a freshly migrated empty database, which works when the change is additive and
 fails noisily when it is not. This is the strongest practical argument for cutting
 over to numbered migrations at release: the in-place policy makes every backup older
-than the last schema edit restorable only with archaeology.
+than the last schema edit restorable only with archaeology. Until then a production
+reset (`scripts/reset-prod-db.sh`, `deploy.sh --reset-db`) deletes the nightly dumps
+with the database -- every version under `pg/`, in the backups bucket and its DR
+replica, past the governance lock -- so no dump of an older `0001` outlives the
+schema it was taken under, nor the accounts it holds. RDS's point-in-time backups
+are left to expire: for `db_backup_retention_days` (30) after a reset they are the
+one way back across it (RUNBOOK, "Resetting the production database").
 
 **Verifying a restore.** Do not declare one finished on "the page loads":
 
@@ -10828,8 +11149,10 @@ only configuration that survives full account compromise.
    says so: ECS waits out the target group's deregistration delay before it
    even sends `SIGTERM`, and the defaults (300 s of draining, then three health
    checks thirty seconds apart for the new task) made it seven or eight
-   minutes — longer than the heartbeat timeout. `infra/ecs.tf` sets 30 s of
-   draining and two checks ten seconds apart. Three things are sized to ride
+   minutes — longer than the heartbeat timeout. `infra/ecs.tf` sets 10 s of
+   draining (30 s until October 2026; a cut upload is retried) and two checks
+   ten seconds apart. Only the backend's service works this way: the frontend
+   has its own service, which rolls. Three things are sized to ride
    out what is left: MAGPIE retries a refused or `5xx` request for about
    fifteen minutes, and a task claim for as long as it takes (see [HTTP](#http-srccompatchttp--srcutilhttp_client)), a
    restarted server reclaims no claim until it has been up for the heartbeat
@@ -10984,7 +11307,7 @@ docker compose exec postgres \
   psql -U birdtest -d birdtest -c "UPDATE users SET is_admin = true WHERE username = 'you';"
 ```
 
-From there, use the now-admin account's session to create a player config and a job through `/admin/player-configs/new` and `/admin/jobs/new` (or the equivalent `POST /api/admin/...` calls directly), then activate the job with an allocation via `/api/admin/jobs/:id/activate`. Once a job is active, `magpie contribute` (step 5) will start claiming and completing real tasks against it, and the dashboard at `http://localhost:5173/jobs/:id` updates live via SSE — this is the fastest way to confirm a full change (backend, frontend, and worker together) actually works end to end.
+From there, use the now-admin account's session to create a player config and a job through `/admin/player-configs/new` and `/admin/jobs/new` (or the equivalent `POST /api/admin/...` calls directly), then give the job an allocation on `/admin/allocation` (`PUT /api/admin/jobs/allocations`), which activates it. Once a job is active, `magpie contribute` (step 5) will start claiming and completing real tasks against it, and the dashboard at `http://localhost:5173/jobs/:id` updates live via SSE — this is the fastest way to confirm a full change (backend, frontend, and worker together) actually works end to end.
 
 ### Running the checks
 

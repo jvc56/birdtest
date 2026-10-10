@@ -26,6 +26,7 @@ pub fn router() -> Router<AppState> {
         .route("/jobs/:id", get(job_detail))
         .route("/jobs/:id/config", get(job_config))
         .route("/jobs/:id/results", get(job_results))
+        .route("/jobs/:id/rack-samples", get(rack_samples))
         .route("/jobs/:id/board", get(job_board))
         .route("/jobs/:id/positions", get(job_positions))
         .route("/jobs/:id/positions/random", get(random_position))
@@ -34,6 +35,9 @@ pub fn router() -> Router<AppState> {
         .route("/player-configs/:id", get(player_config))
         .route("/users", get(list_users))
         .route("/workers", get(list_workers))
+        .route("/workers/movegens", get(site_contributions))
+        .route("/workers/user/:id/movegens", get(user_contributions))
+        .route("/workers/anon/:anon_id/movegens", get(anon_contributions))
 }
 
 #[derive(Deserialize)]
@@ -60,7 +64,7 @@ struct JobListItem {
     name: String,
     job_type: JobType,
     status: String,
-    allocation: Option<i32>,
+    allocation: i32,
     created_at: chrono::DateTime<chrono::Utc>,
     tasks_total: i64,
     tasks_completed: i64,
@@ -238,6 +242,8 @@ struct JobSettings {
     bingo_bonus: i32,
     sim_cutoff: f64,
     min_magpie_version: String,
+    /// The longest one of the job's tasks may run, in seconds.
+    max_task_seconds: i32,
 }
 
 #[derive(Serialize)]
@@ -255,6 +261,8 @@ struct GamesSettings {
     /// Game pairs: of the captured positions, only each pair's first
     /// divergence is kept. Always `false` for a games job.
     capture_first_divergence: bool,
+    /// `igp` or `pgp`: how MAGPIE spends its threads on a task.
+    threading_mode: String,
 }
 
 /// The lexicon and wordmap setting are the player's, and shown with it.
@@ -443,6 +451,7 @@ async fn job_config(
                 confidence_pct: c.confidence_pct,
                 capture_positions: c.capture_positions,
                 capture_first_divergence: false,
+                threading_mode: c.threading_mode,
             });
         }
         JobType::GamePairs => {
@@ -461,6 +470,7 @@ async fn job_config(
                 confidence_pct: c.confidence_pct,
                 capture_positions: c.capture_positions,
                 capture_first_divergence: c.capture_first_divergence,
+                threading_mode: c.threading_mode,
             });
         }
         JobType::OpeningRack => {
@@ -496,6 +506,7 @@ async fn job_config(
             bingo_bonus: job.bingo_bonus,
             sim_cutoff: job.sim_cutoff,
             min_magpie_version: job.min_magpie_version().to_string(),
+            max_task_seconds: job.max_task_seconds,
         },
         games,
         opening_racks,
@@ -868,23 +879,29 @@ async fn resolve_worker(state: &AppState, name: &str) -> AppResult<Option<Worker
     .fetch_optional(&state.read_pool)
     .await?;
 
-    let looks_like_a_pseudonym =
-        name.len() == 16 && name.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
-    let anon_uuid = if looks_like_a_pseudonym {
-        sqlx::query_scalar::<_, Uuid>(
-            "SELECT uuid FROM anonymous_workers
-             WHERE tasks_completed > 0
-               AND left(encode(sha256(convert_to(uuid::text, 'UTF8')), 'hex'), 16) = $1
-             LIMIT 1",
-        )
-        .bind(name)
-        .fetch_optional(&state.read_pool)
-        .await?
-    } else {
-        None
-    };
+    let anon_uuid = resolve_pseudonym(state, name).await?;
 
     Ok((user_id.is_some() || anon_uuid.is_some()).then_some(WorkerFilter { user_id, anon_uuid }))
+}
+
+/// The contributing anonymous worker whose pseudonym `name` is, if any: see
+/// [`resolve_worker`] for why among contributors only. Anything that is not
+/// sixteen lowercase hex characters names nobody, without a query.
+async fn resolve_pseudonym(state: &AppState, name: &str) -> AppResult<Option<Uuid>> {
+    let looks_like_a_pseudonym =
+        name.len() == 16 && name.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if !looks_like_a_pseudonym {
+        return Ok(None);
+    }
+    Ok(sqlx::query_scalar::<_, Uuid>(
+        "SELECT uuid FROM anonymous_workers
+         WHERE tasks_completed > 0
+           AND left(encode(sha256(convert_to(uuid::text, 'UTF8')), 'hex'), 16) = $1
+         LIMIT 1",
+    )
+    .bind(name)
+    .fetch_optional(&state.read_pool)
+    .await?)
 }
 
 /// A named contributor's completed claims in the job (`$1`), from the cursor's
@@ -1125,6 +1142,114 @@ async fn rack_lookup(
 const RACK_LOOKUP_MOVES: i64 = i16::MAX as i64;
 
 #[derive(Deserialize)]
+struct RackSamplesQuery {
+    /// How many racks, at most [`MAX_RACK_SAMPLES`]; 10 unless given.
+    n: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct RackSamples {
+    racks: Vec<String>,
+}
+
+/// The most racks one sample returns.
+const MAX_RACK_SAMPLES: i64 = 50;
+
+/// Probes per rack asked for, on a job too large to read whole: two probes
+/// can land on one rack, and the extra ones make up for it.
+const PROBES_PER_SAMPLE: i64 = 4;
+
+/// The most analyses a job may have and still be read whole for a sample.
+const RACK_SAMPLE_SMALL_JOB: i64 = 1000;
+
+/// A few racks an opening-rack job has analysed, drawn at random, for its page
+/// to offer under the rack lookup. Public, like the lookup.
+///
+/// The page took the first distinct racks of the newest results, which are
+/// the tail of one batch: racks a fixed stride apart in the scattered
+/// enumeration, and so alphabetically close. Not `ORDER BY random()` either,
+/// which reads the whole job -- millions of records. A job of at most
+/// [`RACK_SAMPLE_SMALL_JOB`] analyses is read whole, through
+/// `position_analysis_records_job_rack_idx (job_id, rack)`, and sampled
+/// exactly. A larger one is probed: a rack drawn uniformly from the job's
+/// own rack space ([`RackIndex::rack_at`](crate::jobs::racks::RackIndex)),
+/// then the first analysed rack at or after it in the same index, wrapping to
+/// the first -- one index descent a probe, whatever the job's size, and no
+/// index of its own (a `(job_id, id)` one, to probe ids instead, would cost an
+/// entry per record on the largest table there is). A rack follows a run of
+/// racks not yet analysed as often as the run is long, which the scattered
+/// order keeps short. Duplicates are dropped, so fewer than `n` can come back.
+async fn rack_samples(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Query(query): Query<RackSamplesQuery>,
+) -> AppResult<Json<RackSamples>> {
+    use rand::seq::SliceRandom;
+    use rand::Rng;
+    let job = load_job(&state, id).await?;
+    if job.job_type != JobType::OpeningRack {
+        return Err(AppError::bad_request("only an opening-rack job's racks are sampled"));
+    }
+    let n = query.n.unwrap_or(10).clamp(1, MAX_RACK_SAMPLES) as usize;
+    let pool = &state.read_pool;
+
+    // In the index's order, so the read is a range of it however few of the
+    // table's records are this job's: unordered, the planner may scan the
+    // table for a job it guesses is common.
+    let mut racks: Vec<String> = sqlx::query_scalar(
+        "SELECT r.rack FROM position_analysis_records r
+         WHERE r.job_id = $1 AND r.game_index IS NULL
+         ORDER BY r.rack
+         LIMIT $2",
+    )
+    .bind(id)
+    .bind(RACK_SAMPLE_SMALL_JOB + 1)
+    .fetch_all(pool)
+    .await?;
+    if racks.len() as i64 > RACK_SAMPLE_SMALL_JOB {
+        let size: i32 =
+            sqlx::query_scalar("SELECT rack_size FROM job_opening_rack_config WHERE job_id = $1")
+                .bind(id)
+                .fetch_one(pool)
+                .await?;
+        let letters = job_letters(&state, &job).await?;
+        let index = crate::jobs::racks::RackIndex::new(&letters, size as usize)?;
+        let probes: Vec<String> = {
+            let mut rng = rand::thread_rng();
+            (0..n as i64 * PROBES_PER_SAMPLE)
+                .filter_map(|_| index.rack_at(rng.gen_range(0..index.total().max(1))))
+                .collect()
+        };
+        racks = sqlx::query_scalar(
+            "SELECT COALESCE(hit.rack, (
+                        SELECT r.rack FROM position_analysis_records r
+                        WHERE r.job_id = $1 AND r.game_index IS NULL
+                        ORDER BY r.rack LIMIT 1))
+             FROM unnest($2::text[]) WITH ORDINALITY AS p(probe, n)
+             LEFT JOIN LATERAL (
+                 SELECT r.rack FROM position_analysis_records r
+                 WHERE r.job_id = $1 AND r.game_index IS NULL AND r.rack >= p.probe
+                 ORDER BY r.rack LIMIT 1
+             ) hit ON true
+             ORDER BY p.n",
+        )
+        .bind(id)
+        .bind(&probes)
+        .fetch_all(pool)
+        .await?;
+    } else {
+        // A rack analysed more than once, for a consensus, is one rack; the
+        // read is in rack order, so its analyses are side by side.
+        racks.dedup();
+        racks.shuffle(&mut rand::thread_rng());
+    }
+    let mut seen = std::collections::HashSet::new();
+    racks.retain(|rack| seen.insert(rack.clone()));
+    racks.truncate(n);
+    Ok(Json(RackSamples { racks }))
+}
+
+#[derive(Deserialize)]
 struct PositionsQuery {
     per_page: Option<i64>,
     cursor: Option<String>,
@@ -1307,8 +1432,8 @@ async fn saved_positions_with_partners(
 
 /// The positions a games or game-pairs job captured (`capture_positions`)
 /// where the player to move held one rack, newest first, each with its ranked
-/// moves: for signed-in users, since a job that captures holds millions of
-/// them and the public already has the results feed. A rack nothing was
+/// moves. Public, like everything else a job shows: an account only makes API
+/// keys. A rack nothing was
 /// captured with -- or that no tile of the job's distribution spells -- is an
 /// empty page.
 ///
@@ -1317,7 +1442,6 @@ async fn saved_positions_with_partners(
 /// (`/positions/random`) or one of a rack's -- so the feed had no reader left.
 async fn job_positions(
     State(state): State<AppState>,
-    _user: crate::auth::CurrentUser,
     Path(id): Path<Uuid>,
     Query(query): Query<PositionsQuery>,
 ) -> AppResult<Json<super::CursorPage<serde_json::Value>>> {
@@ -1399,7 +1523,6 @@ const RANDOM_POSITION_TRIES: usize = 8;
 /// shows one.
 async fn random_position(
     State(state): State<AppState>,
-    _user: crate::auth::CurrentUser,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<Option<serde_json::Value>>> {
     use rand::Rng;
@@ -1969,6 +2092,145 @@ async fn worker_page(
     }))
 }
 
+/// One job type's share of the work: the move generations reported for it,
+/// the compute time its claims were credited with (claim to submission, in
+/// seconds, as the contributor list shows it) and its completed tasks.
+#[derive(Debug, Default, PartialEq, Serialize)]
+pub struct Contribution {
+    pub movegens: i64,
+    pub compute_seconds: f64,
+    pub tasks: i64,
+}
+
+/// The work by the type of job it was done for: the whole site's
+/// (`/api/workers/movegens`), or one contributor's
+/// (`/api/workers/user/:id/movegens`, `/api/workers/anon/:anon_id/movegens`).
+/// Every type is always present, at 0 when nothing was done for it, so a page
+/// lists the four whatever the data; the totals are the four's sum.
+#[derive(Debug, Default, PartialEq, Serialize)]
+pub struct ContributionsByType {
+    pub opening_rack: Contribution,
+    pub games: Contribution,
+    pub game_pairs: Contribution,
+    pub leave_generation: Contribution,
+}
+
+/// A row of either query: the job type, then movegens, compute
+/// milliseconds and completed tasks.
+type ContributionRow = (JobType, i64, i64, i64);
+
+impl ContributionsByType {
+    fn from_rows(rows: impl IntoIterator<Item = ContributionRow>) -> Self {
+        let mut by_type = ContributionsByType::default();
+        for (job_type, movegens, compute_ms, tasks) in rows {
+            let share = match job_type {
+                JobType::OpeningRack => &mut by_type.opening_rack,
+                JobType::Games => &mut by_type.games,
+                JobType::GamePairs => &mut by_type.game_pairs,
+                JobType::LeaveGeneration => &mut by_type.leave_generation,
+            };
+            share.movegens += movegens;
+            share.compute_seconds += compute_ms as f64 / 1000.0;
+            share.tasks += tasks;
+        }
+        by_type
+    }
+}
+
+/// The site's work by job type, from the jobs' own running totals
+/// (`jobs.movegens`, `compute_ms`, `tasks_completed`): one row per job,
+/// whatever the claims number, in one scan of a small table. They are credited
+/// in the transaction that credits each claim's contributor, and a purge or
+/// delete takes them away with what it gives the contributors back, so these
+/// sum to the contributor list's columns -- which summing the claims would
+/// too, at a read of every claim the site ever completed per view of a page
+/// that refreshes itself.
+async fn site_contributions(State(state): State<AppState>) -> AppResult<Json<ContributionsByType>> {
+    let rows = sqlx::query_as::<_, ContributionRow>(
+        "SELECT job_type, COALESCE(SUM(movegens), 0)::bigint, COALESCE(SUM(compute_ms), 0)::bigint,
+                COALESCE(SUM(tasks_completed), 0)::bigint
+         FROM jobs GROUP BY job_type",
+    )
+    .fetch_all(&state.read_pool)
+    .await?;
+    Ok(Json(ContributionsByType::from_rows(rows)))
+}
+
+/// One identity's work by job type, the identity in `$1`: its claims summed
+/// per job, through its own index (`task_claims_user_idx` / `_anon_idx`, which
+/// are ordered by job within the identity and carry each claim's `movegens`
+/// and `claimed_at` beside its `completed_at`, so the walk reads no heap page
+/// it can skip), then the jobs -- one row each -- grouped by type. Public for
+/// the plan test, which holds it to that index.
+///
+/// No `state = 'completed'`: only a completed claim has a `completed_at` and
+/// movegens (the submit path writes both as it completes it), so a FILTER on
+/// `completed_at` counts and times exactly the completed ones, and naming the
+/// state invites the fleet-wide `task_claims_completed_idx` (see
+/// `filtered_claims`). The compute expression is the submit path's
+/// (`CLAIM_COMPUTE_MS`), which is NULL rather than 0 for an open claim, hence
+/// the FILTER rather than a plain sum. A purged or deleted job's claims are
+/// gone with it, so what it gave back to the contributor's total is out of
+/// this too.
+pub fn contributor_contributions_query(anonymous: bool) -> String {
+    let identity = if anonymous { "claimed_by_anon_uuid" } else { "claimed_by_user_id" };
+    format!(
+        "SELECT j.job_type, SUM(t.movegens)::bigint, COALESCE(SUM(t.compute_ms), 0)::bigint,
+                SUM(t.tasks)::bigint
+         FROM (SELECT c.job_id, SUM(c.movegens) AS movegens,
+                      SUM({compute}) FILTER (WHERE c.completed_at IS NOT NULL) AS compute_ms,
+                      COUNT(*) FILTER (WHERE c.completed_at IS NOT NULL) AS tasks
+               FROM task_claims c
+               WHERE c.{identity} = $1 GROUP BY c.job_id) t
+         JOIN jobs j ON j.id = t.job_id
+         GROUP BY j.job_type",
+        compute = super::worker::CLAIM_COMPUTE_MS,
+    )
+}
+
+async fn contributor_contributions(
+    state: &AppState,
+    identity: Uuid,
+    anonymous: bool,
+) -> AppResult<Json<ContributionsByType>> {
+    let rows = sqlx::query_as::<_, ContributionRow>(&contributor_contributions_query(anonymous))
+        .bind(identity)
+        .fetch_all(&state.read_pool)
+        .await?;
+    Ok(Json(ContributionsByType::from_rows(rows)))
+}
+
+/// A contributing account's breakdown, by the `user_id` the contributor list
+/// gives it -- a deleted one's too, which the list shows under its tombstone.
+/// Anyone else is `404`: the list's rows are what this answers for.
+async fn user_contributions(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<ContributionsByType>> {
+    let contributes: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users WHERE id = $1 AND tasks_completed > 0)")
+            .bind(id)
+            .fetch_one(&state.read_pool)
+            .await?;
+    if !contributes {
+        return Err(AppError::not_found("no such contributor"));
+    }
+    contributor_contributions(&state, id, false).await
+}
+
+/// A contributing anonymous worker's breakdown, by the pseudonym the
+/// contributor list shows (`anon_id`): never by its UUID, which is its
+/// credential and which no public route takes or gives.
+async fn anon_contributions(
+    State(state): State<AppState>,
+    Path(anon_id): Path<String>,
+) -> AppResult<Json<ContributionsByType>> {
+    let Some(uuid) = resolve_pseudonym(&state, &anon_id).await? else {
+        return Err(AppError::not_found("no such contributor"));
+    };
+    contributor_contributions(&state, uuid, true).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2004,6 +2266,34 @@ mod tests {
         assert_eq!(merged.matches("LIMIT $6").count(), 1, "the merge's own; each page brings one");
         assert!(merged.contains(") UNION ALL ("), "{merged}");
         assert_eq!(merged_pages(std::iter::once("SELECT 1".to_string()), "x"), "(SELECT 1)");
+    }
+
+    /// A-PUBLIC-7a: every job type has its own figures, present at 0 when
+    /// nothing was done for it, and rows of one type add up.
+    #[test]
+    fn contributions_are_summed_into_their_own_type() {
+        let zero = serde_json::json!({ "movegens": 0, "compute_seconds": 0.0, "tasks": 0 });
+        assert_eq!(
+            serde_json::to_value(ContributionsByType::from_rows([])).unwrap(),
+            serde_json::json!({ "opening_rack": zero, "games": zero, "game_pairs": zero, "leave_generation": zero })
+        );
+        let rows = [
+            (JobType::GamePairs, 5, 1500, 1),
+            (JobType::LeaveGeneration, 7, 2000, 2),
+            (JobType::GamePairs, 11, 250, 3),
+            (JobType::OpeningRack, 13, 0, 4),
+            (JobType::Games, 17, 1000, 5),
+        ];
+        let share = |movegens, compute_seconds, tasks| Contribution { movegens, compute_seconds, tasks };
+        assert_eq!(
+            ContributionsByType::from_rows(rows),
+            ContributionsByType {
+                opening_rack: share(13, 0.0, 4),
+                games: share(17, 1.0, 5),
+                game_pairs: share(16, 1.75, 4),
+                leave_generation: share(7, 2.0, 2),
+            }
+        );
     }
 
     /// A-PUBLIC-6b: past the cap a stream is a 503 with `Retry-After`, and a

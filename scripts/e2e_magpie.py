@@ -47,6 +47,10 @@ Each case is selectable with `--cases` (default: every M case):
   two-letter data: it covers its eight racks, then reissues them -- as lists,
   from seeds past the end of the space -- until each is settled, and
   completes once all are; every rack has at least its fewest analyses.
+- `M-17` A worker at 24 threads runs a job whose players solve: each of its
+  24 concurrent games gives its solves one thread. Given every thread each,
+  as before, the solves needed 24 + 24 x 24 move generators of a pool of 512,
+  and magpie exited.
 
 And one case that is not a test: `capture` runs one job of each type through
 `scripts/capture_contract.py`'s recording proxy and writes the contract
@@ -270,10 +274,12 @@ def ranked_moves(job_id_results: list) -> int:
 
 
 def deactivate_everything(ctx: Context) -> None:
-    page = ctx.get("/api/jobs?per_page=100", "list jobs")
-    for job in page["items"]:
-        if job["status"] == "active":
-            ctx.post(f"/api/admin/jobs/{job['id']}/deactivate", "deactivate job")
+    """Every active job to 0%, in one allocation change."""
+    page = ctx.get("/api/jobs?status=active&per_page=100", "list jobs")
+    rows = [{"job_id": job["id"], "allocation": 0} for job in page["items"]]
+    if rows:
+        ctx.client.json(ctx.client.put("/api/admin/jobs/allocations", {"allocations": rows}),
+                        "deactivate jobs")
 
 
 def create_and_activate(ctx: Context, data: dict, body: dict) -> str:
@@ -286,8 +292,8 @@ def create_and_activate(ctx: Context, data: dict, body: dict) -> str:
               "letterdist_id": data["letterdist"], "layout_id": data["layout"], **body},
         headers=ctx.client._headers(), timeout=1800,
     )
-    job_id = ctx.client.json(response, f"create {body['job_type']} job")["job"]["id"]
-    ctx.post(f"/api/admin/jobs/{job_id}/activate", "activate job", {"allocation": 100})
+    job_id = ctx.client.json(response, f"create {body['job_type']} job")["jobs"][0]["id"]
+    ctx.client.allocate(job_id, 100)
     log(f"created and activated {body['job_type']} job {job_id} "
         f"in {time.time() - started:.1f}s")
     return job_id
@@ -378,8 +384,10 @@ class Worker:
     """
 
     def __init__(self, ctx: Context, name: str, *, small: bool = False,
-                 altered: Optional[Dict[str, bytes]] = None, shared_data: bool = False):
+                 altered: Optional[Dict[str, bytes]] = None, shared_data: bool = False,
+                 threads: Optional[int] = None):
         self.ctx = ctx
+        self.threads = threads or ctx.args.threads
         self.dir = ctx.args.workdir.resolve() / name
         shutil.rmtree(self.dir, ignore_errors=True)
         self.dir.mkdir(parents=True)
@@ -410,7 +418,7 @@ class Worker:
         kept = []
         if path.exists():
             kept = [line for line in path.read_text().splitlines() if line.startswith("uuid ")]
-        lines = [f"server {server or self.ctx.args.api}", f"threads {self.ctx.args.threads}",
+        lines = [f"server {server or self.ctx.args.api}", f"threads {self.threads}",
                  f"maxtasks {tasks}", "idlewait 2", *kept]
         path.write_text("\n".join(lines) + "\n")
 
@@ -550,8 +558,16 @@ def solving_player(ctx: Context) -> str:
     })
 
 
+def seats(players: dict) -> dict:
+    """A games or pairs body's players, from a player 1 / player 2 pair: the
+    two configs, or one named once for a self-play job (the same config
+    twice in the list is refused)."""
+    p1, p2 = players["player1_config_id"], players["player2_config_id"]
+    return {"player_config_ids": [p1] if p1 == p2 else [p1, p2]}
+
+
 def games_body(players: dict, batch: int, **extra) -> dict:
-    return {"job_type": "games", **players, "games_per_batch": batch, "test_enabled": True,
+    return {"job_type": "games", **seats(players), "games_per_batch": batch, "test_enabled": True,
             "min_games": 1_000_000, "max_games": 1_000_000, **extra}
 
 
@@ -629,7 +645,7 @@ def case_pairs(ctx: Context) -> None:
         expect(sum(penta) == stats["games"]["units_completed"],
                f"pentanomial {penta} does not count every pair: {stats['games']}")
 
-    run_job(ctx, ctx.data, {"job_type": "game_pairs", **static_players(ctx),
+    run_job(ctx, ctx.data, {"job_type": "game_pairs", **seats(static_players(ctx)),
                             "pairs_per_batch": 2, "test_enabled": True,
                             "min_pairs": 1000, "max_pairs": 1000},
             pairs_counted)
@@ -930,7 +946,7 @@ def case_first_divergences(ctx: Context) -> None:
     # Equity against score, which disagree within a few turns, in pairs: four
     # tasks of five pairs.
     job_id = create_and_activate(ctx, ctx.data, {
-        "job_type": "game_pairs", **static_players(ctx), "pairs_per_batch": 5,
+        "job_type": "game_pairs", **seats(static_players(ctx)), "pairs_per_batch": 5,
         "test_enabled": True, "min_pairs": 1_000_000, "max_pairs": 1_000_000,
         "capture_positions": True, "capture_first_divergence": True})
     worker = Worker(ctx, "m14")
@@ -995,6 +1011,25 @@ def case_solvers(ctx: Context) -> None:
                    f"{total - solved} {analysis} moves lack a spread or a depth: {counts}")
         expect(counts["static"][0] == 0, f"a static position carries a solver's spread: {counts}")
         log(f"M-12: positions by analysis {counts}")
+    finally:
+        delete_job(ctx, job_id)
+        worker.remove()
+
+
+def case_solvers_many_threads(ctx: Context) -> None:
+    """M-17: a solving job at 24 threads finishes, its solves sharing the
+    threads with the games rather than each taking all of them."""
+    deactivate_everything(ctx)
+    solver = solving_player(ctx)
+    players = {"player1_config_id": solver, "player2_config_id": solver}
+    # A game per thread, so all 24 run at once and each reaches its solves.
+    job_id = create_and_activate(ctx, ctx.data, games_body(players, 24))
+    worker = Worker(ctx, "m17", threads=24)
+    try:
+        output = worker.run(tasks=1)
+        expect(completed_claims(ctx, job_id) == 1,
+               f"the 24-thread solving task did not complete:\n{output[-3000:]}")
+        expect("finished task #1" in output, f"no finished line for the task:\n{output[-3000:]}")
     finally:
         delete_job(ctx, job_id)
         worker.remove()
@@ -1295,7 +1330,7 @@ def case_capture(ctx: Context) -> None:
         # Players with a wordmap, so the assignment pins a derived file, and
         # first divergences kept, so the result carries a pair's two positions.
         # Equity against score: the pairs diverge.
-        one({"job_type": "game_pairs", **wordmap_players(ctx), "pairs_per_batch": 2,
+        one({"job_type": "game_pairs", **seats(wordmap_players(ctx)), "pairs_per_batch": 2,
              "test_enabled": True, "min_pairs": 1_000_000, "max_pairs": 1_000_000,
              "capture_positions": True, "capture_first_divergence": True}, ctx.data,
             needs_build=True)
@@ -1357,6 +1392,7 @@ CASES = {
     "M-14": case_first_divergences,
     "M-15": case_consensus,
     "M-16": case_inference,
+    "M-17": case_solvers_many_threads,
     "capture": case_capture,
 }
 DEFAULT_CASES = [name for name in CASES if name.startswith("M-")]

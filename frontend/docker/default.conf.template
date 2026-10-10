@@ -16,6 +16,20 @@ server {
     # reverse.
     keepalive_timeout 310s;
 
+    # The build's JavaScript, CSS, SVG and JSON go out compressed -- deployed
+    # this Nginx serves every page and asset, and the app's chunks are most of
+    # a first visit's bytes -- and so does the HTML, which gzip always takes.
+    # Not what is proxied: the API compresses its own JSON and NDJSON
+    # (backend/src/lib.rs), as it must where the ALB sends /api/ straight to
+    # it, and leaves its event stream alone, whose events gzip would hold back
+    # until its buffer filled. `gzip off` below says so for /api/.
+    gzip on;
+    gzip_types text/css application/javascript text/javascript image/svg+xml application/json
+               application/manifest+json;
+    # The ALB may add a Via header; compressed all the same.
+    gzip_proxied any;
+    gzip_vary on;
+
     # In production the ALB splits /api off to the backend target group. There
     # is no ALB in compose, so Nginx does the same routing itself — which also
     # keeps the app on a single origin, so the session cookie and the CSRF
@@ -23,11 +37,12 @@ server {
     #
     # The backend's address is ${BACKEND_UPSTREAM}, filled in when the
     # container starts (the image's envsubst templates): `backend:8080` in
-    # compose, where each service is a host name, and `127.0.0.1:8080` in the
-    # ECS task, whose containers share one network namespace and are *not*
-    # names anything resolves. Written in literally, Nginx resolved `backend`
-    # while loading its configuration, found nothing on Fargate, and exited --
-    # and the frontend container is essential, so the task never started.
+    # compose, where each service is a host name. In production these two
+    # locations are never reached (the ALB routes /api and /health first) and
+    # the frontend's ECS task sets an address nothing listens on: a name, as
+    # `backend` written in literally was, Nginx resolves while loading its
+    # configuration, and finding nothing on Fargate it exited -- and the task
+    # never started.
     location /api/ {
         proxy_pass http://${BACKEND_UPSTREAM};
         # Nginx's default is 1 MB. A worker result with captured positions is
@@ -51,6 +66,11 @@ server {
         # download is short; with chunking off, Nginx answered without a
         # length and closed the connection, and a cut stream read as a
         # complete one (the audit's pass 21).
+
+        # The backend compresses what it answers here (its JSON and NDJSON,
+        # never its event stream), in compose as deployed; Nginx compressing
+        # too would be a second policy for the same bytes.
+        gzip off;
     }
 
     location /health {

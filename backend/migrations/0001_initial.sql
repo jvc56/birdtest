@@ -392,16 +392,19 @@ CREATE TABLE jobs (
     -- a job created without one (through the API; the form asks for it).
     name       TEXT NOT NULL DEFAULT '' CHECK (char_length(name) <= 100),
     job_type   job_type NOT NULL,
-    -- NULL until the job is first activated; set by the admin at activation
-    -- time. Every active job's share of the fleet: the scheduler hands each
-    -- claim to the active job furthest behind
+    -- Every active job's share of the fleet: the scheduler hands each claim
+    -- to the active job furthest behind
     -- `(claims_issued - claims_baseline) / allocation`, and the active jobs
-    -- may allocate at most 100% between them. There is
-    -- no priority: a job that should get nothing for now is set to 0%, which
-    -- is exactly what `inactive` means, and a job that should get everything
-    -- is the only one above 0%.
-    allocation INT CHECK (allocation BETWEEN 0 AND 100),
-    -- Jobs start inactive; admin activates with an allocation percentage.
+    -- may allocate at most 100% between them. There is no priority: a job
+    -- that should get nothing for now is at 0%, and a job that should get
+    -- everything is the only one above 0%.
+    allocation INT NOT NULL DEFAULT 0 CHECK (allocation BETWEEN 0 AND 100),
+    -- Jobs start inactive at 0%. The allocation is the only switch: setting
+    -- one above 0% activates a job and setting it to 0% deactivates it, so
+    -- `inactive` and 0% are one state rather than two that could disagree --
+    -- an active job at 0% was on offer to nobody while every page called it
+    -- running. A completed job is not active, so it holds 0% too: nothing
+    -- of its old share is kept to come back to (see `jobs_allocation_is_status`).
     status     job_status NOT NULL DEFAULT 'inactive',
     -- SET NULL if the creating admin's account is deleted.
     created_by           UUID REFERENCES users(id) ON DELETE SET NULL,
@@ -439,6 +442,21 @@ CREATE TABLE jobs (
     min_magpie_major INT NOT NULL DEFAULT 0 CHECK (min_magpie_major >= 0),
     min_magpie_minor INT NOT NULL DEFAULT 1 CHECK (min_magpie_minor >= 0),
     min_magpie_patch INT NOT NULL DEFAULT 1 CHECK (min_magpie_patch >= 0),
+    -- The longest one of the job's tasks may run, set at creation (an hour
+    -- unless the admin says otherwise) and changed on the job's Manage page.
+    -- Every claim is given it (the assignment's `max_task_seconds`) and keeps
+    -- its own deadline, claim time plus this as it stood then, so a change
+    -- applies to claims made after it. A claim past its deadline and a
+    -- minute's grace is reclaimed even while its worker heartbeats, and its
+    -- result refused (`task_claims.deadline_at`). Ten minutes at the least, a
+    -- day at the most. The floor is not the shortest batch worth a claim but
+    -- the first claim on a machine: it may build the job's rack info table
+    -- first, a minute to three that cannot be stopped part-way (and is kept
+    -- for every task after it), so a limit near that would stop the task
+    -- that paid for it, every time, on every new machine. The API refuses
+    -- what this refuses (`routes::admin`); a test that wants a claim past its
+    -- deadline moves the claim's `deadline_at`, not this.
+    max_task_seconds INT NOT NULL DEFAULT 3600 CHECK (max_task_seconds BETWEEN 600 AND 86400),
     -- Every claim ever issued for this job, abandoned and declined ones
     -- included: the deficit the scheduler orders on. Kept as a counter rather
     -- than counted, because counting task_claims on every claim request costs
@@ -447,7 +465,8 @@ CREATE TABLE jobs (
     claims_issued   BIGINT NOT NULL DEFAULT 0 CHECK (claims_issued >= 0),
     -- Where this job's share is measured *from*. The scheduler orders on
     -- `(claims_issued - claims_baseline) / allocation`, and the baseline is
-    -- reset -- on activation, on an allocation change, on a purge -- so that
+    -- reset -- on activation and on an allocation change (a purge leaves the
+    -- job inactive, to be reset when it is activated again) -- so that
     -- the job's ratio equals the lowest ratio among the other jobs being
     -- served (see `last_claimed_at` below): it joins at parity and takes its
     -- share from then on.
@@ -483,6 +502,33 @@ CREATE TABLE jobs (
     test_decided_lower  DOUBLE PRECISION,
     test_decided_upper  DOUBLE PRECISION,
     test_decided_units  BIGINT,
+    -- Tasks of this job that hit the time limit (`max_task_seconds`):
+    -- those a worker stopped and handed back, declining them `time_limit`,
+    -- and those whose claim the server took back at the deadline while the
+    -- worker still heartbeat (`task_claims.overrun`, counted once the job's
+    -- row is next taken). The job page says how many, since the cure is a
+    -- smaller batch. And how many of those came in a row with no task of the
+    -- job completed between, which an accepted result zeroes: at three the
+    -- job is set aside -- inactive at 0%, with `set_aside_reason` saying why
+    -- -- since a job whose one unit always outlasts the limit would otherwise
+    -- be handed out, run for the limit and handed back for ever. Giving it an
+    -- allocation again starts the run afresh and clears the reason; a purge
+    -- zeroes all three.
+    time_limit_declines BIGINT NOT NULL DEFAULT 0 CHECK (time_limit_declines >= 0),
+    time_limit_streak   INT NOT NULL DEFAULT 0 CHECK (time_limit_streak >= 0),
+    -- When the run `time_limit_streak` counts began: the last accepted result,
+    -- or the allocation that put the job back; NULL for a job whose run has
+    -- not been broken. An overrun is counted after the fact, so whether it is
+    -- part of the run is a question of when it happened -- its deadline --
+    -- not of when it was counted: one that overran before the completion or
+    -- the allocation that ended its run counts toward the total alone.
+    time_limit_streak_since TIMESTAMPTZ,
+    -- Why the server switched the job off, when it did; read only while the
+    -- job is inactive.
+    set_aside_reason    TEXT,
+    -- The invariant above, for every status: active exactly when above 0%,
+    -- which holds an inactive or completed job at 0%.
+    CONSTRAINT jobs_allocation_is_status CHECK ((status = 'active') = (allocation > 0)),
     CONSTRAINT jobs_test_decided_together CHECK (
         (test_decided_status IS NULL) = (test_decided_lower IS NULL)
         AND (test_decided_status IS NULL) = (test_decided_upper IS NULL)
@@ -518,6 +564,22 @@ CREATE TABLE jobs (
     -- partial restore recomputes them (RUNBOOK 2.3).
     tasks_total     BIGINT NOT NULL DEFAULT 0 CHECK (tasks_total >= 0),
     tasks_completed BIGINT NOT NULL DEFAULT 0 CHECK (tasks_completed >= 0),
+    -- The move generations the job's accepted claims reported, every claim's
+    -- own (`task_claims.movegens`): the job page's figure, and summed by job
+    -- type, the Contributors page's. Added by the same submission, in the
+    -- same `UPDATE jobs` as the counters above, that adds the claim to its
+    -- contributor's `movegens` -- so the jobs' total and the contributors'
+    -- agree, and a purge (which zeroes it) or a delete (which takes the row)
+    -- takes away exactly what it gives the contributors back. A partial
+    -- restore recomputes it (RUNBOOK 2.3).
+    movegens        BIGINT NOT NULL DEFAULT 0 CHECK (movegens >= 0),
+    -- The compute time the job's accepted claims were credited with, every
+    -- claim's own (claim to submission, `CLAIM_COMPUTE_MS`), in whole
+    -- milliseconds: the Contributions page's site totals by job type, beside
+    -- `movegens` and `tasks_completed`. Added in the same `UPDATE jobs` as
+    -- `movegens`, from the figure the same submission credits its
+    -- contributor's `compute_ms` with, and zeroed or taken away with it.
+    compute_ms      BIGINT NOT NULL DEFAULT 0 CHECK (compute_ms >= 0),
     -- When a result was last accepted for the job, to the minute (the
     -- submission that stores one sets it at most once a minute). The job
     -- list's `stalled` flag asks "none in a day"; answered from the claims, it
@@ -747,6 +809,12 @@ CREATE TABLE job_game_config (
     -- recorded. Off by default: at ~22.5 turns a game it roughly doubles the
     -- rows a job produces.
     capture_positions   BOOLEAN NOT NULL DEFAULT FALSE,
+    -- How MAGPIE spends its threads on a task (MULTI_THREADING_MODE): 'igp'
+    -- gives them all to one game at a time, inside its simulation, which makes
+    -- an iteration-bounded simulation reproducible; 'pgp' plays games in
+    -- parallel, a thread each. Matters only when a player simulates; a job of
+    -- static players runs alike in either. Stated on every request.
+    threading_mode      TEXT NOT NULL DEFAULT 'igp' CHECK (threading_mode IN ('igp', 'pgp')),
     -- What `validate_job_body` requires, held here too for a row written any
     -- other way (a script, a fixture, a restore). The stopping rule reads the
     -- counts as unsigned: a negative max_games was a cap no job reached, so it
@@ -781,6 +849,8 @@ CREATE TABLE job_game_pair_config (
     -- are the same game; after it they are two different ones, and the turn
     -- itself is where the players disagree.
     capture_first_divergence BOOLEAN NOT NULL DEFAULT FALSE,
+    -- As on job_game_config.
+    threading_mode      TEXT NOT NULL DEFAULT 'igp' CHECK (threading_mode IN ('igp', 'pgp')),
     CONSTRAINT job_game_pair_config_divergence_needs_capture
         CHECK (capture_positions OR NOT capture_first_divergence),
     -- As job_game_config_counts, in pairs.
@@ -939,6 +1009,11 @@ CREATE INDEX tasks_queue_idx   ON tasks (job_id, created_at) WHERE state = 'avai
 -- this", the other is a claim that lapsed. Only the first is diagnostic.
 CREATE TYPE claim_state AS ENUM ('claimed', 'completed', 'abandoned', 'declined');
 
+-- An abandoned claim that ran past its deadline with its worker alive
+-- (`task_claims.overrun`): `pending` until it is counted against its job,
+-- then `counted`.
+CREATE TYPE claim_overrun AS ENUM ('pending', 'counted');
+
 CREATE TABLE task_claims (
     id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     task_id              UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -954,6 +1029,29 @@ CREATE TABLE task_claims (
     claimed_by_user_id   UUID REFERENCES users(id),
     claimed_by_anon_uuid UUID REFERENCES anonymous_workers(uuid),
     claimed_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- When the task must be done by: `claimed_at` plus its job's
+    -- `max_task_seconds` as it stood when the claim was made, which the assignment told the
+    -- worker. Past it and a minute's grace the claim lapses whether or not its
+    -- worker still heartbeats, and a result for it is refused: a task whose
+    -- one unit outlasts the limit (a deep-sim game pair) would otherwise hold
+    -- its slot for as long as its worker lived. The claim path always sets
+    -- it; the default, the limit's own default, is for a row written any
+    -- other way (a script, a test's fixture).
+    deadline_at          TIMESTAMPTZ NOT NULL DEFAULT now() + interval '1 hour',
+    -- Set on a claim taken back past its deadline while its worker was still
+    -- alive: reclamation found it heartbeating within the heartbeat timeout
+    -- of the moment it lapsed (deadline plus grace), or the worker submitted
+    -- a result for it too late. NULL for every other claim -- a lapse whose
+    -- worker had gone silent is what a dead worker leaves, and says nothing
+    -- about the job. Such a claim is a task that hit the time limit as surely
+    -- as a `time_limit` decline: a solve or a build that overruns MAGPIE's
+    -- stop declines after the claim has lapsed, and that decline is a `404`.
+    -- Counted against the job (`jobs.time_limit_declines`, `time_limit_streak`)
+    -- by whoever next holds the job's row for it -- the job's next claim,
+    -- a decline or a late result -- since reclamation runs over many jobs in
+    -- one statement on the claim path and takes no job's row: `pending` until
+    -- then, `counted` after.
+    overrun              claim_overrun,
     last_heartbeat_at    TIMESTAMPTZ,
     completed_at         TIMESTAMPTZ,
     -- The move generations this claim's accepted result reported (the
@@ -972,7 +1070,7 @@ CREATE TABLE task_claims (
 )
 -- Room on each page for a claim's heartbeats. A heartbeat changes only
 -- `last_heartbeat_at`, which no index covers, so it can be a HOT update -- an
--- in-page rewrite that touches none of this table's eight indexes -- but only
+-- in-page rewrite that touches none of this table's nine indexes -- but only
 -- if the row's page has space, and claims are appended, so at the default
 -- fillfactor of 100 a claim's first heartbeat found its page full and wrote a
 -- new entry into every index: two a minute for every claim in flight.
@@ -1227,7 +1325,7 @@ CREATE TABLE leave_selection_cursors (
 -- Opening rack jobs write one per rack. Games and game-pairs jobs write one per
 -- turn when `capture_positions` is on: a worker analyses a position on every
 -- turn anyway, and keeping those makes a job a corpus of analysed positions as
--- well as an Elo measurement.
+-- well as a measurement of strength.
 --
 -- The request that produced these is job-type-specific -- opening_rack_requests
 -- or game_requests -- but what comes back is a position analysis either way,
@@ -1679,9 +1777,10 @@ CREATE TABLE player_config_ratings (
     run_id           UUID NOT NULL REFERENCES rating_runs(id) ON DELETE CASCADE,
     player_config_id UUID NOT NULL REFERENCES player_configs(id),
     rating           DOUBLE PRECISION NOT NULL,
-    -- Approximate Elo standard error. Wide bars are the honest signal that a
-    -- config has barely played, or has only played opponents far from its own
-    -- strength; the page shows them next to the rating for that reason.
+    -- Approximate standard error, in rating points. Wide bars are the honest
+    -- signal that a config has barely played, or has only played opponents
+    -- far from its own strength; the page shows them next to the rating for
+    -- that reason.
     stderr           DOUBLE PRECISION NOT NULL,
     pairs_played     BIGINT NOT NULL,
     -- FALSE when no chain of games connects this config to the pool's anchor.
@@ -1693,12 +1792,14 @@ CREATE TABLE player_config_ratings (
     PRIMARY KEY (run_id, player_config_id)
 );
 
--- The residuals of one fit: for every head-to-head with games in it, the score
--- the fit's ratings predict against the score that happened. Stored with the
--- run rather than recomputed on each view of the pool, which rebuilt the
--- pool's evidence matrix -- a grouped scan over every paired result it counts
--- -- on every public page view. Stored, they also describe the evidence this
--- fit used, not evidence that has moved on since.
+-- The cross table of one fit, and its residuals: for every head-to-head with
+-- games in it, once (the row is the config whose name sorts first), the score
+-- that happened, its standard error and the average spread, beside the score
+-- the fit's ratings predict. The page mirrors each row for the other side.
+-- Stored with the run rather than recomputed on each view of the pool, which
+-- rebuilt the pool's evidence matrix -- a grouped scan over every paired
+-- result it counts -- on every public page view. Stored, they also describe
+-- the evidence this fit used, not evidence that has moved on since.
 CREATE TABLE rating_run_residuals (
     run_id               UUID NOT NULL REFERENCES rating_runs(id) ON DELETE CASCADE,
     row_player_config_id UUID NOT NULL REFERENCES player_configs(id),
@@ -1706,6 +1807,12 @@ CREATE TABLE rating_run_residuals (
     pairs                DOUBLE PRECISION NOT NULL,
     actual               DOUBLE PRECISION NOT NULL,  -- the row config's score rate
     predicted            DOUBLE PRECISION NOT NULL,
+    -- The standard error of `actual`, from the pairs' score variance in the
+    -- summed pentanomial (ratings::HeadToHeadEvidence::score_and_stderr).
+    stderr               DOUBLE PRECISION NOT NULL,
+    -- The row config's average spread per game: Σ games·(its mean score − the
+    -- other's) / Σ games over the same game_results rows.
+    spread               DOUBLE PRECISION NOT NULL,
     PRIMARY KEY (run_id, row_player_config_id, col_player_config_id)
 );
 
@@ -1747,6 +1854,7 @@ CREATE TABLE backups (
 -- for the most recent successful one.
 CREATE INDEX backups_finished_idx ON backups (finished_at DESC);
 
+
 -- Audit log
 
 -- No foreign keys, deliberately. The log is append-only and has to outlive
@@ -1775,10 +1883,17 @@ CREATE TABLE audit_log (
 CREATE UNIQUE INDEX task_claims_token_idx     ON task_claims (claim_token);
 CREATE INDEX        task_claims_task_idx      ON task_claims (task_id);
 CREATE INDEX        task_claims_open_idx      ON task_claims (task_id) WHERE state = 'claimed';
+-- Overruns not yet counted against their job (`task_claims.overrun`). Every
+-- claim request asks which of its candidate jobs have one, and this is what
+-- keeps that cheap: an entry lives from the reclamation that records it to
+-- the job's next claim, decline or late result, so the index is all but
+-- always empty -- a probe, not a scan of the job's claims.
+CREATE INDEX        task_claims_overrun_idx   ON task_claims (job_id) WHERE overrun = 'pending';
 -- Completed claims by time. The ETA (`jobstats::estimate_eta`, on every
 -- detail view and live push) asks "how many of this job's claims completed
 -- in the last hour" (the job list's `stalled` flag reads
--- `jobs.last_completed_at` instead), and no index on task_claims leads with the job, so
+-- `jobs.last_completed_at` instead), and no index on task_claims leads with the job (but
+-- the overruns', which holds next to nothing), so
 -- the alternative plan walks every task of the job and every claim of each
 -- -- the job's whole history, for a question about its last hour. Through
 -- this index the scan is bounded by the fleet's recent completions instead,
@@ -1798,10 +1913,18 @@ CREATE INDEX        task_claims_completed_idx ON task_claims (completed_at DESC)
 -- column. The completion time adds nothing to a claim's updates: completing
 -- one changes `state`, which the open-claims index's predicate reads, so that
 -- update was never a HOT one, and a heartbeat touches neither.
+--
+-- Each carries the claim's `movegens` and `claimed_at`, so a contributor's
+-- work by job type (`GET /api/workers/*/:id/movegens`) -- movegens, compute
+-- time (claim to completion) and completed tasks -- is an index-only walk of
+-- their range, grouped by the job it is already ordered by, rather than a
+-- heap read per claim they ever made. `movegens` is written by that same
+-- completing update, whose index entries are new ones anyway, and
+-- `claimed_at` never changes.
 CREATE INDEX        task_claims_user_idx      ON task_claims (claimed_by_user_id, job_id, completed_at)
-    WHERE claimed_by_user_id IS NOT NULL;
+    INCLUDE (movegens, claimed_at) WHERE claimed_by_user_id IS NOT NULL;
 CREATE INDEX        task_claims_anon_idx      ON task_claims (claimed_by_anon_uuid, job_id, completed_at)
-    WHERE claimed_by_anon_uuid IS NOT NULL;
+    INCLUDE (movegens, claimed_at) WHERE claimed_by_anon_uuid IS NOT NULL;
 -- There is no (job_id, state) index. The job-scoped reads of `tasks` -- the
 -- detail page's counts by state, the census -- are served by
 -- `tasks_seed_unique_idx (job_id, seed)` and the heap. The opening-rack finish

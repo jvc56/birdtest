@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import {
-  bigCount,
   blankFields,
   computeTime,
+  exactCount,
+  throughputText,
+  timeLimitNotice,
   unchosenText,
   datetime,
   derivedKind,
@@ -423,42 +425,64 @@ describe('F-FMT-17 leavePlayerConflict', () => {
 });
 
 describe('F-FMT-16 computeTime', () => {
-  it('reads a total in its two largest units', () => {
+  it('reads a total to the second, in every unit that is not zero', () => {
     expect(computeTime(0)).toBe('0s');
+    expect(computeTime(45)).toBe('45s');
     expect(computeTime(59.9)).toBe('59s');
     expect(computeTime(60)).toBe('1m');
-    expect(computeTime(3599)).toBe('59m');
+    expect(computeTime(133)).toBe('2m 13s');
+    expect(computeTime(3599)).toBe('59m 59s');
     expect(computeTime(3600)).toBe('1h');
-    expect(computeTime(5 * 3600 + 20 * 60 + 7)).toBe('5h 20m');
+    expect(computeTime(3601)).toBe('1h 1s');
+    expect(computeTime(5 * 3600 + 20 * 60 + 13)).toBe('5h 20m 13s');
     expect(computeTime(86400)).toBe('1d');
-    expect(computeTime(3 * 86400 + 4 * 3600 + 59)).toBe('3d 4h');
+    expect(computeTime(3 * 86400 + 4 * 3600 + 5 * 60 + 6)).toBe('3d 4h 5m 6s');
+    expect(computeTime(3 * 86400 + 59)).toBe('3d 59s');
     expect(computeTime(365 * 86400)).toBe('1y');
-    expect(computeTime((2 * 365 + 17) * 86400 + 3600)).toBe('2y 17d');
+    expect(computeTime((2 * 365 + 17) * 86400 + 3600)).toBe('2y 17d 1h');
+    expect(computeTime(1234 * 365 * 86400)).toBe('1,234y');
   });
 
   it('shows nothing it cannot read as a time', () => {
     expect(computeTime(null)).toBe('—');
     expect(computeTime(Number.NaN)).toBe('—');
+    expect(computeTime(Infinity)).toBe('—');
     expect(computeTime(-1)).toBe('—');
   });
 });
 
-describe('F-FMT-19 bigCount', () => {
-  it('reads a count in its largest unit, rounded down', () => {
-    expect(bigCount(0)).toBe('0');
-    expect(bigCount(999)).toBe('999');
-    expect(bigCount(1000)).toBe('1K');
-    expect(bigCount(12_345)).toBe('12.3K');
-    expect(bigCount(999_999)).toBe('999K');
-    expect(bigCount(4_567_890)).toBe('4.5M');
-    expect(bigCount(1_200_000_000)).toBe('1.2B');
-    expect(bigCount(3e12)).toBe('3T');
+describe('F-FMT-19 exactCount', () => {
+  it('reads a count to its last digit, grouped', () => {
+    expect(exactCount(0)).toBe('0');
+    expect(exactCount(999)).toBe('999');
+    expect(exactCount(1000)).toBe('1,000');
+    expect(exactCount(1_234_567_890)).toBe('1,234,567,890');
+    expect(exactCount(12.9)).toBe('12');
   });
 
   it('shows nothing it cannot read as a count', () => {
-    expect(bigCount(null)).toBe('—');
-    expect(bigCount(Number.NaN)).toBe('—');
-    expect(bigCount(-1)).toBe('—');
+    expect(exactCount(null)).toBe('—');
+    expect(exactCount(Number.NaN)).toBe('—');
+    expect(exactCount(-1)).toBe('—');
+  });
+});
+
+describe('F-FMT-21 throughputText', () => {
+  it("reads the job's pace an hour in its own unit", () => {
+    expect(throughputText({ per_hour: 1240.4, unit: 'game' })).toBe(`${(1240).toLocaleString()} games/hour`);
+    expect(throughputText({ per_hour: 8, unit: 'pair' })).toBe('8 pairs/hour');
+    expect(throughputText({ per_hour: 10.5, unit: 'rack' })).toBe('11 racks/hour');
+  });
+
+  it('keeps a decimal below ten, and one unit is singular', () => {
+    expect(throughputText({ per_hour: 2.46, unit: 'rack' })).toBe('2.5 racks/hour');
+    expect(throughputText({ per_hour: 9.96, unit: 'game' })).toBe('10 games/hour');
+    expect(throughputText({ per_hour: 1, unit: 'game' })).toBe('1 game/hour');
+  });
+
+  it('shows nothing without recent work', () => {
+    expect(throughputText(null)).toBe('—');
+    expect(throughputText({ per_hour: Number.NaN, unit: 'game' })).toBe('—');
   });
 });
 
@@ -466,5 +490,18 @@ describe('F-FMT-18 targetsText', () => {
   it('joins the targets in generation order with arrows, not commas', () => {
     expect(targetsText([100, 1000, 1000])).toBe(`100 → ${(1000).toLocaleString()} → ${(1000).toLocaleString()}`);
     expect(targetsText([500])).toBe('500');
+  });
+});
+
+describe('F-FMT-20 timeLimitNotice', () => {
+  it("counts the tasks that hit the job's own limit and names the cures", () => {
+    const cure = 'lower the batch size, or raise the limit';
+    expect(timeLimitNotice(1, 3600)).toBe(`1 task hit this job's 1h time limit — ${cure}`);
+    expect(timeLimitNotice(3, 1800)).toBe(`3 tasks hit this job's 30m time limit — ${cure}`);
+    expect(timeLimitNotice(1234, 600)).toBe(`${(1234).toLocaleString()} tasks hit this job's 10m time limit — ${cure}`);
+  });
+
+  it('says nothing while none has', () => {
+    expect(timeLimitNotice(0, 3600)).toBeNull();
   });
 });

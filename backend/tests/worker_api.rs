@@ -620,20 +620,20 @@ async fn an_opening_rack_jobs_consensus_can_change_and_the_job_follows() {
         .unwrap();
 
     // Two agreeing analyses a rack now, three at most: every rack is
-    // unsettled, and the completed job is active again at its allocation.
+    // unsettled, and the completed job is reopened -- inactive at the 0% a
+    // completed job holds, until it is given an allocation.
     let before = last_audit().await;
     let (status, body) =
         patch_consensus(&app, &headers, job, json!({ "min_results_per_rack": 2, "max_results_per_rack": 3 })).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["reopened"], json!(true));
-    assert_eq!(body["reopened_inactive_reason"], json!(null));
     assert_eq!(body["unsettled_racks"], json!(4));
-    assert_eq!(body["job"]["status"], json!("active"));
+    assert_eq!((&body["job"]["status"], &body["job"]["allocation"]), (&json!("inactive"), &json!(0)));
     assert_eq!(
         (body["config"]["min_results_per_rack"].clone(), body["config"]["max_results_per_rack"].clone()),
         (json!(2), json!(3))
     );
-    assert_eq!(counters().await, (4, 0, 0, "active".into()));
+    assert_eq!(counters().await, (4, 0, 0, "inactive".into()));
     // The job list counts racks settled, as the job's page does: every rack
     // is analysed, and none is done.
     let listed = || async {
@@ -648,7 +648,7 @@ async fn an_opening_rack_jobs_consensus_can_change_and_the_job_follows() {
         audit(before).await,
         vec![
             ("job.consensus_changed".into(), None, None, Some("min 1 -> 2, max 1 -> 3; 4 racks unsettled".into())),
-            ("job.activated".into(), Some("completed".into()), Some("active".into()), None),
+            ("job.deactivated".into(), Some("completed".into()), Some("inactive".into()), None),
         ]
     );
     let finals: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM job_exports WHERE job_id = $1 AND is_final")
@@ -657,6 +657,10 @@ async fn an_opening_rack_jobs_consensus_can_change_and_the_job_follows() {
         .await
         .unwrap();
     assert_eq!(finals, 0, "the old final export is a snapshot now");
+    let refs: Vec<(&str, &str)> = headers.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    let (status, body) = send(&app, allocate(job, 50, &refs)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(counters().await, (4, 0, 0, "active".into()));
 
     // The reissues start from the rows: the racks the other worker analysed.
     let (status, again_a) = claim_as(&app, &uuid_a).await;
@@ -746,10 +750,10 @@ async fn an_opening_rack_jobs_consensus_can_change_and_the_job_follows() {
 
 /// I-OR-EDIT-2: the edit refuses what creation refuses, and only for an
 /// opening-rack job; a change that changes nothing writes nothing; and a
-/// completed job reopened where the other active jobs leave no room for its
-/// allocation comes back inactive, saying why.
+/// completed job it reopens comes back inactive at 0%, for the admin to give
+/// an allocation.
 #[tokio::test]
-async fn a_consensus_edit_is_checked_and_reopens_inactive_without_room() {
+async fn a_consensus_edit_is_checked_and_reopens_inactive() {
     let db = TestDb::new().await;
     let admin = db.user("admin", true).await;
     let job = consensus_job(&db, admin, 100.0, 1, 1).await;
@@ -815,10 +819,9 @@ async fn a_consensus_edit_is_checked_and_reopens_inactive_without_room() {
     assert_eq!(status, StatusCode::OK, "{response}");
     assert_eq!(audited().await, rows);
 
-    // Completed with a rack analysed once, while the games job takes 50% and
-    // another job 10%: its 50% no longer fits. The others are inactive while
-    // it is claimed from, so the claim is its.
-    sqlx::query("UPDATE jobs SET status = 'inactive' WHERE id <> $1")
+    // Completed with a rack analysed once. The others are inactive while it
+    // is claimed from, so the claim is its.
+    sqlx::query("UPDATE jobs SET status = 'inactive', allocation = 0 WHERE id <> $1")
         .bind(job)
         .execute(&db.pool)
         .await
@@ -831,19 +834,8 @@ async fn a_consensus_edit_is_checked_and_reopens_inactive_without_room() {
     })).collect::<Vec<_>>() });
     let (status, _) = submit_as(&app, &uuid, a["claim_token"].as_str().unwrap(), result).await;
     assert_eq!(status, StatusCode::OK);
-    sqlx::query("UPDATE jobs SET status = 'completed' WHERE id = $1")
+    sqlx::query("UPDATE jobs SET status = 'completed', allocation = 0 WHERE id = $1")
         .bind(job)
-        .execute(&db.pool)
-        .await
-        .unwrap();
-    sqlx::query("UPDATE jobs SET status = 'active' WHERE id = $1")
-        .bind(games)
-        .execute(&db.pool)
-        .await
-        .unwrap();
-    let other = db.bare_job("games", admin).await;
-    sqlx::query("UPDATE jobs SET allocation = 10 WHERE id = $1")
-        .bind(other)
         .execute(&db.pool)
         .await
         .unwrap();
@@ -851,9 +843,7 @@ async fn a_consensus_edit_is_checked_and_reopens_inactive_without_room() {
         patch_consensus(&app, &headers, job, json!({ "min_results_per_rack": 2, "max_results_per_rack": 2 })).await;
     assert_eq!(status, StatusCode::OK, "{response}");
     assert_eq!(response["reopened"], json!(true));
-    assert_eq!(response["job"]["status"], json!("inactive"));
-    let reason = response["reopened_inactive_reason"].as_str().unwrap();
-    assert!(reason.contains("60%") && reason.contains("50%"), "{reason}");
+    assert_eq!((&response["job"]["status"], &response["job"]["allocation"]), (&json!("inactive"), &json!(0)));
 }
 
 /// Every rack of an opening-rack assignment, as the worker would report them,
@@ -900,7 +890,7 @@ async fn a_finish_check_overtaken_by_a_consensus_edit_does_not_complete_the_job(
     }
     // Every rack settled, and a check has read it so -- but not yet written
     // the completion the last submission's own check would have.
-    sqlx::query("UPDATE jobs SET status = 'active' WHERE id = $1")
+    sqlx::query("UPDATE jobs SET status = 'active', allocation = 50 WHERE id = $1")
         .bind(job)
         .execute(&db.pool)
         .await
@@ -1120,7 +1110,7 @@ async fn a_reissue_looks_at_a_window_of_racks_not_every_one() {
     // Another identity has seen none of them: the next two, none in flight.
     let (other, _) = first_claim(&app).await;
     assert_eq!(assigned_racks(&other), racks[2..4]);
-    sqlx::query("UPDATE jobs SET status = 'inactive' WHERE id = $1").bind(job).execute(pool).await.unwrap();
+    sqlx::query("UPDATE jobs SET status = 'inactive', allocation = 0 WHERE id = $1").bind(job).execute(pool).await.unwrap();
 
     // Two identities split the first pass: within the window, each is handed
     // the other's racks first.
@@ -1290,7 +1280,7 @@ async fn a_stale_unsupported_entry_does_not_change_the_shutdown_reason() {
     .unwrap();
     let admin = db.user("admin", true).await;
     let finished = db.bare_job("games", admin).await;
-    sqlx::query("UPDATE jobs SET status = 'completed' WHERE id = $1")
+    sqlx::query("UPDATE jobs SET status = 'completed', allocation = 0 WHERE id = $1")
         .bind(finished)
         .execute(&db.pool)
         .await
@@ -2099,7 +2089,7 @@ async fn a_claim_racing_a_jobs_completion_hands_nothing_out() {
     let app = birdtest::app(db.state().await);
 
     let mut completer = db.pool.begin().await.unwrap();
-    sqlx::query("UPDATE jobs SET status = 'completed' WHERE id = $1")
+    sqlx::query("UPDATE jobs SET status = 'completed', allocation = 0 WHERE id = $1")
         .bind(job)
         .execute(&mut *completer)
         .await
@@ -2155,7 +2145,7 @@ async fn games_jobs_hand_out_nothing_past_their_cap() {
     assert_eq!(status, StatusCode::NO_CONTENT, "a third batch would start past the cap: {body}");
 
     // The same cap, counted in pairs.
-    sqlx::query("UPDATE jobs SET status = 'completed' WHERE id = $1")
+    sqlx::query("UPDATE jobs SET status = 'completed', allocation = 0 WHERE id = $1")
         .bind(games)
         .execute(&db.pool)
         .await
@@ -2254,12 +2244,16 @@ async fn a_pools_residuals_are_the_ones_its_latest_fit_stored() {
     let pool_page = format!("/api/rating-pools/{pool}");
     let (status, detail) = send(&app, get_request(&pool_page, &[])).await;
     assert_eq!(status, StatusCode::OK, "{detail}");
-    let residuals = detail["residuals"].as_array().unwrap();
-    assert_eq!(residuals.len(), 1, "{detail}");
-    assert_eq!(residuals[0]["row"], json!(anchor), "{detail}");
-    assert_eq!(residuals[0]["col"], json!(rival), "{detail}");
-    assert_eq!(residuals[0]["pairs"], json!(1.0), "{detail}");
-    assert_eq!(residuals[0]["actual"], json!(1.0), "{detail}");
+    // Served from both sides; the anchor's is the one stored.
+    let anchor_side = |detail: &serde_json::Value| {
+        let cells = detail["head_to_heads"].as_array().unwrap();
+        assert_eq!(cells.len(), 2, "{detail}");
+        cells.iter().find(|c| c["row"] == json!(anchor)).unwrap().clone()
+    };
+    let cell = anchor_side(&detail);
+    assert_eq!(cell["col"], json!(rival), "{detail}");
+    assert_eq!(cell["pairs"], json!(1.0), "{detail}");
+    assert_eq!(cell["actual"], json!(1.0), "{detail}");
 
     // A second pair the other way, and no refit. The page still shows the
     // fit's evidence, where a rebuilt matrix would show two pairs, split.
@@ -2269,8 +2263,9 @@ async fn a_pools_residuals_are_the_ones_its_latest_fit_stored() {
     let (_, body) = submit_as(&app, &uuid, token, pair(false)).await;
     assert_eq!(body["accepted"], true, "{body}");
     let (_, detail) = send(&app, get_request(&pool_page, &[])).await;
-    assert_eq!(detail["residuals"][0]["pairs"], json!(1.0), "{detail}");
-    assert_eq!(detail["residuals"][0]["actual"], json!(1.0), "{detail}");
+    let cell = anchor_side(&detail);
+    assert_eq!(cell["pairs"], json!(1.0), "{detail}");
+    assert_eq!(cell["actual"], json!(1.0), "{detail}");
 }
 
 // ---------------------------------------------------------------------------
@@ -2643,9 +2638,11 @@ async fn a_jobs_template_is_read_once_survives_a_purge_and_goes_with_the_job() {
         send(&app, post_json(&format!("/api/admin/jobs/{job}/purge"), &borrowed, json!({}))).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(state.templates.get(job).is_some(), "a purge changes no configuration");
+    let (status, body) = send(&app, allocate(job, 50, &borrowed)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 
-    // The purged job starts its space over, and every claim after it carries
-    // exactly what the first did.
+    // The purged job, activated again, starts its space over, and every claim
+    // after it carries exactly what the first did.
     let (status, again) = claim_as(&app, &uuid).await;
     assert_eq!(status, StatusCode::OK, "{again}");
     assert_eq!(again["task_request"]["seed"], "1");
@@ -2664,15 +2661,15 @@ async fn a_jobs_template_is_read_once_survives_a_purge_and_goes_with_the_job() {
     assert!(state.templates.get(job).is_none(), "a deleted job is forgotten");
 }
 
-/// There is no priority: an admin parks a job at 0%, which is offered to
-/// nobody, exactly as an inactive one is. Every claim goes to the active job
-/// above 0% that is furthest behind its share.
+/// There is no priority: an admin parks a job at 0%, which makes it inactive
+/// and offered to nobody. Every claim goes to the active job above 0% that is
+/// furthest behind its share.
 #[tokio::test]
 async fn a_job_at_zero_allocation_is_offered_to_nobody() {
     let db = TestDb::new().await;
     let parked = db.games_job(2).await;
     let running = db.games_job(2).await;
-    sqlx::query("UPDATE jobs SET allocation = 0 WHERE id = $1")
+    sqlx::query("UPDATE jobs SET status = 'inactive', allocation = 0 WHERE id = $1")
         .bind(parked)
         .execute(&db.pool)
         .await
@@ -2684,9 +2681,10 @@ async fn a_job_at_zero_allocation_is_offered_to_nobody() {
         assert_eq!(assignment["job_id"], running.to_string(), "only the job above 0% is offered");
     }
 
-    // With the running job parked too, active jobs exist and nothing rules
-    // them out, so the answer is "nothing right now" rather than a shutdown.
-    sqlx::query("UPDATE jobs SET allocation = 0 WHERE id = $1")
+    // With the running job parked too, nothing is on offer, and nothing
+    // rules the worker out either: the answer is "nothing right now" rather
+    // than a shutdown.
+    sqlx::query("UPDATE jobs SET status = 'inactive', allocation = 0 WHERE id = $1")
         .bind(running)
         .execute(&db.pool)
         .await
@@ -2740,13 +2738,15 @@ async fn every_assignment_states_the_seed_its_task_was_stored_with() {
 /// the worker's MAGPIE answered `magpie_too_old`, and a parked job in its
 /// unsupported set answered `data_out_of_date`. The same job switched to
 /// `inactive` answered `204`. A contributor who exits on that is not there when
-/// the admin raises a job it could have run.
+/// the admin raises a job it could have run. A job at 0% is inactive now
+/// (`jobs_allocation_is_status`), so the two cannot differ again; this holds
+/// the line.
 #[tokio::test]
 async fn a_parked_job_shuts_nobody_down() {
     let db = TestDb::new().await;
     let too_new = db.games_job(2).await;
     sqlx::query(
-        "UPDATE jobs SET allocation = 0, min_magpie_major = 2, min_magpie_minor = 0,
+        "UPDATE jobs SET status = 'inactive', allocation = 0, min_magpie_major = 2, min_magpie_minor = 0,
                          min_magpie_patch = 0
          WHERE id = $1",
     )
@@ -2755,7 +2755,7 @@ async fn a_parked_job_shuts_nobody_down() {
     .await
     .unwrap();
     let unsupported = db.games_job(2).await;
-    sqlx::query("UPDATE jobs SET allocation = 0 WHERE id = $1")
+    sqlx::query("UPDATE jobs SET status = 'inactive', allocation = 0 WHERE id = $1")
         .bind(unsupported)
         .execute(&db.pool)
         .await
@@ -2768,7 +2768,7 @@ async fn a_parked_job_shuts_nobody_down() {
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
 
     // Raised above 0%, the same jobs are what the worker is told about.
-    sqlx::query("UPDATE jobs SET allocation = 50 WHERE id = ANY($1)")
+    sqlx::query("UPDATE jobs SET status = 'active', allocation = 50 WHERE id = ANY($1)")
         .bind(vec![too_new, unsupported])
         .execute(&db.pool)
         .await

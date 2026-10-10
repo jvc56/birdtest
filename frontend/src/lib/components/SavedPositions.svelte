@@ -2,9 +2,9 @@
   /**
    * The positions a games or pairs job captured (`capture_positions`), one at
    * a time on the job's board: a random one, or those where the player to
-   * move held one rack, newest first. Signed-in users only -- the routes
-   * refuse anyone else. Before the job has saved any, it asks again as the
-   * job's progress moves, so the first one appears without a reload.
+   * move held one rack, newest first. Anyone may search them, signed in or
+   * not. Before the job has saved any, it asks again as the job's progress
+   * moves, so the first one appears without a reload.
    *
    * A pairs job's position comes with its partner, the same turn of the
    * pair's other game: up to the turn a pair's games diverge they are one game
@@ -120,7 +120,8 @@
   $: shown = pair[selected] ?? pair[0];
 </script>
 
-<div class="card space-y-4">
+<!-- Less padding on a phone, where every pixel of it is taken from the board. -->
+<div class="card space-y-4 p-3 sm:p-5">
   <div class="space-y-1">
     <h2 class="text-lg font-medium">Saved positions</h2>
     <p class="text-sm text-muted-foreground">
@@ -139,17 +140,21 @@
     </p>
   </div>
 
+  <!-- One line where it fits; on a phone the search drops to a line of its
+       own, its box taking what Search leaves. -->
   <div class="flex flex-wrap gap-2">
     <button class="btn-primary" disabled={busy} on:click={random}>Random position</button>
-    <label class="sr-only" for="position-rack">Rack</label>
-    <input
-      id="position-rack"
-      class="input w-40"
-      bind:value={rackQuery}
-      placeholder="Rack, e.g. AEINRS?"
-      on:keydown={(e) => e.key === 'Enter' && find()}
-    />
-    <button class="btn-secondary" disabled={busy} on:click={find}>Search</button>
+    <div class="flex min-w-[14rem] flex-1 gap-2 sm:max-w-sm">
+      <label class="sr-only" for="position-rack">Rack</label>
+      <input
+        id="position-rack"
+        class="input min-w-0 flex-1"
+        bind:value={rackQuery}
+        placeholder="Rack, e.g. AEINRS?"
+        on:keydown={(e) => e.key === 'Enter' && find()}
+      />
+      <button class="btn-secondary" disabled={busy} on:click={find}>Search</button>
+    </div>
   </div>
 
   {#if error}<p class="field-error" role="alert">{error}</p>{/if}
@@ -194,20 +199,37 @@
           chose differently{/if}
       </p>
       {#if pair.length > 1}
-        <div class="flex flex-wrap items-center gap-2 text-sm" role="group" aria-label="Whose move is shown">
-          <span class="text-muted-foreground">Showing:</span>
-          {#each pair as game, i (game.game_index)}
-            <button
-              type="button"
-              class={selected === i ? 'btn-primary' : 'btn-secondary'}
-              aria-pressed={selected === i}
-              data-testid="pair-toggle"
-              on:click={() => (selected = i)}
-            >
-              <span class="mr-1 inline-block h-2.5 w-2.5 rounded-full" style="background: {colorOf(movers[i])}"
-              ></span>{nameOf(movers[i]) || `Game ${(game.game_index % 2) + 1}`}'s move
-            </button>
-          {/each}
+        <!-- Two segments of one control, each a player's name and colour: as
+             two buttons, each long name took a line of its own on a phone.
+             There the segments are equal halves of the width, a name wrapping
+             inside its own; wider, each is as wide as its name. -->
+        <div class="flex items-center gap-2 text-sm">
+          <span class="hidden text-muted-foreground sm:inline">Showing:</span>
+          <div
+            class="grid min-w-0 flex-1 grid-cols-2 gap-1 rounded-md border border-border p-1 sm:flex sm:flex-none"
+            role="group"
+            aria-label="Whose move is shown"
+          >
+            {#each pair as game, i (game.game_index)}
+              <button
+                type="button"
+                class="flex min-w-0 items-center justify-center gap-1.5 rounded px-2 py-1.5 font-medium leading-tight transition-colors {selected ===
+                i
+                  ? 'bg-primary text-primary-foreground'
+                  : 'text-muted-foreground hover:bg-muted hover:text-foreground'}"
+                aria-pressed={selected === i}
+                data-testid="pair-toggle"
+                on:click={() => (selected = i)}
+              >
+                <span class="inline-block h-2.5 w-2.5 shrink-0 rounded-full" style="background: {colorOf(movers[i])}"
+                ></span><span class="min-w-0 [overflow-wrap:anywhere]"
+                  >{nameOf(movers[i]) || `Game ${(game.game_index % 2) + 1}`}<span class="hidden sm:inline"
+                    >'s move</span
+                  ></span
+                >
+              </button>
+            {/each}
+          </div>
         </div>
       {:else}
         <p class="text-sm text-muted-foreground">

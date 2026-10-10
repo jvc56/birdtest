@@ -231,6 +231,15 @@ const MAX_UNSUPPORTED_JOBS: usize = 200;
 struct TaskAssignment {
     claim_token: Uuid,
     job_id: Uuid,
+    /// The job's name, for the worker to say what it is running (never empty:
+    /// see `scheduler::TaskClaim::job_name`).
+    job_name: String,
+    /// The longest the worker may run this task, in seconds. The claim's
+    /// deadline is its claim time plus this; a worker that reaches it stops,
+    /// hands the task back unfinished and declines it `time_limit`. Past the
+    /// deadline and `scheduler::DEADLINE_GRACE` the claim lapses whatever the
+    /// worker does, and a result for it is refused.
+    max_task_seconds: i32,
     task_request: TaskRequest,
     min_magpie_version: String,
     /// Every file this task will load, with the digest the worker must be able
@@ -396,6 +405,8 @@ async fn claim_task(
         scheduler::ClaimOutcome::Task(claim) => Ok(Json(TaskAssignment {
             claim_token: claim.claim_token,
             job_id: claim.job_id,
+            job_name: claim.job_name,
+            max_task_seconds: claim.max_task_seconds,
             task_request: claim.request,
             min_magpie_version: claim.min_magpie_version,
             expected_data: ExpectedData {
@@ -424,12 +435,33 @@ struct MissingFile {
 #[derive(Deserialize)]
 struct DeclineBody {
     claim_token: Uuid,
-    /// `missing_data`, `magpie_version`, `unknown_job_type`, `derived_mismatch`
-    /// or `task_failed`.
+    /// One of [`DECLINE_REASONS`].
     reason: String,
     #[serde(default)]
     missing: Vec<MissingFile>,
 }
+
+/// Why a worker hands a claim back. `task_failed` is a worker that ran the
+/// task and could not produce a result the server accepted; `time_limit` one
+/// that stopped it at the assignment's `max_task_seconds`, unfinished. The
+/// rest say the worker cannot run the job at all: its data, its version, the
+/// job type, or a derived file it built and got other bytes for.
+const DECLINE_REASONS: [&str; 6] = [
+    "missing_data",
+    "magpie_version",
+    "unknown_job_type",
+    "derived_mismatch",
+    "task_failed",
+    "time_limit",
+];
+
+/// Tasks in a row that hit the time limit -- `time_limit` declines and
+/// overruns (`task_claims.overrun`) -- with no task of the job completed
+/// between, that set the job aside (`Job::time_limit_streak`). One is a slow
+/// machine or an unlucky batch, and its task goes to another worker (none is
+/// handed back a task it declined within the hour); three with nothing
+/// completed between is a batch too big for the limit.
+pub const TIME_LIMIT_STREAK: i32 = 3;
 
 /// A task loads at most a handful of files, so an honest decline names a
 /// handful. Past this the list is truncated: every entry is a row in
@@ -463,18 +495,16 @@ async fn decline_task(
     // the contributor can do fixes this one, and the two hashes it carries are
     // the evidence that the fleet's builders disagree -- which is exactly what
     // should be visible in the admin view rather than worked around silently.
-    if !matches!(
-        body.reason.as_str(),
-        "missing_data"
-            | "magpie_version"
-            | "unknown_job_type"
-            | "derived_mismatch"
-            | "task_failed"
-    ) {
-        return Err(AppError::bad_request(
-            "reason must be 'missing_data', 'magpie_version', 'unknown_job_type', \
-             'derived_mismatch' or 'task_failed'",
-        ));
+    //
+    // `time_limit` is a worker that stopped the task at the assignment's
+    // `max_task_seconds`. Counted against the job, since the cure is the
+    // job's (a smaller batch), and a job whose tasks keep hitting it is set
+    // aside (`record_time_limit`).
+    if !DECLINE_REASONS.contains(&body.reason.as_str()) {
+        return Err(AppError::bad_request(format!(
+            "reason must be one of {}",
+            DECLINE_REASONS.map(|r| format!("'{r}'")).join(", ")
+        )));
     }
 
     // Postgres cannot store a NUL in a string: named in a missing file, it
@@ -493,7 +523,8 @@ async fn decline_task(
     // it a second time.
     bound_claim_lock_wait(&mut tx).await?;
     let row = sqlx::query(
-        "SELECT c.id, t.job_id
+        "SELECT c.id, t.job_id,
+                EXTRACT(EPOCH FROM c.deadline_at - c.claimed_at)::int AS max_task_seconds
          FROM task_claims c
          JOIN tasks t ON t.id = c.task_id
          WHERE c.claim_token = $1 AND c.state = 'claimed'
@@ -515,14 +546,21 @@ async fn decline_task(
     };
     let claim_id: Uuid = row.get("id");
     let job_id: Uuid = row.get("job_id");
+    let max_task_seconds: i32 = row.get("max_task_seconds");
 
     scheduler::release_claim(&mut tx, claim_id, "declined").await?;
     // A worker that cannot run the job at all did not show where its pace
     // is: the settling its claim gave the job is undone (`scheduler::unsettle`).
-    // A task that failed was a task it could run.
-    if body.reason != "task_failed" {
+    // A task that failed, or ran out of time, was a task it could run.
+    if !matches!(body.reason.as_str(), "task_failed" | "time_limit") {
         scheduler::unsettle(&mut tx, job_id, state.cfg.heartbeat_timeout).await?;
     }
+    // After the claim and its task, as every path takes the job's row.
+    let set_aside = if body.reason == "time_limit" {
+        record_time_limit(&mut tx, job_id, Some(max_task_seconds)).await?
+    } else {
+        false
+    };
 
     // One statement for all of them: this runs with the claim and its task
     // locked, and a round trip per file was up to thirty-two.
@@ -565,8 +603,126 @@ async fn decline_task(
     )
     .await?;
     tx.commit().await?;
+    if set_aside {
+        // No admin action is coming to push this to open pages.
+        push_after_change(&state, job_id);
+    }
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Counts the tasks of a job that hit the time limit -- a `time_limit` decline
+/// when `declined` gives its claim's limit, and every overrun reclamation has
+/// marked on the job's claims and nobody has counted yet
+/// (`task_claims.overrun`) -- and sets the job aside, inactive at 0% with the
+/// reason on the job and in the audit log, once [`TIME_LIMIT_STREAK`] of them
+/// have come in a row with no task of the job completed between. Whether it
+/// did.
+///
+/// A job whose one unit outlasts the limit -- a game pair of deep simmers --
+/// fails every task the same way on every worker, and handed out again each
+/// time it was handed back it took a share of the fleet for nothing, for
+/// ever. Set aside, it waits for the admin: a job's batch is fixed when it is
+/// created, so the cure is a new job with a smaller batch, or a longer limit
+/// (the job's own, `PATCH /api/admin/jobs/:id/time-limit`) and an allocation
+/// again, which starts the run afresh.
+///
+/// The run is in order of when each happened. A decline is counted as it
+/// arrives. An overrun is counted later than it happened -- reclamation marks
+/// it without the job's row, and this, run by whoever next holds that row,
+/// counts it -- so it joins the run only if its deadline came after the run
+/// began (`jobs.time_limit_streak_since`: the last accepted result, or the
+/// allocation that put the job back); one from before counts toward the
+/// total alone. Called by the job's next claim (`scheduler::count_overruns`),
+/// a `time_limit` decline, and a result refused past its deadline.
+///
+/// The job's row first, then its overruns: every caller takes them in that
+/// order, so two of them queue on the row rather than lock the same claims
+/// in two orders. Nothing else locks an abandoned claim -- a submission, a
+/// decline, a heartbeat and reclamation take only open ones -- but a purge or
+/// a delete, which holds the job's dispatch lock throughout (the claim path
+/// takes it before calling this) and waits out the open claim a decline or a
+/// refusal holds. Each of those callers holds its claim and task already: the
+/// order every submission takes, claim, task, job.
+///
+/// Like `set_allocations` at 0%: the status and the allocation in one write,
+/// keeping `jobs_allocation_is_status`, and one audit row with the share it
+/// moved from. Only an active job is set aside; a job already off counts and
+/// nothing more.
+pub(crate) async fn record_time_limit(
+    tx: &mut sqlx::PgConnection,
+    job_id: Uuid,
+    declined: Option<i32>,
+) -> AppResult<bool> {
+    let since: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT time_limit_streak_since FROM jobs WHERE id = $1 FOR UPDATE")
+            .bind(job_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    // Through `task_claims_overrun_idx`, which holds only the uncounted.
+    let (overruns, in_run, overrun_limit): (i64, i64, Option<i32>) = sqlx::query_as(
+        "WITH counted AS (
+             UPDATE task_claims SET overrun = 'counted'
+             WHERE job_id = $1 AND overrun = 'pending'
+             RETURNING deadline_at, EXTRACT(EPOCH FROM deadline_at - claimed_at)::int AS limit_secs
+         )
+         SELECT COUNT(*), COUNT(*) FILTER (WHERE $2::timestamptz IS NULL OR deadline_at > $2),
+                (array_agg(limit_secs ORDER BY deadline_at DESC))[1]
+         FROM counted",
+    )
+    .bind(job_id)
+    .bind(since)
+    .fetch_one(&mut *tx)
+    .await?;
+    // The limit the reason names: the decline's, or the latest overrun's.
+    let Some(max_task_seconds) = declined.or(overrun_limit) else {
+        return Ok(false);
+    };
+    let declined = i64::from(declined.is_some());
+    let (streak, allocation): (i32, i32) = sqlx::query_as(
+        "UPDATE jobs SET time_limit_declines = time_limit_declines + $2,
+                         time_limit_streak = time_limit_streak + $3
+         WHERE id = $1
+         RETURNING time_limit_streak, allocation",
+    )
+    .bind(job_id)
+    .bind(declined + overruns)
+    .bind(i32::try_from(declined + in_run).unwrap_or(i32::MAX))
+    .fetch_one(&mut *tx)
+    .await?;
+    if streak < TIME_LIMIT_STREAK || allocation == 0 {
+        return Ok(false);
+    }
+    let reason = format!(
+        "{streak} tasks in a row hit the {} time limit with none completed between: \
+         a task's batch is more than a worker finishes in that time. Lower the batch \
+         size (in a new job), or raise the job's time limit on its Manage page, and \
+         give it an allocation again.",
+        limit_text(max_task_seconds)
+    );
+    let set_aside = sqlx::query(
+        "UPDATE jobs SET status = 'inactive', allocation = 0, set_aside_reason = $2
+         WHERE id = $1 AND status = 'active'",
+    )
+    .bind(job_id)
+    .bind(&reason)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected()
+        > 0;
+    if set_aside {
+        audit::log_server_set_aside(&mut *tx, job_id, &format!("{allocation}% -> 0%: {reason}")).await?;
+    }
+    Ok(set_aside)
+}
+
+/// A time limit as a reader says it: "1-hour", "90-minute", "45-second".
+fn limit_text(seconds: i32) -> String {
+    match seconds {
+        s if s % 3600 == 0 => format!("{}-hour", s / 3600),
+        s if s % 60 == 0 => format!("{}-minute", s / 60),
+        s => format!("{s}-second"),
+    }
 }
 
 /// How long a submission or a decline waits for its claim's row lock.
@@ -799,7 +955,8 @@ async fn submit_result(
     // clean `accepted: false` instead of a duplicate-key error.
     bound_claim_lock_wait(&mut tx).await?;
     let claim = sqlx::query(
-        "SELECT c.id, c.task_id, t.job_id
+        "SELECT c.id, c.task_id, t.job_id,
+                c.deadline_at < now() - make_interval(secs => $4) AS past_deadline
          FROM task_claims c JOIN tasks t ON t.id = c.task_id
          WHERE c.claim_token = $1 AND c.state = 'claimed'
            AND c.claimed_by_user_id IS NOT DISTINCT FROM $2
@@ -809,6 +966,7 @@ async fn submit_result(
     .bind(body.claim_token)
     .bind(identity.user_id())
     .bind(identity.anon_uuid())
+    .bind(scheduler::DEADLINE_GRACE.as_secs_f64())
     .fetch_optional(&mut *tx)
     .await?;
     end_claim_lock_wait(&mut tx).await?;
@@ -829,6 +987,32 @@ async fn submit_result(
     let claim_id: Uuid = claim.get("id");
     let task_id: Uuid = claim.get("task_id");
     let job_id: Uuid = claim.get("job_id");
+
+    // Past its deadline and the grace, the claim has lapsed whether or not a
+    // sweep has got to it -- one of a job nobody claims from is never swept
+    // -- and its result is answered as a lapsed claim's is. Released here,
+    // as the sweep would, so the task goes back out now. Not while the sweep
+    // would spare it (`scheduler::deadlines_enforced`).
+    //
+    // It is an overrun as the sweep marks one -- the worker is plainly alive,
+    // and ran the task past the limit -- and counted against the job now,
+    // with the claim and its task held, as a decline is
+    // (`record_time_limit`): a job whose tasks all finish a little too late
+    // would otherwise be handed out for ever.
+    if claim.get::<bool, _>("past_deadline") && scheduler::deadlines_enforced(&state, job_id) {
+        scheduler::release_claim(&mut tx, claim_id, "abandoned").await?;
+        sqlx::query("UPDATE task_claims SET overrun = 'pending' WHERE id = $1")
+            .bind(claim_id)
+            .execute(&mut *tx)
+            .await?;
+        let set_aside = record_time_limit(&mut tx, job_id, None).await?;
+        tx.commit().await?;
+        if set_aside {
+            push_after_change(&state, job_id);
+        }
+        tracing::debug!(claim_token = %body.claim_token, "refusing a result past its claim's deadline");
+        return Ok(Json(ResultAck { accepted: false }));
+    }
 
     // The task row is locked by the update below anyway; taking it before
     // anything is stored keeps the order every path uses -- claim, then task,
@@ -933,7 +1117,15 @@ async fn submit_result(
     // -- a claim for the job then waited on this whole transaction.
     //
     // `last_completed_at` rides along. Every accepted submission completes its
-    // task, so every one takes the lock regardless.
+    // task, so every one takes the lock regardless -- which is also what ends
+    // a run of tasks that hit the time limit (`time_limit_streak`, and when
+    // the next began, `record_time_limit`): a completed task shows the job's
+    // batch fits the limit.
+    //
+    // So do the claim's `movegens` and `compute_ms`, the same figures its
+    // contributor was credited with above: the job's share of the
+    // contributors' totals, kept here rather than summed from the claims on
+    // every view, at no lock this statement did not already take.
     {
         sqlx::query(
             "UPDATE jobs SET games_completed = games_completed + $2,
@@ -941,9 +1133,12 @@ async fn submit_result(
                              tasks_completed = tasks_completed + $4,
                              racks_settled = racks_settled + $5,
                              racks_without_consensus = racks_without_consensus + $6,
+                             movegens = movegens + $7,
+                             compute_ms = compute_ms + $8,
+                             time_limit_streak = 0, time_limit_streak_since = now(),
                              last_completed_at = now()
              WHERE id = $1
-               AND ($2 <> 0 OR $3 <> 0 OR $4 <> 0 OR $5 <> 0 OR $6 <> 0
+               AND ($2 <> 0 OR $3 <> 0 OR $4 <> 0 OR $5 <> 0 OR $6 <> 0 OR $7 <> 0 OR $8 <> 0
                     OR last_completed_at IS NULL
                     OR last_completed_at < now() - interval '1 minute')",
         )
@@ -953,6 +1148,8 @@ async fn submit_result(
         .bind(i64::from(task_completed))
         .bind(progress.racks_settled)
         .bind(progress.racks_without_consensus)
+        .bind(movegens)
+        .bind(compute_ms)
         .execute(&mut *tx)
         .await?;
     }
@@ -1475,6 +1672,8 @@ mod contract_fixtures {
         serde_json::to_value(TaskAssignment {
             claim_token: Uuid::nil(),
             job_id: Uuid::nil(),
+            job_name: "a job".into(),
+            max_task_seconds: 3600,
             task_request: request,
             min_magpie_version: "1.4.0".into(),
             expected_data,
@@ -1488,6 +1687,14 @@ mod contract_fixtures {
         for (name, fixture) in [
             ("games", include_str!("../../../contract-fixtures/assignment-games.json")),
             ("game-pairs", GAME_PAIRS_ASSIGNMENT),
+            (
+                "opening-rack",
+                include_str!("../../../contract-fixtures/assignment-opening-rack.json"),
+            ),
+            (
+                "leave-generation",
+                include_str!("../../../contract-fixtures/assignment-leave-generation.json"),
+            ),
         ] {
             let fixture: Value = serde_json::from_str(fixture).unwrap();
             // Absent from both: it is sent only to a worker that arrived with
@@ -1498,6 +1705,60 @@ mod contract_fixtures {
                 &format!("assignment-{name} envelope"),
             );
         }
+    }
+
+    /// C-11: every assignment names its job and states its time limit, a whole
+    /// number of seconds within what the settings allow; a games or pairs
+    /// request states its threading mode, `igp` or `pgp`, and no other request
+    /// does.
+    #[test]
+    fn every_assignment_names_its_job_its_time_limit_and_a_games_threading_mode() {
+        for (name, fixture) in [
+            ("games", include_str!("../../../contract-fixtures/assignment-games.json")),
+            (
+                "opening-rack",
+                include_str!("../../../contract-fixtures/assignment-opening-rack.json"),
+            ),
+            (
+                "leave-generation",
+                include_str!("../../../contract-fixtures/assignment-leave-generation.json"),
+            ),
+            ("game-pairs", GAME_PAIRS_ASSIGNMENT),
+            ("anon-uuid", ANON_UUID_ASSIGNMENT),
+        ] {
+            let value: Value = serde_json::from_str(fixture).unwrap();
+            let job_name = value["job_name"].as_str().unwrap_or_else(|| panic!("{name}: no job_name"));
+            assert!(!job_name.is_empty(), "{name}");
+            let limit = value["max_task_seconds"].as_i64().unwrap_or_else(|| panic!("{name}: no max_task_seconds"));
+            assert!((600..=86_400).contains(&limit), "{name}: {limit}");
+            let request: TaskRequest = serde_json::from_value(value["task_request"].clone()).unwrap();
+            match request {
+                TaskRequest::Games(r) | TaskRequest::GamePairs(r) => {
+                    assert!(matches!(r.threading_mode.as_str(), "igp" | "pgp"), "{name}");
+                }
+                _ => assert!(value["task_request"].get("threading_mode").is_none(), "{name}"),
+            }
+        }
+    }
+
+    /// C-12: a decline at the time limit is a token and its reason alone.
+    #[test]
+    fn a_time_limit_decline_parses_as_a_decline_body() {
+        let body: DeclineBody = serde_json::from_str(include_str!(
+            "../../../contract-fixtures/decline-time-limit.json"
+        ))
+        .expect("decline-time-limit.json no longer parses as DeclineBody");
+        assert_eq!(body.reason, "time_limit");
+        assert!(DECLINE_REASONS.contains(&body.reason.as_str()));
+        assert!(body.missing.is_empty());
+    }
+
+    #[test]
+    fn a_time_limit_reads_as_a_reader_says_it() {
+        assert_eq!(limit_text(3600), "1-hour");
+        assert_eq!(limit_text(7200), "2-hour");
+        assert_eq!(limit_text(5400), "90-minute");
+        assert_eq!(limit_text(90), "90-second");
     }
 
     /// C-2: the pairs assignment is a `game_pairs` request, and only its tag

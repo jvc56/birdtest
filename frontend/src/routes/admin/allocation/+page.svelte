@@ -9,11 +9,18 @@
    * run again.
    */
   import { onMount } from 'svelte';
+  import { page } from '$app/stores';
   import { api, errorText, type JobListItem, type JobStatus } from '$lib/api';
+  import { equalShares } from '$lib/allocation';
   import { jobTitle, jobTypeLabel } from '$lib/format';
   import JobStatusBadge from '$lib/components/JobStatusBadge.svelte';
 
   let jobs: JobListItem[] = [];
+  // The jobs the creation form just made (`?new=id,id`): a round robin's
+  // pairings, inactive at 0%, marked so they can be found among the rest and
+  // listed first.
+  $: fresh = new Set(($page.url.searchParams.get('new') ?? '').split(',').filter(Boolean));
+  $: listed = [...jobs].sort((a, b) => Number(fresh.has(b.id)) - Number(fresh.has(a.id)));
   /** The allocation each job is set to on the page, by id. */
   let values: Record<string, number> = {};
   let loaded = false;
@@ -36,7 +43,7 @@
       const [active, inactive] = await Promise.all([every('active'), every('inactive')]);
       jobs = [...active, ...inactive];
       values = Object.fromEntries(
-        jobs.map((job) => [job.id, job.status === 'active' ? (job.allocation ?? 0) : 0])
+        jobs.map((job) => [job.id, job.allocation])
       );
       loaded = true;
     } catch (e) {
@@ -46,7 +53,7 @@
 
   onMount(load);
 
-  const current = (job: JobListItem) => (job.status === 'active' ? (job.allocation ?? 0) : 0);
+  const current = (job: JobListItem) => job.allocation;
   $: total = jobs.reduce((sum, job) => sum + (Number(values[job.id]) || 0), 0);
   $: invalid = jobs.some((job) => {
     const v = values[job.id];
@@ -54,20 +61,9 @@
   });
   $: changed = jobs.filter((job) => Number(values[job.id]) !== current(job));
 
-  /** Every job's share, the same whole number each, the rest to the first. */
+  /** The running and new jobs' share, the same whole number each. */
   function shareEqually() {
-    const running = jobs.filter((job) => Number(values[job.id]) > 0);
-    const among = running.length ? running : jobs;
-    if (!among.length) return;
-    const each = Math.floor(100 / among.length);
-    let left = 100 - each * among.length;
-    const next = { ...values };
-    for (const job of jobs) next[job.id] = 0;
-    for (const job of among) {
-      next[job.id] = each + (left > 0 ? 1 : 0);
-      if (left > 0) left -= 1;
-    }
-    values = next;
+    values = equalShares(listed.map((job) => job.id), values, fresh);
   }
 
   async function save() {
@@ -93,8 +89,9 @@
     <h1 class="text-2xl font-semibold">Allocation</h1>
     <p class="text-sm text-muted-foreground">
       Each job's share of the claims workers make. The active jobs may allocate at most 100%
-      between them; set them all here and save once. Above 0% a job is active; at 0% it is
-      inactive. Completed jobs cannot run again and are not listed.
+      between them; set them all here and save once. This is the only place a job is switched on
+      or off: above 0% it is active, and at 0% it is inactive. Completed jobs cannot run again and
+      are not listed.
     </p>
   </div>
 
@@ -106,6 +103,14 @@
   {:else if loaded && !jobs.length}
     <p class="text-muted-foreground">No job is active or inactive: there is nothing to allocate.</p>
   {:else if loaded}
+    {#if fresh.size}
+      <p class="text-sm" data-testid="new-jobs">
+        {fresh.size === 1 ? 'The new job is' : `The ${fresh.size} new jobs are`} marked
+        <span class="rounded-full border border-primary/30 bg-primary/15 px-2 py-0.5 text-xs font-medium text-primary">new</span> and listed first, inactive at 0%: give
+        {fresh.size === 1 ? 'it an allocation' : 'them allocations'} to start
+        {fresh.size === 1 ? 'it' : 'them'}.
+      </p>
+    {/if}
     <form class="card space-y-4" on:submit|preventDefault={save}>
       <div class="overflow-x-auto">
         <table class="table text-sm" data-testid="allocations">
@@ -116,9 +121,12 @@
             </tr>
           </thead>
           <tbody>
-            {#each jobs as job (job.id)}
+            {#each listed as job (job.id)}
               <tr class:font-medium={Number(values[job.id]) !== current(job)}>
-                <td><a href="/admin/jobs/{job.id}">{jobTitle(job)}</a></td>
+                <td>
+                  <a href="/admin/jobs/{job.id}">{jobTitle(job)}</a>
+                  {#if fresh.has(job.id)}<span class="ml-1 rounded-full border border-primary/30 bg-primary/15 px-2 py-0.5 text-xs font-medium text-primary">new</span>{/if}
+                </td>
                 <td>{jobTypeLabel(job.job_type)}</td>
                 <td><JobStatusBadge status={job.status} /></td>
                 <td class="text-right tabular-nums">{current(job)}%</td>
@@ -157,7 +165,8 @@
         <p class="field-error">Every allocation must be a whole number from 0 to 100.</p>
       {/if}
       <p class="text-xs text-muted-foreground">
-        "Share equally" splits 100% among the jobs set above 0% (all of them when none is).
+        "Share equally" splits 100% among the jobs set above 0% and the new ones (all of them
+        when there are none).
         Jobs you leave unchanged are not sent.
       </p>
     </form>

@@ -47,8 +47,8 @@ test.beforeAll(async ({ playwright }) => {
     max_pairs: 300
   };
   const jobs = [
-    await api.activeJob({ ...pairs, player1_config_id: ratedId, player2_config_id: thirdId }, 20),
-    await api.activeJob({ ...pairs, player1_config_id: anchorId, player2_config_id: thirdId }, 20),
+    await api.activeJob({ ...pairs, player_config_ids: [ratedId, thirdId] }, 20),
+    await api.activeJob({ ...pairs, player_config_ids: [anchorId, thirdId] }, 20),
     (await seededJob(request)).id
   ];
   for (const job of jobs) await waitUntilSettled(request, job);
@@ -63,7 +63,7 @@ test.afterAll(async () => {
   await api.dispose();
 });
 
-/** A config's row in the pool's table (not in the residuals below it). */
+/** A config's row in the pool's table (not in the cross table below it). */
 function configRow(page: Page, name: string) {
   return page
     .locator('.card', { has: page.getByRole('heading', { name: 'All configs' }) })
@@ -93,7 +93,7 @@ async function addMember(page: Page, name: string) {
   await expect(configRow(page, name)).toHaveCount(1);
 }
 
-test('E-7: an admin builds a rating pool and watches membership move the ratings', async ({ page }) => {
+test('E-7: an admin builds a rating pool and watches membership move the ratings', async ({ page, browser }) => {
   await page.goto('/ratings');
   await page.getByRole('link', { name: 'New rating pool' }).click();
   await page.getByLabel('Pool name').fill(poolName);
@@ -136,6 +136,35 @@ test('E-7: an admin builds a rating pool and watches membership move the ratings
   const withThird = await rating(page, RATED);
   expect(withThird).not.toBe(alone);
   expect(await rating(page, third)).toMatch(/^\d+\.\d$/);
+
+  // The cross table: three configs, each against the other two from its own
+  // side -- a win % with its error over the average spread -- and its rating
+  // last, as the table above prints it.
+  const cross = page.getByTestId('cross-table');
+  await expect(cross.locator('tbody tr')).toHaveCount(3);
+  const cells = cross.locator('td[title]');
+  await expect(cells).toHaveCount(6);
+  await expect(cells.first()).toHaveText(/^\s*\d+\.\d% ±\d+\.\d\s*[-+]?\d+\.\d\s*$/);
+  await expect(cells.first()).toHaveAttribute('title', / against .+ The ratings predict /);
+  const ratedCross = cross.locator('tbody tr', { has: page.locator('th', { hasText: RATED }) });
+  await expect(ratedCross.locator('td').last()).toHaveText(withThird);
+  // Each cell tinted by its record as it shows it: above 50.0% a win, below a
+  // loss, 50.0% itself even.
+  for (const cell of await cells.all()) {
+    const shown = Number(/(\d+\.\d)%/.exec(await cell.innerText())![1]);
+    await expect(cell).toHaveAttribute('data-record', shown > 50 ? 'win' : shown < 50 ? 'loss' : 'even');
+  }
+
+  // A visitor reads the cross table and then the plot under it; the exact
+  // figures and the controls are an admin's.
+  const signedOut = await browser.newContext({ storageState: { cookies: [], origins: [] } });
+  const visitor = await signedOut.newPage();
+  await visitor.goto(page.url());
+  await expect(visitor.getByTestId('cross-table').locator('tbody tr')).toHaveCount(3);
+  await expect(visitor.locator('.card > h2')).toHaveText(['Cross table', 'Ratings']);
+  await expect(visitor.getByRole('heading', { name: 'All configs' })).toHaveCount(0);
+  await expect(visitor.getByText('WESPA players')).toBeVisible();
+  await signedOut.close();
 
   // Remove it again: the refit takes its games back out, and the rating it
   // moved returns to exactly what those games alone support.

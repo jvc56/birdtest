@@ -108,7 +108,7 @@ VALUES ('letterdistributions/check.csv', 'letterdist', 'check', repeat('a', 64),
        ('layouts/check.txt', 'layout', 'check', repeat('b', 64), 3, '20260101', '\x010203'::bytea);
 INSERT INTO jobs (id, job_type, status, allocation, variant,
                   letterdist_id, layout_id, created_by, bingo_bonus, sim_cutoff)
-SELECT j.id::uuid, j.kind::job_type, 'inactive', 100, 'classic',
+SELECT j.id::uuid, j.kind::job_type, 'inactive', 0, 'classic',
        (SELECT id FROM input_data WHERE role = 'letterdist'),
        (SELECT id FROM input_data WHERE role = 'layout'),
        (SELECT id FROM users), 50, 0.1
@@ -191,7 +191,7 @@ want_games=$(digest "$SCRATCH" "$GAMES")
 want_leave=$(digest "$SCRATCH" "$LEAVE")
 want_other=$(digest "$PROD" "$OTHER")
 want_deleted=$(digest "$SCRATCH" "$DELETED")
-want_deleted_job=$(val "$SCRATCH" "SELECT j::text FROM (SELECT id, job_type, allocation, letterdist_id, layout_id, created_by FROM jobs WHERE id = '$DELETED') j")
+want_deleted_job=$(val "$SCRATCH" "SELECT j::text FROM (SELECT id, job_type, letterdist_id, layout_id, created_by FROM jobs WHERE id = '$DELETED') j")
 
 # The purge, for both jobs, and a sequence behind the ids it removed.
 psql_ -d "$PROD" <<SQL
@@ -230,10 +230,10 @@ ${EXEC} sh -c 'printf "restoring\npg_restore exit 0\n" > /tmp/restore-job-check.
 echo "-- refuses production as its scratch copy, an active or since-completed job, and a job it holds nothing of"
 if out=$(restore "$GAMES" SCRATCH_URL="postgresql:///$PROD?user=$PGUSER_"); then fail "restored from production: $out"; fi
 [[ "$out" == *"SCRATCH_URL is production itself"* ]] || fail "not told why: $out"
-val "$PROD" "UPDATE jobs SET status = 'active' WHERE id = '$GAMES'" >/dev/null
+val "$PROD" "UPDATE jobs SET status = 'active', allocation = 100 WHERE id = '$GAMES'" >/dev/null
 if out=$(restore "$GAMES"); then fail "restored into an active job: $out"; fi
 [[ "$out" == *"the job is active in production"* ]] || fail "not told why: $out"
-val "$PROD" "UPDATE jobs SET status = 'completed' WHERE id = '$GAMES'" >/dev/null
+val "$PROD" "UPDATE jobs SET status = 'completed', allocation = 0 WHERE id = '$GAMES'" >/dev/null
 if out=$(restore "$GAMES"); then fail "restored into a job completed since the purge: $out"; fi
 [[ "$out" == *"is completed in production"* ]] || fail "not told why: $out"
 val "$PROD" "UPDATE jobs SET status = 'inactive' WHERE id = '$GAMES'" >/dev/null
@@ -298,9 +298,11 @@ if out=$(restore "$DELETED"); then fail "the refused config did not stop the run
 val "$PROD" "DROP TRIGGER refuse ON job_game_config; DROP FUNCTION refuse()" >/dev/null
 out=$(restore "$DELETED") || fail "the deleted job's restore failed: $(tail -5 <<<"$out")"
 [[ "$(digest "$PROD" "$DELETED")" == "$want_deleted" ]] || fail "the deleted job's rows came back different: $out"
-[[ "$(val "$PROD" "SELECT j::text FROM (SELECT id, job_type, allocation, letterdist_id, layout_id, created_by FROM jobs WHERE id = '$DELETED') j")" == "$want_deleted_job" ]] \
+[[ "$(val "$PROD" "SELECT j::text FROM (SELECT id, job_type, letterdist_id, layout_id, created_by FROM jobs WHERE id = '$DELETED') j")" == "$want_deleted_job" ]] \
   || fail "its jobs row came back different"
-[[ "$(val "$PROD" "SELECT status FROM jobs WHERE id = '$DELETED'")" == inactive ]] || fail "it came back dispatching"
+# Inactive at 0%, as the schema holds an inactive job, whatever share it had.
+[[ "$(val "$PROD" "SELECT status || ' ' || allocation FROM jobs WHERE id = '$DELETED'")" == "inactive 0" ]] \
+  || fail "it came back dispatching"
 [[ "$(val "$PROD" "SELECT count(*) FROM job_game_config c JOIN player_configs p ON p.id = c.player1_config_id
                     JOIN input_data k ON k.id = p.klv_id WHERE c.job_id = '$DELETED'")" == 1 ]] \
   || fail "its config, player config or input data did not come back"

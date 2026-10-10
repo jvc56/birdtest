@@ -270,7 +270,7 @@ async fn idle_and_each_shutdown_reason_are_distinct_answers() {
     first_claim(&app).await;
     let (status, body) = claim(&app, &[], claim_body("1.0.0", &[])).await;
     assert_eq!((status, &body), (StatusCode::NO_CONTENT, &Value::Null), "idle is not a shutdown");
-    sqlx::query("UPDATE jobs SET status = 'inactive' WHERE id = $1")
+    sqlx::query("UPDATE jobs SET status = 'inactive', allocation = 0 WHERE id = $1")
         .bind(capped)
         .execute(&db.pool)
         .await
@@ -317,7 +317,7 @@ async fn idle_and_each_shutdown_reason_are_distinct_answers() {
     assert_eq!(shutdown["download_url"], download, "{body}");
 
     // Below every job's own floor, with no data problem.
-    sqlx::query("UPDATE jobs SET status = 'inactive' WHERE id = $1")
+    sqlx::query("UPDATE jobs SET status = 'inactive', allocation = 0 WHERE id = $1")
         .bind(job)
         .execute(&db.pool)
         .await
@@ -548,13 +548,19 @@ async fn a_leave_claim_carries_its_player_and_pins_only_its_lexicon() {
     assert_eq!(again["task_request"]["player"], request["player"], "{again}");
 }
 
-/// A-WORKER-8: a decline must give one of the five reasons the protocol knows.
+/// Every reason a decline may give, as `routes::worker::DECLINE_REASONS`
+/// lists them.
+const DECLINE_REASONS: [&str; 6] =
+    ["missing_data", "magpie_version", "unknown_job_type", "derived_mismatch", "task_failed", "time_limit"];
+
+/// A-WORKER-8: a decline must give one of the six reasons the protocol knows.
 /// Anything else is a `400` listing them, and leaves the claim held; each of
-/// `missing_data`, `magpie_version`, `unknown_job_type`, `derived_mismatch` and
-/// `task_failed` is accepted, releases the claim, and is recorded on the audit
-/// row so a decline can be told from a vanished worker afterwards.
+/// `missing_data`, `magpie_version`, `unknown_job_type`, `derived_mismatch`,
+/// `task_failed` and `time_limit` is accepted, releases the claim, and is
+/// recorded on the audit row so a decline can be told from a vanished worker
+/// afterwards.
 #[tokio::test]
-async fn only_the_five_known_decline_reasons_are_accepted() {
+async fn only_the_six_known_decline_reasons_are_accepted() {
     let db = TestDb::new().await;
     db.games_job(2).await;
     let app = birdtest::app(db.state().await);
@@ -562,7 +568,7 @@ async fn only_the_five_known_decline_reasons_are_accepted() {
     let (assignment, uuid) = first_claim(&app).await;
     let (status, body) = decline_as(&app, &uuid, &assignment["claim_token"], "bored", json!([])).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    for reason in ["missing_data", "magpie_version", "unknown_job_type", "derived_mismatch", "task_failed"] {
+    for reason in DECLINE_REASONS {
         assert!(message(&body).contains(reason), "the refusal should list {reason}: {body}");
     }
     let held: String = sqlx::query_scalar("SELECT state::text FROM task_claims WHERE claim_token = $1::uuid")
@@ -572,7 +578,7 @@ async fn only_the_five_known_decline_reasons_are_accepted() {
         .unwrap();
     assert_eq!(held, "claimed", "a refused decline released nothing");
 
-    for reason in ["missing_data", "magpie_version", "unknown_job_type", "derived_mismatch", "task_failed"] {
+    for reason in DECLINE_REASONS {
         let (assignment, uuid) = first_claim(&app).await;
         let token = &assignment["claim_token"];
         let (status, body) = decline_as(&app, &uuid, token, reason, json!([])).await;
@@ -1308,4 +1314,469 @@ async fn a_chunked_first_claim_is_held_to_its_bound() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     drop(sender);
+}
+
+// --- A-WORKER-23..26: the task time limit ------------------------------------
+
+/// A claim's own time limit, in seconds: its deadline less its claim time.
+async fn claim_limit(db: &TestDb, token: &Value) -> i64 {
+    sqlx::query_scalar(
+        "SELECT EXTRACT(EPOCH FROM deadline_at - claimed_at)::bigint FROM task_claims
+         WHERE claim_token = $1::uuid",
+    )
+    .bind(token.as_str().unwrap())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap()
+}
+
+/// Moves a claim's deadline to `seconds` ago.
+async fn past_deadline(db: &TestDb, token: &Value, seconds: i64) {
+    sqlx::query(
+        "UPDATE task_claims SET deadline_at = now() - make_interval(secs => $2)
+         WHERE claim_token = $1::uuid",
+    )
+    .bind(token.as_str().unwrap())
+    .bind(seconds as f64)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+}
+
+async fn claim_state(db: &TestDb, token: &Value) -> String {
+    sqlx::query_scalar("SELECT state::text FROM task_claims WHERE claim_token = $1::uuid")
+        .bind(token.as_str().unwrap())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+}
+
+/// A-WORKER-23: every assignment names its job and states the time limit the
+/// claim was given, which is its job's as it stood at the claim: the claim's
+/// deadline is its claim time plus that, a change to the job's limit moves
+/// later claims' and not an earlier one's, and two jobs with different limits
+/// give each claim its own job's. A job created without a name is named for
+/// its type and id, never "".
+#[tokio::test]
+async fn an_assignment_names_its_job_and_states_the_limit_it_was_claimed_under() {
+    let db = TestDb::new().await;
+    let job = db.games_job(2).await;
+    let app = birdtest::app(db.state().await);
+
+    let (first, _) = first_claim(&app).await;
+    let unnamed = format!("games job {}", &job.simple().to_string()[..8]);
+    assert_eq!(first["job_name"], json!(unnamed), "{first}");
+    assert_eq!(first["max_task_seconds"], json!(3600), "the default: {first}");
+    assert_eq!(claim_limit(&db, &first["claim_token"]).await, 3600);
+
+    sqlx::query("UPDATE jobs SET max_task_seconds = 900 WHERE id = $1")
+        .bind(job)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE jobs SET name = 'NWL23 static mirror' WHERE id = $1")
+        .bind(job)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let worker = registered_worker(&db).await;
+    let (status, second) = claim_as(&app, &worker).await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(second["job_name"], "NWL23 static mirror", "{second}");
+    assert_eq!(second["max_task_seconds"], json!(900), "the job's limit at the claim: {second}");
+    assert_eq!(claim_limit(&db, &second["claim_token"]).await, 900);
+    assert_eq!(claim_limit(&db, &first["claim_token"]).await, 3600, "an earlier claim keeps its own");
+
+    // A second job with a limit of its own, claimed from in the same run:
+    // each claim is given its own job's limit, not the other's.
+    let other = db.games_job(2).await;
+    sqlx::query("UPDATE jobs SET max_task_seconds = 1200 WHERE id = $1")
+        .bind(other)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let mut claimed_from = std::collections::HashSet::new();
+    for _ in 0..8 {
+        let worker = registered_worker(&db).await;
+        let (status, assignment) = claim_as(&app, &worker).await;
+        assert_eq!(status, StatusCode::OK, "{assignment}");
+        let from: Uuid = assignment["job_id"].as_str().unwrap().parse().unwrap();
+        let want = if from == other { 1200 } else { 900 };
+        assert_eq!(assignment["max_task_seconds"], json!(want), "{assignment}");
+        assert_eq!(claim_limit(&db, &assignment["claim_token"]).await, want);
+        claimed_from.insert(from);
+    }
+    assert_eq!(claimed_from, [job, other].into(), "both jobs were claimed from");
+}
+
+/// A-WORKER-24: a claim past its deadline and the minute's grace lapses at the
+/// next reclamation however recently its worker heartbeat, and its task goes
+/// back out, the claim marked an overrun (A-WORKER-27); inside the grace it
+/// stands. A process in its startup grace
+/// lapses nothing on a deadline either, as it lapses nothing on a heartbeat.
+#[tokio::test]
+async fn a_claim_past_its_deadline_lapses_even_while_heartbeating() {
+    let db = TestDb::new().await;
+    let job = db.games_job(2).await;
+    let mut state = db.state().await;
+    let app = birdtest::app(state.clone());
+
+    let (assignment, uuid) = first_claim(&app).await;
+    let token = &assignment["claim_token"];
+    past_deadline(&db, token, 30).await;
+    assert_eq!(heartbeat_as(&app, &uuid, token).await, StatusCode::NO_CONTENT);
+    assert_eq!(birdtest::scheduler::reclaim_expired(&db.pool, job, 300.0).await.unwrap(), 0, "inside the grace");
+    assert_eq!(claim_state(&db, token).await, "claimed");
+
+    past_deadline(&db, token, 61).await;
+    assert_eq!(heartbeat_as(&app, &uuid, token).await, StatusCode::NO_CONTENT);
+    state.reclaim_from = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    assert_eq!(birdtest::scheduler::reclaim_lapsed(&state, &[job]).await.unwrap(), 0, "the startup grace");
+    state.reclaim_from = std::time::Instant::now();
+    assert_eq!(birdtest::scheduler::reclaim_lapsed(&state, &[job]).await.unwrap(), 1);
+    assert_eq!(claim_state(&db, token).await, "abandoned");
+    assert_eq!(overrun_of(&db, token).await.as_deref(), Some("pending"), "its worker was alive");
+    let task_state: String = sqlx::query_scalar(
+        "SELECT t.state::text FROM tasks t JOIN task_claims c ON c.task_id = t.id
+         WHERE c.claim_token = $1::uuid",
+    )
+    .bind(token.as_str().unwrap())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(task_state, "available", "the task goes back out");
+}
+
+/// A-WORKER-25: a result for a claim past its deadline and the grace is
+/// answered as a lapsed claim's is, `accepted: false`, whether or not a
+/// reclamation got there first -- and the claim is released then and there,
+/// its task back out and nothing stored. Inside the grace, or while the
+/// process is in its startup grace (the worker could not have landed it
+/// sooner), the result is accepted.
+#[tokio::test]
+async fn a_result_past_its_claims_deadline_is_refused_and_frees_the_task() {
+    let db = TestDb::new().await;
+    let job = db.games_job(2).await;
+    let mut state = db.state().await;
+    let app = birdtest::app(state.clone());
+
+    let (late, uuid) = first_claim(&app).await;
+    past_deadline(&db, &late["claim_token"], 120).await;
+    let (status, body) = submit_as(&app, &uuid, &late["claim_token"], games_result(2, 1)).await;
+    assert_eq!((status, body), (StatusCode::OK, json!({ "accepted": false })));
+    assert_eq!(claim_state(&db, &late["claim_token"]).await, "abandoned");
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM game_results").await, 0, "nothing stored");
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM tasks WHERE state = 'available'").await, 1);
+    assert_eq!(
+        count(&db, &format!("SELECT tasks_completed FROM jobs WHERE id = '{job}'")).await,
+        0
+    );
+
+    // Its task, claimed again: late, but inside the grace.
+    let worker = registered_worker(&db).await;
+    let (_, within) = claim_as(&app, &worker).await;
+    past_deadline(&db, &within["claim_token"], 30).await;
+    let (status, body) = submit_as(&app, &worker, &within["claim_token"], games_result(2, 1)).await;
+    assert_eq!((status, body), (StatusCode::OK, json!({ "accepted": true })));
+
+    // And past it, on a server that has just started.
+    state.reclaim_from = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    let app = birdtest::app(state);
+    let worker = registered_worker(&db).await;
+    let (_, restarted) = claim_as(&app, &worker).await;
+    past_deadline(&db, &restarted["claim_token"], 120).await;
+    let (status, body) = submit_as(&app, &worker, &restarted["claim_token"], games_result(2, 1)).await;
+    assert_eq!((status, body), (StatusCode::OK, json!({ "accepted": true })));
+}
+
+/// The job's time-limit counters and status: declines, the run of them, the
+/// status, the allocation and the reason it was set aside.
+async fn time_limit_row(db: &TestDb, job: Uuid) -> (i64, i32, String, i32, Option<String>) {
+    sqlx::query_as(
+        "SELECT time_limit_declines, time_limit_streak, status::text, allocation, set_aside_reason
+         FROM jobs WHERE id = $1",
+    )
+    .bind(job)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap()
+}
+
+/// A fresh worker claims and declines `time_limit`, as MAGPIE does when it
+/// stops a task at the assignment's `max_task_seconds`.
+async fn decline_at_the_limit(db: &TestDb, app: &axum::Router) {
+    let worker = registered_worker(db).await;
+    let (status, assignment) = claim_as(app, &worker).await;
+    assert_eq!(status, StatusCode::OK, "{assignment}");
+    let (status, body) = decline_as(app, &worker, &assignment["claim_token"], "time_limit", json!([])).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert_eq!(claim_state(db, &assignment["claim_token"]).await, "declined");
+}
+
+/// A-WORKER-26: a `time_limit` decline releases the claim and is counted
+/// against its job, which the job's page shows. Three in a row with no task
+/// of the job completed between set the job aside: inactive at 0%, the reason
+/// on the job and its page, and a `job.set_aside` audit row from its share;
+/// an accepted result between them starts the run again. An allocation puts
+/// the job back, its reason cleared and its run started afresh.
+#[tokio::test]
+async fn three_time_limit_declines_in_a_row_set_the_job_aside() {
+    let db = TestDb::new().await;
+    let job = db.games_job(2).await;
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+    let admin = db.user("root", true).await;
+    let headers = admin_headers(&state.cfg, admin);
+    let headers: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+
+    decline_at_the_limit(&db, &app).await;
+    decline_at_the_limit(&db, &app).await;
+    assert_eq!(time_limit_row(&db, job).await, (2, 2, "active".into(), 50, None));
+    let (_, page) = send(&app, get_request(&format!("/api/jobs/{job}"), &[])).await;
+    assert_eq!(page["job"]["time_limit_declines"], json!(2), "{page}");
+    assert!(page["job"]["set_aside_reason"].is_null(), "{page}");
+
+    // A completion between: the run starts again, the count stands.
+    let worker = registered_worker(&db).await;
+    let (_, assignment) = claim_as(&app, &worker).await;
+    let (status, body) = submit_as(&app, &worker, &assignment["claim_token"], games_result(2, 1)).await;
+    assert_eq!((status, body), (StatusCode::OK, json!({ "accepted": true })));
+    assert_eq!(time_limit_row(&db, job).await, (2, 0, "active".into(), 50, None));
+
+    decline_at_the_limit(&db, &app).await;
+    decline_at_the_limit(&db, &app).await;
+    assert_eq!(time_limit_row(&db, job).await.2, "active", "two in a row is not three");
+    decline_at_the_limit(&db, &app).await;
+    let (declines, streak, status, allocation, reason) = time_limit_row(&db, job).await;
+    assert_eq!((declines, streak, status.as_str(), allocation), (5, 3, "inactive", 0));
+    let reason = reason.expect("a job set aside says why");
+    assert!(reason.contains("3 tasks in a row hit the 1-hour time limit"), "{reason}");
+    assert!(reason.contains("batch"), "{reason}");
+    let (audited, old, new): (String, String, String) = sqlx::query_as(
+        "SELECT reason, old_status, new_status FROM audit_log
+         WHERE action = 'job.set_aside' AND job_id = $1",
+    )
+    .bind(job)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!((old.as_str(), new.as_str()), ("active", "inactive"));
+    assert_eq!(audited, format!("50% -> 0%: {reason}"));
+    let (_, page) = send(&app, get_request(&format!("/api/jobs/{job}"), &[])).await;
+    assert_eq!(page["job"]["status"], "inactive", "{page}");
+    assert_eq!(page["job"]["set_aside_reason"], json!(reason), "{page}");
+    assert_eq!(page["job"]["time_limit_declines"], json!(5), "{page}");
+    let worker = registered_worker(&db).await;
+    assert_eq!(claim_as(&app, &worker).await.0, StatusCode::NO_CONTENT, "offered to nobody");
+
+    // Given an allocation again: back, with a fresh run and no reason.
+    let (status, body) = send(&app, allocate(job, 40, &headers)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(time_limit_row(&db, job).await, (5, 0, "active".into(), 40, None));
+}
+
+// --- A-WORKER-27..30: overruns -- claims lapsed at the deadline, worker alive --
+
+/// Puts a claim `deadline_ago` seconds past a one-hour deadline, claimed an
+/// hour before that, as if it had run that long, with its last heartbeat
+/// `heartbeat_ago` seconds ago (`None`: it never heartbeat). The settings
+/// cannot go under ten minutes, so a test moves the claim, not the limit.
+async fn overran(db: &TestDb, token: &Value, deadline_ago: i64, heartbeat_ago: Option<i64>) {
+    sqlx::query(
+        "UPDATE task_claims SET claimed_at = now() - make_interval(secs => $2 + 3600),
+                                deadline_at = now() - make_interval(secs => $2),
+                                last_heartbeat_at = now() - make_interval(secs => $3)
+         WHERE claim_token = $1::uuid",
+    )
+    .bind(token.as_str().unwrap())
+    .bind(deadline_ago as f64)
+    .bind(heartbeat_ago.map(|s| s as f64))
+    .execute(&db.pool)
+    .await
+    .unwrap();
+}
+
+/// A claim's `overrun`: `None` for one that was not.
+async fn overrun_of(db: &TestDb, token: &Value) -> Option<String> {
+    sqlx::query_scalar("SELECT overrun::text FROM task_claims WHERE claim_token = $1::uuid")
+        .bind(token.as_str().unwrap())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+}
+
+/// A fresh worker's claim, which must be handed a task.
+async fn claimed(db: &TestDb, app: &axum::Router) -> (String, Value) {
+    let worker = registered_worker(db).await;
+    let (status, assignment) = claim_as(app, &worker).await;
+    assert_eq!(status, StatusCode::OK, "{assignment}");
+    (worker, assignment)
+}
+
+/// A-WORKER-27: a claim lapsed at its deadline while its worker still
+/// heartbeat is an overrun, a task that hit the time limit: reclamation marks
+/// it and leaves the job's row alone, and the job's next claim counts it.
+/// Three in a row set the job aside as three `time_limit` declines do, and
+/// the claim that found the third is handed another job's task.
+#[tokio::test]
+async fn three_overruns_with_the_worker_alive_set_the_job_aside_at_the_next_claim() {
+    let db = TestDb::new().await;
+    let job = db.games_job(2).await;
+    let app = birdtest::app(db.state().await);
+
+    let (_, first) = claimed(&db, &app).await;
+    overran(&db, &first["claim_token"], 61, Some(0)).await;
+    assert_eq!(birdtest::scheduler::reclaim_expired(&db.pool, job, 300.0).await.unwrap(), 1);
+    assert_eq!(claim_state(&db, &first["claim_token"]).await, "abandoned");
+    assert_eq!(overrun_of(&db, &first["claim_token"]).await.as_deref(), Some("pending"));
+    assert_eq!(time_limit_row(&db, job).await, (0, 0, "active".into(), 50, None), "marked, not counted");
+
+    let (_, second) = claimed(&db, &app).await;
+    assert_eq!(overrun_of(&db, &first["claim_token"]).await.as_deref(), Some("counted"));
+    assert_eq!(time_limit_row(&db, job).await, (1, 1, "active".into(), 50, None), "counted by the next claim");
+    overran(&db, &second["claim_token"], 61, Some(10)).await;
+    let (_, third) = claimed(&db, &app).await;
+    assert_eq!(time_limit_row(&db, job).await, (2, 2, "active".into(), 50, None));
+    overran(&db, &third["claim_token"], 61, Some(0)).await;
+
+    // The claim that counts the third is handed the other job's task.
+    let other = db.games_job(2).await;
+    let (_, fourth) = claimed(&db, &app).await;
+    assert_eq!(fourth["job_id"], json!(other), "{fourth}");
+    let (declines, streak, status, allocation, reason) = time_limit_row(&db, job).await;
+    assert_eq!((declines, streak, status.as_str(), allocation), (3, 3, "inactive", 0));
+    let reason = reason.expect("a job set aside says why");
+    assert!(reason.contains("3 tasks in a row hit the 1-hour time limit"), "{reason}");
+    let audited: String =
+        sqlx::query_scalar("SELECT reason FROM audit_log WHERE action = 'job.set_aside' AND job_id = $1")
+            .bind(job)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(audited, format!("50% -> 0%: {reason}"));
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM task_claims WHERE overrun = 'pending'").await, 0);
+}
+
+/// A-WORKER-28: a claim lapsed at its deadline whose worker had gone silent
+/// -- a dead worker's -- counts toward nothing, never having heartbeat or
+/// having stopped a timeout before the claim lapsed. What decides is whether
+/// the worker was alive when the claim lapsed, not when reclamation came
+/// round: one that heartbeat to the end and went quiet after is an overrun.
+#[tokio::test]
+async fn a_silent_workers_lapse_at_the_deadline_counts_toward_nothing() {
+    let db = TestDb::new().await;
+    let job = db.games_job(2).await;
+    let app = birdtest::app(db.state().await);
+
+    let mut lapsed = Vec::new();
+    for heartbeat in [Some(3000), None, Some(400)] {
+        let (_, assignment) = claimed(&db, &app).await;
+        overran(&db, &assignment["claim_token"], 61, heartbeat).await;
+        lapsed.push(assignment["claim_token"].clone());
+    }
+    claimed(&db, &app).await;
+    for token in &lapsed {
+        assert_eq!(claim_state(&db, token).await, "abandoned");
+        assert_eq!(overrun_of(&db, token).await, None, "a dead worker's lapse");
+    }
+    assert_eq!(time_limit_row(&db, job).await, (0, 0, "active".into(), 50, None));
+
+    // Two hours past its deadline when reclamation reaches it, and silent for
+    // most of that -- but it heartbeat until its deadline and grace, so it was
+    // alive when it lapsed.
+    let (_, alive) = claimed(&db, &app).await;
+    overran(&db, &alive["claim_token"], 7200, Some(7200 - 30)).await;
+    claimed(&db, &app).await;
+    assert_eq!(overrun_of(&db, &alive["claim_token"]).await.as_deref(), Some("counted"));
+    assert_eq!(time_limit_row(&db, job).await, (1, 1, "active".into(), 50, None));
+}
+
+/// A-WORKER-29: `time_limit` declines, overruns and results refused past
+/// their deadline make one run, in the order they happened. An accepted
+/// result ends it; an overrun whose deadline came before that result, counted
+/// after it, counts toward the total and not the run. Three in a row set the
+/// job aside, here at a late result, and nothing more is handed out.
+#[tokio::test]
+async fn declines_overruns_and_late_results_make_one_run_that_a_completion_ends() {
+    let db = TestDb::new().await;
+    let job = db.games_job(2).await;
+    let app = birdtest::app(db.state().await);
+
+    decline_at_the_limit(&db, &app).await;
+    assert_eq!(time_limit_row(&db, job).await, (1, 1, "active".into(), 50, None));
+
+    // An overrun, then a completion, then the claim that counts the overrun.
+    let (_, before) = claimed(&db, &app).await;
+    let (worker, done) = claimed(&db, &app).await;
+    overran(&db, &before["claim_token"], 61, Some(0)).await;
+    let (status, body) = submit_as(&app, &worker, &done["claim_token"], games_result(2, 1)).await;
+    assert_eq!((status, body), (StatusCode::OK, json!({ "accepted": true })));
+    assert_eq!(time_limit_row(&db, job).await, (1, 0, "active".into(), 50, None));
+    let (_, after) = claimed(&db, &app).await;
+    assert_eq!(overrun_of(&db, &before["claim_token"]).await.as_deref(), Some("counted"));
+    assert_eq!(time_limit_row(&db, job).await, (2, 0, "active".into(), 50, None), "before the completion");
+
+    // The completion an hour ago, so that what follows overruns after it.
+    sqlx::query("UPDATE jobs SET time_limit_streak_since = now() - interval '1 hour' WHERE id = $1")
+        .bind(job)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    overran(&db, &after["claim_token"], 61, Some(0)).await;
+    decline_at_the_limit(&db, &app).await;
+    assert_eq!(time_limit_row(&db, job).await, (4, 2, "active".into(), 50, None), "an overrun and a decline");
+
+    let (worker, late) = claimed(&db, &app).await;
+    overran(&db, &late["claim_token"], 61, Some(0)).await;
+    let (status, body) = submit_as(&app, &worker, &late["claim_token"], games_result(2, 1)).await;
+    assert_eq!((status, body), (StatusCode::OK, json!({ "accepted": false })));
+    assert_eq!(overrun_of(&db, &late["claim_token"]).await.as_deref(), Some("counted"));
+    let (declines, streak, status, allocation, reason) = time_limit_row(&db, job).await;
+    assert_eq!((declines, streak, status.as_str(), allocation), (5, 3, "inactive", 0));
+    assert!(reason.expect("why").contains("3 tasks in a row hit the 1-hour time limit"));
+    let worker = registered_worker(&db).await;
+    assert_eq!(claim_as(&app, &worker).await.0, StatusCode::NO_CONTENT, "offered to nobody");
+}
+
+/// A-WORKER-30: a purge ends the run, its overruns counted or not going with
+/// the claims it deletes; and an allocation that puts a job back starts a
+/// run that an overrun from before it, counted after, is not part of.
+#[tokio::test]
+async fn a_purge_or_an_allocation_starts_the_run_afresh() {
+    let db = TestDb::new().await;
+    let job = db.games_job(2).await;
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+    let admin = db.user("root", true).await;
+    let headers = admin_headers(&state.cfg, admin);
+    let headers: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+
+    let (_, first) = claimed(&db, &app).await;
+    overran(&db, &first["claim_token"], 61, Some(0)).await;
+    let (_, second) = claimed(&db, &app).await;
+    overran(&db, &second["claim_token"], 61, Some(0)).await;
+    let (_, third) = claimed(&db, &app).await;
+    overran(&db, &third["claim_token"], 61, Some(0)).await;
+    assert_eq!(birdtest::scheduler::reclaim_expired(&db.pool, job, 300.0).await.unwrap(), 1);
+    assert_eq!(time_limit_row(&db, job).await, (2, 2, "active".into(), 50, None), "one still to count");
+
+    let (status, body) = send(&app, post_json(&format!("/api/admin/jobs/{job}/purge"), &headers, json!({}))).await;
+    assert!(status.is_success(), "{body}");
+    assert_eq!(time_limit_row(&db, job).await, (0, 0, "inactive".into(), 0, None));
+    let (status, body) = send(&app, allocate(job, 50, &headers)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, fourth) = claimed(&db, &app).await;
+    assert_eq!(time_limit_row(&db, job).await, (0, 0, "active".into(), 50, None), "nothing left to count");
+
+    // Switched off and back on with an overrun from before still to count:
+    // the total has it, the new run does not.
+    overran(&db, &fourth["claim_token"], 61, Some(0)).await;
+    assert_eq!(birdtest::scheduler::reclaim_expired(&db.pool, job, 300.0).await.unwrap(), 1);
+    let (status, body) = send(&app, allocate(job, 0, &headers)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = send(&app, allocate(job, 50, &headers)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    claimed(&db, &app).await;
+    assert_eq!(overrun_of(&db, &fourth["claim_token"]).await.as_deref(), Some("counted"));
+    assert_eq!(time_limit_row(&db, job).await, (1, 0, "active".into(), 50, None));
 }

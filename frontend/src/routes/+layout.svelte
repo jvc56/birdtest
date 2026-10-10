@@ -12,7 +12,7 @@
     { href: '/jobs', label: 'Jobs' },
     { href: '/ratings', label: 'Ratings' },
     { href: '/player-configs', label: 'Players' },
-    { href: '/workers', label: 'Contributors' },
+    { href: '/workers', label: 'Contributions' },
     { href: '/users', label: 'Users' }
   ];
 
@@ -34,13 +34,19 @@
 
 <div class="flex min-h-screen flex-col">
   <header class="border-b border-border bg-card/50">
-    <!-- Wraps on a phone: in one row the links ran past the screen, and a
-         phone's browser widened the page to fit them rather than clip. -->
+    <!-- Two rows on a phone: in one the links ran past the screen, and a
+         phone's browser widened the page to fit them rather than clip. The
+         sign-in block shares the brand's row, on its right, and the links
+         take the second row to themselves -- a third row of its own pushed
+         the page's heading half a screen down. From `sm` up, one row in
+         source order. -->
     <nav class="mx-auto flex max-w-6xl flex-wrap items-center gap-x-6 gap-y-2 px-4 py-3 sm:px-6">
       <a href="/" class="text-lg font-semibold text-foreground no-underline hover:no-underline">
         birdtest
       </a>
-      <div class="flex flex-1 basis-full flex-wrap gap-x-4 gap-y-1 text-sm sm:basis-auto">
+      <div
+        class="order-last flex flex-1 basis-full flex-wrap gap-x-4 gap-y-1 text-sm sm:order-none sm:basis-auto"
+      >
         {#each links as link}
           <a
             href={link.href}
@@ -58,7 +64,7 @@
           >
         {/if}
       </div>
-      <div class="flex items-center gap-3 text-sm">
+      <div class="ml-auto flex items-center gap-3 text-sm sm:order-last">
         {#if $session}
           <a
             href="/account"

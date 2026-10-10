@@ -543,7 +543,7 @@ async fn the_eta_is_none_without_recent_throughput() {
     let eta = stats(&db, job).await.eta_seconds.expect("recent throughput");
     assert!(eta.is_finite() && eta > 0.0, "{eta}");
 
-    sqlx::query("UPDATE jobs SET status = 'inactive' WHERE id = $1")
+    sqlx::query("UPDATE jobs SET status = 'inactive', allocation = 0 WHERE id = $1")
         .bind(job)
         .execute(&db.pool)
         .await
@@ -591,6 +591,59 @@ async fn a_new_jobs_eta_is_measured_since_it_was_activated() {
     let expected = left / (2.0 / 600.0 * 10.0);
     let eta = stats.eta_seconds.expect("recent throughput");
     assert!((eta - expected).abs() < 0.01 * expected, "{eta} vs {expected}");
+}
+
+/// I-STATS-8d: a job's throughput is the rate its ETA extrapolates, an hour,
+/// in its own unit: claims times the batch, as games, pairs, rack analyses or
+/// a leave job's games. Nothing done recently, or a job not active, has none.
+#[tokio::test]
+async fn throughput_is_recent_claims_times_the_batch_in_the_jobs_unit() {
+    let db = TestDb::new().await;
+    let worker = Owner::Anon(anon(&db).await);
+    let admin = db.user("admin", true).await;
+    let throughput = |stats: jobstats::JobStats| stats.throughput.map(|t| (t.per_hour, t.unit));
+
+    let games = db.games_job(10).await;
+    assert_eq!(throughput(stats(&db, games).await), None, "nothing done at all");
+    claim(&db, games, worker, "completed", 120).await;
+    assert_eq!(throughput(stats(&db, games).await), None, "nothing done in the last hour");
+    claim(&db, games, worker, "completed", 10).await;
+    claim(&db, games, worker, "completed", 10).await;
+    // Two claims in the last hour, ten games a batch.
+    assert_eq!(throughput(stats(&db, games).await), Some((20.0, "game")));
+
+    let pairs = pairs_job(&db).await;
+    claim(&db, pairs, worker, "completed", 10).await;
+    assert_eq!(throughput(stats(&db, pairs).await), Some((8.0, "pair")));
+
+    let racks = db.bare_job("opening_rack", admin).await;
+    let solver = db.static_player("solver", admin).await;
+    sqlx::query(
+        "INSERT INTO job_opening_rack_config
+             (job_id, player_config_id, racks_per_batch, rack_size, total_racks)
+         VALUES ($1, $2, 25, 7, 100)",
+    )
+    .bind(racks)
+    .bind(solver)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    claim(&db, racks, worker, "completed", 10).await;
+    assert_eq!(throughput(stats(&db, racks).await), Some((25.0, "rack")));
+
+    // A hundred games a task; no ETA, but a pace.
+    let leaves = leave_job(&db, 2).await;
+    claim(&db, leaves, worker, "completed", 10).await;
+    let leave_stats = stats(&db, leaves).await;
+    assert_eq!(leave_stats.eta_seconds, None);
+    assert_eq!(throughput(leave_stats), Some((100.0, "game")));
+
+    sqlx::query("UPDATE jobs SET status = 'inactive', allocation = 0 WHERE id = $1")
+        .bind(games)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(throughput(stats(&db, games).await), None, "an inactive job has no pace");
 }
 
 /// I-STATS-11: the stats payload cache. A payload is served from the cache

@@ -49,6 +49,7 @@ class Stats:
     no_work: int = 0
     rate_limited: int = 0
     unavailable: int = 0
+    declined: int = 0
     errors: int = 0
     lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -62,7 +63,7 @@ class Stats:
             f"shutdown={self.shutdown} submitted={self.submitted} "
             f"accepted={self.accepted} rejected={self.rejected} "
             f"no_work={self.no_work} rate_limited={self.rate_limited} "
-            f"unavailable={self.unavailable} errors={self.errors}"
+            f"unavailable={self.unavailable} declined={self.declined} errors={self.errors}"
         )
 
 
@@ -639,10 +640,10 @@ def _submission(assignment: dict, mode: str, rng: random.Random,
     The one place a submission is built, shared by the running worker and by
     `--emit-fixture`, so a captured fixture is exactly what a run would send.
     """
-    if mode == "abandon":
+    if mode in ("abandon", "time_limit"):
         # Claim and never submit, so the heartbeat timeout has to reclaim the
         # task. Pair with a short HEARTBEAT_TIMEOUT_SECONDS (180, the least the
-        # server accepts).
+        # server accepts). A `time_limit` worker declines instead (`run`).
         return None
     token = assignment["claim_token"]
     result = _result_for(assignment["task_request"], rng, p1_win_probability)
@@ -799,10 +800,33 @@ class FakeWorker:
             )
             return None
         self.stats.bump("claimed")
+        # What MAGPIE prints a task as, and the limit it stops it at. The fake
+        # finishes every task at once, so the limit binds only in `time_limit`
+        # mode, which hits it every time.
+        logger.debug(
+            "claimed a task of %s (limit %ss)",
+            assignment.get("job_name"),
+            assignment.get("max_task_seconds"),
+        )
         # Adopt the identity the server assigned and use it from here on.
         if not self.worker_uuid:
             self.worker_uuid = assignment.get("worker_uuid")
         return assignment
+
+    def decline(self, claim_token: str, reason: str) -> None:
+        """Hands a claim back, as MAGPIE does a task it stopped at the
+        assignment's `max_task_seconds` (`time_limit`)."""
+        response = self.session.post(
+            self._url("/api/worker/decline"),
+            headers=self.headers,
+            json={"claim_token": claim_token, "reason": reason},
+            timeout=30,
+        )
+        if response.status_code == 429:
+            self.stats.bump("rate_limited")
+            return
+        response.raise_for_status()
+        self.stats.bump("declined")
 
     def submit(self, claim_token: str, result: dict) -> None:
         # Back off and retry rather than counting a throttle or an outage as a
@@ -874,6 +898,12 @@ class FakeWorker:
                 continue
 
             if submission is None:
+                if self.args.mode == "time_limit":
+                    try:
+                        self.decline(assignment["claim_token"], "time_limit")
+                    except Exception:
+                        self.stats.bump("errors")
+                        logger.warning("decline failed", exc_info=True)
                 completed += 1
                 continue
             token, result = submission
@@ -908,12 +938,14 @@ def main() -> None:
     )
     parser.add_argument(
         "--mode",
-        choices=["normal", "malformed", "stale", "abandon"],
+        choices=["normal", "malformed", "stale", "abandon", "time_limit"],
         default="normal",
         help=(
             "normal: plausible results. malformed: submissions the server should "
             "reject. stale: submit under a claim token that was never issued. "
-            "abandon: claim and never submit, so the heartbeat timeout reclaims."
+            "abandon: claim and never submit, so the heartbeat timeout reclaims. "
+            "time_limit: decline every task as one stopped at its time limit, so "
+            "three in a row set the job aside."
         ),
     )
     parser.add_argument(
@@ -963,6 +995,7 @@ def main() -> None:
         "no_work": stats.no_work,
         "rate_limited": stats.rate_limited,
         "unavailable": stats.unavailable,
+        "declined": stats.declined,
         "errors": stats.errors,
         "elapsed_seconds": round(elapsed, 3),
     }))

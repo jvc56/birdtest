@@ -88,9 +88,9 @@ async fn a_leave_job_is_created_inactive_with_its_generation_zero_leaves_stored(
     let created = stack.leave_job().await;
 
     let keys: Vec<&String> = created.as_object().unwrap().keys().collect();
-    assert_eq!(keys, ["job"], "{created}");
-    let job = &created["job"];
-    assert_eq!((&job["job_type"], &job["status"], &job["allocation"]), (&json!("leave_generation"), &json!("inactive"), &Value::Null));
+    assert_eq!(keys, ["jobs"], "{created}");
+    let job = &created["jobs"][0];
+    assert_eq!((&job["job_type"], &job["status"], &job["allocation"]), (&json!("leave_generation"), &json!("inactive"), &json!(0)));
     let id: Uuid = job["id"].as_str().unwrap().parse().unwrap();
 
     let (key, sha256, builder): (String, String, String) = sqlx::query_as(
@@ -128,7 +128,7 @@ async fn a_leave_job_is_created_inactive_with_its_generation_zero_leaves_stored(
 async fn a_forced_rebuild_is_logged_before_it_rewrites_anything() {
     let stack = Stack::new().await;
     let created = stack.leave_job().await;
-    let id: Uuid = created["job"]["id"].as_str().unwrap().parse().unwrap();
+    let id: Uuid = created["jobs"][0]["id"].as_str().unwrap().parse().unwrap();
     // A generation 1 on record with no universe behind it: its rebuild fails.
     sqlx::query(
         "INSERT INTO leave_generation_artifacts (job_id, generation, artifact_key, sha256, builder)
@@ -168,7 +168,7 @@ async fn a_forced_rebuild_is_logged_before_it_rewrites_anything() {
 async fn rebuilding_artifacts_restores_what_is_missing_and_is_idempotent() {
     let stack = Stack::new().await;
     let created = stack.leave_job().await;
-    let id: Uuid = created["job"]["id"].as_str().unwrap().parse().unwrap();
+    let id: Uuid = created["jobs"][0]["id"].as_str().unwrap().parse().unwrap();
     let path = format!("/api/admin/jobs/{id}/rebuild-artifacts");
 
     // A closed generation 1, from a fully counted universe, whose object was
@@ -247,14 +247,14 @@ async fn rebuilding_artifacts_restores_what_is_missing_and_is_idempotent() {
 
     // `force` rewrites what is present -- once the job is not dispatching:
     // a worker mid-task would refuse the rewritten bytes.
-    sqlx::query("UPDATE jobs SET status = 'active' WHERE id = $1")
+    sqlx::query("UPDATE jobs SET status = 'active', allocation = 50 WHERE id = $1")
         .bind(id)
         .execute(&stack.state.pool)
         .await
         .unwrap();
     let (status, refused) = stack.post(&format!("{path}?force=true"), json!({})).await;
     assert_eq!(status, axum::http::StatusCode::CONFLICT, "{refused}");
-    sqlx::query("UPDATE jobs SET status = 'inactive' WHERE id = $1")
+    sqlx::query("UPDATE jobs SET status = 'inactive', allocation = 0 WHERE id = $1")
         .bind(id)
         .execute(&stack.state.pool)
         .await

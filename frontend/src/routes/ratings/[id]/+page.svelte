@@ -5,9 +5,21 @@
   import { api, errorText, type PlayerConfig, type RatingPoolDetail } from '$lib/api';
   import { session } from '$lib/auth';
   import RatingDotPlot from '$lib/components/RatingDotPlot.svelte';
-  import ResidualMatrix from '$lib/components/ResidualMatrix.svelte';
   import { ratingCell, stderrCell } from '$lib/charts/ratingDotPlot';
-  import { poolMembership } from '$lib/ratingPool';
+  import { fitLabels } from '$lib/charts/labels';
+  import { isNonTransitive, NOTABLE, significantResiduals } from '$lib/charts/residuals';
+  import {
+    cellTitle,
+    crossTable,
+    oneSide,
+    poolMembership,
+    recordSide,
+    spreadText,
+    winText
+  } from '$lib/ratingPool';
+
+  /** A cross-table cell's background by its record; even is untinted. */
+  const RECORD_TINT = { win: 'bg-success/10', loss: 'bg-destructive/10', even: '' } as const;
 
   let pool: RatingPoolDetail | null = null;
   let configs: PlayerConfig[] = [];
@@ -28,6 +40,13 @@
   // Remove button, and is not offered under "Add" (the anchor of a pool never
   // fitted included).
   $: membership = pool ? poolMembership(pool, configs) : null;
+  $: table = pool ? crossTable(pool) : null;
+  $: columnLabels = table ? fitLabels(table.configs.map((c) => c.name)) : [];
+  // Each head-to-head once: a cell and its mirror are the same miss.
+  $: misses = pool ? significantResiduals(oneSide(pool.head_to_heads)) : [];
+  $: nonTransitive = pool ? isNonTransitive(oneSide(pool.head_to_heads)) : false;
+  /** A cell the ratings predict badly, on enough pairs that it is not chance. */
+  $: missed = new Set(misses.flatMap((c) => [`${c.row}:${c.col}`, `${c.col}:${c.row}`]));
   $: members = pool?.members ?? [];
   $: others = membership?.others ?? [];
   // The anchor form starts from the pool as stored, and again after every
@@ -163,36 +182,114 @@
     {/if}
 
     <div class="card space-y-3">
+      <h2 class="text-lg font-medium">Cross table</h2>
+      {#if table && pool.head_to_heads.length}
+        <p class="text-sm text-muted-foreground">
+          Each cell is the row config's score against the column's — (wins + ½ draws) / games —
+          ± its standard error, and beneath it the row's average spread per game. Hover a cell for
+          what the ratings predict. Green is a winning record and red a losing one; amber text is a
+          score the ratings predict badly, on enough pairs that it is not chance.
+        </p>
+        <!-- Scrolls inside the card on a phone, the row names held in place. -->
+        <div class="overflow-x-auto">
+          <table class="table text-xs" data-testid="cross-table">
+            <thead>
+              <tr>
+                <th class="sticky left-0 z-10 bg-card">Player config</th>
+                {#each table.configs as col, c}
+                  <th class="whitespace-nowrap text-center" title={col.name}>{columnLabels[c]}</th>
+                {/each}
+                <th class="whitespace-nowrap text-right">Rating</th>
+              </tr>
+            </thead>
+            <tbody>
+              {#each table.configs as row}
+                <tr>
+                  <th scope="row" class="sticky left-0 z-10 bg-card">
+                    <!-- Held to a third of a phone, so the cells have the rest. -->
+                    <span class="block max-w-[8rem] truncate sm:max-w-xs" title={row.name}>
+                      {row.name}
+                    </span>
+                  </th>
+                  {#each table.configs as col}
+                    {@const cell = table.cell(row.player_config_id, col.player_config_id)}
+                    {#if row.player_config_id === col.player_config_id}
+                      <td class="bg-muted/40"></td>
+                    {:else if cell}
+                      {@const side = recordSide(cell)}
+                      <!-- The record is the background, a miss the text:
+                           a cell can be both. -->
+                      <td
+                        class="whitespace-nowrap text-center tabular-nums {RECORD_TINT[side]}"
+                        class:text-warning={missed.has(`${cell.row}:${cell.col}`)}
+                        title={cellTitle(cell, row.name, col.name)}
+                        data-record={side}
+                      >
+                        <div>{winText(cell)}</div>
+                        <div class="text-muted-foreground">{spreadText(cell)}</div>
+                      </td>
+                    {:else}
+                      <td class="text-center text-muted-foreground">·</td>
+                    {/if}
+                  {/each}
+                  <td class="whitespace-nowrap text-right tabular-nums">{ratingCell(row)}</td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        </div>
+        {#if nonTransitive}
+          <p class="text-xs text-warning">
+            {misses.length} head-to-heads are more than {(100 * NOTABLE).toFixed(0)} points
+            from what the ratings predict, on enough pairs that it is not chance. That is the signature
+            of a non-transitive pool — configs that beat some opponents and lose to others in a way no
+            single number per config can express. Read the ratings as a summary here, not as a
+            ranking.
+          </p>
+        {/if}
+      {:else}
+        <p class="text-sm text-muted-foreground">No head-to-head results in this pool yet.</p>
+      {/if}
+      <p class="text-xs text-muted-foreground">
+        A gap between two ratings predicts the score the same gap does between two established
+        WESPA players; the absolute level is only where the anchor was pinned, since bot games say
+        nothing about strength against people.
+      </p>
+    </div>
+
+    <div class="card space-y-3">
       <h2 class="text-lg font-medium">Ratings</h2>
       <RatingDotPlot ratings={pool.ratings} />
     </div>
 
-    <div class="card space-y-3">
-      <h2 class="text-lg font-medium">All configs</h2>
-      <div class="overflow-x-auto">
-      <table class="table">
-        <thead>
-          <tr>
-            <th>Player config</th>
-            <th class="text-right">Rating</th>
-            <th class="text-right">± SE</th>
-            <th class="text-right">Pairs</th>
-            {#if isAdmin}<th></th>{/if}
-          </tr>
-        </thead>
-        <tbody>
-          {#each pool.ratings as row}
+    <!-- The exact figures, and the membership controls: an admin's. A
+         visitor reads the ratings off the plot and the cross table. -->
+    {#if isAdmin}
+      <div class="card space-y-3">
+        <h2 class="text-lg font-medium">All configs</h2>
+        <div class="overflow-x-auto">
+        <table class="table">
+          <thead>
             <tr>
-              <td>
-                {row.name}
-                {#if row.is_anchor}
-                  <span class="ml-1 text-xs text-warning">anchor</span>
-                {/if}
-              </td>
-              <td class="text-right tabular-nums">{ratingCell(row)}</td>
-              <td class="text-right tabular-nums text-muted-foreground">{stderrCell(row)}</td>
-              <td class="text-right tabular-nums">{row.pairs_played.toLocaleString()}</td>
-              {#if isAdmin}
+              <th>Player config</th>
+              <th class="text-right">Rating (WESPA scale)</th>
+              <th class="text-right">± SE</th>
+              <th class="text-right">Pairs</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {#each pool.ratings as row}
+              <tr>
+                <td>
+                  {row.name}
+                  {#if row.is_anchor}
+                    <span class="ml-1 text-xs text-warning">anchor</span>
+                  {/if}
+                </td>
+                <td class="text-right tabular-nums">{ratingCell(row)}</td>
+                <td class="text-right tabular-nums text-muted-foreground">{stderrCell(row)}</td>
+                <td class="text-right tabular-nums">{row.pairs_played.toLocaleString()}</td>
                 <td class="text-right">
                   <!-- A config removed since the latest fit is still rated by it. -->
                   {#if !membership?.memberIds.has(row.player_config_id)}
@@ -208,21 +305,19 @@
                     </button>
                   {/if}
                 </td>
-              {/if}
-            </tr>
-          {/each}
-          {#each membership?.unrated ?? [] as member}
-            <tr>
-              <td>
-                {member.name}
-                {#if member.player_config_id === pool.anchor_player_config_id}
-                  <span class="ml-1 text-xs text-warning">anchor</span>
-                {/if}
-              </td>
-              <td class="text-right text-muted-foreground">not yet rated</td>
-              <td class="text-right text-muted-foreground">—</td>
-              <td class="text-right text-muted-foreground">—</td>
-              {#if isAdmin}
+              </tr>
+            {/each}
+            {#each membership?.unrated ?? [] as member}
+              <tr>
+                <td>
+                  {member.name}
+                  {#if member.player_config_id === pool.anchor_player_config_id}
+                    <span class="ml-1 text-xs text-warning">anchor</span>
+                  {/if}
+                </td>
+                <td class="text-right text-muted-foreground">not yet rated</td>
+                <td class="text-right text-muted-foreground">—</td>
+                <td class="text-right text-muted-foreground">—</td>
                 <td class="text-right">
                   {#if member.player_config_id !== pool.anchor_player_config_id}
                     <button
@@ -235,14 +330,12 @@
                     </button>
                   {/if}
                 </td>
-              {/if}
-            </tr>
-          {/each}
-        </tbody>
-      </table>
-      </div>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+        </div>
 
-      {#if isAdmin}
         <div class="flex flex-wrap items-end gap-2 border-t border-border pt-3">
           <div class="min-w-56 flex-1">
             <label class="label" for="add-config">Add a player config</label>
@@ -282,8 +375,8 @@
           everyone else's rating too, so taking it out moves every other number — that is correct,
           and it is why this is not a per-row edit.
         </p>
-      {/if}
-    </div>
+      </div>
+    {/if}
 
     {#if isAdmin}
       <div class="card space-y-3">
@@ -338,15 +431,6 @@
         </div>
       </div>
     {/if}
-
-    <div class="card space-y-3">
-      <h2 class="text-lg font-medium">Where the model disagrees with the games</h2>
-      <p class="text-sm text-muted-foreground">
-        One rating per config cannot express a cycle — A beating B, B beating C and C beating A.
-        These are the head-to-heads the fitted ratings predict worst, largest first.
-      </p>
-      <ResidualMatrix residuals={pool.residuals} ratings={pool.ratings} />
-    </div>
   </section>
 {:else if loadError}
   <p class="text-sm text-destructive">Could not load this rating pool: {loadError}</p>

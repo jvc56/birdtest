@@ -322,7 +322,7 @@ async fn a_1_9_worker_gets_a_1_9_job_and_never_a_1_10_one() {
     assert_eq!(task.job_id, needs_1_10, "the job furthest behind, for a worker that can run it");
     assert_eq!(task.min_magpie_version, "1.10.0");
 
-    exec(&db, "UPDATE jobs SET status = 'inactive' WHERE id = $1", needs_1_9).await;
+    exec(&db, "UPDATE jobs SET status = 'inactive', allocation = 0 WHERE id = $1", needs_1_9).await;
     let directive = claim_shutdown(&state, &anon(&db).await, &caps("1.9.0", &[])).await;
     assert_eq!(directive.reason, "magpie_too_old");
     assert_eq!(directive.required_magpie_version.as_deref(), Some("1.10.0"));
@@ -341,14 +341,14 @@ async fn idle_means_work_exists_and_no_work_exists_means_none_is_offered() {
     assert_eq!(outcome_kind(&claim(&state, &worker, &caps("1.0.0", &[])).await), "no_work_exists");
 
     let job = db.games_job(2).await;
-    exec(&db, "UPDATE jobs SET status = 'inactive' WHERE id = $1", job).await;
+    exec(&db, "UPDATE jobs SET status = 'inactive', allocation = 0 WHERE id = $1", job).await;
     assert_eq!(
         outcome_kind(&claim(&state, &worker, &caps("1.0.0", &[])).await),
         "no_work_exists",
         "an inactive job offers nothing"
     );
 
-    exec(&db, "UPDATE jobs SET status = 'active' WHERE id = $1", job).await;
+    exec(&db, "UPDATE jobs SET status = 'active', allocation = 50 WHERE id = $1", job).await;
     // A cap of one batch, and no test: the floor of a million it had would
     // be past the cap, which the schema refuses.
     exec(
@@ -379,7 +379,7 @@ async fn each_shutdown_reason_names_what_the_worker_must_change() {
     let state = db.state().await;
     let worker = anon(&db).await;
 
-    exec(&db, "UPDATE jobs SET status = 'inactive' WHERE id = $1", data).await;
+    exec(&db, "UPDATE jobs SET status = 'inactive', allocation = 0 WHERE id = $1", data).await;
     let directive = claim_shutdown(&state, &worker, &caps("1.0.0", &[])).await;
     assert_eq!(directive.reason, "magpie_too_old");
     assert_eq!(directive.required_magpie_version.as_deref(), Some("2.0.0"));
@@ -387,15 +387,15 @@ async fn each_shutdown_reason_names_what_the_worker_must_change() {
     assert!(directive.required_tarball_dates.is_empty());
     assert!(directive.message.contains("2.0.0") && directive.message.contains("1.0.0"), "{}", directive.message);
 
-    exec(&db, "UPDATE jobs SET status = 'inactive' WHERE id = $1", too_new).await;
-    exec(&db, "UPDATE jobs SET status = 'active' WHERE id = $1", data).await;
+    exec(&db, "UPDATE jobs SET status = 'inactive', allocation = 0 WHERE id = $1", too_new).await;
+    exec(&db, "UPDATE jobs SET status = 'active', allocation = 50 WHERE id = $1", data).await;
     let directive = claim_shutdown(&state, &worker, &caps("1.0.0", &[data])).await;
     assert_eq!(directive.reason, "data_out_of_date");
     assert_eq!(directive.required_magpie_version, None);
     assert_eq!(directive.download_url, None, "no MAGPIE to download");
     assert_eq!(directive.required_tarball_dates, vec!["20251004".to_string()]);
 
-    exec(&db, "UPDATE jobs SET status = 'active' WHERE id = $1", too_new).await;
+    exec(&db, "UPDATE jobs SET status = 'active', allocation = 50 WHERE id = $1", too_new).await;
     let directive = claim_shutdown(&state, &worker, &caps("1.0.0", &[data])).await;
     assert_eq!(directive.reason, "both");
     assert_eq!(directive.required_magpie_version.as_deref(), Some("2.0.0"));
@@ -411,7 +411,8 @@ async fn each_shutdown_reason_names_what_the_worker_must_change() {
 /// smallest upgrade that unblocks anything, compared as numbers (2.9.5, not
 /// 2.10.0, which sorts first as text); the dates are those of the unsupported
 /// active jobs' distributions and boards, newest first, and nothing from an
-/// inactive or parked job; the download link is the configured one.
+/// inactive job (one parked at 0% is inactive); the download link is the
+/// configured one.
 #[tokio::test]
 async fn a_shutdown_names_what_the_active_jobs_actually_require() {
     let db = TestDb::new().await;
@@ -422,15 +423,12 @@ async fn a_shutdown_names_what_the_active_jobs_actually_require() {
     let d1 = db.games_job(1).await;
     let d2 = db.games_job(1).await;
     let inactive = db.games_job(1).await;
-    let parked = db.games_job(1).await;
-    exec(&db, "UPDATE jobs SET status = 'inactive' WHERE id = $1", inactive).await;
-    exec(&db, "UPDATE jobs SET allocation = 0 WHERE id = $1", parked).await;
+    exec(&db, "UPDATE jobs SET status = 'inactive', allocation = 0 WHERE id = $1", inactive).await;
 
     for (job, ld_date, layout_date) in [
         (d1, "20260101", "20250505"),
         (d2, "20240303", "20250505"),
         (inactive, "19990101", "19990101"),
-        (parked, "19980101", "19980101"),
     ] {
         sqlx::query(
             "UPDATE input_data d SET tarball_date = CASE WHEN d.id = j.letterdist_id THEN $2 ELSE $3 END
@@ -451,7 +449,7 @@ async fn a_shutdown_names_what_the_active_jobs_actually_require() {
     let directive = claim_shutdown(
         &state,
         &anon(&db).await,
-        &caps("2.9.0", &[d1, d2, inactive, parked]),
+        &caps("2.9.0", &[d1, d2, inactive]),
     )
     .await;
     assert_eq!(directive.reason, "both");
@@ -847,7 +845,7 @@ async fn an_inactive_job_is_never_selected() {
     let db = TestDb::new().await;
     let inactive = db.games_job(1).await;
     let active = db.games_job(1).await;
-    exec(&db, "UPDATE jobs SET status = 'inactive' WHERE id = $1", inactive).await;
+    exec(&db, "UPDATE jobs SET status = 'inactive', allocation = 0 WHERE id = $1", inactive).await;
     set_created(&db, inactive, 60).await;
     sqlx::query("UPDATE jobs SET claims_issued = 1000 WHERE id = $1")
         .bind(active)

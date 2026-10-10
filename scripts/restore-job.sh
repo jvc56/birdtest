@@ -91,7 +91,7 @@ there=$(sql "$SCRATCH_URL" "$fingerprint") || { echo "stopped: cannot reach SCRA
 [[ "$here" != "$there" ]] || { echo "stopped: SCRATCH_URL is production itself" >&2; exit 1; }
 status=$(sql "$DATABASE_URL" "SELECT status FROM jobs WHERE id = '$job'") \
   || { echo "stopped: cannot read the job in production" >&2; exit 1; }
-[[ "$status" != active ]] || { echo "stopped: the job is active in production; deactivate it and clear it first (RUNBOOK §2.0)" >&2; exit 1; }
+[[ "$status" != active ]] || { echo "stopped: the job is active in production; set it to 0% on the admin allocation page and clear it first (RUNBOOK §2.0)" >&2; exit 1; }
 # A purge leaves a completed job inactive, so one completed now has completed
 # again since, on the results §2.0 deletes: its status and verdict are theirs.
 [[ "$status" != completed ]] || { echo "stopped: the job is completed in production. If §2.3 has put it back -- it was completed before the mistake -- the restore is done: do not run §2.0 again. Otherwise it completed again since the mistake, on the results §2.0 deletes: RUNBOOK §2.0 returns it to inactive with its verdict cleared" >&2; exit 1; }
@@ -139,14 +139,14 @@ PRELUDE=(
   "job_opening_rack_config|job_id = '$job'"
   "job_leave_config|job_id = '$job'"
 )
-# Changes to a table's rows before they go in: the job comes back inactive (a
-# restored job dispatching before its counters are repaired is what §2.0
-# prevents), and a reference to an account deleted since is cleared.
+# Changes to a table's rows before they go in: the job comes back inactive at
+# 0% (a restored job dispatching before its counters are repaired is what §2.0
+# prevents; the schema holds an inactive job at 0%), and a reference to an account deleted since is cleared.
 declare -A ADJUST=(
   [input_data]="UPDATE restoring r SET imported_by = NULL WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.id = r.imported_by);"
   [player_configs]="UPDATE restoring r SET created_by = NULL WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.id = r.created_by);
                     UPDATE restoring r SET cloned_from_id = NULL WHERE NOT EXISTS (SELECT 1 FROM player_configs p WHERE p.id = r.cloned_from_id) AND NOT EXISTS (SELECT 1 FROM restoring c WHERE c.id = r.cloned_from_id);"
-  [jobs]="UPDATE restoring SET status = 'inactive'; UPDATE restoring r SET created_by = NULL WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.id = r.created_by);"
+  [jobs]="UPDATE restoring SET status = 'inactive', allocation = 0; UPDATE restoring r SET created_by = NULL WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.id = r.created_by);"
 )
 # Rows whose production copy may rightly differ from the dump -- shared rows
 # another job may use (an object key filled in since), and the job's own row

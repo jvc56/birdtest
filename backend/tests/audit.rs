@@ -89,7 +89,7 @@ async fn each_audit_helper_records_who_did_what_to_which_target() {
     .await
     .unwrap();
     birdtest::audit::log(&mut conn, "thing.bare", None, None, None, None, None).await.unwrap();
-    birdtest::audit::log_status_change(&mut conn, "job.activated", actor, job, "inactive", "active")
+    birdtest::audit::log_status_change(&mut conn, "job.activated", actor, job, "inactive", "active", Some("0% -> 40%"))
         .await
         .unwrap();
     birdtest::audit::log_ban(&mut conn, actor, "w-1".into(), Some("spam".into())).await.unwrap();
@@ -130,6 +130,7 @@ async fn each_audit_helper_records_who_did_what_to_which_target() {
             job_id: Some(job),
             old_status: Some("inactive".into()),
             new_status: Some("active".into()),
+            reason: Some("0% -> 40%".into()),
             ..row("job.activated")
         },
         AuditRow {
@@ -282,7 +283,7 @@ async fn every_destructive_admin_action_writes_exactly_its_record() {
 
     let purged = db.games_job(2).await;
     with_history(&app).await;
-    sqlx::query("UPDATE jobs SET status = 'inactive' WHERE id = $1")
+    sqlx::query("UPDATE jobs SET status = 'inactive', allocation = 0 WHERE id = $1")
         .bind(purged)
         .execute(&db.pool)
         .await
@@ -333,10 +334,13 @@ async fn every_destructive_admin_action_writes_exactly_its_record() {
 
     let actions: Vec<(&str, String, Option<Value>, Vec<AuditRow>)> = vec![
         (
-            "POST",
-            format!("/api/admin/jobs/{lifecycle}/deactivate"),
-            None,
-            vec![status_row("job.deactivated", lifecycle, "active", "inactive")],
+            "PUT",
+            "/api/admin/jobs/allocations".to_string(),
+            Some(json!({ "allocations": [{ "job_id": lifecycle, "allocation": 0 }] })),
+            vec![AuditRow {
+                reason: Some("50% -> 0%".into()),
+                ..status_row("job.deactivated", lifecycle, "active", "inactive")
+            }],
         ),
         (
             "POST",
@@ -377,6 +381,15 @@ async fn every_destructive_admin_action_writes_exactly_its_record() {
             vec![census(
                 "job.consensus_changed", "job", racks.to_string(), Some(racks),
                 "min 1 -> 2, max 1 -> 3; 0 racks unsettled",
+            )],
+        ),
+        (
+            "PATCH",
+            format!("/api/admin/jobs/{racks}/time-limit"),
+            Some(json!({ "max_task_seconds": 1800 })),
+            vec![census(
+                "job.time_limit_changed", "job", racks.to_string(), Some(racks),
+                "max_task_seconds 3600 -> 1800",
             )],
         ),
         (

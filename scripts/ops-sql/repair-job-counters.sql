@@ -55,11 +55,14 @@ UPDATE tasks t
 -- are maintained one task at a time in the claim and submit paths, so a row
 -- copy leaves them describing the results the job had before. Each is
 -- recomputed here exactly as the read it replaced computed it.
--- The claims are read once, for both of their columns: a second subquery for
--- last_completed_at was a second pass over them.
+-- The claims are read once, for all of their columns: a second subquery for
+-- last_completed_at was a second pass over them. movegens and compute_ms are
+-- what the submit path added, each accepted claim's own.
 UPDATE jobs j
    SET claims_issued = cl.issued,
        last_completed_at = cl.last,
+       movegens = cl.movegens,
+       compute_ms = cl.compute_ms,
        tasks_total = (SELECT count(*) FROM tasks t WHERE t.job_id = j.id),
        tasks_completed = (SELECT count(*) FROM tasks t
                            WHERE t.job_id = j.id AND t.state = 'completed'),
@@ -76,7 +79,11 @@ UPDATE jobs j
        racks_without_consensus = (SELECT count(*) FROM opening_rack_progress p
                                    WHERE p.job_id = j.id AND p.without_consensus)
   FROM (SELECT count(*) AS issued,
-               max(c.completed_at) FILTER (WHERE c.state = 'completed') AS last
+               max(c.completed_at) FILTER (WHERE c.state = 'completed') AS last,
+               COALESCE(sum(c.movegens) FILTER (WHERE c.state = 'completed'), 0) AS movegens,
+               -- The submit path's `CLAIM_COMPUTE_MS`, claim by claim.
+               COALESCE(sum(GREATEST((EXTRACT(EPOCH FROM c.completed_at - c.claimed_at) * 1000)::bigint, 0))
+                        FILTER (WHERE c.state = 'completed'), 0) AS compute_ms
           FROM task_claims c JOIN tasks t ON t.id = c.task_id
          WHERE t.job_id = :'job') cl
  WHERE j.id = :'job';
