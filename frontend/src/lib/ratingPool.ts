@@ -78,6 +78,16 @@ export function winText(cell: RatingHeadToHead): string {
   return `${scorePct(cell.actual)} ±${error}`;
 }
 
+/**
+ * Which side of even a cell's record is, as the cell shows it: a cell that
+ * says 50.0% is even whatever its score is to fifteen places, so the colour
+ * never disagrees with the figure beside it.
+ */
+export function recordSide(cell: RatingHeadToHead): 'win' | 'loss' | 'even' {
+  const shown = Number(scorePct(cell.actual).slice(0, -1));
+  return shown > 50 ? 'win' : shown < 50 ? 'loss' : 'even';
+}
+
 /** The average spread per game, signed: "+6.8", "-12.5", "0.0". */
 export function spreadText(cell: RatingHeadToHead): string {
   return signed(cell.spread);

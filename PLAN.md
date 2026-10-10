@@ -591,7 +591,8 @@ Ratings are **displayed on the ratings pages and nowhere else**:
 - `/ratings` (`GET /api/rating-pools`) — every pool with its conditions,
   member count and the time of its last fit.
 - `/ratings/[id]` (`GET /api/rating-pools/:id`) — the pool's **newest run**:
-  each member's rating with its standard error as a dot plot and a table, the
+  each member's rating with its standard error as a dot plot (and, for an
+  admin, a table), the
   run's provenance (trigger, iterations, convergence, evidence consumed), and
   the [cross table](#the-cross-table) of every head-to-head, whose hover shows
   where the fit disagrees with the games. A config
@@ -6055,21 +6056,26 @@ hundred pairs and one with two million otherwise produce identical-looking
 numbers and only the interval says which to believe. A config with no path to the
 anchor is listed beneath the chart as **unrated** rather than drawn at a number.
 
-**A table of every config**, since the chart caps what it draws and the table
-must not. This is also the accessible view of the same data. Its column is
-"Rating (WESPA scale)", with one line under the table saying that a gap means
-what it does between WESPA players and the absolute level only where the
-anchor was pinned ([The scale is WESPA's](#the-scale-is-wespas)).
-
-**The cross table.** Every rated config against every other: win %, its
-standard error and the average spread, the rating last ([The cross
-table](#the-cross-table)). Its hover carries what the ratings predict, so this
+**The cross table**, straight after the plot. Every rated config against every
+other: win %, its standard error and the average spread, the rating last ([The
+cross table](#the-cross-table)). A cell's background is its record as the cell
+shows it -- green over 50.0%, red under, none at 50.0% (`recordSide`: the
+rounded figure, never the float, so the colour cannot disagree with the
+number). Under it one line saying that a gap means what it does between WESPA
+players and the absolute level only where the anchor was pinned ([The scale is
+WESPA's](#the-scale-is-wespas)). Its hover carries what the ratings predict, so this
 is the panel that makes non-transitivity visible instead of letting it quietly
-distort the ranking: a cell the ratings predict badly is amber, and when enough
+distort the ranking: a cell the ratings predict badly has amber text (on its
+record's tint: it can be both), and when enough
 head-to-heads are badly mispredicted the page says outright that the ratings
 should be read as a summary rather than a ranking. It replaced a separate
 residual table, listed largest disagreement first, which said the same about
 the model in a list nobody could read against the results.
+
+**A table of every config**, for admins only, after the cross table: the
+exact rating to a decimal, ± SE as a number and pairs played per config, with
+the membership controls. A visitor has the interval on the plot and the rating
+in the cross table's last column, which said the same thing twice.
 
 Admin controls live inline on this page rather than under `/admin`, because
 adding or removing a config is an act whose consequence — every other rating

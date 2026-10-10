@@ -1256,7 +1256,9 @@ server refuses. Each rule mirrors one in `routes/auth.rs`, with its wording.
   each head-to-head once for the residual checks (the API serves both sides),
   shows a cell as "58.8% ±6.2" over a signed spread ("+6.8", never "-0.0"),
   and spells it out in its hover with what the ratings predict and the
-  residual. *(Covered: `ratingPool.test.ts`.)*
+  residual. A cell's record (`recordSide`) is a win, a loss or even by the
+  figure it shows: 50.1% a win, 49.9% a loss, 50.04% and 49.951% even.
+  *(Covered: `ratingPool.test.ts`.)*
 
 ### `F-DOCS-*` — contributor instructions in `routes/`
 
@@ -3948,8 +3950,10 @@ admin in once and the admin journeys reuse its storage state.
   through its form, from the ratings list, with only its anchor; membership,
   the fit and the moved ratings go through the pool's page, and with three
   configs the cross table holds every head-to-head from both sides, each
-  cell's hover what the ratings predict, its last column the table's rating.
-  *(Covered: `e7-ratings.spec.ts`.)*
+  cell's hover what the ratings predict, each cell tinted by its record as it
+  shows it (`data-record`), its last column the table's rating. Signed out,
+  the cross table is the first card after the plot and there is no All
+  configs card. *(Covered: `e7-ratings.spec.ts`.)*
 - `E-8` A job detail page renders the pentanomial table — three rows (Won both,
   Won one, drew one, Even) with a column per player, each read from that
   player's buckets, the higher of a row marked and the even row never — the significance test's verdict in words ("Completed: decided: player 1

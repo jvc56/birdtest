@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { PlayerConfig, RatingHeadToHead, RatingPoolDetail, RatingRow } from '$lib/api';
-import { cellTitle, crossTable, oneSide, poolMembership, spreadText, winText } from './ratingPool';
+import { cellTitle, crossTable, oneSide, poolMembership, recordSide, spreadText, winText } from './ratingPool';
 
 function config(id: string): PlayerConfig {
   return { id, name: `config ${id}` } as PlayerConfig;
@@ -94,6 +94,15 @@ describe('crossTable', () => {
     expect(spreadText(h2h('b', 'a', { spread: -12.46 }))).toBe('-12.5');
     // No "-0.0" for a spread that rounds to nothing.
     expect(spreadText(h2h('a', 'b', { spread: -0.04 }))).toBe('0.0');
+  });
+
+  it('sides a record by the figure the cell shows, not the float behind it', () => {
+    expect(recordSide(h2h('a', 'b', { actual: 0.501 }))).toBe('win');
+    expect(recordSide(h2h('a', 'b', { actual: 0.499 }))).toBe('loss');
+    // Both show 50.0%: even, whatever they are to fifteen places.
+    expect(recordSide(h2h('a', 'b', { actual: 0.5004 }))).toBe('even');
+    expect(recordSide(h2h('a', 'b', { actual: 0.49951 }))).toBe('even');
+    expect(recordSide(h2h('a', 'b', { actual: 0.5 }))).toBe('even');
   });
 
   it('spells the cell out in its hover, with what the ratings predict', () => {

@@ -93,7 +93,7 @@ async function addMember(page: Page, name: string) {
   await expect(configRow(page, name)).toHaveCount(1);
 }
 
-test('E-7: an admin builds a rating pool and watches membership move the ratings', async ({ page }) => {
+test('E-7: an admin builds a rating pool and watches membership move the ratings', async ({ page, browser }) => {
   await page.goto('/ratings');
   await page.getByRole('link', { name: 'New rating pool' }).click();
   await page.getByLabel('Pool name').fill(poolName);
@@ -148,6 +148,23 @@ test('E-7: an admin builds a rating pool and watches membership move the ratings
   await expect(cells.first()).toHaveAttribute('title', / against .+ The ratings predict /);
   const ratedCross = cross.locator('tbody tr', { has: page.locator('th', { hasText: RATED }) });
   await expect(ratedCross.locator('td').last()).toHaveText(withThird);
+  // Each cell tinted by its record as it shows it: above 50.0% a win, below a
+  // loss, 50.0% itself even.
+  for (const cell of await cells.all()) {
+    const shown = Number(/(\d+\.\d)%/.exec(await cell.innerText())![1]);
+    await expect(cell).toHaveAttribute('data-record', shown > 50 ? 'win' : shown < 50 ? 'loss' : 'even');
+  }
+
+  // A visitor reads the plot and the cross table, which comes straight after
+  // it; the exact figures and the controls are an admin's.
+  const signedOut = await browser.newContext({ storageState: { cookies: [], origins: [] } });
+  const visitor = await signedOut.newPage();
+  await visitor.goto(page.url());
+  await expect(visitor.getByTestId('cross-table').locator('tbody tr')).toHaveCount(3);
+  await expect(visitor.locator('.card > h2')).toHaveText(['Ratings', 'Cross table']);
+  await expect(visitor.getByRole('heading', { name: 'All configs' })).toHaveCount(0);
+  await expect(visitor.getByText('WESPA players')).toBeVisible();
+  await signedOut.close();
 
   // Remove it again: the refit takes its games back out, and the rating it
   // moved returns to exactly what those games alone support.

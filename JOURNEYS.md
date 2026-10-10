@@ -376,16 +376,21 @@ Open "dev game pairs (first divergences saved)".
   <time> (membership) over N pairs from 1 job, K iterations", and a warning
   if the fit did not converge.
 - [ ] **Expect** a dot plot with ±1 standard-error bars and the anchor in
-  amber, and an "All configs" table (Rating (WESPA scale), ± SE, pairs; the
-  anchor tagged) with a line under it: a gap predicts what it does between
-  WESPA players, and the absolute level is only where the anchor was pinned.
-- [ ] **Expect** a "Cross table": every rated config against every other,
-  best first, each cell the row's win % "±" its standard error over its
-  average spread ("+6.8"), a blank diagonal, "·" where two never played, and
-  the rating in the last column. Each pair of cells mirrors across the
-  diagonal (100 − the win %, the same error, the spread negated). **Do** hover
-  a cell. **Expect** "<row> against <column>: … The ratings predict …%
-  (residual … percentage points)."
+  amber.
+- [ ] **Expect** straight after it a "Cross table": every rated config against
+  every other, best first, each cell the row's win % "±" its standard error
+  over its average spread ("+6.8"), a blank diagonal, "·" where two never
+  played, and the rating in the last column. Each pair of cells mirrors across
+  the diagonal (100 − the win %, the same error, the spread negated). A cell
+  over 50.0% is tinted green, under it red, and one showing 50.0% not at all;
+  a score the ratings predict badly is amber text on that tint. Under the
+  table a line: a gap predicts what it does between WESPA players, and the
+  absolute level is only where the anchor was pinned. **Do** hover a cell.
+  **Expect** "<row> against <column>: … The ratings predict …% (residual …
+  percentage points)."
+- [ ] As an admin, **expect** after it an "All configs" table (Rating (WESPA
+  scale), ± SE, pairs; the anchor tagged), then the Anchor card. Signed out,
+  **expect** neither.
 - [ ] Narrow the window to phone width. **Expect** the cross table to scroll
   sideways inside its card with the config names staying put, and nothing
   else on the page scrolling sideways.
