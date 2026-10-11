@@ -73,3 +73,50 @@ describe('F-NGINX-2 Nginx keeps an idle connection longer than the load balancer
     expect(seconds(keepalive[0][1])).toBeGreaterThan(Number(alb![1]));
   });
 });
+
+// Deployed, this Nginx serves every page and asset, and the app's chunks are
+// most of a first visit's bytes: they go out gzipped. The API is not its to
+// compress -- the ALB sends /api/ straight to the backend, which gzips its own
+// JSON and NDJSON (backend/src/lib.rs) -- and server-sent events must never
+// be compressed, or gzip holds each event back until its buffer fills and the
+// live pages stop being live.
+describe('F-NGINX-3 Nginx compresses the build, and leaves the API to the backend', () => {
+  const code = readFileSync(join(__dirname, '..', '..', 'docker', 'default.conf.template'), 'utf8')
+    .split('\n')
+    .map((line) => line.replace(/#.*$/, ''))
+    .join('\n');
+  const types = [...code.matchAll(/^\s*gzip_types\s+([^;]*);/gm)].flatMap((m) => m[1].trim().split(/\s+/));
+
+  /** The body of `location <path> { ... }`, braces balanced. */
+  function location(path: string): string {
+    const start = code.search(new RegExp(`location\\s+${path.replace(/\//g, '\\/')}\\s*\\{`));
+    expect(start, `no \`location ${path}\` block`).toBeGreaterThanOrEqual(0);
+    let end = code.indexOf('{', start);
+    for (let depth = 0; end < code.length; end++) {
+      if (code[end] === '{') depth++;
+      if (code[end] === '}' && --depth === 0) break;
+    }
+    return code.slice(start, end + 1);
+  }
+
+  /** The server block's own directives, every location taken out. */
+  const serverLevel = () => ['/api/', '/health', '/_app/immutable/', '/'].reduce((rest, path) => rest.replace(location(path), ''), code);
+
+  it('turns gzip on for the whole server, for the JavaScript, CSS, SVG and JSON it serves', () => {
+    expect(serverLevel()).toMatch(/^\s*gzip\s+on\s*;/m);
+    expect(types).toEqual(
+      expect.arrayContaining(['application/javascript', 'text/css', 'image/svg+xml', 'application/json'])
+    );
+  });
+
+  it('never for text/event-stream, nor every type', () => {
+    expect(types).not.toContain('text/event-stream');
+    expect(types).not.toContain('*');
+  });
+
+  it('turns it off where the API is proxied, and nowhere else', () => {
+    expect(location('/api/')).toMatch(/^\s*gzip\s+off\s*;/m);
+    expect(code.match(/^\s*gzip\s+off\s*;/gm)).toHaveLength(1);
+    expect(code.match(/^\s*gzip\s+on\s*;/gm)).toHaveLength(1);
+  });
+});

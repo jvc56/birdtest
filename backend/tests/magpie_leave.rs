@@ -402,7 +402,7 @@ async fn generation_zeros_klv_exists_at_creation_and_is_worth_exactly_nothing() 
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{created}");
-    let job: Uuid = created["job"]["id"].as_str().unwrap().parse().unwrap();
+    let job: Uuid = created["jobs"][0]["id"].as_str().unwrap().parse().unwrap();
 
     let (key, recorded, builder) = artifact(&db, job, 0)
         .await

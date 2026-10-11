@@ -33,10 +33,13 @@ async function pairsCompleted(page: Page): Promise<number> {
 }
 
 /**
- * E-4: an admin creates two player configs and a game-pairs job, activates it
- * with an allocation, and watches its dashboard move over SSE as the fake
- * workers contribute. The one journey where the built app, the stream, the
- * scheduler and a worker are all in play at once.
+ * E-4: an admin creates two player configs and a game-pairs job between them
+ * -- previewing a round robin of three on the way, the job's players being a
+ * checklist -- lands on the Allocation page with the new job marked, activates
+ * it there by giving it an allocation, and watches its
+ * dashboard move over SSE as the fake workers contribute. The one journey
+ * where the built app, the stream, the scheduler and a worker are all in play
+ * at once.
  */
 test('E-4: an admin creates configs and a job, activates it, and watches it fill live', async ({ page }) => {
   const suffix = crypto.randomUUID().slice(0, 8);
@@ -58,8 +61,20 @@ test('E-4: an admin creates configs and a job, activates it, and watches it fill
   await letterdist.selectOption((await fixtureBag.getAttribute('value'))!);
   const board = layout.locator('option', { hasText: `standard15 (${SEEDED_DATA},` });
   await layout.selectOption((await board.getAttribute('value'))!);
-  await page.getByLabel('Player 1').selectOption({ label: p1 });
-  await page.getByLabel('Player 2').selectOption({ label: p2 });
+  // The players are a checklist, previewed as the jobs they make: three
+  // ticked are a round robin of three jobs, two are one job between them.
+  const matchups = page.getByTestId('matchups');
+  await page.getByLabel(p1, { exact: true }).check();
+  await expect(matchups).toContainText('1 config → 1 self-play job');
+  await page.getByLabel(p2, { exact: true }).check();
+  await page.getByLabel('static-score', { exact: true }).check();
+  await expect(matchups).toContainText('3 configs → 3 jobs');
+  await expect(matchups.getByRole('listitem')).toHaveCount(3);
+  await expect(page.getByRole('button', { name: 'Create 3 jobs' })).toBeVisible();
+  await page.getByLabel('static-score', { exact: true }).uncheck();
+  await expect(matchups).toContainText('2 configs → 1 job');
+  // Named for its pairing, player 1 the config ticked first.
+  await expect(matchups.getByRole('listitem')).toHaveText([`${jobName}: ${p1} vs ${p2}`]);
   // One pair per task, so results arrive steadily rather than in lumps.
   await page.getByLabel('Pairs Per Task').fill('1');
   // The test is off unless asked for; on, so the page has one to watch too.
@@ -67,25 +82,31 @@ test('E-4: an admin creates configs and a job, activates it, and watches it fill
   await expect(page.getByLabel('Minimum Pairs')).toBeVisible();
   await page.getByRole('button', { name: 'Create job' }).click();
 
-  await expect(page).toHaveURL(/\/admin\/jobs\/[0-9a-f-]{36}$/);
-  const jobId = page.url().split('/').pop()!;
-  const header = page.locator('main header');
-  // Titled by the name it was given, its type beside it; its status in the
-  // figures below.
-  await expect(header.getByRole('heading', { name: jobName })).toBeVisible();
-  await expect(header.getByText('Game Pairs', { exact: true })).toBeVisible();
-  const status = page.getByTestId('job-status');
-  await expect(status.getByText('inactive', { exact: true })).toBeVisible();
+  // Created inactive at 0%, on the allocation page, marked new and listed
+  // first: that is where it starts.
+  await expect(page).toHaveURL(/\/admin\/allocation\?new=[0-9a-f-]{36}$/);
+  const jobId = new URL(page.url()).searchParams.get('new')!;
+  await expect(page.getByTestId('new-jobs')).toContainText('The new job is marked');
+  const firstRow = page.getByTestId('allocations').locator('tbody tr').first();
+  await expect(firstRow).toContainText(jobName);
+  await expect(firstRow).toContainText('new');
+  await expect(page.locator(`#alloc-${jobId}`)).toHaveValue('0');
 
-  // Activating refetches the job once, after the action; wait that out.
+  // The allocation is the switch.
+  await setAllocation(page, jobId, 20);
   const isJobFetch = (url: string, method: string) =>
     method === 'GET' && new URL(url).pathname === `/api/jobs/${jobId}`;
-  const refetched = page.waitForResponse((r) => isJobFetch(r.url(), r.request().method()));
-  await page.getByLabel('Allocation %').fill('20');
-  await page.getByRole('button', { name: 'Activate', exact: true }).click();
-  await refetched;
-  await expect(page.getByText('Job activated.')).toBeVisible();
+  const loaded = page.waitForResponse((r) => isJobFetch(r.url(), r.request().method()));
+  await page.goto(`/admin/jobs/${jobId}`);
+  await loaded;
+  const header = page.locator('main header');
+  // Titled by the name it was given and its pairing, its type beside it; its
+  // status in the figures below.
+  await expect(header.getByRole('heading', { name: `${jobName}: ${p1} vs ${p2}` })).toBeVisible();
+  await expect(header.getByText('Game Pairs', { exact: true })).toBeVisible();
+  const status = page.getByTestId('job-status');
   await expect(status.getByText('active', { exact: true })).toBeVisible();
+  await expect(page.getByTestId('job-allocation')).toContainText('20%');
 
   // From here on the page must update itself. It fetches the job over REST
   // only on load and after an admin action, so count those fetches: the
@@ -116,7 +137,17 @@ test('E-4: an admin creates configs and a job, activates it, and watches it fill
   ).toBeVisible();
 
   // And the admin takes the job out of rotation again, handing its share back.
-  await page.getByRole('button', { name: 'Deactivate' }).click();
-  await expect(page.getByText('Job deactivated.')).toBeVisible();
+  await setAllocation(page, jobId, 0);
+  await page.goto(`/admin/jobs/${jobId}`);
   await expect(status.getByText('inactive', { exact: true })).toBeVisible();
+  await expect(page.getByTestId('job-allocation')).toContainText('0%');
 });
+
+/** Sets one job's allocation on the Allocation page, and saves. */
+async function setAllocation(page: Page, jobId: string, allocation: number) {
+  if (new URL(page.url()).pathname !== '/admin/allocation') await page.goto('/admin/allocation');
+  const input = page.locator(`#alloc-${jobId}`);
+  await input.fill(String(allocation));
+  await page.getByRole('button', { name: 'Save 1 change' }).click();
+  await expect(page.getByText('Saved: 1 job changed.')).toBeVisible();
+}

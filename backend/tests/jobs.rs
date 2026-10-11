@@ -84,6 +84,13 @@ impl Admin {
     async fn create_job(&self, body: Value) -> (StatusCode, Value) {
         self.post("/api/admin/jobs", body).await
     }
+
+    /// Sets one job's allocation, the only way a job is activated or
+    /// deactivated.
+    async fn allocate(&self, job: Uuid, allocation: i32) -> (StatusCode, Value) {
+        let body = json!({ "allocations": [{ "job_id": job, "allocation": allocation }] });
+        self.call("PUT", "/api/admin/jobs/allocations", Some(body)).await
+    }
 }
 
 /// The job's letter distribution and board.
@@ -91,17 +98,23 @@ async fn board(db: &TestDb) -> (Uuid, Uuid) {
     (db.input_data("letterdist", "english").await, db.input_data("layout", "standard15").await)
 }
 
+/// `p1` against `p2`, or one config's self-play job when they are the same:
+/// a config is named once.
+fn players(p1: Uuid, p2: Uuid) -> Value {
+    if p1 == p2 { json!([p1]) } else { json!([p1, p2]) }
+}
+
 fn games_body(ld: Uuid, layout: Uuid, p1: Uuid, p2: Uuid) -> Value {
     json!({
         "job_type": "games", "variant": "classic", "letterdist_id": ld, "layout_id": layout,
-        "player1_config_id": p1, "player2_config_id": p2, "max_games": 10,
+        "player_config_ids": players(p1, p2), "max_games": 10,
     })
 }
 
 fn pairs_body(ld: Uuid, layout: Uuid, p1: Uuid, p2: Uuid) -> Value {
     json!({
         "job_type": "game_pairs", "variant": "classic", "letterdist_id": ld, "layout_id": layout,
-        "player1_config_id": p1, "player2_config_id": p2, "max_pairs": 10,
+        "player_config_ids": players(p1, p2), "max_pairs": 10,
     })
 }
 
@@ -168,14 +181,14 @@ async fn each_job_type_stores_every_setting_it_was_created_with() {
         .create_job(json!({
             "job_type": "games", "variant": "wordsmog",
             "letterdist_id": ld, "layout_id": layout, "min_magpie_version": "1.2.3",
-            "player1_config_id": p1, "player2_config_id": p2, "games_per_batch": 4,
+            "player_config_ids": [p1, p2], "games_per_batch": 4,
             "test_enabled": true,
             "min_games": 100, "max_games": 2000, "confidence_pct": 97.5,
-            "capture_positions": true,
+            "capture_positions": true, "threading_mode": "pgp",
         }))
         .await;
     assert_eq!(status, StatusCode::CREATED, "{created}");
-    let games: Uuid = created["job"]["id"].as_str().unwrap().parse().unwrap();
+    let games: Uuid = created["jobs"][0]["id"].as_str().unwrap().parse().unwrap();
     let row = config_row(&db, "job_game_config", games).await;
     assert_reads_back(
         "job_game_config",
@@ -183,7 +196,7 @@ async fn each_job_type_stores_every_setting_it_was_created_with() {
         &json!({
             "job_id": games, "player1_config_id": p1, "player2_config_id": p2,
             "games_per_batch": 4, "test_enabled": true, "min_games": 100, "max_games": 2000,
-            "confidence_pct": 97.5, "capture_positions": true,
+            "confidence_pct": 97.5, "capture_positions": true, "threading_mode": "pgp",
         }),
     );
     let job = job_row(&db, games).await;
@@ -196,7 +209,7 @@ async fn each_job_type_stores_every_setting_it_was_created_with() {
         ("min_magpie_minor", json!(2)),
         ("min_magpie_patch", json!(3)),
         ("status", json!("inactive")),
-        ("allocation", Value::Null),
+        ("allocation", json!(0)),
     ] {
         assert_eq!(job[column], expected, "jobs.{column}: {job}");
     }
@@ -207,15 +220,15 @@ async fn each_job_type_stores_every_setting_it_was_created_with() {
         .create_job(json!({
             "job_type": "game_pairs", "variant": "classic",
             "letterdist_id": ld, "layout_id": layout,
-            "player1_config_id": p2, "player2_config_id": p1, "pairs_per_batch": 3,
+            "player_config_ids": [p2, p1], "pairs_per_batch": 3,
             "test_enabled": true,
             "min_pairs": 10, "max_pairs": 500, "confidence_pct": 90.0,
             "capture_positions": true,
-            "capture_first_divergence": true,
+            "capture_first_divergence": true, "threading_mode": "pgp",
         }))
         .await;
     assert_eq!(status, StatusCode::CREATED, "{created}");
-    let pairs: Uuid = created["job"]["id"].as_str().unwrap().parse().unwrap();
+    let pairs: Uuid = created["jobs"][0]["id"].as_str().unwrap().parse().unwrap();
     let row = config_row(&db, "job_game_pair_config", pairs).await;
     assert_reads_back(
         "job_game_pair_config",
@@ -224,7 +237,7 @@ async fn each_job_type_stores_every_setting_it_was_created_with() {
             "job_id": pairs, "player1_config_id": p2, "player2_config_id": p1,
             "pairs_per_batch": 3, "test_enabled": true, "min_pairs": 10, "max_pairs": 500,
             "confidence_pct": 90.0, "capture_positions": true,
-            "capture_first_divergence": true,
+            "capture_first_divergence": true, "threading_mode": "pgp",
         }),
     );
     assert_eq!(job_row(&db, pairs).await["job_type"], "game_pairs");
@@ -234,7 +247,7 @@ async fn each_job_type_stores_every_setting_it_was_created_with() {
     // nothing reads.
     let (status, created) = admin.create_job(games_body(ld, layout, p1, p2)).await;
     assert_eq!(status, StatusCode::CREATED, "{created}");
-    let plain: Uuid = created["job"]["id"].as_str().unwrap().parse().unwrap();
+    let plain: Uuid = created["jobs"][0]["id"].as_str().unwrap().parse().unwrap();
     let row = config_row(&db, "job_game_config", plain).await;
     assert_reads_back(
         "job_game_config",
@@ -242,7 +255,7 @@ async fn each_job_type_stores_every_setting_it_was_created_with() {
         &json!({
             "job_id": plain, "player1_config_id": p1, "player2_config_id": p2,
             "games_per_batch": 2, "test_enabled": false, "min_games": 0, "max_games": 10,
-            "confidence_pct": 95.0, "capture_positions": false,
+            "confidence_pct": 95.0, "capture_positions": false, "threading_mode": "igp",
         }),
     );
 
@@ -256,7 +269,7 @@ async fn each_job_type_stores_every_setting_it_was_created_with() {
         }))
         .await;
     assert_eq!(status, StatusCode::CREATED, "{created}");
-    let racks: Uuid = created["job"]["id"].as_str().unwrap().parse().unwrap();
+    let racks: Uuid = created["jobs"][0]["id"].as_str().unwrap().parse().unwrap();
     let row = config_row(&db, "job_opening_rack_config", racks).await;
     let total = row["total_racks"].as_i64().expect("total_racks is a count");
     assert!(total > 0, "the rack space was counted: {total}");
@@ -306,7 +319,7 @@ async fn an_opening_rack_jobs_consensus_is_stored_and_refused_where_it_cannot_wo
         })))
         .await;
     assert_eq!(status, StatusCode::CREATED, "{created}");
-    let job: Uuid = created["job"]["id"].as_str().unwrap().parse().unwrap();
+    let job: Uuid = created["jobs"][0]["id"].as_str().unwrap().parse().unwrap();
     let row = config_row(&db, "job_opening_rack_config", job).await;
     assert_eq!(row["consensus_pct"].as_f64(), Some(80.0));
     assert_eq!((&row["min_results_per_rack"], &row["max_results_per_rack"]), (&json!(3), &json!(7)));
@@ -393,7 +406,7 @@ async fn a_leave_generation_job_stores_every_setting_it_was_created_with() {
         }))
         .await;
     assert_eq!(status, StatusCode::CREATED, "{created}");
-    let job: Uuid = created["job"]["id"].as_str().unwrap().parse().unwrap();
+    let job: Uuid = created["jobs"][0]["id"].as_str().unwrap().parse().unwrap();
     let row = config_row(&db, "job_leave_config", job).await;
     assert_reads_back(
         "job_leave_config",
@@ -475,7 +488,7 @@ async fn a_leave_job_takes_a_bingo_bonus_and_no_sim_cutoff() {
 
     let (status, created) = admin.create_job(body(json!({ "bingo_bonus": 40 }))).await;
     assert_eq!(status, StatusCode::CREATED, "{created}");
-    assert_eq!(created["job"]["bingo_bonus"], json!(40), "{created}");
+    assert_eq!(created["jobs"][0]["bingo_bonus"], json!(40), "{created}");
 }
 
 /// I-JOB-2: `validate_shared_player_options` reads the two stored configs --
@@ -543,8 +556,9 @@ async fn a_job_whose_lexicons_do_not_fit_its_distribution_is_refused() {
     assert_eq!(status, StatusCode::CREATED, "{created}");
 
     let refusals = [
-        (games_body(german, layout, nwl, csw), "player1: lexicon \"NWL23\" is not compatible with letter distribution \"german\""),
-        (pairs_body(english, layout, nwl, rd), "player2: lexicon \"RD28\" is not compatible with letter distribution \"english\""),
+        // Named for the pairing, as every pairing's refusal is.
+        (games_body(german, layout, nwl, csw), "nwl vs csw: player1: lexicon \"NWL23\" is not compatible with letter distribution \"german\""),
+        (pairs_body(english, layout, nwl, rd), "nwl vs rd: player2: lexicon \"RD28\" is not compatible with letter distribution \"english\""),
         (
             json!({
                 "job_type": "opening_rack", "variant": "classic", "letterdist_id": german,
@@ -639,7 +653,7 @@ async fn a_games_or_pairs_jobs_counts_are_held_by_the_schema() {
     ] {
         let (status, created) = admin.create_job(body).await;
         assert_eq!(status, StatusCode::CREATED, "{created}");
-        let job: Uuid = created["job"]["id"].as_str().unwrap().parse().unwrap();
+        let job: Uuid = created["jobs"][0]["id"].as_str().unwrap().parse().unwrap();
         let batch = format!("{unit}_per_batch");
         for set in [
             format!("{batch} = 0"),
@@ -719,8 +733,8 @@ async fn a_jobs_bingo_bonus_is_bounded() {
     for bonus in [0, 500] {
         let (status, created) = admin.create_job(with_bonus(bonus)).await;
         assert_eq!(status, StatusCode::CREATED, "{bonus}: {created}");
-        assert_eq!(created["job"]["bingo_bonus"], json!(bonus), "{created}");
-        job = created["job"]["id"].as_str().unwrap().parse().unwrap();
+        assert_eq!(created["jobs"][0]["bingo_bonus"], json!(bonus), "{created}");
+        job = created["jobs"][0]["id"].as_str().unwrap().parse().unwrap();
     }
 
     for bonus in [-1, 501] {
@@ -745,12 +759,12 @@ async fn api_games_job(db: &TestDb, admin: &Admin) -> Uuid {
     let p2 = admin.static_player(&format!("p2-{}", Uuid::new_v4()), kwg, klv, json!({})).await;
     let (status, created) = admin.create_job(games_body(ld, layout, p1, p2)).await;
     assert_eq!(status, StatusCode::CREATED, "{created}");
-    created["job"]["id"].as_str().unwrap().parse().unwrap()
+    created["jobs"][0]["id"].as_str().unwrap().parse().unwrap()
 }
 
 /// `(status, allocation, activated_at IS NOT NULL, deactivated on record)`. A
 /// deactivation's only record is its audit row, which says who and when.
-async fn lifecycle(db: &TestDb, job: Uuid) -> (String, Option<i32>, bool, bool) {
+async fn lifecycle(db: &TestDb, job: Uuid) -> (String, i32, bool, bool) {
     sqlx::query_as(
         "SELECT status::text, allocation, activated_at IS NOT NULL,
                 EXISTS (SELECT 1 FROM audit_log a
@@ -775,31 +789,157 @@ async fn claim(app: &Router) -> StatusCode {
     send(app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await.0
 }
 
-/// I-JOB-6: a job is created inactive with no allocation; activation sets its
-/// allocation and `activated_at` and puts it on offer; deactivation takes it
-/// off offer without destroying its tasks, and it can be activated again;
-/// completion is terminal -- neither activation nor deactivation moves it
-/// again, and nothing is dispatched from it.
+/// Every games and pairs job with its name and seating, oldest first and in
+/// creation order within a request.
+async fn seatings(db: &TestDb) -> Vec<(String, Uuid, Uuid, String, i32)> {
+    sqlx::query_as(
+        "SELECT j.name, COALESCE(g.player1_config_id, p.player1_config_id),
+                COALESCE(g.player2_config_id, p.player2_config_id), j.status::text, j.allocation
+         FROM jobs j
+         LEFT JOIN job_game_config g ON g.job_id = j.id
+         LEFT JOIN job_game_pair_config p ON p.job_id = j.id
+         WHERE j.job_type IN ('games', 'game_pairs')
+         ORDER BY j.created_at, j.id",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap()
+}
+
+/// I-JOB-15: a games or pairs request naming n ≥ 2 player configs is a round
+/// robin: C(n, 2) jobs, every pairing once, seated in the order the configs
+/// were listed and named "{name}: A vs B", all inactive at 0% and answered
+/// together. One config is a self-play job under the name as given.
+#[tokio::test]
+async fn a_round_robin_creates_a_job_for_every_pairing() {
+    let db = TestDb::new().await;
+    let admin = Admin::new(&db, db.state().await).await;
+    let (ld, layout) = board(&db).await;
+    let kwg = db.input_data("kwg", "NWL23").await;
+    let klv = db.input_data("klv", "NWL23").await;
+    let mut configs = Vec::new();
+    for name in ["a", "b", "c", "d"] {
+        configs.push(admin.static_player(name, kwg, klv, json!({})).await);
+    }
+    let (a, b, c, d) = (configs[0], configs[1], configs[2], configs[3]);
+    let request = |job_type: &str, name: &str, ids: &[Uuid]| {
+        let mut body = if job_type == "games" { games_body(ld, layout, a, a) } else { pairs_body(ld, layout, a, a) };
+        body["name"] = json!(name);
+        body["player_config_ids"] = json!(ids);
+        body
+    };
+
+    let (status, created) = admin.create_job(request("games", "trio", &[c, a, b])).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let answered: Vec<&str> =
+        created["jobs"].as_array().unwrap().iter().map(|j| j["name"].as_str().unwrap()).collect();
+    assert_eq!(answered, ["trio: c vs a", "trio: c vs b", "trio: a vs b"], "{created}");
+    let inactive = |name: &str, p1: Uuid, p2: Uuid| (name.to_string(), p1, p2, "inactive".to_string(), 0);
+    assert_eq!(
+        seatings(&db).await,
+        [inactive("trio: c vs a", c, a), inactive("trio: c vs b", c, b), inactive("trio: a vs b", a, b)]
+    );
+    let audited: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE action = 'job.created'")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(audited, 3, "each job's creation is on record");
+
+    sqlx::query("DELETE FROM jobs").execute(&db.pool).await.unwrap();
+    let (status, created) = admin.create_job(request("game_pairs", "", &[a, b, c, d])).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(created["jobs"].as_array().unwrap().len(), 6, "{created}");
+    let pairs: Vec<(String, Uuid, Uuid)> =
+        seatings(&db).await.into_iter().map(|(name, p1, p2, _, _)| (name, p1, p2)).collect();
+    assert_eq!(
+        pairs,
+        [
+            ("a vs b".to_string(), a, b), ("a vs c".to_string(), a, c), ("a vs d".to_string(), a, d),
+            ("b vs c".to_string(), b, c), ("b vs d".to_string(), b, d), ("c vs d".to_string(), c, d),
+        ],
+        "unnamed, each job is named for its pairing alone"
+    );
+
+    sqlx::query("DELETE FROM jobs").execute(&db.pool).await.unwrap();
+    let (status, created) = admin.create_job(request("games", "solo", &[b])).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(created["jobs"].as_array().unwrap().len(), 1, "{created}");
+    assert_eq!(seatings(&db).await, [inactive("solo", b, b)], "one config plays itself");
+}
+
+/// I-JOB-16: a round robin is created whole or not at all. Every pairing is
+/// checked before anything is inserted, and a clash is named by its pairing;
+/// a config named twice, or more than twelve, is refused on the field.
+#[tokio::test]
+async fn a_round_robin_with_one_bad_pairing_creates_nothing() {
+    let db = TestDb::new().await;
+    let admin = Admin::new(&db, db.state().await).await;
+    let (ld, layout) = board(&db).await;
+    let kwg = db.input_data("kwg", "NWL23").await;
+    let klv = db.input_data("klv", "NWL23").await;
+    let winpct = db.input_data("winpct", "winpct").await;
+    let other_winpct = db.input_data("winpct", "winpct").await;
+    let plain = admin.static_player("plain", kwg, klv, json!({})).await;
+    let sim_a = admin.simmer("sim-a", kwg, klv, winpct).await;
+    let sim_other = admin.simmer("sim-other", kwg, klv, other_winpct).await;
+    let with = |ids: Vec<Uuid>| {
+        let mut body = pairs_body(ld, layout, plain, plain);
+        body["name"] = json!("rr");
+        body["player_config_ids"] = json!(ids);
+        body
+    };
+
+    // plain vs sim-a and plain vs sim-other are fine; sim-a vs sim-other is not.
+    let (status, refused) = admin.create_job(with(vec![plain, sim_a, sim_other])).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    let message = refused["message"].as_str().unwrap();
+    assert!(message.starts_with("sim-a vs sim-other: "), "the clash names its pairing: {message}");
+    assert!(message.contains("disagree on the win% model"), "{message}");
+    assert_eq!(job_count(&db).await, 0, "no pairing's job was created");
+
+    let many: Vec<Uuid> = (0..13).map(|_| Uuid::new_v4()).collect();
+    for ids in [vec![plain, sim_a, plain], many, Vec::new()] {
+        let (status, refused) = admin.create_job(with(ids.clone())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{ids:?}: {refused}");
+        assert_eq!(refused["fields"][0]["field"], "player_config_ids", "{refused}");
+    }
+    assert_eq!(job_count(&db).await, 0);
+
+    // A pairing whose name would pass a job name's length is refused too,
+    // before anything is written.
+    let mut long = with(vec![plain, sim_a]);
+    long["name"] = json!("x".repeat(95));
+    let (status, refused) = admin.create_job(long).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    assert_eq!(refused["fields"][0]["field"], "name", "{refused}");
+    assert_eq!(job_count(&db).await, 0);
+}
+
+/// I-JOB-6: a job is created inactive at 0%; an allocation above 0% sets
+/// `activated_at` and puts it on offer; 0% takes it off offer -- inactive, at
+/// 0% -- without destroying its tasks, and it can be given an allocation
+/// again; completion is terminal and holds the job at 0% -- no allocation
+/// moves it again, and nothing is dispatched from it.
 #[tokio::test]
 async fn a_job_moves_through_its_lifecycle_and_completion_is_final() {
     let db = TestDb::new().await;
     let admin = Admin::new(&db, db.state().await).await;
     let job = api_games_job(&db, &admin).await;
-    assert_eq!(lifecycle(&db, job).await, ("inactive".into(), None, false, false));
+    assert_eq!(lifecycle(&db, job).await, ("inactive".into(), 0, false, false));
     assert_eq!(claim(&admin.app).await, StatusCode::NO_CONTENT, "an inactive job is not offered");
 
-    let (status, body) =
-        admin.post(&format!("/api/admin/jobs/{job}/activate"), json!({ "allocation": 40 })).await;
+    let (status, body) = admin.allocate(job, 40).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["allocation"], 40, "{body}");
-    assert_eq!(lifecycle(&db, job).await, ("active".into(), Some(40), true, false));
+    assert_eq!(body["jobs"][0]["allocation"], 40, "{body}");
+    assert_eq!(body["jobs"][0]["status"], "active", "{body}");
+    assert_eq!(lifecycle(&db, job).await, ("active".into(), 40, true, false));
     assert_eq!(claim(&admin.app).await, StatusCode::OK, "an active job is offered");
     assert_eq!(task_count(&db, job).await, 1);
 
-    let (status, body) = admin.call("POST", &format!("/api/admin/jobs/{job}/deactivate"), None).await;
+    let (status, body) = admin.allocate(job, 0).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    let (state, _, _, deactivated) = lifecycle(&db, job).await;
-    assert_eq!((state.as_str(), deactivated), ("inactive", true));
+    let (state, allocation, _, deactivated) = lifecycle(&db, job).await;
+    assert_eq!((state.as_str(), allocation, deactivated), ("inactive", 0, true));
     assert_eq!(task_count(&db, job).await, 1, "deactivation keeps the job's tasks");
     let open_claims: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM task_claims c JOIN tasks t ON t.id = c.task_id
@@ -812,35 +952,40 @@ async fn a_job_moves_through_its_lifecycle_and_completion_is_final() {
     assert_eq!(open_claims, 1, "and the claim already out on them");
     assert_eq!(claim(&admin.app).await, StatusCode::NO_CONTENT, "but offers nothing more");
 
-    let (status, body) =
-        admin.post(&format!("/api/admin/jobs/{job}/activate"), json!({ "allocation": 60 })).await;
+    let (status, body) = admin.allocate(job, 60).await;
     assert_eq!(status, StatusCode::OK, "an inactive job can be activated again: {body}");
-    assert_eq!(lifecycle(&db, job).await.1, Some(60));
+    assert_eq!(lifecycle(&db, job).await.1, 60);
 
     let (status, body) = admin.call("POST", &format!("/api/admin/jobs/{job}/complete"), None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["status"], "completed", "{body}");
+    assert_eq!(body["allocation"], 0, "a completed job holds 0%: {body}");
 
-    let (status, body) =
-        admin.post(&format!("/api/admin/jobs/{job}/activate"), json!({ "allocation": 10 })).await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert_eq!(body["message"], "a completed job cannot be reactivated");
-    let (status, body) = admin.call("POST", &format!("/api/admin/jobs/{job}/deactivate"), None).await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert_eq!(body["message"], "a completed job cannot be deactivated");
+    for allocation in [10, 0] {
+        let (status, body) = admin.allocate(job, allocation).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["fields"][0]["field"], "allocations[0].job_id", "{body}");
+        assert_eq!(
+            body["fields"][0]["message"],
+            "the job is completed, and a completed job cannot be reactivated",
+            "{body}"
+        );
+    }
     // Completed again -- from a stale page, after the server's own finish
     // check -- is a conflict, not a second completion on record (pass 23).
     let (status, body) = admin.call("POST", &format!("/api/admin/jobs/{job}/complete"), None).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["message"], "this job is already completed");
-    assert_eq!(lifecycle(&db, job).await.0, "completed", "completion is terminal");
+    assert_eq!(lifecycle(&db, job).await, ("completed".into(), 0, true, true), "completion is terminal");
     assert_eq!(claim(&admin.app).await, StatusCode::NO_CONTENT, "a completed job is not offered");
     assert_eq!(task_count(&db, job).await, 1);
 }
 
 /// I-JOB-7: an allocation outside 0-100 is refused by the endpoint, and by the
 /// schema's CHECK for a write that bypasses it; the ends of the range are
-/// accepted.
+/// accepted. And the schema holds the allocation to the status: active
+/// exactly when above 0%, so neither an active job at 0% nor an inactive or
+/// completed one above it can be written.
 #[tokio::test]
 async fn an_allocation_outside_0_to_100_is_refused() {
     let db = TestDb::new().await;
@@ -848,30 +993,40 @@ async fn an_allocation_outside_0_to_100_is_refused() {
     let job = api_games_job(&db, &admin).await;
 
     for allocation in [101, -1, 1000] {
-        let (status, body) = admin
-            .post(&format!("/api/admin/jobs/{job}/activate"), json!({ "allocation": allocation }))
-            .await;
+        let (status, body) = admin.allocate(job, allocation).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{allocation}: {body}");
-        assert_eq!(body["message"], "allocation must be between 0 and 100", "{body}");
+        assert_eq!(body["fields"][0]["field"], "allocations[0].allocation", "{body}");
+        assert_eq!(body["fields"][0]["message"], "must be between 0 and 100", "{body}");
     }
-    assert_eq!(lifecycle(&db, job).await, ("inactive".into(), None, false, false), "unchanged");
+    assert_eq!(lifecycle(&db, job).await, ("inactive".into(), 0, false, false), "unchanged");
 
-    for allocation in [0, 100] {
-        let (status, body) = admin
-            .post(&format!("/api/admin/jobs/{job}/activate"), json!({ "allocation": allocation }))
-            .await;
-        assert_eq!(status, StatusCode::OK, "{allocation}: {body}");
-        assert_eq!(lifecycle(&db, job).await.1, Some(allocation));
+    for (allocation, status) in [(0, "inactive"), (100, "active")] {
+        let (code, body) = admin.allocate(job, allocation).await;
+        assert_eq!(code, StatusCode::OK, "{allocation}: {body}");
+        let (now, at, _, _) = lifecycle(&db, job).await;
+        assert_eq!((now.as_str(), at), (status, allocation));
     }
 
     // The schema holds the same line for anything that writes the row
     // directly.
-    let err = sqlx::query("UPDATE jobs SET allocation = 101 WHERE id = $1")
-        .bind(job)
-        .execute(&db.pool)
-        .await
-        .expect_err("the CHECK refuses 101");
-    assert_eq!(err.as_database_error().unwrap().constraint(), Some("jobs_allocation_check"));
+    let refused = |sql: &'static str| {
+        let pool = db.pool.clone();
+        async move {
+            let err = sqlx::query(sql).bind(job).execute(&pool).await.expect_err(sql);
+            err.as_database_error().unwrap().constraint().map(str::to_string)
+        }
+    };
+    assert_eq!(
+        refused("UPDATE jobs SET allocation = 101 WHERE id = $1").await.as_deref(),
+        Some("jobs_allocation_check")
+    );
+    for sql in [
+        "UPDATE jobs SET allocation = 0 WHERE id = $1",
+        "UPDATE jobs SET status = 'inactive' WHERE id = $1",
+        "UPDATE jobs SET status = 'completed' WHERE id = $1",
+    ] {
+        assert_eq!(refused(sql).await.as_deref(), Some("jobs_allocation_is_status"), "{sql}");
+    }
 }
 
 /// Claims and completes one games task, with a captured position whose moves
@@ -1071,7 +1226,7 @@ async fn deleting_a_job_leaves_nothing_anywhere_that_points_at_it() {
     games_history(&admin.app).await;
     // A second claim, left open.
     assert_eq!(claim(&admin.app).await, StatusCode::OK);
-    sqlx::query("UPDATE jobs SET status = 'inactive' WHERE id = $1")
+    sqlx::query("UPDATE jobs SET status = 'inactive', allocation = 0 WHERE id = $1")
         .bind(games)
         .execute(&db.pool)
         .await
@@ -1179,7 +1334,7 @@ async fn a_malformed_magpie_floor_is_refused() {
         json!({
             "job_type": "games", "variant": "classic",
             "letterdist_id": ld, "layout_id": layout, "min_magpie_version": floor,
-            "player1_config_id": p1, "player2_config_id": p2, "max_games": 100,
+            "player_config_ids": [p1, p2], "max_games": 100,
         })
     };
     for floor in ["v1.6.0", "1", "1,6"] {
@@ -1244,7 +1399,7 @@ async fn a_player_config_in_use_by_any_job_cannot_be_deleted() {
     ] {
         let (status, created) = admin.create_job(body).await;
         assert_eq!(status, StatusCode::CREATED, "{created}");
-        jobs.push(created["job"]["id"].as_str().unwrap().to_string());
+        jobs.push(created["jobs"][0]["id"].as_str().unwrap().to_string());
     }
     // A leave job by hand: created through the API it would build its
     // generation-0 KLV, which needs a MAGPIE and an object store.
@@ -1379,6 +1534,9 @@ async fn a_purged_job_hands_out_its_seed_space_again_from_the_start() {
     assert_eq!(claims, 0);
     let (status, row) = admin.call("GET", &format!("/api/jobs/{job}"), None).await;
     assert_eq!(status, StatusCode::OK, "the job row survives: {row}");
+    assert_eq!((&row["job"]["status"], &row["job"]["allocation"]), (&json!("inactive"), &json!(0)), "{row}");
+    let (status, body) = admin.allocate(job, 50).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 
     let mut after = Vec::new();
     for _ in 0..3 {
@@ -1424,10 +1582,9 @@ async fn a_catalan_games_job_runs_and_a_catalan_rack_job_is_refused_at_creation(
 
     let (status, created) = admin.create_job(games_body(ld, layout, p1, p2)).await;
     assert_eq!(status, StatusCode::CREATED, "{created}");
-    let games: Uuid = created["job"]["id"].as_str().unwrap().parse().unwrap();
+    let games: Uuid = created["jobs"][0]["id"].as_str().unwrap().parse().unwrap();
     db.derived_ready(games).await;
-    let (status, body) =
-        admin.post(&format!("/api/admin/jobs/{games}/activate"), json!({ "allocation": 50 })).await;
+    let (status, body) = admin.allocate(games, 50).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let (status, assignment) =
         send(&admin.app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;

@@ -95,7 +95,9 @@ impl TestStatus {
 }
 
 /// Where the test stands: player 1's score per game and the interval around
-/// it, the same three as Elo, the confidence asked for, and the decision.
+/// it, the confidence asked for, and the decision. Nothing on a rating scale:
+/// a job's test is one comparison's score, and a number beside it in rating
+/// points would read as a pool's rating, which it is not.
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct TestResult {
     /// Player 1's mean score per game; ½ before anything is played.
@@ -103,28 +105,8 @@ pub struct TestResult {
     /// The interval, clipped to the scores that exist, 0 to 1.
     pub lower: f64,
     pub upper: f64,
-    /// Player 1's Elo difference: [`elo`] of the three above.
-    pub elo: f64,
-    pub elo_lower: f64,
-    pub elo_upper: f64,
     pub confidence_pct: f64,
     pub status: TestStatus,
-}
-
-/// The largest Elo difference reported: a score of 0 or 1 is infinitely far
-/// off the scale.
-pub const MAX_ELO: f64 = 1000.0;
-
-/// The Elo difference at which a player expects this score per game,
-/// `−400·log10(1/s − 1)`, within ±[`MAX_ELO`].
-pub fn elo(score: f64) -> f64 {
-    if score <= 0.0 {
-        return -MAX_ELO;
-    }
-    if score >= 1.0 {
-        return MAX_ELO;
-    }
-    (-400.0 * (1.0 / score - 1.0).log10()).clamp(-MAX_ELO, MAX_ELO)
 }
 
 /// Where the boundary is tightest: the geometric mean of the first units the
@@ -202,16 +184,7 @@ pub fn evaluate(
     } else {
         TestStatus::Running
     };
-    TestResult {
-        mean,
-        lower,
-        upper,
-        elo: elo(mean),
-        elo_lower: elo(lower),
-        elo_upper: elo(upper),
-        confidence_pct,
-        status,
-    }
+    TestResult { mean, lower, upper, confidence_pct, status }
 }
 
 #[cfg(test)]
@@ -294,7 +267,7 @@ mod tests {
         let result = evaluate(&sample, Unit::Pair, 10_000, 95.0, 500, 10_000);
         approx(result.upper - 0.5, 0.001_027_173_831_966_772_8, 1e-12);
         assert_eq!(result.status, TestStatus::Inconclusive);
-        assert_eq!((result.elo, result.elo_lower < 0.0, result.elo_upper > 0.0), (0.0, true, true));
+        assert!(result.lower < 0.5 && result.upper > 0.5);
     }
 
     #[test]
@@ -313,17 +286,7 @@ mod tests {
         let empty = Sample::from_pentanomial(&Pentanomial::default());
         let result = evaluate(&empty, Unit::Pair, 0, 95.0, 100, 1_000);
         assert_eq!((result.mean, result.lower, result.upper), (0.5, 0.0, 1.0));
-        assert_eq!((result.elo_lower, result.elo_upper), (-MAX_ELO, MAX_ELO));
         assert_eq!(result.status, TestStatus::Running);
-    }
-
-    #[test]
-    fn elo_is_the_logistic_inverse_within_its_bounds() {
-        assert_eq!(elo(0.5), 0.0);
-        approx(elo(0.75), 400.0 * 3f64.log10(), 1e-12);
-        approx(elo(0.25), -400.0 * 3f64.log10(), 1e-12);
-        assert_eq!((elo(0.0), elo(1.0)), (-MAX_ELO, MAX_ELO));
-        assert_eq!(elo(1e-12), -MAX_ELO);
     }
 
     /// Pairs drawn from a pentanomial with these bucket probabilities, the
@@ -377,8 +340,8 @@ mod tests {
         assert_eq!(p1 + p2 + inconclusive, runs);
     }
 
-    /// U-STATS-3b: a player scoring 53.5% per game (about +24
-    /// Elo) is found better in nearly every run before the cap.
+    /// U-STATS-3b: a player scoring 53.5% per game is found better
+    /// in nearly every run before the cap.
     #[test]
     fn a_better_player_is_found() {
         let runs = 200;

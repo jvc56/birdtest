@@ -65,7 +65,7 @@ variable "azs" {
 }
 
 variable "backend_image" {
-  description = "ECR image for the Axum backend container."
+  description = "ECR image the backend's service runs (the Axum backend), at the tag of the commit that last changed it."
   type        = string
 
   validation {
@@ -75,7 +75,7 @@ variable "backend_image" {
 }
 
 variable "frontend_image" {
-  description = "ECR image for the Nginx container serving the SvelteKit build."
+  description = "ECR image the frontend's service runs (Nginx serving the SvelteKit build). Its own tag: a release that changes only the backend leaves it as it is, and the reverse."
   type        = string
 
   validation {
@@ -387,8 +387,10 @@ variable "task_memory" {
 
 variable "desired_count" {
   description = <<-EOT
-    Number of ECS tasks. Must be 1 (0 only while the stack is being built or
-    rebuilt). The correctness of a claim rests on Postgres's locks, but much
+    Number of tasks of each ECS service, the backend's and the frontend's.
+    Must be 1 (0 only while the stack is being built or rebuilt). The
+    frontend is stateless (ecs.tf says why it runs one task all the same); the
+    backend is not. The correctness of a claim rests on Postgres's locks, but much
     around it is in-process: the dispatch holds (`jobs::DispatchHolds`) that
     keep claims off a job being purged, deleted, seeded or having its
     consensus edited and answer its submissions at once, and the purge count

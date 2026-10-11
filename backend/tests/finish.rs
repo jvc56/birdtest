@@ -506,12 +506,12 @@ async fn the_in_flight_probe_reads_the_open_claims_not_the_jobs_tasks() {
 // A job whose last results landed with nobody to check them
 // ---------------------------------------------------------------------------
 
-async fn admin_post(app: &axum::Router, headers: &[(String, String)], path: &str) -> Value {
+/// Deactivates (0%) or reactivates (above 0%) the job through the
+/// allocation page's request.
+async fn set_allocation(app: &axum::Router, headers: &[(String, String)], job: Uuid, allocation: i32) {
     let refs: Vec<(&str, &str)> = headers.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
-    let body = if path.ends_with("/activate") { json!({ "allocation": 50 }) } else { json!({}) };
-    let (status, body) = send(app, post_json(path, &refs, body)).await;
-    assert_eq!(status, StatusCode::OK, "{path}: {body}");
-    body
+    let (status, body) = send(app, allocate(job, allocation, &refs)).await;
+    assert_eq!(status, StatusCode::OK, "{job} at {allocation}%: {body}");
 }
 
 /// The idle check runs off the claim request, so its result is waited for.
@@ -542,12 +542,12 @@ async fn a_job_whose_last_results_landed_while_inactive_completes_once_reactivat
 
     let (a, uuid_a) = first_claim(&app).await;
     let (b, uuid_b) = first_claim(&app).await;
-    admin_post(&app, &headers, &format!("/api/admin/jobs/{job}/deactivate")).await;
+    set_allocation(&app, &headers, job, 0).await;
     submit(&app, &uuid_a, &a, analysis(&a)).await;
     submit(&app, &uuid_b, &b, analysis(&b)).await;
     assert_eq!(job_status(&db, job).await, "inactive");
 
-    admin_post(&app, &headers, &format!("/api/admin/jobs/{job}/activate")).await;
+    set_allocation(&app, &headers, job, 50).await;
     let (status, _) = send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     assert_eq!(eventually_completed(&db, job).await, "completed");
@@ -581,10 +581,10 @@ async fn a_games_job_whose_cap_landed_while_inactive(test_enabled: bool) -> (Tes
     // pacing must not stop the check after reactivation from running.
     assert_eq!(job_status(&db, job).await, "active");
 
-    admin_post(&app, &headers, &format!("/api/admin/jobs/{job}/deactivate")).await;
+    set_allocation(&app, &headers, job, 0).await;
     submit(&app, &uuid_a, &a, games_result(100, 50)).await;
     submit(&app, &uuid_b, &b, games_result(100, 50)).await;
-    admin_post(&app, &headers, &format!("/api/admin/jobs/{job}/activate")).await;
+    set_allocation(&app, &headers, job, 50).await;
     let (status, _) = send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     assert_eq!(eventually_completed(&db, job).await, "completed");

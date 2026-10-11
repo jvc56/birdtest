@@ -268,7 +268,7 @@ async fn the_job_list_filters_by_status() {
     let admin = db.user("root", true).await;
     let active = db.bare_job("games", admin).await;
     let inactive = db.bare_job("games", admin).await;
-    sqlx::query("UPDATE jobs SET status = 'inactive' WHERE id = $1")
+    sqlx::query("UPDATE jobs SET status = 'inactive', allocation = 0 WHERE id = $1")
         .bind(inactive)
         .execute(&db.pool)
         .await
@@ -729,6 +729,103 @@ async fn rack_lookup_finds_an_analysed_rack() {
     assert_eq!(body["message"], "no such job");
 }
 
+/// A-PUBLIC-4h: `/rack-samples` draws distinct racks an opening-rack job has
+/// analysed: exactly, from a small job read whole; by probes of its rack
+/// space, from a large one. Only an opening-rack job's; an unknown job is a
+/// 404.
+#[tokio::test]
+async fn rack_samples_are_distinct_analysed_racks() {
+    let db = TestDb::new().await;
+    let app = birdtest::app(db.state().await);
+    let job = opening_rack_job(&db, 12).await;
+    let path = format!("/api/jobs/{job}/rack-samples");
+    let racks_of = |body: &serde_json::Value| -> Vec<String> {
+        body["racks"].as_array().unwrap().iter().map(|r| r.as_str().unwrap().to_string()).collect()
+    };
+
+    let (status, body) = send(&app, get_request(&path, &[])).await;
+    assert_eq!((status, &body), (StatusCode::OK, &json!({ "racks": [] })), "nothing analysed yet");
+
+    let (assignment, uuid) = first_claim(&app).await;
+    let mut analysed: Vec<String> = assignment["task_request"]["racks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(analysed.len(), 12);
+    let result = json!({
+        "racks": analysed.iter().map(|rack| json!({
+            "rack": rack, "num_moves": 1, "moves": [{ "move": "8G AB", "score": 8, "equity": 9.5 }],
+        })).collect::<Vec<_>>()
+    });
+    submit(&app, &assignment, &uuid, result).await;
+
+    // A small job, read whole: ten of its racks by default, all of them when
+    // asked for more, never one twice.
+    let (status, body) = send(&app, get_request(&path, &[])).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ten = racks_of(&body);
+    assert_eq!(ten.len(), 10, "{body}");
+    assert_eq!(ten.iter().collect::<std::collections::HashSet<_>>().len(), 10, "{body}");
+    assert!(ten.iter().all(|rack| analysed.contains(rack)), "{body}");
+    let (_, body) = send(&app, get_request(&format!("{path}?n=500"), &[])).await;
+    let mut all = racks_of(&body);
+    all.sort();
+    analysed.sort();
+    assert_eq!(all, analysed, "every rack once, the request held to the cap");
+    let (_, body) = send(&app, get_request(&format!("{path}?n=0"), &[])).await;
+    assert_eq!(racks_of(&body).len(), 1, "at least one is asked for");
+
+    // A large one, probed: past a thousand analyses, spread over the space of
+    // strings the probes are drawn from.
+    let (claim, task): (Uuid, Uuid) =
+        sqlx::query_as("SELECT id, task_id FROM task_claims WHERE claim_token = $1")
+            .bind(Uuid::parse_str(assignment["claim_token"].as_str().unwrap()).unwrap())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    let mut more = std::collections::BTreeSet::new();
+    let mut seed: u64 = 7;
+    while more.len() < 1200 {
+        let rack: String = (0..7)
+            .map(|_| {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                b"?ABCDE"[(seed >> 33) as usize % 6] as char
+            })
+            .collect();
+        if !analysed.contains(&rack) {
+            more.insert(rack);
+        }
+    }
+    let more: Vec<String> = more.into_iter().collect();
+    sqlx::query(
+        "INSERT INTO position_analysis_records (task_claim_id, task_id, job_id, rack, analysis, num_moves)
+         SELECT $1, $2, $3, rack, 'static', 1 FROM unnest($4::text[]) AS rack",
+    )
+    .bind(claim)
+    .bind(task)
+    .bind(job)
+    .bind(&more)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let every: std::collections::HashSet<&String> = analysed.iter().chain(&more).collect();
+    let (status, body) = send(&app, get_request(&path, &[])).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let probed = racks_of(&body);
+    assert_eq!(probed.len(), 10, "{body}");
+    assert_eq!(probed.iter().collect::<std::collections::HashSet<_>>().len(), 10, "{body}");
+    assert!(probed.iter().all(|rack| every.contains(rack)), "{body}");
+
+    let games = db.games_job(2).await;
+    let (status, body) = send(&app, get_request(&format!("/api/jobs/{games}/rack-samples"), &[])).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, _) =
+        send(&app, get_request(&format!("/api/jobs/{}/rack-samples", Uuid::new_v4()), &[])).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
 /// A games job with `capture_positions` on.
 async fn capturing_games_job(db: &TestDb) -> Uuid {
     let job = db.games_job(2).await;
@@ -890,13 +987,13 @@ async fn a_simulated_position_shows_its_plies_and_its_inference() {
     assert_eq!(stored, 9, "three plies a move, three positions (game 1's too)");
 }
 
-/// A-PUBLIC-4b: a games job's captured positions are searchable by rack by a
-/// signed-in user -- newest first, a page at a time, each with its ranked
-/// moves -- the rack however it is typed, spelt as MAGPIE spells one (blank
-/// last), and by nobody signed out. A search names a rack; a job type that
-/// captures nothing is refused.
+/// A-PUBLIC-4b: a games job's captured positions are searchable by rack by
+/// anyone, signed in or not -- newest first, a page at a time, each with its
+/// ranked moves -- the rack however it is typed, spelt as MAGPIE spells one
+/// (blank last). A search names a rack; a job type that captures nothing is
+/// refused.
 #[tokio::test]
-async fn captured_positions_are_searchable_when_signed_in() {
+async fn captured_positions_are_searchable_by_anyone() {
     let db = TestDb::new().await;
     let state = db.state().await;
     let cfg = state.cfg.clone();
@@ -920,9 +1017,6 @@ async fn captured_positions_are_searchable_when_signed_in() {
     }
 
     let path = format!("/api/jobs/{job}/positions");
-    let (status, _) = send(&app, get_request(&format!("{path}?rack=AABCDE?"), &[])).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED, "signed out");
-
     let user = db.user(&format!("reader{}", Uuid::new_v4().simple()), false).await;
     let headers = admin_headers(&cfg, user);
 
@@ -971,6 +1065,9 @@ async fn captured_positions_are_searchable_when_signed_in() {
     assert_eq!(items[0]["played_move"], "8D PLAYED");
     assert_eq!(items[0]["played_move_score"], 10);
     assert_eq!(items[0]["num_moves"], 30);
+    // Signed out reads the same: an account only makes API keys.
+    let (status, signed_out) = send(&app, get_request(&format!("{path}?rack=eedcbba"), &[])).await;
+    assert_eq!((status, &signed_out), (StatusCode::OK, &later));
 
     // A rack no tile of the distribution spells finds nothing, rather than
     // failing.
@@ -991,8 +1088,8 @@ async fn captured_positions_are_searchable_when_signed_in() {
 
 /// A-PUBLIC-4c: a random position is drawn from the tasks that have one,
 /// passing over those still being played, and a job that has captured
-/// nothing -- no task yet, or none returned -- answers `null`. Signed in only;
-/// games and pairs jobs only.
+/// nothing -- no task yet, or none returned -- answers `null`. Anyone may
+/// draw, signed in or not; games and pairs jobs only.
 #[tokio::test]
 async fn a_random_position_is_drawn_from_the_tasks_that_have_one() {
     let db = TestDb::new().await;
@@ -1001,8 +1098,8 @@ async fn a_random_position_is_drawn_from_the_tasks_that_have_one() {
     let app = birdtest::app(state);
     let job = capturing_games_job(&db).await;
     let path = format!("/api/jobs/{job}/positions/random");
-    let (status, _) = send(&app, get_request(&path, &[])).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED, "signed out");
+    let (status, body) = send(&app, get_request(&path, &[])).await;
+    assert_eq!((status, &body), (StatusCode::OK, &json!(null)), "signed out, no task yet");
     let user = db.user(&format!("reader{}", Uuid::new_v4().simple()), false).await;
     let headers = admin_headers(&cfg, user);
 
@@ -1051,6 +1148,10 @@ async fn a_random_position_is_drawn_from_the_tasks_that_have_one() {
         seen.insert(body["position"].as_str().unwrap().to_string());
     }
     assert_eq!(seen.len(), 2, "both positions drawn: {seen:?}");
+    // Signed out draws from them too.
+    let (status, body) = send(&app, get_request(&path, &[])).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["task_id"], json!(task), "signed out: {body}");
 
     let racks = opening_rack_job(&db, 3).await;
     let (status, body) =
@@ -1496,7 +1597,7 @@ async fn live_pushes_are_spaced_by_the_stats_interval_but_admin_changes_are_not(
     // Mid-interval, a deactivation is pushed within a second or two.
     let refs: Vec<(&str, &str)> = headers.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
     let (status, deactivated) =
-        send(&app, post_json(&format!("/api/admin/jobs/{job}/deactivate"), &refs, serde_json::json!({}))).await;
+        send(&app, allocate(job, 0, &refs)).await;
     assert_eq!(status, StatusCode::OK, "{deactivated}");
     let event = tokio::time::timeout(std::time::Duration::from_secs(3), async {
         loop {
@@ -1721,7 +1822,7 @@ async fn a_pairs_position_without_a_partner_turn_says_so() {
     }
 
     // Out of the way, so the next claim is the games job's.
-    sqlx::query("UPDATE jobs SET status = 'inactive' WHERE id = $1")
+    sqlx::query("UPDATE jobs SET status = 'inactive', allocation = 0 WHERE id = $1")
         .bind(job)
         .execute(&db.pool)
         .await
@@ -1820,5 +1921,298 @@ async fn a_cursor_older_than_postgres_can_hold_reads_as_the_first_page() {
             assert_eq!(status, StatusCode::OK, "{path}: {body}");
             assert_eq!(body["items"], expected["items"], "{path}: the first page");
         }
+    }
+}
+
+/// A-PUBLIC-9: the API gzips its JSON for a client that asks -- deployed, the
+/// load balancer sends `/api/*` straight to the backend, past Nginx -- and
+/// sends it as it is to one that does not. Never the event stream, whose
+/// events gzip would hold back, and never an answer with no body.
+#[tokio::test]
+async fn the_api_compresses_its_json_and_never_its_event_stream() {
+    use std::io::Read;
+    let db = TestDb::new().await;
+    let job = db.games_job(2).await;
+    let app = birdtest::app(db.state().await);
+    let gzip = [("accept-encoding".to_string(), "gzip".to_string())];
+    let encoding = |response: &axum::response::Response| {
+        response.headers().get("content-encoding").map(|v| v.to_str().unwrap().to_string())
+    };
+
+    let response = app.clone().oneshot(get_request(&format!("/api/jobs/{job}"), &gzip)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(encoding(&response).as_deref(), Some("gzip"));
+    assert!(response.headers()["content-type"].to_str().unwrap().starts_with("application/json"));
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    let mut text = String::new();
+    flate2::read::GzDecoder::new(&bytes[..]).read_to_string(&mut text).unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(payload["job"]["id"], json!(job.to_string()), "{payload}");
+
+    let plain = app.clone().oneshot(get_request(&format!("/api/jobs/{job}"), &[])).await.unwrap();
+    assert_eq!(encoding(&plain), None, "not asked for");
+
+    let stream = app.clone().oneshot(get_request(&format!("/api/jobs/{job}/stream"), &gzip)).await.unwrap();
+    assert_eq!(stream.status(), StatusCode::OK);
+    assert_eq!(stream.headers()["content-type"], "text/event-stream");
+    assert_eq!(encoding(&stream), None, "the event stream is never compressed");
+
+    // An idle claim's `204`, with nothing to compress.
+    sqlx::query("UPDATE jobs SET status = 'inactive', allocation = 0").execute(&db.pool).await.unwrap();
+    let idle = app
+        .clone()
+        .oneshot(post_json("/api/worker/task", &[("accept-encoding", "gzip")], claim_body("1.0.0", &[])))
+        .await
+        .unwrap();
+    assert_eq!(idle.status(), StatusCode::NO_CONTENT);
+    assert_eq!(encoding(&idle), None);
+}
+
+/// A-PUBLIC-7a: contributions by job type -- movegens, compute time and tasks.
+/// Each accepted claim's movegens and compute time are credited to its job
+/// (`jobs.movegens`, on the job's page, and `jobs.compute_ms`) as well as to
+/// its contributor; the site's totals by type are the jobs', a contributor's
+/// breakdown is their claims', and both add up to the contributor list's
+/// columns. A purge or delete takes a job's work out of all three, as it
+/// gives it back from the contributors' totals. A contributor is named as
+/// the list names them -- an account by id, an anonymous worker by pseudonym,
+/// never by the UUID that is its credential -- and anyone the list does not
+/// show is a 404.
+#[tokio::test]
+async fn contributions_are_broken_down_by_job_type() {
+    use std::collections::HashMap;
+    let db = TestDb::new().await;
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+    let games = db.games_job(2).await;
+    let racks = opening_rack_job(&db, 3).await;
+    let user = db.user("mover", false).await;
+    let raw_key = "bt_".to_string() + &"d".repeat(64);
+    sqlx::query("INSERT INTO api_keys (user_id, key_hash) VALUES ($1, $2)")
+        .bind(user)
+        .bind(birdtest::auth::api_key::hash_key(&raw_key))
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let bearer = vec![("authorization", format!("Bearer {raw_key}"))];
+
+    // Claims whichever task the scheduler hands out and completes it,
+    // reporting `movegens`; answers the job it was for and the identity a new
+    // anonymous worker was given.
+    let complete = |headers: Vec<(&'static str, String)>, movegens: i64| {
+        let app = app.clone();
+        async move {
+            let headers: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            let (status, assignment) =
+                send(&app, post_json("/api/worker/task", &headers, claim_body("1.0.0", &[]))).await;
+            assert_eq!(status, StatusCode::OK, "{assignment}");
+            let job: Uuid = assignment["job_id"].as_str().unwrap().parse().unwrap();
+            let minted = assignment["worker_uuid"].as_str().map(str::to_string);
+            let headers = match &minted {
+                Some(uuid) if headers.is_empty() => vec![("x-worker-uuid", uuid.as_str())],
+                _ => headers,
+            };
+            let result = if job == racks {
+                let racks = assignment["task_request"]["racks"].as_array().unwrap().clone();
+                json!({ "racks": racks.iter().map(|rack| json!({
+                    "rack": rack, "num_moves": 1,
+                    "moves": [{ "move": "8G WUZ", "score": 30, "equity": 32.5 }],
+                })).collect::<Vec<_>>() })
+            } else {
+                games_result(2, 1)
+            };
+            let (status, body) = send(
+                &app,
+                post_json(
+                    "/api/worker/result",
+                    &headers,
+                    json!({
+                        "claim_token": assignment["claim_token"], "movegens": movegens, "result": result,
+                    }),
+                ),
+            )
+            .await;
+            assert_eq!((status, &body), (StatusCode::OK, &json!({ "accepted": true })));
+            (job, minted)
+        }
+    };
+
+    let (job, a) = complete(Vec::new(), 1000).await;
+    let a = a.unwrap();
+    let mut done = vec![("a", job, 1000)];
+    for (i, who) in ["user", "a", "user", "a", "user", "a", "user", "a"].into_iter().enumerate() {
+        let movegens = 2000 + 100 * i as i64;
+        let headers = match who {
+            "user" => bearer.clone(),
+            _ => vec![("x-worker-uuid", a.clone())],
+        };
+        let (job, _) = complete(headers, movegens).await;
+        done.push((who, job, movegens));
+    }
+    assert!(
+        done.iter().any(|d| d.1 == games) && done.iter().any(|d| d.1 == racks),
+        "both jobs were served: {done:?}"
+    );
+
+    const TYPES: [&str; 4] = ["opening_rack", "games", "game_pairs", "leave_generation"];
+    let type_of = |job: Uuid| if job == games { "games" } else { "opening_rack" };
+    // The movegens and the completed tasks by type that `rows` should come to.
+    let by_type = |rows: &mut dyn Iterator<Item = &(&str, Uuid, i64)>| {
+        let mut sums = HashMap::from(TYPES.map(|t| (t, (0, 0))));
+        for (_, job, movegens) in rows {
+            let sum = sums.get_mut(type_of(*job)).unwrap();
+            *sum = (sum.0 + movegens, sum.1 + 1);
+        }
+        json!(sums.into_iter().map(|(t, (m, n))| (t, json!({ "movegens": m, "tasks": n }))).collect::<HashMap<_, _>>())
+    };
+    // A breakdown without its compute time, which is the claims' own clock.
+    let counts = |v: &serde_json::Value| {
+        json!(TYPES
+            .map(|t| (t, json!({ "movegens": v[t]["movegens"], "tasks": v[t]["tasks"] })))
+            .into_iter()
+            .collect::<HashMap<_, _>>())
+    };
+    let compute = |v: &serde_json::Value, t: &str| v[t]["compute_seconds"].as_f64().unwrap();
+    let get = |path: String| {
+        let app = app.clone();
+        async move { send(&app, get_request(&path, &[])).await }
+    };
+    let pseudonym = birdtest::auth::public_anon_id(a.parse().unwrap());
+    let listed = || async {
+        let (_, body) = get("/api/workers".to_string()).await;
+        body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|w| {
+                let who = if w["user_id"] == json!(user) { "user" } else { "a" };
+                let figures = (
+                    w["movegens"].as_i64().unwrap(),
+                    w["tasks_completed"].as_i64().unwrap(),
+                    w["compute_seconds"].as_f64().unwrap(),
+                );
+                (who, figures)
+            })
+            .collect::<HashMap<_, _>>()
+    };
+    // A breakdown's totals, as the list shows a contributor's.
+    let total = |v: &serde_json::Value| {
+        TYPES.iter().fold((0, 0, 0.0), |(m, n, c), t| {
+            (m + v[t]["movegens"].as_i64().unwrap(), n + v[t]["tasks"].as_i64().unwrap(), c + compute(v, t))
+        })
+    };
+    let same = |a: (i64, i64, f64), b: (i64, i64, f64)| a.0 == b.0 && a.1 == b.1 && (a.2 - b.2).abs() < 1e-6;
+
+    // The job pages, the site, each contributor.
+    for job in [games, racks] {
+        let (_, detail) = get(format!("/api/jobs/{job}")).await;
+        let want: i64 = done.iter().filter(|d| d.1 == job).map(|d| d.2).sum();
+        assert_eq!(detail["movegens"], want, "the job's own movegens on its page");
+    }
+    let (status, site) = get("/api/workers/movegens".to_string()).await;
+    assert_eq!(status, StatusCode::OK, "{site}");
+    assert_eq!(counts(&site), by_type(&mut done.iter()));
+    let (status, mine) = get(format!("/api/workers/user/{user}/movegens")).await;
+    assert_eq!(status, StatusCode::OK, "{mine}");
+    assert_eq!(counts(&mine), by_type(&mut done.iter().filter(|d| d.0 == "user")));
+    let (status, theirs) = get(format!("/api/workers/anon/{pseudonym}/movegens")).await;
+    assert_eq!(status, StatusCode::OK, "{theirs}");
+    assert_eq!(counts(&theirs), by_type(&mut done.iter().filter(|d| d.0 == "a")));
+    // The compute time is the claims' own: the jobs' totals by type are the
+    // two contributors' together.
+    for t in TYPES {
+        let both = compute(&mine, t) + compute(&theirs, t);
+        assert!((compute(&site, t) - both).abs() < 1e-6, "{t}: {site} vs {mine} + {theirs}");
+    }
+    let list = listed().await;
+    assert!(same(total(&mine), list["user"]), "the breakdown adds up to the list: {mine} vs {:?}", list["user"]);
+    assert!(same(total(&theirs), list["a"]), "the breakdown adds up to the list: {theirs} vs {:?}", list["a"]);
+    let whole = list.values().fold((0, 0, 0.0), |s, w| (s.0 + w.0, s.1 + w.1, s.2 + w.2));
+    assert!(same(total(&site), whole), "and the site's to the whole list");
+
+    // Nobody the list does not show: an unknown account, an account that has
+    // done nothing, the worker's own UUID (its credential), a pseudonym of
+    // nobody, an anonymous worker that has done nothing.
+    let idle_user = db.user("idle", false).await;
+    let idle_anon = birdtest::auth::public_anon_id(anon_worker(&db, 0).await);
+    for path in [
+        format!("/api/workers/user/{}/movegens", Uuid::new_v4()),
+        format!("/api/workers/user/{idle_user}/movegens"),
+        format!("/api/workers/anon/{a}/movegens"),
+        format!("/api/workers/anon/{}/movegens", "0".repeat(16)),
+        format!("/api/workers/anon/{idle_anon}/movegens"),
+    ] {
+        let (status, body) = get(path.clone()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}: {body}");
+    }
+
+    // A purge takes the job's movegens out of everything, as it gives them
+    // back to its contributors.
+    let admin = db.user("root", true).await;
+    let headers = admin_headers(&state.cfg, admin);
+    let headers: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let purge = post_json(&format!("/api/admin/jobs/{racks}/purge"), &headers, json!({}));
+    let (status, body) = send(&app, purge).await;
+    assert!(status.is_success(), "{body}");
+    let kept: Vec<_> = done.iter().filter(|d| d.1 == games).cloned().collect();
+    let (_, detail) = get(format!("/api/jobs/{racks}")).await;
+    assert_eq!(detail["movegens"], 0, "a purged job starts again from nothing");
+    let (_, site) = get("/api/workers/movegens".to_string()).await;
+    assert_eq!(counts(&site), by_type(&mut kept.iter()));
+    assert_eq!(compute(&site, "opening_rack"), 0.0, "the purged job's compute time is gone: {site}");
+    let list = listed().await;
+    for (who, path) in [
+        ("user", format!("/api/workers/user/{user}/movegens")),
+        ("a", format!("/api/workers/anon/{pseudonym}/movegens")),
+    ] {
+        let (status, body) = get(path).await;
+        if !kept.iter().any(|d| d.0 == who) {
+            // All of its work was the purged job's: it is off the list.
+            assert_eq!(status, StatusCode::NOT_FOUND, "{who}: {body}");
+            assert!(!list.contains_key(who), "{who}");
+            continue;
+        }
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(counts(&body), by_type(&mut kept.iter().filter(|d| d.0 == who)), "{who}");
+        assert!(same(total(&body), list[who]), "{who}: the breakdown still adds up to the list");
+    }
+
+    // And a delete, the job's row with it: nothing is left, and nobody is
+    // listed to break down.
+    let delete = axum::http::Request::delete(format!("/api/admin/jobs/{games}"));
+    let delete = headers
+        .iter()
+        .fold(delete, |r, (k, v)| r.header(*k, *v))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let (status, body) = send(&app, delete).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (_, site) = get("/api/workers/movegens".to_string()).await;
+    assert_eq!(counts(&site), by_type(&mut std::iter::empty::<&(&str, Uuid, i64)>()));
+    assert!(TYPES.iter().all(|t| compute(&site, t) == 0.0), "{site}");
+    let (status, _) = get(format!("/api/workers/user/{user}/movegens")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "no longer a contributor");
+}
+
+/// A-PUBLIC-7a (cost): a contributor's breakdown is an index-only walk of
+/// their own claims -- the identity index carries each claim's movegens and
+/// claim time beside its completion time -- not a heap read per claim they
+/// ever made.
+#[tokio::test]
+async fn a_contributors_breakdown_reads_only_their_index() {
+    let db = TestDb::new().await;
+    for (anonymous, index) in [(false, "task_claims_user_idx"), (true, "task_claims_anon_idx")] {
+        let mut tx = db.pool.begin().await.unwrap();
+        // An empty table's pages are not known to be all-visible, which
+        // prices an index-only scan as a bitmap scan's equal.
+        sqlx::query("VACUUM task_claims").execute(&db.pool).await.unwrap();
+        sqlx::query("SET LOCAL enable_seqscan = off").execute(&mut *tx).await.unwrap();
+        sqlx::query("SET LOCAL enable_bitmapscan = off").execute(&mut *tx).await.unwrap();
+        let query = birdtest::routes::public::contributor_contributions_query(anonymous);
+        let query = query.replace("$1", &format!("'{}'", Uuid::nil()));
+        let plan: Vec<String> =
+            sqlx::query_scalar(&format!("EXPLAIN {query}")).fetch_all(&mut *tx).await.unwrap();
+        let plan = plan.join("\n");
+        assert!(plan.contains(&format!("Index Only Scan using {index}")), "{plan}");
     }
 }

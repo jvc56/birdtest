@@ -12,6 +12,18 @@ pub enum JobType {
     LeaveGeneration,
 }
 
+impl JobType {
+    /// The wire name, as serde and Postgres spell it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OpeningRack => "opening_rack",
+            Self::Games => "games",
+            Self::GamePairs => "game_pairs",
+            Self::LeaveGeneration => "leave_generation",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
 #[sqlx(type_name = "job_status", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
@@ -27,9 +39,10 @@ pub struct Job {
     /// What the admin called it; empty for a job created without one.
     pub name: String,
     pub job_type: JobType,
-    /// The job's share of the fleet while active; `None` until first
-    /// activated. There is no priority: 0% is what `inactive` means.
-    pub allocation: Option<i32>,
+    /// The job's share of the fleet: above 0% exactly when the job is active
+    /// (`jobs_allocation_is_status`), so 0% is what `inactive` means and a
+    /// completed job holds 0%. There is no priority.
+    pub allocation: i32,
     pub status: JobStatus,
     pub created_by: Option<Uuid>,
     /// Rules setting, not a file: 'classic' | 'wordsmog'.
@@ -47,13 +60,17 @@ pub struct Job {
     pub min_magpie_major: i32,
     pub min_magpie_minor: i32,
     pub min_magpie_patch: i32,
+    /// The longest one of the job's tasks may run, 600 to 86,400 seconds:
+    /// each claim's deadline is its claim time plus this as it stood then.
+    pub max_task_seconds: i32,
     /// Every claim ever issued for this job; the scheduler's deficit
     /// numerator. See `scheduler::candidate_jobs`.
     pub claims_issued: i64,
     /// Where the job's share is measured from: the scheduler orders on
     /// `(claims_issued - claims_baseline) / allocation`. Reset to parity with
-    /// the jobs being served on activation, on an allocation change and on a
-    /// purge (`scheduler::join_at_parity`); lifted to parity when a claim passes
+    /// the jobs being served on activation and on an allocation change
+    /// (`scheduler::join_at_parity`; a purge zeroes it with the job inactive);
+    /// lifted to parity when a claim passes
     /// the job over for want of a task (`scheduler::lift_passed_over`), on its
     /// first claim after a heartbeat timeout unserved, and on each claim within
     /// `scheduler::JOIN_SETTLE` of joining.
@@ -70,6 +87,15 @@ pub struct Job {
     pub test_decided_lower: Option<f64>,
     pub test_decided_upper: Option<f64>,
     pub test_decided_units: Option<i64>,
+    /// Tasks that hit the time limit -- `time_limit` declines, and claims
+    /// taken back at their deadline while their worker was alive
+    /// (`task_claims.overrun`, counted later) -- and how many of those in a
+    /// row with nothing completed between: at [`crate::routes::worker::TIME_LIMIT_STREAK`] the job is set
+    /// aside, and `set_aside_reason` says why. The reason is read only while
+    /// the job is inactive; an allocation clears it.
+    pub time_limit_declines: i64,
+    pub time_limit_streak: i32,
+    pub set_aside_reason: Option<String>,
     /// Games recorded by the job's accepted results (one per task); the dashboard's
     /// progress numerator, maintained in the submit transaction rather than
     /// summed on read. A pairs job's unit count is half of it.
@@ -80,9 +106,13 @@ pub struct Job {
     /// their most analyses without a consensus.
     pub racks_settled: i64,
     pub racks_without_consensus: i64,
+    /// The move generations the job's accepted claims reported, added in the
+    /// submit transaction beside its contributors' own totals: the job page's
+    /// figure, and summed by type, the Contributors page's.
+    pub movegens: i64,
     pub created_at: DateTime<Utc>,
-    /// When the job last joined the jobs on offer: its activation, a purge, or
-    /// its first claim after a spell unserved. The scheduler settles a job for
+    /// When the job last joined the jobs on offer: its activation, or its
+    /// first claim after a spell unserved. The scheduler settles a job for
     /// an hour from it (`scheduler::JOIN_SETTLE`); the ETA's rate is measured
     /// from it.
     pub activated_at: Option<DateTime<Utc>>,
@@ -241,6 +271,9 @@ pub struct GameConfig {
     /// Keep the position analyses produced while playing. Off by default: at
     /// ~22.5 turns a game it roughly doubles the rows a job produces.
     pub capture_positions: bool,
+    /// How MAGPIE spends its threads: `igp` or `pgp` (see
+    /// [`crate::jobs::handler::GameRequest::threading_mode`]).
+    pub threading_mode: String,
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
@@ -263,6 +296,8 @@ pub struct GamePairConfig {
     /// games' positions at the first turn they play different moves, and
     /// nothing from a pair played identically.
     pub capture_first_divergence: bool,
+    /// As on [`GameConfig::threading_mode`].
+    pub threading_mode: String,
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
@@ -395,6 +430,7 @@ mod tests {
             let wire = serde_json::to_value(job_type).unwrap();
             assert_eq!(wire, serde_json::Value::String(label.clone()));
             assert_eq!(pg_text(job_type), *label);
+            assert_eq!(job_type.as_str(), label);
             let back: JobType = serde_json::from_value(wire).unwrap();
             assert_eq!(back, *job_type);
         }
@@ -430,6 +466,7 @@ mod tests {
             max_games: 5000,
             confidence_pct: 97.5,
             capture_positions: false,
+            threading_mode: "igp".into(),
         };
         let pairs = GamePairConfig {
             job_id,
@@ -442,6 +479,7 @@ mod tests {
             confidence_pct: 97.5,
             capture_positions: false,
             capture_first_divergence: false,
+            threading_mode: "igp".into(),
         };
 
         let fields = |p: TestParams| (p.enabled, p.min_units, p.max_units, p.confidence_pct);

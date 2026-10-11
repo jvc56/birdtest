@@ -1,6 +1,6 @@
 -- RUNBOOK.md §2.0: clear what a job purged by mistake has generated since,
--- before §2.2 copies the old rows back. Deactivate the job first (admin
--- page or API); this refuses an active one.
+-- before §2.2 copies the old rows back. Deactivate the job first (0% on the
+-- admin allocation page, or the API); this refuses an active one.
 --
 --   scripts/prod-psql.sh -v job=<the job's id> scripts/ops-sql/clear-job.sql
 --
@@ -17,14 +17,14 @@ SELECT id, name, job_type, status FROM jobs WHERE id = :'job'::uuid;
 SELECT EXISTS (SELECT 1 FROM jobs WHERE id = :'job'::uuid) AS job_exists,
        EXISTS (SELECT 1 FROM jobs WHERE id = :'job'::uuid AND status = 'active') AS job_active \gset
 \if :job_active
-DO $$ BEGIN RAISE EXCEPTION 'the job is active: deactivate it first (admin page or API), then run this again'; END $$;
+DO $$ BEGIN RAISE EXCEPTION 'the job is active: set it to 0%% on the admin allocation page first, then run this again'; END $$;
 \endif
 \if :job_exists
 \else
 \echo 'no jobs row: a deleted job has nothing to clear (2.2 restores it whole)'
 \endif
 -- A purged job that completed again since -- a small job, or a force-complete --
--- cannot be deactivated from the admin page, and its verdict is from the
+-- cannot be given an allocation from the admin pages, and its verdict is from the
 -- results about to be deleted: back to inactive, with no verdict.
 UPDATE jobs SET status = 'inactive', test_decided_status = NULL,
                 test_decided_lower = NULL, test_decided_upper = NULL,

@@ -94,16 +94,6 @@ struct RatingRow {
     is_anchor: bool,
 }
 
-/// One head-to-head, with what the ratings predict against what happened.
-#[derive(Serialize)]
-struct MatrixCell {
-    row: Uuid,
-    col: Uuid,
-    pairs: f64,
-    actual: f64,
-    predicted: f64,
-}
-
 #[derive(Serialize)]
 struct RunSummary {
     id: Uuid,
@@ -138,12 +128,14 @@ struct PoolDetail {
     members: Vec<PoolMember>,
     run: Option<RunSummary>,
     ratings: Vec<RatingRow>,
-    /// Actual-versus-predicted for every head-to-head, worst first. This is
-    /// where non-transitivity becomes visible: no single rating per player can
-    /// reproduce an A-beats-B-beats-C-beats-A triangle, so the model's failure
-    /// shows up here as large residuals rather than silently distorting the
-    /// ratings.
-    residuals: Vec<MatrixCell>,
+    /// The cross table: every head-to-head with games in it, from each side
+    /// (a fit stores one; [`ratings::both_sides`]), by row then column. Each
+    /// holds the score, its standard error and the average spread, beside
+    /// what the ratings predict -- where non-transitivity becomes visible: no
+    /// single rating per player can reproduce an A-beats-B-beats-C-beats-A
+    /// triangle, so the model's failure shows up as large residuals rather
+    /// than silently distorting the ratings.
+    head_to_heads: Vec<ratings::CrossCell>,
 }
 
 async fn pool_detail(
@@ -226,25 +218,30 @@ async fn pool_detail(
     // on every view of a public, unauthenticated page, holding a connection
     // from the pool claims and submissions share. A fit stores them in the
     // same transaction as its ratings, so the two cannot disagree.
-    let residuals = match run.as_ref() {
-        Some(run) => sqlx::query(
-            "SELECT row_player_config_id, col_player_config_id, pairs, actual, predicted
-             FROM rating_run_residuals
-             WHERE run_id = $1
-             ORDER BY abs(actual - predicted) DESC, row_player_config_id, col_player_config_id",
-        )
-        .bind(run.id)
-        .fetch_all(&state.read_pool)
-        .await?
-        .iter()
-        .map(|row| MatrixCell {
-            row: row.get("row_player_config_id"),
-            col: row.get("col_player_config_id"),
-            pairs: row.get("pairs"),
-            actual: row.get("actual"),
-            predicted: row.get("predicted"),
-        })
-        .collect(),
+    let head_to_heads = match run.as_ref() {
+        Some(run) => {
+            let stored: Vec<ratings::CrossCell> = sqlx::query(
+                "SELECT row_player_config_id, col_player_config_id, pairs, actual, predicted,
+                        stderr, spread
+                 FROM rating_run_residuals
+                 WHERE run_id = $1",
+            )
+            .bind(run.id)
+            .fetch_all(&state.read_pool)
+            .await?
+            .iter()
+            .map(|row| ratings::CrossCell {
+                row: row.get("row_player_config_id"),
+                col: row.get("col_player_config_id"),
+                pairs: row.get("pairs"),
+                actual: row.get("actual"),
+                predicted: row.get("predicted"),
+                stderr: row.get("stderr"),
+                spread: row.get("spread"),
+            })
+            .collect();
+            ratings::both_sides(&stored)
+        }
         None => Vec::new(),
     };
 
@@ -259,7 +256,7 @@ async fn pool_detail(
         members,
         run,
         ratings,
-        residuals,
+        head_to_heads,
     }))
 }
 

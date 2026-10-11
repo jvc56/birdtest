@@ -246,9 +246,9 @@ describe('F-API-7 query strings', () => {
       '/api/jobs/j/positions?rack=%3FAB&per_page=1&cursor=c%2F2'
     );
 
-    respond(200, '{"items":[]}');
-    await api.jobResults('j', { per_page: 50, cursor: undefined });
-    expect(fetchMock.mock.calls.at(-1)![0]).toBe('/api/jobs/j/results?per_page=50');
+    respond(200, '{"racks":[]}');
+    await api.rackSamples('j');
+    expect(fetchMock.mock.calls.at(-1)![0]).toBe('/api/jobs/j/rack-samples?n=10');
 
     respond(200, '{"items":[]}');
     await api.auditLog({ page: 0, action: undefined });

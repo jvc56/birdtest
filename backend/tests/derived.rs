@@ -543,7 +543,7 @@ async fn two_distributions_with_one_name_size_two_different_rack_spaces() {
         )
         .await;
         assert_eq!(status, StatusCode::CREATED, "{body}");
-        let job: Uuid = body["job"]["id"].as_str().expect("a job id").parse().unwrap();
+        let job: Uuid = body["jobs"][0]["id"].as_str().expect("a job id").parse().unwrap();
         let total: i64 =
             sqlx::query_scalar("SELECT total_racks FROM job_opening_rack_config WHERE job_id = $1")
                 .bind(job)

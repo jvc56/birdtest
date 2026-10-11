@@ -247,6 +247,12 @@ pub struct GameRequest {
     /// See [`OpeningRackRequest::bingo_bonus`].
     pub bingo_bonus: i32,
     pub sim_cutoff: f64,
+    /// How MAGPIE spends its threads on the batch, the job's choice: `igp`
+    /// gives them all to one game's simulation at a time, which makes an
+    /// iteration-bounded simulation reproducible, and `pgp` plays the games in
+    /// parallel. Stated, like every setting, so no worker's build supplies its
+    /// own; it changes nothing for static players.
+    pub threading_mode: String,
     pub player1: PlayerSpec,
     pub player2: PlayerSpec,
 }

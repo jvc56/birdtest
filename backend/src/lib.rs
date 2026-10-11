@@ -68,6 +68,37 @@ pub fn app(state: state::AppState) -> Router {
             axum::http::header::X_CONTENT_TYPE_OPTIONS,
             axum::http::HeaderValue::from_static("nosniff"),
         ))
+        .layer(compression())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+/// Gzip for the API's JSON and NDJSON, for a client that asks for it.
+///
+/// Here and not in Nginx: deployed, the ALB sends `/api/*` straight to this
+/// process, so a compression Nginx did reached only the local stacks. The
+/// paginated results and the results stream compress to a sixth or less --
+/// their long key names (`blended_utility`) are most of what gzip takes out.
+///
+/// Only those two types. Never `text/event-stream`: gzip holds back what it
+/// has not yet filled a block with, so a compressed event would sit in the
+/// encoder until enough others followed it, and the live pages would stop
+/// being live. Nor a redirect, an empty answer or an error of a few bytes:
+/// nothing under 256 bytes is worth the header, and those carry no JSON type
+/// or no body. A compressed stream is still chunked, so a cut one still shows.
+fn compression() -> tower_http::compression::CompressionLayer<impl tower_http::compression::Predicate> {
+    use tower_http::compression::predicate::{NotForContentType, Predicate, SizeAbove};
+    let json = |_: axum::http::StatusCode,
+                _: axum::http::Version,
+                headers: &axum::http::HeaderMap,
+                _: &axum::http::Extensions| {
+        let essence = headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .map(str::trim);
+        matches!(essence, Some("application/json" | "application/x-ndjson"))
+    };
+    tower_http::compression::CompressionLayer::new()
+        .compress_when(SizeAbove::new(256).and(NotForContentType::SSE).and(json))
 }

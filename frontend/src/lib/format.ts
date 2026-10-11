@@ -29,46 +29,64 @@ export function duration(seconds: number | null): string {
 }
 
 /**
- * A contributor's compute time, in its two largest units: "45s", "12m",
- * "5h 20m", "3d 4h", "2y 17d". `duration` gives one unit to a decimal, which
- * reads well for a time left but blurs a total that runs to years across
- * the whole fleet: "1.0h" and "912.3d" side by side in one column.
+ * A contributor's compute time to the second, in every unit it has: "45s",
+ * "2m 13s", "5h 20m 13s", "3d 4h 5m 6s", "2y 17d 1h"; a unit that is zero is
+ * left out. `duration` gives one unit to a decimal, which reads well for a
+ * time left but blurs a total that runs to years across the whole fleet; and
+ * the two largest units alone hid a list that the page refreshes every half
+ * minute moving at all.
  */
 export function computeTime(seconds: number | null): string {
   if (seconds === null || !isFinite(seconds) || seconds < 0) return '—';
-  const s = Math.floor(seconds);
-  if (s < 60) return `${s}s`;
-  const m = Math.floor(s / 60);
-  if (m < 60) return `${m}m`;
-  const h = Math.floor(m / 60);
-  if (h < 24) return m % 60 ? `${h}h ${m % 60}m` : `${h}h`;
-  const d = Math.floor(h / 24);
-  if (d < 365) return h % 24 ? `${d}d ${h % 24}h` : `${d}d`;
-  const y = Math.floor(d / 365);
-  return d % 365 ? `${y.toLocaleString()}y ${d % 365}d` : `${y.toLocaleString()}y`;
+  let s = Math.floor(seconds);
+  if (s === 0) return '0s';
+  const parts: string[] = [];
+  for (const [size, unit] of [
+    [365 * 86400, 'y'],
+    [86400, 'd'],
+    [3600, 'h'],
+    [60, 'm'],
+    [1, 's']
+  ] as const) {
+    const count = Math.floor(s / size);
+    s -= count * size;
+    if (count) parts.push(`${count.toLocaleString()}${unit}`);
+  }
+  return parts.join(' ');
 }
 
 /**
- * A large count in three significant figures or fewer: "950", "12.3K",
- * "4.56M" reads as "4.5M", "1.2B". Rounded down, so a count never shows as
- * more than it is -- or reaches the next unit early ("1000K"). Movegens run
- * to billions per contributor, where every digit side by side is noise.
+ * What a job page says of its tasks that hit the job's time limit
+ * (`limitSeconds`): workers stop a task at the limit and hand it back (or the
+ * server takes it back a minute later), so a job whose batch is too big for
+ * it makes no progress, and the cure is the admin's -- a smaller batch, or a
+ * longer limit for this job. `null` while none has.
  */
-export function bigCount(n: number | null): string {
+export function timeLimitNotice(declines: number, limitSeconds: number): string | null {
+  if (!(declines > 0)) return null;
+  const tasks = declines === 1 ? '1 task' : `${declines.toLocaleString()} tasks`;
+  return `${tasks} hit this job's ${computeTime(limitSeconds)} time limit — lower the batch size, or raise the limit`;
+}
+
+/**
+ * A count to its last digit, grouped: "1,234,567,890". Movegens run to
+ * billions per contributor; rounded to "1.2B" the list stood still between
+ * refreshes while every contributor's count was rising.
+ */
+export function exactCount(n: number | null): string {
   if (n === null || !isFinite(n) || n < 0) return '—';
-  const units: [number, string][] = [
-    [1e12, 'T'],
-    [1e9, 'B'],
-    [1e6, 'M'],
-    [1e3, 'K']
-  ];
-  for (const [size, suffix] of units) {
-    if (n >= size) {
-      const v = n / size;
-      return `${v >= 100 ? Math.floor(v) : Math.floor(v * 10) / 10}${suffix}`;
-    }
-  }
-  return String(Math.floor(n));
+  return Math.floor(n).toLocaleString();
+}
+
+/**
+ * A job's pace in its own unit: "1,240 games/hour", "8 pairs/hour",
+ * "2.5 racks/hour". Whole units from ten up and a decimal below, where a
+ * rounded slow job read the same at twice the speed. "—" with no recent work.
+ */
+export function throughputText(t: { per_hour: number; unit: string } | null): string {
+  if (!t || !isFinite(t.per_hour) || t.per_hour < 0) return '—';
+  const n = t.per_hour >= 10 ? Math.round(t.per_hour).toLocaleString() : String(Math.round(t.per_hour * 10) / 10);
+  return `${n} ${n === '1' ? t.unit : `${t.unit}s`}/hour`;
 }
 
 export function datetime(value: string | null): string {

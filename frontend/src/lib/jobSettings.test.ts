@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { jobSettings, keySettings, playerRows, playersLine, playerSummary, show, unusedPlayerSettings, type JobConfig, type PlayerSettings } from './jobSettings';
+import { jobSettings, keySettings, playerRows, playersLine, playerSummary, differingSettings, settingsFor, show, unusedPlayerSettings, type JobConfig, type PlayerSettings } from './jobSettings';
 
 const staticPlayer: PlayerSettings = {
   role: 'player 1', id: 'p1', name: 'static-NWL23', lexicon: 'NWL23', leaves: 'NWL23', win_pct: null,
@@ -28,12 +28,13 @@ const simPlayer: PlayerSettings = {
 const config: JobConfig = {
   job: {
     id: 'j', name: 'n', job_type: 'game_pairs', variant: 'classic', letter_distribution: 'english',
-    layout: 'standard15', bingo_bonus: 50, sim_cutoff: 0, min_magpie_version: '0.1.1'
+    layout: 'standard15', bingo_bonus: 50, sim_cutoff: 0, min_magpie_version: '0.1.1',
+    max_task_seconds: 3600
   },
   games: {
     unit: 'pair', per_batch: 1, test_enabled: true, min_units: 100, max_units: 5000,
     confidence_pct: 95, capture_positions: false,
-    capture_first_divergence: false
+    capture_first_divergence: false, threading_mode: 'igp'
   },
   players: [staticPlayer, simPlayer]
 };
@@ -85,9 +86,13 @@ describe('F-SET-1 job settings', () => {
     const rows = jobSettings(config);
     expect(labels(rows)).toEqual([
       'Type', 'Variant', 'Letter Distribution', 'Board', 'Bingo Bonus', 'Maximum Pairs',
-      'Significance Test', 'Position Recorder', 'Sim Cutoff', 'Minimum Pairs', 'Pairs Per Task',
-      'Oldest MAGPIE'
+      'Significance Test', 'Position Recorder', 'Sim Cutoff', 'Threading', 'Minimum Pairs',
+      'Pairs Per Task', 'Task Time Limit', 'Oldest MAGPIE'
     ]);
+    // The job's own limit, in its units and the seconds it was set in.
+    expect(byLabel(rows, 'Task Time Limit').value).toBe(`1h (${(3600).toLocaleString()} seconds)`);
+    const shorter = jobSettings({ ...config, job: { ...config.job, max_task_seconds: 1800 } });
+    expect(byLabel(shorter, 'Task Time Limit').value).toBe(`30m (${(1800).toLocaleString()} seconds)`);
     expect(rows[0].value).toBe('Game Pairs');
     // The test and its confidence in one row.
     expect(byLabel(rows, 'Significance Test').value).toBe('yes (95%)');
@@ -113,6 +118,14 @@ describe('F-SET-1 job settings', () => {
     expect(value({ capture_positions: true, capture_first_divergence: true })).toBe('yes (first divergences)');
   });
 
+  it("names a games or pairs job's threading as the form does", () => {
+    const value = (threading_mode: 'igp' | 'pgp') =>
+      byLabel(jobSettings({ ...config, games: { ...config.games!, threading_mode } }), 'Threading').value;
+    expect(value('igp')).toBe('Intra-game parallelism (all threads on one game)');
+    expect(value('pgp')).toBe('Per-game parallelism (one game per thread)');
+    expect(labels(jobSettings(opening))).not.toContain('Threading');
+  });
+
   it('shows a job without a test its target, and none of the test it does not run', () => {
     const rows = jobSettings({ ...config, games: { ...config.games!, test_enabled: false } });
     expect(byLabel(rows, 'Pairs To Play').value).toBe((5000).toLocaleString());
@@ -123,7 +136,8 @@ describe('F-SET-1 job settings', () => {
   it("lists an opening-rack job's analyses per rack, and a leave job's generations and no sim cutoff", () => {
     expect(labels(jobSettings(opening))).toEqual([
       'Type', 'Variant', 'Letter Distribution', 'Board', 'Bingo Bonus', 'Minimum Analyses Per Rack',
-      'Maximum Analyses Per Rack', 'Consensus %', 'Sim Cutoff', 'Racks Per Task', 'Oldest MAGPIE'
+      'Maximum Analyses Per Rack', 'Consensus %', 'Sim Cutoff', 'Racks Per Task', 'Task Time Limit',
+      'Oldest MAGPIE'
     ]);
     const value = (label: string, o: Partial<NonNullable<JobConfig['opening_racks']>> = {}) =>
       byLabel(jobSettings({ ...opening, opening_racks: { ...opening.opening_racks!, ...o } }), label).value;
@@ -135,7 +149,7 @@ describe('F-SET-1 job settings', () => {
     const rows = jobSettings(leave);
     expect(labels(rows)).toEqual([
       'Type', 'Variant', 'Letter Distribution', 'Board', 'Bingo Bonus', 'Generations', 'Target Per Rack',
-      'Games Per Task', 'Racks Per Task', 'Oldest MAGPIE'
+      'Games Per Task', 'Racks Per Task', 'Task Time Limit', 'Oldest MAGPIE'
     ]);
     expect(byLabel(rows, 'Target Per Rack').value).toBe(`100 → 200 → ${(5000).toLocaleString()}`);
     // The lexicon and wordmap are the player's rows, not the job's.
@@ -247,6 +261,26 @@ describe('F-SET-1 job settings', () => {
     const rows = playerRows(config.players);
     expect(byLabel(rows, 'Plies')).toEqual({ id: 'num_plies', label: 'Plies', values: ['0', '4'], differs: true });
     expect(byLabel(rows, 'Lexicon').differs).toBe(false);
+  });
+
+  it('lists every setting the players differ in, key or not, and nothing else', () => {
+    // A difference outside the key rows (Stopping %, Time Limit) is one too:
+    // listed only under "All settings" it was missed.
+    const differences = differingSettings(config.players, unusedPlayerSettings(config));
+    expect(labels(differences)).toEqual(labels(playerRows(config.players, unusedPlayerSettings(config)).filter((r) => r.differs)));
+    expect(labels(differences)).toEqual(expect.arrayContaining(['Plies', 'Uses Inference', 'Stopping %']));
+    expect(differences.every((r) => r.differs)).toBe(true);
+    expect(settingsFor(config.players, 'differences', unusedPlayerSettings(config))).toEqual(differences);
+    // The other modes are the key rows and every row.
+    expect(settingsFor(config.players, 'key')).toEqual(keySettings(config.players));
+    expect(settingsFor(config.players, 'all')).toEqual(playerRows(config.players));
+    // A setting the job never reads is never a difference.
+    expect(labels(differingSettings([staticPlayer, { ...staticPlayer, movegen_margin: 9 }], unusedPlayerSettings(config)))).toEqual([]);
+  });
+
+  it('finds no difference in one player, or two alike', () => {
+    expect(differingSettings([staticPlayer])).toEqual([]);
+    expect(differingSettings([staticPlayer, { ...staticPlayer, role: 'player 2' }])).toEqual([]);
   });
 
   it('shows how a player solves the end of the game, where the job reaches it', () => {

@@ -6,7 +6,7 @@ test.use({ storageState: ADMIN_STATE });
 
 /**
  * E-17: a game-pairs job made through the form keeping only where each pair
- * first diverges shows a signed-in user the two games' positions of one pair,
+ * first diverges shows anyone the two games' positions of one pair,
  * one player's at a time with a toggle between them: the same turn, the same
  * rack, each player to move in one of them, its move drawn where it goes and
  * marked in its list. The fake workers synthesize first divergences the way MAGPIE keeps
@@ -34,8 +34,10 @@ test.beforeAll(async ({ browser, playwright }) => {
   const layout = form.getByLabel('Board', { exact: true });
   const board = layout.locator('option', { hasText: `standard15 (${SEEDED_DATA},` });
   await layout.selectOption((await board.getAttribute('value'))!);
-  await form.getByLabel('Player 1').selectOption({ label: names[0] });
-  await form.getByLabel('Player 2').selectOption({ label: names[1] });
+  // Two players ticked: one job between them.
+  await form.getByLabel(names[0], { exact: true }).check();
+  await form.getByLabel(names[1], { exact: true }).check();
+  await expect(form.getByTestId('matchups')).toContainText('2 configs → 1 job');
   await form.getByLabel('Pairs Per Task').fill('5');
   await form.getByLabel('Pairs To Play').fill('30');
   // Offered only once positions are saved.
@@ -44,10 +46,11 @@ test.beforeAll(async ({ browser, playwright }) => {
   await form.getByLabel('Position Recorder').check();
   await firstDivergence.check();
   await form.getByRole('button', { name: 'Create job' }).click();
-  await expect(form).toHaveURL(/\/admin\/jobs\/[0-9a-f-]{36}$/);
-  jobId = form.url().split('/').pop()!;
+  // A games or pairs job is started from the allocation page, which marks it new.
+  await expect(form).toHaveURL(/\/admin\/allocation\?new=[0-9a-f-]{36}$/);
+  jobId = new URL(form.url()).searchParams.get('new')!;
   await admin.close();
-  await api.post(`/api/admin/jobs/${jobId}/activate`, { allocation: 10 });
+  await api.allocate(jobId, 10);
 
   const request = await playwright.request.newContext({ baseURL: env.baseURL });
   await waitUntilSettled(request, jobId);

@@ -2,9 +2,10 @@
   import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
   import { api, errorText, type InputData, type JobType, type PlayerConfig } from '$lib/api';
-  import { blankFields, jobTypeLabel, leavePlayerConflict, parseTargetRackCounts, targetsText, unchosenText } from '$lib/format';
+  import { blankFields, computeTime, jobTypeLabel, leavePlayerConflict, parseTargetRackCounts, targetsText, unchosenText } from '$lib/format';
   import { consensusFields, consensusProblem as checkConsensus } from '$lib/consensus';
   import { confidenceProblem as checkConfidence } from '$lib/matchTest';
+  import { matchups as matchupsOf, matchupsAllowed, matchupSummary } from '$lib/roundRobin';
 
   let configs: PlayerConfig[] = [];
   let files: InputData[] = [];
@@ -28,6 +29,14 @@
   // writes in when the form leaves them as they are.
   let bingoBonus = 50;
   let simCutoff = 0.005;
+  // The longest one of the job's tasks may run: an hour unless changed, here
+  // or later on the job's Manage page. Ten minutes to a day, as the server
+  // holds it.
+  const MIN_TASK_SECONDS = 600;
+  const MAX_TASK_SECONDS = 86_400;
+  let maxTaskSeconds = 3600;
+  $: taskLimitValid =
+    Number.isInteger(maxTaskSeconds) && maxTaskSeconds >= MIN_TASK_SECONDS && maxTaskSeconds <= MAX_TASK_SECONDS;
 
   $: letterdists = files.filter((f) => f.role === 'letterdist');
   $: layouts = files.filter((f) => f.role === 'layout');
@@ -38,8 +47,20 @@
 
   // Per-type fields. Only the ones the selected type uses are submitted.
   let playerConfigId = '';
-  let player1 = '';
-  let player2 = '';
+  // A games or pairs job's players, ticked: one is a self-play job, more a
+  // round robin of a job per pairing. Seated in the order they were ticked,
+  // so the admin decides who is player 1 -- the checklist's own order is
+  // newest first, which says nothing about the match -- and the preview
+  // shows the seating before anything is created.
+  let ticked: string[] = [];
+  $: players = ticked
+    .map((id) => configs.find((config) => config.id === id))
+    .filter((config): config is PlayerConfig => config !== undefined);
+  function tick(id: string, on: boolean) {
+    ticked = on ? [...ticked.filter((t) => t !== id), id] : ticked.filter((t) => t !== id);
+  }
+  $: matchups = matchupsOf(players, name, (config) => config.name);
+  $: roundRobin = jobType === 'games' || jobType === 'game_pairs';
   let batchSize = 1;
   // Off by default: without a test the job plays its games and stops, and the
   // test's settings are not sent (the server refuses them without the flag).
@@ -53,6 +74,10 @@
   let capturePositions = false;
   // Game pairs, with positions saved: only each pair's first divergence.
   let captureFirstDivergence = false;
+  // How MAGPIE spends a task's threads, which matters only when a player
+  // simulates: intra-game parallelism (`igp`), all of them on one game's
+  // simulation, is the default.
+  let threadingMode: 'igp' | 'pgp' = 'igp';
   let numIterations = 10000;
   // One occurrence target per generation, as MAGPIE's `leavegen` takes them:
   // the list's length is how many generations the job runs.
@@ -110,11 +135,7 @@
 
   async function loadChoices() {
     [configs, files] = await Promise.all([api.playerConfigs(), api.inputData()]);
-    if (configs.length) {
-      playerConfigId = configs[0].id;
-      player1 = configs[0].id;
-      player2 = configs[configs.length - 1].id;
-    }
+    if (configs.length) playerConfigId = configs[0].id;
     // The letter distribution and board are left for the admin to choose: the
     // first of each was whichever was imported first, and a job made on it
     // unnoticed played with the wrong bag or board.
@@ -130,6 +151,7 @@
       letterdist_id: letterdistId,
       layout_id: layoutId,
       bingo_bonus: bingoBonus,
+      max_task_seconds: maxTaskSeconds,
       // A leave job's bot never simulates, so it states no cutoff: the server
       // refuses one.
       ...(jobType === 'leave_generation' ? {} : { sim_cutoff: simCutoff }),
@@ -155,19 +177,21 @@
       case 'games':
         return {
           ...common,
-          player1_config_id: player1, player2_config_id: player2,
+          player_config_ids: players.map((config) => config.id),
           games_per_batch: batchSize, max_games: maxUnits, ...test,
           ...(testEnabled ? { min_games: minUnits } : {}),
-          capture_positions: capturePositions
+          capture_positions: capturePositions,
+          threading_mode: threadingMode
         };
       case 'game_pairs':
         return {
           ...common,
-          player1_config_id: player1, player2_config_id: player2,
+          player_config_ids: players.map((config) => config.id),
           pairs_per_batch: batchSize, max_pairs: maxUnits, ...test,
           ...(testEnabled ? { min_pairs: minUnits } : {}),
           capture_positions: capturePositions,
-          capture_first_divergence: capturePositions && captureFirstDivergence
+          capture_first_divergence: capturePositions && captureFirstDivergence,
+          threading_mode: threadingMode
         };
       case 'leave_generation':
         return {
@@ -211,6 +235,11 @@
       fromSubmit = true;
       return;
     }
+    if (roundRobin && !matchupsAllowed(players.length)) {
+      error = `Players: ${matchupSummary(players.length)}`;
+      fromSubmit = true;
+      return;
+    }
     const request = body();
     const blank = blankFields(request);
     if (blank.length) {
@@ -221,7 +250,14 @@
     busy = true;
     try {
       const created = await api.createJob(request);
-      goto(`/admin/jobs/${created.job.id}`);
+      // A games or pairs request may have made many jobs, and every one is
+      // inactive at 0%: the allocation page is where they start, all of them
+      // in view. Any other job's own page is where to go next.
+      if (roundRobin) {
+        goto(`/admin/allocation?new=${created.jobs.map((job) => job.id).join(',')}`);
+      } else {
+        goto(`/admin/jobs/${created.jobs[0].id}`);
+      }
     } catch (e) {
       error = errorText(e);
       fromSubmit = true;
@@ -233,8 +269,9 @@
 
 <h1 class="mb-2 text-2xl font-semibold">Create a job</h1>
 <p class="mb-6 text-sm text-muted-foreground">
-  Jobs are created inactive. You set the allocation when you activate one, so you can review the
-  whole active set first.
+  Jobs are created inactive at 0%. You give them an allocation on the Allocation page, which
+  activates them, so you can review the whole active set first. A games or game-pairs job with
+  several players ticked is a round robin: one job per pairing.
 </p>
 
 <!-- Any edit clears the last server error: a submit the browser blocks never
@@ -273,6 +310,34 @@
       <p class="mt-1 text-xs text-muted-foreground">
         Server-wide floor: {serverFloor || '—'}. Workers below this are never offered the job;
         raise it per job when the work needs a newer MAGPIE.
+      </p>
+    </div>
+    <div>
+      <label class="label" for="max-task-seconds">Task Time Limit (Seconds)</label>
+      <input
+        id="max-task-seconds"
+        type="number"
+        min={MIN_TASK_SECONDS}
+        max={MAX_TASK_SECONDS}
+        step="1"
+        required
+        class="input"
+        bind:value={maxTaskSeconds}
+      />
+      <p class="mt-1 text-xs text-muted-foreground">
+        {#if taskLimitValid}
+          {computeTime(maxTaskSeconds)}.
+        {:else}
+          <span class="field-error"
+            >A whole number of seconds from {MIN_TASK_SECONDS} to {MAX_TASK_SECONDS.toLocaleString()} (ten
+            minutes to a day).</span
+          >
+        {/if}
+        A worker stops a task that runs this long and hands it back, and a claim that runs a minute
+        past it is taken back whether or not its worker still answers. Three tasks in a row that hit
+        it with none completed between set the job aside, since its batch is too big for the limit.
+        Ten minutes at the least: a worker's first task of a job may spend a few of them building
+        data it cannot stop part-way. It can be changed on the job's page later.
       </p>
     </div>
   </div>
@@ -410,20 +475,40 @@
       however large the space is.
     </p>
   {:else if jobType === 'games' || jobType === 'game_pairs'}
-    <div class="grid grid-cols-2 gap-3">
-      <div>
-        <label class="label" for="p1">Player 1</label>
-        <select id="p1" class="input" bind:value={player1} required>
-          {#each configs as config}<option value={config.id}>{config.name}</option>{/each}
-        </select>
+    <fieldset class="space-y-2" data-testid="players">
+      <legend class="label">Players</legend>
+      <p class="text-xs text-muted-foreground">
+        Tick one config for a self-play job, or several for a round robin: a job for every
+        pairing, player 1 the one ticked first.
+      </p>
+      <ul class="grid gap-1 sm:grid-cols-2">
+        {#each configs as config (config.id)}
+          <li class="flex min-w-0 items-baseline gap-2">
+            <label class="flex min-w-0 items-center gap-2">
+              <input
+                type="checkbox"
+                checked={ticked.includes(config.id)}
+                on:change={(e) => tick(config.id, e.currentTarget.checked)}
+              />
+              <span class="truncate" title={config.name}>{config.name}</span>
+            </label>
+            <span class="shrink-0 text-xs text-muted-foreground">
+              {config.num_plies > 0 ? `${config.num_plies}-ply sim` : 'static'}
+            </span>
+          </li>
+        {/each}
+      </ul>
+      <div data-testid="matchups" aria-live="polite">
+        <p class="text-sm font-medium" class:field-error={!matchupsAllowed(players.length)}>
+          {matchupSummary(players.length)}
+        </p>
+        {#if matchupsAllowed(players.length)}
+          <ul class="mt-1 list-disc pl-5 text-sm text-muted-foreground">
+            {#each matchups as matchup}<li>{matchup.name || `${matchup.player1.name} (self-play)`}</li>{/each}
+          </ul>
+        {/if}
       </div>
-      <div>
-        <label class="label" for="p2">Player 2</label>
-        <select id="p2" class="input" bind:value={player2} required>
-          {#each configs as config}<option value={config.id}>{config.name}</option>{/each}
-        </select>
-      </div>
-    </div>
+    </fieldset>
     <div class="grid {testEnabled ? 'grid-cols-3' : 'grid-cols-2'} gap-3">
       <div>
         <label class="label" for="batch">
@@ -521,6 +606,18 @@
         </p>
       {/if}
     </div>
+    <div>
+      <label class="label" for="threading">Threading</label>
+      <select id="threading" class="input" bind:value={threadingMode}>
+        <option value="igp">Intra-game parallelism (all threads on one game)</option>
+        <option value="pgp">Per-game parallelism (one game per thread)</option>
+      </select>
+      <p class="mt-1 text-xs text-muted-foreground">
+        Intra-game parallelism gives all of a task's threads to one game's simulation, which makes a
+        simulation bounded by iterations reproducible; per-game parallelism plays games in parallel,
+        a thread each. It only matters when a player simulates.
+      </p>
+    </div>
   {:else}
     {#if leaveConflict}
       <p class="field-error">{leaveConflict} Pick a static config that sorts on equity.</p>
@@ -567,5 +664,7 @@
   <!-- Announced: an error that appears after a submit is otherwise silent to a
        screen reader. -->
   {#if error}<p class="field-error" role="alert">{error}</p>{/if}
-  <button class="btn-primary" disabled={busy}>{busy ? 'Creating…' : 'Create job'}</button>
+  <button class="btn-primary" disabled={busy}>
+    {busy ? 'Creating…' : roundRobin && matchups.length > 1 ? `Create ${matchups.length} jobs` : 'Create job'}
+  </button>
 </form>

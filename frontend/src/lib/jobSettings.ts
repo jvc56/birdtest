@@ -5,7 +5,7 @@
  * ordered list; its players' are another table, side by side.
  */
 import type { JobType } from '$lib/api';
-import { jobTypeLabel, targetsText } from '$lib/format';
+import { computeTime, jobTypeLabel, targetsText } from '$lib/format';
 
 export interface PlayerSettings {
   /** Its part in a job ("player 1"); absent for a config read on its own. */
@@ -67,6 +67,8 @@ export interface JobConfig {
     bingo_bonus: number;
     sim_cutoff: number;
     min_magpie_version: string;
+    /** The longest one of the job's tasks may run, in seconds. */
+    max_task_seconds: number;
   };
   games?: {
     unit: 'game' | 'pair';
@@ -80,6 +82,11 @@ export interface JobConfig {
     capture_positions: boolean;
     /** Game pairs: only each pair's first divergence is kept. */
     capture_first_divergence: boolean;
+    /**
+     * How MAGPIE spends a task's threads: `igp` gives them all to one game's
+     * simulation, `pgp` plays games in parallel. Matters only to a simmer.
+     */
+    threading_mode: 'igp' | 'pgp';
   };
   opening_racks?: {
     racks_per_batch: number;
@@ -163,8 +170,8 @@ const setting = (id: string, label: string, value: string): JobSetting => ({ id,
  * bonus; how much it plays -- a games job's target, its significance test and
  * whether it records positions, an opening-rack job's analyses per rack and
  * the agreement that settles a rack, a leave job's generations and each one's
- * target. Then the simulation cutoff, the test's minimum, batch sizes and the
- * oldest MAGPIE. A leave job's lexicon and wordmap are its player's, and shown
+ * target. Then the simulation cutoff, a games or pairs job's threading, the
+ * test's minimum, batch sizes, the task time limit and the oldest MAGPIE. A leave job's lexicon and wordmap are its player's, and shown
  * with it; it has no sim cutoff row, since it never simulates.
  */
 export function jobSettings(c: JobConfig): JobSetting[] {
@@ -213,13 +220,27 @@ export function jobSettings(c: JobConfig): JobSetting[] {
     );
   }
   if (!l) rows.push(setting('sim_cutoff', 'Sim Cutoff', show(c.job.sim_cutoff)));
+  if (g) rows.push(setting('threading_mode', 'Threading', threadingText(g.threading_mode)));
   if (g?.test_enabled) rows.push(setting('min_units', `Minimum ${units}`, show(g.min_units)));
   if (g) rows.push(setting('per_batch', `${units} Per Task`, show(g.per_batch)));
   if (l) rows.push(setting('num_iterations', 'Games Per Task', show(l.num_iterations)));
   if (o) rows.push(setting('racks_per_batch', 'Racks Per Task', show(o.racks_per_batch)));
   if (l) rows.push(setting('racks_per_task', 'Racks Per Task', show(l.racks_per_task)));
+  rows.push(setting('max_task_seconds', 'Task Time Limit', timeLimitText(c.job.max_task_seconds)));
   rows.push(setting('min_magpie_version', 'Oldest MAGPIE', show(c.job.min_magpie_version)));
   return rows;
+}
+
+/** A job's task time limit, in its units and in the seconds it was set in: "1h (3,600 seconds)". */
+export function timeLimitText(seconds: number): string {
+  return `${computeTime(seconds)} (${seconds.toLocaleString()} seconds)`;
+}
+
+/** A games or pairs job's threading, spelt out as the job form names it. */
+export function threadingText(mode: string): string {
+  if (mode === 'igp') return 'Intra-game parallelism (all threads on one game)';
+  if (mode === 'pgp') return 'Per-game parallelism (one game per thread)';
+  return show(mode);
 }
 
 /** A player setting as the table lists it. */
@@ -228,7 +249,7 @@ interface PlayerRowSpec {
   id: string;
   label: string;
   value: (p: PlayerSettings) => string;
-  /** Always shown; the rest only under "All settings". */
+  /** A key row: listed by "Key settings only"; the rest only under "All settings". */
   key?: true;
   /** A simulation setting: "—" for a static player, hidden when all are. */
   sim?: true;
@@ -441,6 +462,27 @@ export function keySettings(players: PlayerSettings[], unused = NONE): SettingRo
  */
 export function playerRows(players: PlayerSettings[], unused = NONE): SettingRow[] {
   return rowsFor(players, false, unused);
+}
+
+/**
+ * Every setting the players differ in, key or not, in `playerRows`' order:
+ * what a reader of two configs is looking for. Empty for one player, or two
+ * alike. A setting the job never reads (`unused`) is never a difference.
+ */
+export function differingSettings(players: PlayerSettings[], unused = NONE): SettingRow[] {
+  return playerRows(players, unused).filter((r) => r.differs);
+}
+
+/**
+ * What a player settings table lists: the settings the players differ in,
+ * the key rows, or every one.
+ */
+export type SettingsMode = 'differences' | 'key' | 'all';
+
+/** The rows a player settings table lists in `mode`. */
+export function settingsFor(players: PlayerSettings[], mode: SettingsMode, unused = NONE): SettingRow[] {
+  if (mode === 'differences') return differingSettings(players, unused);
+  return mode === 'key' ? keySettings(players, unused) : playerRows(players, unused);
 }
 
 /** The players' searches in one line, for beside a job's lexicon and variant. */

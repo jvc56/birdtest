@@ -52,11 +52,11 @@
     <div class="card space-y-4">
       <div class="flex flex-wrap items-center justify-between gap-2">
         <h2 class="text-lg font-medium">Settings</h2>
-        <button type="button" class="btn-secondary" aria-expanded={all} on:click={() => (all = !all)}>
+        <button type="button" class="btn-secondary" aria-pressed={all} on:click={() => (all = !all)}>
           {all ? 'Key settings only' : 'All settings'}
         </button>
       </div>
-      <PlayerSettingsTable players={[config]} {all} />
+      <PlayerSettingsTable players={[config]} mode={all ? 'all' : 'key'} />
       <p class="text-xs">
         <a href="/api/player-configs/{config.id}" download="player-config-{config.id}.json"
           >Download every setting as JSON</a

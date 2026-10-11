@@ -39,6 +39,19 @@ export class AdminApi {
     return body<T>(response, `POST ${path}`);
   }
 
+  async put<T>(path: string, data: unknown): Promise<T> {
+    const response = await this.ctx.put(path, { data, headers: { 'x-csrf-token': this.csrf } });
+    return body<T>(response, `PUT ${path}`);
+  }
+
+  /**
+   * Sets one job's allocation: the only way a job is activated (above 0%) or
+   * deactivated (0%).
+   */
+  async allocate(jobId: string, allocation: number): Promise<void> {
+    await this.put('/api/admin/jobs/allocations', { allocations: [{ job_id: jobId, allocation }] });
+  }
+
   async delete(path: string): Promise<void> {
     const response = await this.ctx.delete(path, { headers: { 'x-csrf-token': this.csrf } });
     if (!response.ok()) throw new Error(`DELETE ${path}: ${response.status()} ${await response.text()}`);
@@ -88,16 +101,20 @@ export class AdminApi {
     return created.id;
   }
 
-  /** Creates a job on the seeded data and leaves it inactive; returns its id. */
+  /**
+   * Creates a job on the seeded data and leaves it inactive; returns its id.
+   * A games or pairs `config` names its two players as `player_config_ids`
+   * (more would be a round robin of several jobs).
+   */
   async inactiveJob(config: Record<string, unknown>): Promise<string> {
     const data = await this.seededData();
-    const created = await this.post<{ job: { id: string } }>('/api/admin/jobs', {
+    const created = await this.post<{ jobs: { id: string }[] }>('/api/admin/jobs', {
       variant: 'classic',
       letterdist_id: data.letterdist,
       layout_id: data.layout,
       ...config
     });
-    return created.job.id;
+    return created.jobs[0].id;
   }
 
   async playerConfigId(name: string): Promise<string> {
@@ -131,19 +148,21 @@ export class AdminApi {
    */
   async activeJob(config: Record<string, unknown>, allocation: number): Promise<string> {
     const data = await this.seededData();
-    const created = await this.post<{ job: { id: string } }>('/api/admin/jobs', {
+    const created = await this.post<{ jobs: { id: string }[] }>('/api/admin/jobs', {
       variant: 'classic',
       letterdist_id: data.letterdist,
       layout_id: data.layout,
       ...config
     });
-    await this.post(`/api/admin/jobs/${created.job.id}/activate`, { allocation });
-    return created.job.id;
+    await this.allocate(created.jobs[0].id, allocation);
+    return created.jobs[0].id;
   }
 }
 
 export interface JobSummary {
   id: string;
+  /** A games or pairs job between two configs is named "A vs B" for them. */
+  name: string;
   job_type: string;
   status: string;
   created_at: string;

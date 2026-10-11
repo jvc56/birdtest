@@ -3,8 +3,9 @@
    * Ratings as a dot plot with error bars.
    *
    * Deliberately **not** a bar chart. A bar encodes magnitude from zero, and
-   * Elo has no meaningful zero — its scale is anchored wherever the pool's
-   * anchor was pinned, so bar length would imply a ratio that does not exist.
+   * a rating has no meaningful zero — only gaps carry meaning (WESPA's scale,
+   * 250 points a logit), and the level is wherever the pool's anchor was
+   * pinned — so bar length would imply a ratio that does not exist.
    * A dot on a common scale encodes position, which is what a rating is.
    *
    * The error bar is the point of the chart as much as the dot: a config with

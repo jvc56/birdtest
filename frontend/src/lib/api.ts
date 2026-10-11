@@ -231,6 +231,25 @@ export interface Contributor {
   last_seen_at: string | null;
 }
 
+/**
+ * One job type's share of the work: the move generations reported for it, the
+ * compute time its claims were credited with (claim to submission) and its
+ * completed tasks.
+ */
+export interface Contribution {
+  movegens: number;
+  compute_seconds: number;
+  tasks: number;
+}
+
+/**
+ * The work by the type of job it was done for: the site's
+ * (`/api/workers/movegens`) or one contributor's
+ * (`/api/workers/user/:id/movegens`, `/api/workers/anon/:anon_id/movegens`).
+ * Every type is present, at 0 when nothing was done for it.
+ */
+export type ContributionsByType = Record<JobType, Contribution>;
+
 /** A layout square, by what it multiplies (`#` in MAGPIE's layout is a brick). */
 export type BoardSquare =
   | 'normal'
@@ -276,8 +295,8 @@ export interface JobListItem {
   name: string;
   job_type: JobType;
   status: JobStatus;
-  /** The job's share of claims while active (not of worker time: PLAN's KL-88); null until first activated. 0% means what inactive means. */
-  allocation: number | null;
+  /** The job's share of claims (not of worker time: PLAN's KL-88): above 0 exactly when the job is active, so 0% is what inactive means and a completed job holds 0. */
+  allocation: number;
   created_at: string;
   tasks_total: number;
   tasks_completed: number;
@@ -288,15 +307,15 @@ export interface JobListItem {
 }
 
 /**
- * A job's own row, as the admin actions (create, activate, deactivate,
- * complete) return it -- not the list's summary, which adds counts.
+ * A job's own row, as the admin actions (create, set allocations, complete)
+ * return it -- not the list's summary, which adds counts.
  */
 export interface JobRow {
   id: string;
   name: string;
   job_type: JobType;
   status: JobStatus;
-  allocation: number | null;
+  allocation: number;
   variant: string;
   created_at: string;
 }
@@ -389,18 +408,38 @@ export interface JobStats {
     name: string;
     job_type: JobType;
     status: JobStatus;
-    allocation: number | null;
+    allocation: number;
       min_magpie_version: string;
     created_at: string;
     created_by: string | null;
     /** The lexicons in play. A games job comparing two reads "CSW21 vs NWL23". */
     lexicon: string | null;
     variant: string | null;
+    /**
+     * Tasks that hit the time limit: stopped and handed back, or taken back at
+     * the deadline while their worker was alive.
+     */
+    time_limit_declines: number;
+    /** The job's task time limit, in seconds, which those tasks hit. */
+    max_task_seconds: number;
+    /**
+     * Why the server switched the job off, while it is off: three of its tasks
+     * in a row hit the time limit. Null for a job an admin switched off.
+     */
+    set_aside_reason: string | null;
   };
   tasks_total: number;
   tasks_completed: number;
   tasks_available: number;
   tasks_claimed: number;
+  /** The move generations the job's accepted claims reported: the work done for it. */
+  movegens: number;
+  /**
+   * Units finished an hour, over the last hour (or since activation): the
+   * rate `eta_seconds` extrapolates. Null when the job is not active or
+   * nothing finished recently.
+   */
+  throughput: { per_hour: number; unit: 'game' | 'pair' | 'rack' } | null;
   games?: GameStats;
   opening_racks?: {
     racks_analyzed: number;
@@ -554,6 +593,7 @@ export interface FleetVersion {
   workers: number;
   claims: number;
 }
+
 
 /** One run of scripts/backup.sh, as recorded in the `backups` table. */
 export interface BackupRun {
@@ -742,11 +782,9 @@ export const api = {
   jobs: (page = 0, status?: JobStatus) =>
     get<Page<JobListItem>>(`/api/jobs?page=${page}${status ? `&status=${status}` : ''}`),
   job: (id: string) => get<JobStats>(`/api/jobs/${id}`),
-  /** Cursor-paginated; see {@link CursorPage}. `?rack=` is `rackLookup`'s one page. */
-  jobResults: (id: string, params: Record<string, string | number | undefined> = {}) =>
-    get<CursorPage<Record<string, unknown>>>(
-      `/api/jobs/${id}/results?${query(params)}`
-    ),
+  /** Up to `n` distinct racks an opening-rack job has analysed, drawn at random. */
+  rackSamples: (id: string, n = 10) =>
+    get<{ racks: string[] }>(`/api/jobs/${id}/rack-samples?${query({ n })}`),
   /**
    * One rack's ranked moves in an opening-rack job, in one page: every analysis
    * of it, each with its best moves -- the whole list when there are few
@@ -770,6 +808,10 @@ export const api = {
   users: (page = 0) => get<Page<Record<string, unknown>>>(`/api/users?page=${page}`),
   workers: (page = 0, sort: ContributorSort = 'movegens') =>
     get<Page<Contributor>>(`/api/workers?page=${page}&sort=${sort}`),
+  /** The site's work by job type: movegens, compute time and tasks. */
+  siteContributions: () => get<ContributionsByType>('/api/workers/movegens'),
+  /** One contributor's, by `contributorKey` (`user/<id>` or `anon/<pseudonym>`). */
+  contributorContributions: (key: string) => get<ContributionsByType>(`/api/workers/${key}/movegens`),
 
   clientVersion: () =>
     get<{ min_magpie_version: string; download_url: string }>('/api/worker/client-version'),
@@ -844,24 +886,26 @@ export const api = {
     ),
   rebuildArtifacts: (id: string, force = false) =>
     post<ArtifactRebuild[]>(`/api/admin/jobs/${id}/rebuild-artifacts?force=${force}`),
+  /**
+   * Every job the request made, inactive at 0%: one, or for a games or pairs
+   * request naming n ≥ 2 player configs, one per pairing.
+   */
   createJob: (body: Record<string, unknown>) =>
-    post<{ job: JobRow }>('/api/admin/jobs', body),
-  activateJob: (id: string, allocation: number) =>
-    post<JobRow>(`/api/admin/jobs/${id}/activate`, { allocation }),
-  deactivateJob: (id: string) => post<JobRow>(`/api/admin/jobs/${id}/deactivate`),
+    post<{ jobs: JobRow[] }>('/api/admin/jobs', body),
   /**
    * Several jobs' allocations at once, the active jobs checked against 100%
    * as they will stand: above 0% activates a job, 0% deactivates one, and a
    * job not named keeps what it has. Nothing changes unless all of it does.
+   * The only way a job is activated or deactivated.
    */
   setAllocations: (rows: { job_id: string; allocation: number }[]) =>
     put<{ jobs: JobRow[] }>('/api/admin/jobs/allocations', { allocations: rows }),
   completeJob: (id: string) => post<JobRow>(`/api/admin/jobs/${id}/complete`),
   /**
    * An opening-rack job's consensus settings, changed: only the fields given.
-   * The job follows -- a completed one with racks unsettled again reopens
-   * (inactive, with the reason, when its allocation no longer fits), and an
-   * active one with every rack settled completes.
+   * The job follows -- a completed one with racks unsettled again reopens,
+   * inactive at 0% until it is given an allocation, and an active one with
+   * every rack settled completes.
    */
   updateConsensus: (
     id: string,
@@ -871,8 +915,16 @@ export const api = {
       job: JobRow;
       unsettled_racks: number;
       reopened: boolean;
-      reopened_inactive_reason: string | null;
     }>(`/api/admin/jobs/${id}/consensus`, body),
+  /**
+   * A job's task time limit, in seconds (600 to 86,400). The claims made from
+   * now on are given it; every claim already made keeps its deadline. One that
+   * changes nothing writes nothing.
+   */
+  updateTimeLimit: (id: string, maxTaskSeconds: number) =>
+    patch<{ max_task_seconds: number }>(`/api/admin/jobs/${id}/time-limit`, {
+      max_task_seconds: maxTaskSeconds
+    }),
   purgeJob: (id: string) => post<{ tasks_reset: number }>(`/api/admin/jobs/${id}/purge`),
   deleteJob: (id: string) => del<void>(`/api/admin/jobs/${id}`),
   deleteUser: (id: string) => del<void>(`/api/admin/users/${id}`),
@@ -910,7 +962,10 @@ export interface RatingRow {
   player_config_id: string;
   name: string;
   rating: number;
-  /** Approximate Elo standard error. Wide bars mean "barely measured". */
+  /**
+   * Approximate standard error, in rating points (WESPA's scale: a gap of
+   * 250·ln 3 ≈ 275 is a 75% score). Wide bars mean "barely measured".
+   */
   stderr: number;
   pairs_played: number;
   /**
@@ -922,12 +977,23 @@ export interface RatingRow {
   is_anchor: boolean;
 }
 
-export interface RatingResidual {
+/**
+ * One cell of a pool's cross table, from the row config's side. The API
+ * serves every head-to-head from both sides: the mirror has `1 - actual`,
+ * `1 - predicted` and `-spread`, and the same `stderr`.
+ */
+export interface RatingHeadToHead {
   row: string;
   col: string;
   pairs: number;
+  /** The row config's score per game, (W + ½D) / games, 0 to 1. */
   actual: number;
+  /** What the fitted ratings predict `actual` to be: the gap is the residual. */
   predicted: number;
+  /** The standard error of `actual`, from the pairs' score variance. */
+  stderr: number;
+  /** The row config's average spread per game: its game score minus the other's. */
+  spread: number;
 }
 
 export interface RatingRun {
@@ -962,6 +1028,6 @@ export interface RatingPoolDetail {
   members: RatingPoolMember[];
   run: RatingRun | null;
   ratings: RatingRow[];
-  residuals: RatingResidual[];
+  head_to_heads: RatingHeadToHead[];
 }
 

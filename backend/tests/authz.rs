@@ -202,10 +202,9 @@ const ROUTES: &[(&str, &str, Access, &str)] = &[
         r#"{"job_type":"opening_rack","variant":"classic","letterdist_id":"00000000-0000-4000-8000-000000000001","layout_id":"00000000-0000-4000-8000-000000000001","player_config_id":"00000000-0000-4000-8000-000000000001"}"#,
     ),
     ("PUT", "/api/admin/jobs/allocations", Admin, r#"{"allocations":[{"job_id":"00000000-0000-4000-8000-000000000001","allocation":50}]}"#),
-    ("POST", "/api/admin/jobs/:id/activate", Admin, r#"{"allocation":50}"#),
-    ("POST", "/api/admin/jobs/:id/deactivate", Admin, ""),
     ("POST", "/api/admin/jobs/:id/complete", Admin, ""),
     ("PATCH", "/api/admin/jobs/:id/consensus", Admin, r#"{"consensus_pct":80}"#),
+    ("PATCH", "/api/admin/jobs/:id/time-limit", Admin, r#"{"max_task_seconds":1800}"#),
     ("POST", "/api/admin/jobs/:id/purge", Admin, ""),
     ("DELETE", "/api/admin/jobs/:id", Admin, ""),
     ("DELETE", "/api/admin/users/:id", Admin, ""),
@@ -293,16 +292,20 @@ const ROUTES: &[(&str, &str, Access, &str)] = &[
     ("GET", "/api/jobs", Public, ""),
     ("GET", "/api/jobs/:id", Public, ""),
     ("GET", "/api/jobs/:id/results", Public, ""),
+    ("GET", "/api/jobs/:id/rack-samples", Public, ""),
     ("GET", "/api/jobs/:id/stream", Public, ""),
     ("GET", "/api/users", Public, ""),
     ("GET", "/api/workers", Public, ""),
+    ("GET", "/api/workers/movegens", Public, ""),
+    ("GET", "/api/workers/user/:id/movegens", Public, ""),
+    ("GET", "/api/workers/anon/:anon_id/movegens", Public, ""),
     ("GET", "/api/rating-pools", Public, ""),
     ("GET", "/api/rating-pools/:id", Public, ""),
     ("GET", "/api/rating-pools/:id/history", Public, ""),
     ("GET", "/api/jobs/:id/config", Public, ""),
     ("GET", "/api/jobs/:id/board", Public, ""),
-    ("GET", "/api/jobs/:id/positions", Session, ""),
-    ("GET", "/api/jobs/:id/positions/random", Session, ""),
+    ("GET", "/api/jobs/:id/positions", Public, ""),
+    ("GET", "/api/jobs/:id/positions/random", Public, ""),
     ("GET", "/api/player-configs", Public, ""),
     ("GET", "/api/player-configs/:id", Public, ""),
 ];
@@ -457,8 +460,8 @@ async fn every_cookie_backed_write_requires_the_csrf_pair() {
         }
         checked += 1;
     }
-    // 26 admin writes, 3 account writes, logout and sign-out-everywhere.
-    assert_eq!(checked, 31);
+    // 25 admin writes, 3 account writes, logout and sign-out-everywhere.
+    assert_eq!(checked, 30);
 
     // Nothing was done under any of them: the admin is still signed in, and
     // the audit log is empty.

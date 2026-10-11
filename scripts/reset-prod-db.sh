@@ -10,21 +10,30 @@
 # before the new task starts. This script is for a reset on its own -- the
 # live release on an empty database.
 #
-# Steps: the site's hostname typed (it deletes every account, admin flag, API
-# key, job, result and the imported input data), the service stopped (desired
-# count 0, by the AWS CLI: Terraform's state keeps saying one task, and the
-# next apply agrees with what this leaves), every other session of the
-# database's role ended -- a derived-data build (every five minutes) or the
-# 03:00 backup, which then mails a failure -- and the public schema dropped
-# and made again, through the ops task (scripts/prod-sql.sh). Then, unless
-# --no-start, the service started again and waited for until healthy, and the
-# checklist printed: register again, scripts/confirm-user.sh --admin, import
-# the input data.
+# Steps: the nightly dumps counted in the backups bucket and its DR replica;
+# the site's hostname typed (it deletes every account, admin flag, API key,
+# job, result and the imported input data, and those dumps), the backend's
+# service stopped (desired count 0, by the AWS CLI: Terraform's state keeps
+# saying one task, and the next apply agrees with what this leaves), every
+# other session of the database's role ended -- a derived-data build (every
+# five minutes) or the 03:00 backup, which then mails a failure -- and the
+# public schema dropped and made again, through the ops task
+# (scripts/prod-sql.sh). Then every object version and delete marker under pg/
+# in both buckets is deleted, bypassing their governance Object Lock. Then,
+# unless --no-start, the backend started again and waited for until healthy,
+# and the checklist printed: register again, scripts/confirm-user.sh --admin,
+# import the input data.
 #
-# While it runs the derived-data builder's schedule goes on starting tasks;
-# with no schema they fail and change nothing (the builder never migrates).
-# The nightly dumps in the backups bucket are kept, but they are of the old
-# schema: restoring one needs the release that wrote it.
+# The frontend's service runs on throughout: pages load, and the API answers
+# 503 until the backend is back. While it runs the derived-data builder's
+# schedule goes on starting tasks; with no schema they fail and change nothing
+# (the builder never migrates). RDS's automated backups are not touched: a
+# point-in-time restore to before the reset stays possible until they expire,
+# db_backup_retention_days (30) after it.
+#
+# The deletes need s3:ListBucketVersions, s3:DeleteObjectVersion and
+# s3:BypassGovernanceRetention on both buckets, which the deployers'
+# AdministratorAccess holds.
 #
 # Needs aws, terraform, jq, curl, the settings in ~/.birdtest-env and infra/
 # initialized with the stack's backend.

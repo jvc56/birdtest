@@ -22,10 +22,9 @@ pub fn router() -> Router<AppState> {
         .route("/player-configs/:id", get(get_player_config).delete(delete_player_config))
         .route("/jobs", post(create_job))
         .route("/jobs/allocations", put(set_allocations))
-        .route("/jobs/:id/activate", post(activate_job))
-        .route("/jobs/:id/deactivate", post(deactivate_job))
         .route("/jobs/:id/complete", post(complete_job))
         .route("/jobs/:id/consensus", patch(update_consensus))
+        .route("/jobs/:id/time-limit", patch(update_time_limit))
         .route("/jobs/:id/purge", post(purge_job))
         .route("/jobs/:id", delete(delete_job))
         .route("/users/:id", delete(delete_user))
@@ -53,6 +52,94 @@ pub fn router() -> Router<AppState> {
         .route("/derived-data/retry", post(retry_derived_data))
         .route("/backups", get(backups))
         .route("/fleet", get(fleet))
+}
+
+// ---------------------------------------------------------------------------
+// A job's task time limit
+// ---------------------------------------------------------------------------
+
+/// The longest and shortest task time limit an admin may give a job: the
+/// column's CHECK (`jobs.max_task_seconds`), which a test cannot get under
+/// either (one that wants a claim past its deadline moves the claim's
+/// `deadline_at`). Ten minutes, because a task's first claim on a machine may
+/// build the job's rack info table first -- a minute to three, which cannot
+/// be stopped part-way and is kept for every task after it -- and a limit
+/// near that would stop that task, every time, on every new machine. Over a
+/// day a lost claim held its task for that long.
+const MIN_TASK_SECONDS: i32 = 600;
+const MAX_TASK_SECONDS: i32 = 86_400;
+/// A new job's limit when its body names none: an hour, the column's own
+/// default.
+const DEFAULT_TASK_SECONDS: i32 = 3600;
+
+/// What a time limit outside those bounds is told, on its field; `None` for
+/// one inside them.
+fn time_limit_problem(seconds: i32) -> Option<String> {
+    (!(MIN_TASK_SECONDS..=MAX_TASK_SECONDS).contains(&seconds)).then(|| {
+        format!("must be between {MIN_TASK_SECONDS} and {MAX_TASK_SECONDS} (ten minutes to a day)")
+    })
+}
+
+#[derive(Deserialize)]
+struct TimeLimitBody {
+    max_task_seconds: i32,
+}
+
+/// A job's time limit as it now stands. It applies to the claims made from
+/// now on: every claim already made keeps the deadline it was given.
+#[derive(Serialize)]
+struct TimeLimitView {
+    max_task_seconds: i32,
+}
+
+/// Changes a job's task time limit, any job type and any status. The limit
+/// applies to claims made from now on: every claim keeps the deadline it was
+/// given (`task_claims.deadline_at`), which its worker was told, so a running
+/// task is neither cut short nor given longer. One `job.time_limit_changed`
+/// audit row, from what to what; a request that changes nothing is a `200`
+/// that writes nothing. Under the job's row lock, which the claim path's
+/// `UPDATE jobs` takes too, so a claim reads the limit before or after the
+/// change, never half of it.
+async fn update_time_limit(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    Path(id): Path<Uuid>,
+    method: Method,
+    headers: HeaderMap,
+    jar: CookieJar,
+    ApiJson(body): ApiJson<TimeLimitBody>,
+) -> AppResult<Json<TimeLimitView>> {
+    csrf::verify(&method, &headers, &jar)?;
+    if let Some(problem) = time_limit_problem(body.max_task_seconds) {
+        return Err(AppError::bad_request("the time limit is invalid").with_field("max_task_seconds", problem));
+    }
+    let mut tx = state.pool.begin().await?;
+    let before: i32 = sqlx::query_scalar("SELECT max_task_seconds FROM jobs WHERE id = $1 FOR UPDATE")
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| AppError::not_found("no such job"))?;
+    if before != body.max_task_seconds {
+        sqlx::query("UPDATE jobs SET max_task_seconds = $2 WHERE id = $1")
+            .bind(id)
+            .bind(body.max_task_seconds)
+            .execute(&mut *tx)
+            .await?;
+        audit::log_detail(
+            &mut tx,
+            "job.time_limit_changed",
+            admin.0.id,
+            "job",
+            id.to_string(),
+            Some(id),
+            format!("max_task_seconds {before} -> {}", body.max_task_seconds),
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    // The job's page shows its limit: read again, not from before the change.
+    crate::jobstats::forget(id);
+    Ok(Json(TimeLimitView { max_task_seconds: body.max_task_seconds }))
 }
 
 // ---------------------------------------------------------------------------
@@ -1232,6 +1319,12 @@ struct CreateJobBody {
     bingo_bonus: Option<i32>,
     #[serde(default)]
     sim_cutoff: Option<f64>,
+    /// The longest one of the job's tasks may run, in seconds
+    /// ([`MIN_TASK_SECONDS`] to [`MAX_TASK_SECONDS`]); the column's default,
+    /// an hour, when the body leaves it out. Changed later with
+    /// `PATCH /api/admin/jobs/:id/time-limit`.
+    #[serde(default)]
+    max_task_seconds: Option<i32>,
     #[serde(flatten)]
     config: JobTypeConfig,
 }
@@ -1284,8 +1377,10 @@ enum JobTypeConfig {
         max_results_per_rack: i32,
     },
     Game {
-        player1_config_id: Uuid,
-        player2_config_id: Uuid,
+        /// The configs to play each other: one is a self-play job, and n ≥ 2
+        /// a round robin of C(n, 2) jobs, one per pairing (see
+        /// [`pairings`]).
+        player_config_ids: Vec<Uuid>,
         #[serde(default = "two")]
         games_per_batch: i32,
         /// With the test off, the job plays this many games and stops; with it
@@ -1303,10 +1398,13 @@ enum JobTypeConfig {
         /// refused rather than ignored by this untagged body.
         #[serde(default)]
         capture_first_divergence: bool,
+        /// `igp` or `pgp`: see [`crate::jobs::handler::GameRequest::threading_mode`].
+        #[serde(default = "default_threading_mode")]
+        threading_mode: String,
     },
     GamePair {
-        player1_config_id: Uuid,
-        player2_config_id: Uuid,
+        /// As for `Game`: one config is self-play, n ≥ 2 a round robin.
+        player_config_ids: Vec<Uuid>,
         #[serde(default = "one")]
         pairs_per_batch: i32,
         /// With the test off, the job plays this many pairs and stops; with it
@@ -1323,6 +1421,9 @@ enum JobTypeConfig {
         /// Of the captured positions, keep only each pair's first divergence.
         #[serde(default)]
         capture_first_divergence: bool,
+        /// As for `Game`.
+        #[serde(default = "default_threading_mode")]
+        threading_mode: String,
     },
 }
 
@@ -1358,6 +1459,13 @@ impl TestRequest {
     }
 }
 
+/// Intra-game parallelism (`igp`): all of a task's threads on one game's
+/// simulation at a time, which is what makes a simulation bounded by
+/// iterations reproducible. Per-game parallelism (`pgp`), a game a thread, is
+/// the job's to ask for.
+fn default_threading_mode() -> String {
+    "igp".to_string()
+}
 fn default_consensus_pct() -> f64 {
     100.0
 }
@@ -1373,12 +1481,88 @@ fn default_rack_size() -> i32 {
 /// as it does every generation's. Seeding generation 1 here held the creating
 /// request open for the tens of seconds 3.2 million rows take.
 #[derive(Serialize)]
-struct CreatedJob {
-    job: Job,
+struct CreatedJobs {
+    /// Every job the request created, as stored: one, or for a games or
+    /// pairs request naming n ≥ 2 configs, one per pairing in the order of
+    /// [`pairings`].
+    jobs: Vec<Job>,
 }
 
-/// Jobs are always created inactive. Allocation is supplied later, at
-/// activation, so the admin sets it while looking at the whole active set.
+/// One job a request makes: its name and, for games and pairs, its seating.
+struct PlannedJob {
+    name: String,
+    pair: Option<(Uuid, Uuid)>,
+    /// "A vs B", for an error to name the pairing it is about; `None` for a
+    /// request that makes one job, whose errors need no qualifying.
+    pairing: Option<String>,
+}
+
+impl PlannedJob {
+    /// `err` about this job, named for its pairing when it has one -- in a
+    /// round robin, "player configs disagree on the win% model" alone does
+    /// not say which two.
+    fn qualify(&self, mut err: AppError) -> AppError {
+        if let Some(pairing) = &self.pairing {
+            if err.status.is_client_error() {
+                err.message = format!("{pairing}: {}", err.message);
+            }
+        }
+        err
+    }
+}
+
+/// The jobs `body` asks for: one, or for a games or pairs request naming
+/// n ≥ 2 configs, one per pairing, named "{name}: {A} vs {B}" (or "A vs B"
+/// with no name), A and B the configs' names -- two configs too, so a job's
+/// name says who plays whom however many were asked for. A self-play job (one
+/// config) and every other type keep the name as given.
+async fn plan_jobs(conn: &mut sqlx::PgConnection, body: &CreateJobBody) -> AppResult<Vec<PlannedJob>> {
+    let name = job_name(body);
+    let pairs = pairings(&body.config);
+    let one_job = match pairs.as_slice() {
+        [] => true,
+        [(a, b)] => a == b,
+        _ => false,
+    };
+    if one_job {
+        return Ok(vec![PlannedJob { name, pair: pairs.first().copied(), pairing: None }]);
+    }
+    let ids: Vec<Uuid> = pairs.iter().flat_map(|(a, b)| [*a, *b]).collect();
+    let names: std::collections::HashMap<Uuid, String> =
+        sqlx::query_as::<_, (Uuid, String)>("SELECT id, name FROM player_configs WHERE id = ANY($1)")
+            .bind(&ids)
+            .fetch_all(&mut *conn)
+            .await?
+            .into_iter()
+            .collect();
+    if let Some(missing) = ids.iter().find(|id| !names.contains_key(id)) {
+        return Err(AppError::bad_request("player config not found")
+            .with_field("player_config_ids", format!("no such player config: {missing}")));
+    }
+    let mut planned = Vec::with_capacity(pairs.len());
+    for (a, b) in pairs {
+        let pairing = format!("{} vs {}", names[&a], names[&b]);
+        let full = if name.is_empty() { pairing.clone() } else { format!("{name}: {pairing}") };
+        if let Some(problem) = name_problem(&full) {
+            return Err(AppError::bad_request("job settings are invalid").with_field(
+                "name",
+                format!("named for its pairing, {full:?} breaks a job name's rule ({problem}): shorten the name"),
+            ));
+        }
+        planned.push(PlannedJob { name: full, pair: Some((a, b)), pairing: Some(pairing) });
+    }
+    Ok(planned)
+}
+
+/// Jobs are always created inactive at 0%. The allocation is set later, on
+/// the allocation page, so the admin sets it while looking at the whole
+/// active set -- for a round robin, the whole set of pairings at once.
+///
+/// A games or pairs request naming n ≥ 2 configs creates every pairing's job
+/// or none: each pairing is checked before anything is inserted (its players
+/// must agree on what MAGPIE cannot vary per player), and all of them are
+/// inserted in one transaction, so a check that only the insert can make (two
+/// files under one name, a wordmap for too many blanks) refuses the lot.
 async fn create_job(
     State(state): State<AppState>,
     admin: AdminUser,
@@ -1386,7 +1570,7 @@ async fn create_job(
     headers: HeaderMap,
     jar: CookieJar,
     ApiJson(body): ApiJson<CreateJobBody>,
-) -> AppResult<(StatusCode, Json<CreatedJob>)> {
+) -> AppResult<(StatusCode, Json<CreatedJobs>)> {
     csrf::verify(&method, &headers, &jar)?;
 
     validate_job_body(&body)?;
@@ -1425,14 +1609,73 @@ async fn create_job(
             .unwrap_or(&state.cfg.min_magpie_version),
     );
 
+    let planned = {
+        let mut conn = state.pool.acquire().await?;
+        let planned = plan_jobs(&mut conn, &body).await?;
+        let capture = matches!(
+            body.config,
+            JobTypeConfig::Game { capture_positions: true, .. }
+                | JobTypeConfig::GamePair { capture_positions: true, .. }
+        );
+        for plan in &planned {
+            if let Some(pair) = plan.pair {
+                validate_pairing(&mut conn, pair, capture, &letterdist_name)
+                    .await
+                    .map_err(|e| plan.qualify(e))?;
+            }
+        }
+        planned
+    };
+
     let mut tx = state.pool.begin().await?;
+    let mut jobs = Vec::with_capacity(planned.len());
+    for plan in &planned {
+        let job = insert_job(&mut tx, &body, &admin, floor, plan, &letterdist_name, blanks)
+            .await
+            .map_err(|e| plan.qualify(e))?;
+        jobs.push(job);
+    }
+    tx.commit().await?;
+
+    for job in &jobs {
+        // The zeroed KLV generation 1 starts from (stored as generation 0): a
+        // multi-megabyte build and an object-store
+        // write, so it happens after the transaction commits rather than inside it.
+        registry::initialize_job_artifacts(&state, job).await?;
+
+        // Queued at creation rather than at activation: a rack info table takes
+        // minutes to build, and the admin who creates a job typically activates it
+        // in the next breath. Requesting it now means the wait happens while they
+        // are still deciding rather than after.
+        request_derived_data(&state, job.id).await?;
+    }
+
+    Ok((StatusCode::CREATED, Json(CreatedJobs { jobs })))
+}
+
+/// One planned job's row, config and audit entry, in the creating
+/// transaction.
+#[allow(clippy::too_many_arguments)]
+async fn insert_job(
+    tx: &mut sqlx::PgConnection,
+    body: &CreateJobBody,
+    admin: &AdminUser,
+    floor: crate::version::Version,
+    plan: &PlannedJob,
+    letterdist_name: &str,
+    blanks: u32,
+) -> AppResult<Job> {
     let job = sqlx::query_as::<_, Job>(
         "INSERT INTO jobs
              (job_type, variant, letterdist_id, layout_id,
               min_magpie_major, min_magpie_minor, min_magpie_patch, bingo_bonus,
-              sim_cutoff, created_by, name)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *",
+              sim_cutoff, created_by, name, created_at, max_task_seconds)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, clock_timestamp(), $12)
+         RETURNING *",
     )
+    // `clock_timestamp()`, not the column's `now()`: a round robin's jobs are
+    // inserted in one transaction, where `now()` is one instant, and every
+    // list that orders by creation then showed its pairings in id order.
     .bind(body.job_type)
     .bind(&body.variant)
     .bind(body.letterdist_id)
@@ -1448,12 +1691,13 @@ async fn create_job(
     // carry it.
     .bind(body.sim_cutoff.unwrap_or(crate::magpie_defaults::SIM_CUTOFF))
     .bind(admin.0.id)
-    .bind(job_name(&body))
+    .bind(&plan.name)
+    .bind(body.max_task_seconds.unwrap_or(DEFAULT_TASK_SECONDS))
     .fetch_one(&mut *tx)
     .await?;
 
-    insert_job_config(&mut tx, &job, &body.config, &letterdist_name).await?;
-    refuse_one_name_for_two_files(&mut tx, &job).await?;
+    insert_job_config(&mut *tx, &job, &body.config, plan.pair, letterdist_name).await?;
+    refuse_one_name_for_two_files(&mut *tx, &job).await?;
     // MAGPIE builds a wordmap, and so a rack info table, for at most two
     // blanks (`cannot create WMP with more than 2 blanks`, an abort): a job
     // that needs either on `english_super` was created, its build failed
@@ -1461,7 +1705,7 @@ async fn create_job(
     // why (the audit's pass 7). A word info table is built from the `.kwg`
     // alone, which has no blanks, so it is no reason to refuse.
     if blanks > MAGPIE_MAX_WORDMAP_BLANKS
-        && crate::derived::needs_for_job(&mut tx, job.id).await?.iter().any(|need| need.role != "wit")
+        && crate::derived::needs_for_job(&mut *tx, job.id).await?.iter().any(|need| need.role != "wit")
     {
         return Err(AppError::bad_request(
             "no wordmap or rack info table can be built for this letter distribution",
@@ -1476,7 +1720,7 @@ async fn create_job(
     }
 
     audit::log(
-        &mut tx,
+        &mut *tx,
         "job.created",
         Some(admin.0.id),
         None,
@@ -1485,20 +1729,7 @@ async fn create_job(
         Some(job.id),
     )
     .await?;
-    tx.commit().await?;
-
-    // The zeroed KLV generation 1 starts from (stored as generation 0): a
-    // multi-megabyte build and an object-store
-    // write, so it happens after the transaction commits rather than inside it.
-    registry::initialize_job_artifacts(&state, &job).await?;
-
-    // Queued at creation rather than at activation: a rack info table takes
-    // minutes to build, and the admin who creates a job typically activates it
-    // in the next breath. Requesting it now means the wait happens while they
-    // are still deciding rather than after.
-    request_derived_data(&state, job.id).await?;
-
-    Ok((StatusCode::CREATED, Json(CreatedJob { job })))
+    Ok(job)
 }
 
 /// The largest opening-rack batch accepted. A task's racks are expanded into
@@ -1583,6 +1814,61 @@ const MAX_BINGO_BONUS: i32 = 500;
 /// forever and dispatches nothing; a confidence of 100% puts a logarithm of
 /// zero in the test's interval, which then never closes. Every problem is
 /// reported at once, like registration does.
+/// The most player configs one games or pairs request names. Twelve make 66
+/// jobs, every pairing once -- more than a fleet runs at once, and as many as
+/// the allocation page can usefully show.
+const MAX_ROUND_ROBIN_CONFIGS: usize = 12;
+
+/// A games or pairs request's configs: at least one, at most
+/// [`MAX_ROUND_ROBIN_CONFIGS`], none twice. A config named twice would pair
+/// with itself in the middle of a round robin -- a self-play job is asked for
+/// by naming it alone.
+fn round_robin_problems(mut err: AppError, ids: &[Uuid]) -> AppError {
+    if ids.is_empty() {
+        err = err.with_field("player_config_ids", "must name at least one player config");
+    } else if ids.len() > MAX_ROUND_ROBIN_CONFIGS {
+        err = err.with_field(
+            "player_config_ids",
+            format!(
+                "must name at most {MAX_ROUND_ROBIN_CONFIGS} player configs ({} jobs)",
+                MAX_ROUND_ROBIN_CONFIGS * (MAX_ROUND_ROBIN_CONFIGS - 1) / 2
+            ),
+        );
+    }
+    let mut seen = std::collections::HashSet::new();
+    if let Some(twice) = ids.iter().find(|id| !seen.insert(**id)) {
+        err = err.with_field(
+            "player_config_ids",
+            format!("names {twice} twice; name a config alone for a self-play job"),
+        );
+    }
+    err
+}
+
+/// The seatings a games or pairs request asks for, as (player 1, player 2):
+/// one config plays itself, and n ≥ 2 give every pairing once, each seated in
+/// the order the configs were listed. The seat matters little -- a pair swaps
+/// seats within itself, and a games batch is even, so each player moves first
+/// in half of every task's games -- but a fixed rule keeps "A vs B" A's
+/// player-1 side wherever the job is shown. Empty for every other job type.
+fn pairings(config: &JobTypeConfig) -> Vec<(Uuid, Uuid)> {
+    let ids = match config {
+        JobTypeConfig::Game { player_config_ids, .. }
+        | JobTypeConfig::GamePair { player_config_ids, .. } => player_config_ids,
+        _ => return Vec::new(),
+    };
+    if let [only] = ids.as_slice() {
+        return vec![(*only, *only)];
+    }
+    let mut out = Vec::with_capacity(ids.len() * ids.len().saturating_sub(1) / 2);
+    for (i, a) in ids.iter().enumerate() {
+        for b in &ids[i + 1..] {
+            out.push((*a, *b));
+        }
+    }
+    out
+}
+
 fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
     let mut err = AppError::bad_request("job settings are invalid");
     if let Some(problem) = name_problem(&job_name(body)) {
@@ -1600,6 +1886,9 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
             "bingo_bonus",
             format!("must be between 0 and {MAX_BINGO_BONUS}"),
         );
+    }
+    if let Some(problem) = body.max_task_seconds.and_then(time_limit_problem) {
+        err = err.with_field("max_task_seconds", problem);
     }
     if let Some(cutoff) = body.sim_cutoff {
         // The range MAGPIE's -cutoff accepts, and the column's CHECK.
@@ -1687,9 +1976,10 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
             consensus_problems(err, *consensus_pct, *min_results_per_rack, *max_results_per_rack)
         }
         JobTypeConfig::Game {
-            games_per_batch, min_games, max_games, test, capture_positions,
-            capture_first_divergence, ..
+            player_config_ids, games_per_batch, min_games, max_games, test, capture_positions,
+            capture_first_divergence, threading_mode,
         } => {
+            let err = threading_mode_problem(round_robin_problems(err, player_config_ids), threading_mode);
             let mut err = match_test(err, "game", *games_per_batch, *min_games, *max_games, test);
             err = games_batch_field(err, "game", 1, *games_per_batch, *capture_positions);
             if *capture_first_divergence {
@@ -1700,10 +1990,11 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
             }
             // MAGPIE alternates the first mover within one run, from player 1,
             // and every task is a run of its own: at a batch of 1 player 1
-            // moved first in every game of the job, and the SPRT then in use passed two
-            // identical players on the first move alone (+42 Elo; the audit's
-            // pass 18). An even batch gives each player the first move equally
-            // in every task. Game pairs swap it within each pair already.
+            // moved first in every game of the job, so the first move's edge
+            // read as player 1's strength: enough for the test of the time to
+            // pass two identical players (the audit's pass 18). An even batch
+            // gives each player the first move equally in every task. Game
+            // pairs swap it within each pair already.
             if *games_per_batch >= 1 && games_per_batch % 2 != 0 {
                 err = err.with_field(
                     "games_per_batch",
@@ -1713,9 +2004,10 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
             err
         }
         JobTypeConfig::GamePair {
-            pairs_per_batch, min_pairs, max_pairs, test, capture_positions,
-            capture_first_divergence, ..
+            player_config_ids, pairs_per_batch, min_pairs, max_pairs, test, capture_positions,
+            capture_first_divergence, threading_mode,
         } => {
+            let err = threading_mode_problem(round_robin_problems(err, player_config_ids), threading_mode);
             let mut err = match_test(err, "pair", *pairs_per_batch, *min_pairs, *max_pairs, test);
             if *capture_first_divergence && !*capture_positions {
                 err = err.with_field(
@@ -1767,6 +2059,16 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
         Ok(())
     } else {
         Err(err)
+    }
+}
+
+/// A games or pairs job's threading mode, which MAGPIE takes as `igp` or `pgp`
+/// and nothing else (the column's CHECK).
+fn threading_mode_problem(err: AppError, threading_mode: &str) -> AppError {
+    if matches!(threading_mode, "igp" | "pgp") {
+        err
+    } else {
+        err.with_field("threading_mode", "must be 'igp' or 'pgp'")
     }
 }
 
@@ -2107,10 +2409,37 @@ async fn validate_player_compatibility(
     crate::compat::validate_job_files(&files, letterdist_name)
 }
 
+/// What a games or pairs job's two players must agree on, checked for one
+/// pairing: the win% model, the files MAGPIE loads by name, and with capture
+/// on, what a captured position keeps. A round robin checks every pairing
+/// before it inserts anything.
+async fn validate_pairing(
+    conn: &mut sqlx::PgConnection,
+    (player1, player2): (Uuid, Uuid),
+    capture_positions: bool,
+    letterdist_name: &str,
+) -> AppResult<()> {
+    validate_shared_player_options(&mut *conn, player1, player2).await?;
+    validate_player_compatibility(
+        &mut *conn,
+        &[("player1", player1), ("player2", player2)],
+        letterdist_name,
+    )
+    .await?;
+    if capture_positions {
+        validate_capture_play_cap(&mut *conn, player1, player2).await?;
+    }
+    Ok(())
+}
+
+/// Inserts the job's config row. `pair` is the games or pairs job's seating
+/// (from [`pairings`], already checked by [`validate_pairing`]); `None` for
+/// every other type.
 async fn insert_job_config(
     conn: &mut sqlx::PgConnection,
     job: &Job,
     config: &JobTypeConfig,
+    pair: Option<(Uuid, Uuid)>,
     letterdist_name: &str,
 ) -> AppResult<()> {
     // The untagged config must actually match the declared job type, or the job
@@ -2162,64 +2491,42 @@ async fn insert_job_config(
         (
             JobType::Games,
             JobTypeConfig::Game {
-                player1_config_id, player2_config_id, games_per_batch,
-                min_games, max_games, test, capture_positions, ..
+                games_per_batch, min_games, max_games, test, capture_positions, threading_mode, ..
             },
         ) => {
-            validate_shared_player_options(&mut *conn, *player1_config_id, *player2_config_id)
-                .await?;
-            validate_player_compatibility(
-                &mut *conn,
-                &[("player1", *player1_config_id), ("player2", *player2_config_id)],
-                letterdist_name,
-            )
-            .await?;
-            if *capture_positions {
-                validate_capture_play_cap(&mut *conn, *player1_config_id, *player2_config_id)
-                    .await?;
-            }
+            let (player1_config_id, player2_config_id) = pair.ok_or_else(mismatch)?;
             let test = test.settings(*min_games);
             sqlx::query(
                 "INSERT INTO job_game_config
                      (job_id, player1_config_id,
                       player2_config_id, games_per_batch, test_enabled, min_games, max_games,
-                      confidence_pct, capture_positions)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+                      confidence_pct, capture_positions, threading_mode)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
             )
             .bind(job.id)
             .bind(player1_config_id).bind(player2_config_id)
             .bind(games_per_batch).bind(test.enabled).bind(test.min_units).bind(max_games)
             .bind(test.confidence_pct)
             .bind(capture_positions)
+            .bind(threading_mode)
             .execute(conn)
             .await?;
         }
         (
             JobType::GamePairs,
             JobTypeConfig::GamePair {
-                player1_config_id, player2_config_id, pairs_per_batch,
-                min_pairs, max_pairs, test, capture_positions, capture_first_divergence,
+                pairs_per_batch, min_pairs, max_pairs, test, capture_positions,
+                capture_first_divergence, threading_mode, ..
             },
         ) => {
-            validate_shared_player_options(&mut *conn, *player1_config_id, *player2_config_id)
-                .await?;
-            validate_player_compatibility(
-                &mut *conn,
-                &[("player1", *player1_config_id), ("player2", *player2_config_id)],
-                letterdist_name,
-            )
-            .await?;
-            if *capture_positions {
-                validate_capture_play_cap(&mut *conn, *player1_config_id, *player2_config_id)
-                    .await?;
-            }
+            let (player1_config_id, player2_config_id) = pair.ok_or_else(mismatch)?;
             let test = test.settings(*min_pairs);
             sqlx::query(
                 "INSERT INTO job_game_pair_config
                      (job_id, player1_config_id,
                       player2_config_id, pairs_per_batch, test_enabled, min_pairs, max_pairs,
-                      confidence_pct, capture_positions, capture_first_divergence)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+                      confidence_pct, capture_positions, capture_first_divergence, threading_mode)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
             )
             .bind(job.id)
             .bind(player1_config_id).bind(player2_config_id)
@@ -2227,6 +2534,7 @@ async fn insert_job_config(
             .bind(test.confidence_pct)
             .bind(capture_positions)
             .bind(capture_first_divergence)
+            .bind(threading_mode)
             .execute(conn)
             .await?;
         }
@@ -2259,107 +2567,6 @@ async fn insert_job_config(
     Ok(())
 }
 
-#[derive(Deserialize)]
-struct ActivateBody {
-    allocation: i32,
-}
-
-/// Activation sets the allocation. The active jobs must sum to at most 100%,
-/// which is checked here rather than in the schema — the intermediate states
-/// an admin passes through while rebalancing would violate a DB constraint
-/// even when the end state is fine. An allocation of 0 is accepted and means
-/// what `inactive` means: the job is offered to nobody until it is raised.
-async fn activate_job(
-    State(state): State<AppState>,
-    admin: AdminUser,
-    Path(id): Path<Uuid>,
-    method: Method,
-    headers: HeaderMap,
-    jar: CookieJar,
-    ApiJson(body): ApiJson<ActivateBody>,
-) -> AppResult<Json<Job>> {
-    csrf::verify(&method, &headers, &jar)?;
-    let purges = refuse_while_purging(&state, id)?;
-
-    if !(0..=100).contains(&body.allocation) {
-        return Err(AppError::bad_request("allocation must be between 0 and 100"));
-    }
-
-    // A leave-generation job cannot dispatch without its generation-0 KLV.
-    // Creation writes it after committing, so a failed object-store write
-    // there leaves a job that exists without one; activating it as-is would
-    // make every claim against it fail. Built here, outside the transaction,
-    // for the same reason creation builds it outside its own.
-    let unlocked = crate::jobstats::load_job(&state.pool, id).await?;
-    if !registry::job_artifacts_ready(&state.pool, &unlocked).await? {
-        registry::initialize_job_artifacts(&state, &unlocked).await?;
-    }
-    // Again at activation, because the builder may have moved since creation:
-    // a deployment with a newer MAGPIE needs this job's files rebuilt under
-    // the new builder before it can dispatch, and nothing else would ask.
-    request_derived_data(&state, id).await?;
-
-    let mut tx = state.pool.begin().await?;
-    let job = load_job_for_update(&mut tx, id).await?;
-    refuse_if_purged_since(&state.dispatch_holds, id, purges)?;
-    if job.status == JobStatus::Completed {
-        return Err(AppError::conflict("a completed job cannot be reactivated"));
-    }
-
-    // Serializes activations. The row lock above covers only this job, so two
-    // jobs activated at once would each read the other's allocation as absent
-    // and together exceed 100%.
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('birdtest.activate'))")
-        .execute(&mut *tx)
-        .await?;
-
-    let others = sqlx::query_scalar::<_, Option<i64>>(
-        "SELECT SUM(allocation) FROM jobs WHERE status = 'active' AND id <> $1",
-    )
-    .bind(id)
-    .fetch_one(&mut *tx)
-    .await?
-    .unwrap_or(0);
-
-    if others + body.allocation as i64 > 100 {
-        return Err(AppError::conflict(format!(
-            "the other active jobs already allocate {others}% — {}% is the most this job can take",
-            100 - others
-        )));
-    }
-
-    sqlx::query("UPDATE jobs SET status = 'active', allocation = $1, activated_at = now() WHERE id = $2")
-        .bind(body.allocation)
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
-    // The job joins the others level with the lowest of the jobs being
-    // served, rather than with a lifetime deficit to work off at their
-    // expense. Activation is also how an allocation is changed, and a new
-    // allocation rescales the ratio, so this runs every time. Under the
-    // activation lock, so two jobs activated together each see the other or
-    // neither.
-    crate::scheduler::join_at_parity(&mut tx, id, state.cfg.heartbeat_timeout).await?;
-    let updated = sqlx::query_as::<_, Job>("SELECT * FROM jobs WHERE id = $1")
-        .bind(id)
-        .fetch_one(&mut *tx)
-        .await?;
-
-    audit::log_status_change(
-        &mut tx,
-        "job.activated",
-        admin.0.id,
-        id,
-        status_name(job.status),
-        "active",
-    )
-    .await?;
-    tx.commit().await?;
-    state.finish_checks.rearm_idle(id);
-    super::worker::push_after_change(&state, id);
-    Ok(Json(updated))
-}
-
 /// The most jobs one allocation change names: more than any fleet runs at once.
 const MAX_ALLOCATION_ROWS: usize = 200;
 
@@ -2386,16 +2593,20 @@ struct AllocationsResult {
 /// the first before the second could be raised, and an admin rebalancing
 /// three jobs had to work out an order that never passed through 101%.
 ///
-/// A row above 0% leaves its job active at that allocation, activating it if
-/// it was not; a row at 0% leaves it inactive, deactivating it if it was
-/// active (its last allocation is kept, as deactivation keeps it). A job the
-/// request does not name keeps what it has. A completed job, or one being
-/// purged, is refused, and so is everything else in the request with it:
-/// nothing changes unless all of it does.
+/// This is the only way a job is activated or deactivated: the allocation is
+/// the switch (`jobs_allocation_is_status`). A row above 0% leaves its job
+/// active at that allocation, activating it if it was not; a row at 0% leaves
+/// it inactive at 0%, deactivating it if it was active. Nothing of the old
+/// share is kept: a separate activate and deactivate, with a remembered
+/// allocation between them, made "inactive" and "0%" two states that could
+/// disagree -- an active job at 0% was on offer to nobody while every page
+/// called it running. A job the request does not name keeps what it has. A
+/// completed job, or one being purged, is refused, and so is everything else
+/// in the request with it: nothing changes unless all of it does.
 ///
-/// Each job that changes is audited as activation and deactivation are --
-/// `job.activated` / `job.deactivated` when its status changes -- and a new
-/// allocation as `job.allocation_changed`, from what to what.
+/// Each job that changes is audited once: `job.activated` / `job.deactivated`
+/// when its status changes, and `job.allocation_changed` when an active job
+/// stays active at a new share -- each with the allocation from what to what.
 async fn set_allocations(
     State(state): State<AppState>,
     admin: AdminUser,
@@ -2430,9 +2641,12 @@ async fn set_allocations(
         purges.insert(row.job_id, refuse_while_purging(&state, row.job_id)?);
     }
 
-    // What activation does first, for each job this activates: a leave job's
-    // generation-0 KLV, and its derived files under this deployment's
-    // builder. Outside the transaction, as there.
+    // First, for each job this activates: a leave job's generation-0 KLV --
+    // creation writes it after committing, so a failed object-store write
+    // there leaves a job without one, and every claim against it would fail
+    // -- and its derived files under this deployment's builder, which may
+    // have moved since creation. Outside the transaction, for the reason
+    // creation builds them outside its own.
     for row in body.allocations.iter().filter(|r| r.allocation > 0) {
         let unlocked = match crate::jobstats::load_job(&state.pool, row.job_id).await {
             Ok(job) => job,
@@ -2449,9 +2663,10 @@ async fn set_allocations(
     }
 
     let mut tx = state.pool.begin().await?;
-    // Every row first, in id order, then the activation lock: the order
-    // `activate_job` takes them in (a row, then the lock), so the two never
-    // wait on each other the wrong way round.
+    // Every row first, in id order, then the activation lock, which
+    // serializes allocation changes: the row locks cover only the jobs named,
+    // so two requests naming different jobs would each read the other's
+    // allocations as they were and together exceed 100%.
     let mut ids: Vec<Uuid> = body.allocations.iter().map(|r| r.job_id).collect();
     ids.sort();
     let locked: Vec<Job> = sqlx::query_as::<_, Job>(
@@ -2506,64 +2721,74 @@ async fn set_allocations(
     let mut changed = Vec::new();
     for row in &body.allocations {
         let job = &before[&row.job_id];
-        let active = job.status == JobStatus::Active;
+        if row.allocation == job.allocation {
+            continue;
+        }
+        let moved = format!("{}% -> {}%", job.allocation, row.allocation);
         if row.allocation > 0 {
-            if active && job.allocation == Some(row.allocation) {
-                continue;
-            }
+            // A job set aside for tasks that hit the time limit starts a new
+            // run of them, and is no longer set aside
+            // (`worker::record_time_limit`): the admin has decided it should
+            // run, and may have raised the limit since. The run starts now, so
+            // an overrun from before it, counted later, is not part of it. An
+            // active job's new share keeps its run.
             sqlx::query(
-                "UPDATE jobs SET status = 'active', allocation = $1, activated_at = now() WHERE id = $2",
+                "UPDATE jobs SET status = 'active', allocation = $1, activated_at = now(),
+                                 time_limit_streak = CASE WHEN status = 'active'
+                                                          THEN time_limit_streak ELSE 0 END,
+                                 time_limit_streak_since = CASE WHEN status = 'active'
+                                                                THEN time_limit_streak_since
+                                                                ELSE now() END,
+                                 set_aside_reason = NULL
+                 WHERE id = $2",
             )
             .bind(row.allocation)
             .bind(row.job_id)
             .execute(&mut *tx)
             .await?;
-            // As activation does, and for the same reason: a new allocation
-            // rescales the job's ratio, so it joins level with the jobs being
-            // served rather than with a deficit to work off.
+            // The job joins the others level with the lowest of the jobs
+            // being served, rather than with a lifetime deficit to work off at
+            // their expense -- and a new allocation rescales its ratio, so an
+            // active job's change does the same.
             crate::scheduler::join_at_parity(&mut tx, row.job_id, state.cfg.heartbeat_timeout).await?;
-            if !active {
-                audit::log_status_change(
-                    &mut tx,
-                    "job.activated",
-                    admin.0.id,
-                    row.job_id,
-                    status_name(job.status),
-                    "active",
-                )
-                .await?;
-                activated.push(row.job_id);
-            }
-            if job.allocation != Some(row.allocation) {
-                let from = job.allocation.map_or("none".to_string(), |a| format!("{a}%"));
-                audit::log_detail(
-                    &mut tx,
-                    "job.allocation_changed",
-                    admin.0.id,
-                    "job",
-                    row.job_id.to_string(),
-                    Some(row.job_id),
-                    format!("{from} -> {}%", row.allocation),
-                )
-                .await?;
-            }
-            changed.push(row.job_id);
-        } else if active {
-            sqlx::query("UPDATE jobs SET status = 'inactive' WHERE id = $1")
+        } else {
+            sqlx::query("UPDATE jobs SET status = 'inactive', allocation = 0 WHERE id = $1")
                 .bind(row.job_id)
                 .execute(&mut *tx)
                 .await?;
+        }
+        // One row per job: a status change when it switched on or off,
+        // naming the allocation it moved between, and otherwise the new
+        // allocation alone.
+        let to = if row.allocation > 0 { JobStatus::Active } else { JobStatus::Inactive };
+        if to != job.status {
+            let action = if to == JobStatus::Active { "job.activated" } else { "job.deactivated" };
             audit::log_status_change(
                 &mut tx,
-                "job.deactivated",
+                action,
                 admin.0.id,
                 row.job_id,
                 status_name(job.status),
-                "inactive",
+                status_name(to),
+                Some(&moved),
             )
             .await?;
-            changed.push(row.job_id);
+            if to == JobStatus::Active {
+                activated.push(row.job_id);
+            }
+        } else {
+            audit::log_detail(
+                &mut tx,
+                "job.allocation_changed",
+                admin.0.id,
+                "job",
+                row.job_id.to_string(),
+                Some(row.job_id),
+                moved,
+            )
+            .await?;
         }
+        changed.push(row.job_id);
     }
 
     let after: std::collections::HashMap<Uuid, Job> =
@@ -2590,49 +2815,6 @@ async fn set_allocations(
     Ok(Json(AllocationsResult { jobs }))
 }
 
-async fn deactivate_job(
-    State(state): State<AppState>,
-    admin: AdminUser,
-    Path(id): Path<Uuid>,
-    method: Method,
-    headers: HeaderMap,
-    jar: CookieJar,
-) -> AppResult<Json<Job>> {
-    csrf::verify(&method, &headers, &jar)?;
-    let purges = refuse_while_purging(&state, id)?;
-
-    let mut tx = state.pool.begin().await?;
-    let before = load_job_for_update(&mut tx, id).await?;
-    refuse_if_purged_since(&state.dispatch_holds, id, purges)?;
-    // Completion is final as far as the lifecycle actions go (only a purge,
-    // or an opening-rack job's consensus edit, takes a job out of it).
-    // Flipping a completed job to inactive would be a way around that rule:
-    // activation only refuses jobs that are *currently* completed, so
-    // deactivate-then-activate would restart it.
-    if before.status == JobStatus::Completed {
-        return Err(AppError::conflict("a completed job cannot be deactivated"));
-    }
-    let job = sqlx::query_as::<_, Job>(
-        "UPDATE jobs SET status = 'inactive' WHERE id = $1 RETURNING *",
-    )
-    .bind(id)
-    .fetch_one(&mut *tx)
-    .await?;
-
-    audit::log_status_change(
-        &mut tx,
-        "job.deactivated",
-        admin.0.id,
-        id,
-        status_name(before.status),
-        "inactive",
-    )
-    .await?;
-    tx.commit().await?;
-    super::worker::push_after_change(&state, id);
-    Ok(Json(job))
-}
-
 async fn complete_job(
     State(state): State<AppState>,
     admin: AdminUser,
@@ -2653,11 +2835,13 @@ async fn complete_job(
     if before.status == JobStatus::Completed {
         return Err(AppError::conflict("this job is already completed"));
     }
-    let job =
-        sqlx::query_as::<_, Job>("UPDATE jobs SET status = 'completed' WHERE id = $1 RETURNING *")
-            .bind(id)
-            .fetch_one(&mut *tx)
-            .await?;
+    // At 0%, as every completed job is: its share goes back to the fleet.
+    let job = sqlx::query_as::<_, Job>(
+        "UPDATE jobs SET status = 'completed', allocation = 0 WHERE id = $1 RETURNING *",
+    )
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await?;
 
     audit::log_status_change(
         &mut tx,
@@ -2666,6 +2850,7 @@ async fn complete_job(
         id,
         status_name(before.status),
         "completed",
+        None,
     )
     .await?;
     tx.commit().await?;
@@ -2694,11 +2879,9 @@ struct ConsensusResult {
     config: OpeningRackConfig,
     /// How many of its racks the settings leave unsettled.
     unsettled_racks: i64,
-    /// Whether the change took a completed job back out of completed.
+    /// Whether the change took a completed job back out of completed. A
+    /// reopened job is inactive at 0% until an allocation is set for it.
     reopened: bool,
-    /// Why a reopened job is inactive rather than active: the other active
-    /// jobs leave no room for its allocation.
-    reopened_inactive_reason: Option<String>,
 }
 
 /// Changes an opening-rack job's consensus settings -- the fewest and most
@@ -2708,9 +2891,8 @@ struct ConsensusResult {
 /// the fields given change; none that differ is a `200` that writes nothing.
 ///
 /// The job then starts or stops to match. A completed job the change leaves
-/// with unsettled racks is reopened: active at its allocation if the other
-/// active jobs leave room for it, inactive otherwise (the admin then makes
-/// room and activates it). Either way a completed job's final exports become
+/// with unsettled racks is reopened, inactive at 0%: the admin gives it an
+/// allocation when it should run. A completed job's final exports become
 /// snapshots, since the standings they carry are the old settings': the job
 /// has a new final corpus once it completes again, or, left completed, once
 /// it is exported again. An active job
@@ -2834,62 +3016,26 @@ async fn consensus_body(
     )
     .await?;
 
-    // A completed job with racks to analyse again goes back to work. A job
-    // the server completed has its first pass covered (it completes only
-    // once every rack is settled), so what it hands out now are the
-    // unsettled racks. One an admin force-completed may not: `next_request`
+    // A completed job with racks to analyse again is taken back out of
+    // completed. A job the server completed has its first pass covered (it
+    // completes only once every rack is settled), so what it hands out once
+    // given an allocation are the unsettled racks. One an admin force-completed may not: `next_request`
     // resumes its first pass where it stopped before it reissues anything.
     // That is the behaviour as built; whether an edit should undo a
     // force-complete at all is an open question (PLAN.md, "Editing the
     // consensus").
-    let mut reopened_inactive_reason = None;
     let reopened = job.status == JobStatus::Completed && unsettled > 0;
     if reopened {
-        // Serialized with activations, which check the same sum.
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtext('birdtest.activate'))")
+        // Inactive, at the 0% a completed job holds: completion kept nothing
+        // of its old share to come back to, and the fleet may have been given
+        // to other jobs since. The admin sets its allocation when it should
+        // run (on the allocation page), as for a job just created.
+        sqlx::query("UPDATE jobs SET status = 'inactive' WHERE id = $1")
+            .bind(id)
             .execute(&mut *tx)
             .await?;
-        let others = sqlx::query_scalar::<_, Option<i64>>(
-            "SELECT SUM(allocation) FROM jobs WHERE status = 'active' AND id <> $1",
-        )
-        .bind(id)
-        .fetch_one(&mut *tx)
-        .await?
-        .unwrap_or(0);
-        // A job never activated has no allocation, and one at 0% is offered to
-        // nobody: either way it comes back inactive, for the admin to give
-        // it one.
-        let allocation = job.allocation.unwrap_or(0);
-        let fits = allocation > 0 && others + i64::from(allocation) <= 100;
-        if fits {
-            sqlx::query("UPDATE jobs SET status = 'active', activated_at = now() WHERE id = $1")
-                .bind(id)
-                .execute(&mut *tx)
-                .await?;
-            crate::scheduler::join_at_parity(&mut tx, id, state.cfg.heartbeat_timeout).await?;
-        } else {
-            sqlx::query("UPDATE jobs SET status = 'inactive' WHERE id = $1")
-                .bind(id)
-                .execute(&mut *tx)
-                .await?;
-            reopened_inactive_reason = Some(if allocation == 0 {
-                "it has no allocation: activate it with one".to_string()
-            } else {
-                format!(
-                    "the other active jobs allocate {others}%, which leaves no room for its \
-                     {allocation}%: free some and activate it"
-                )
-            });
-        }
-        audit::log_status_change(
-            &mut tx,
-            if fits { "job.activated" } else { "job.deactivated" },
-            admin_id,
-            id,
-            "completed",
-            if fits { "active" } else { "inactive" },
-        )
-        .await?;
+        audit::log_status_change(&mut tx, "job.deactivated", admin_id, id, "completed", "inactive", None)
+            .await?;
     }
     // Any change to a completed job's settings, not only one that reopens
     // it: each line of an export carries its rack's standing under the
@@ -2914,17 +3060,6 @@ async fn consensus_body(
     // a 5xx would skip the finish check below and invite a second edit.
     // Logged instead, as the purge does.
     if job.status == JobStatus::Active {
-        if reopened {
-            // As activation does: the builder may have moved since the job
-            // last dispatched.
-            if let Err(err) = request_derived_data(&state, id).await {
-                tracing::error!(
-                    job_id = %id, error = %err.message,
-                    "could not queue a reopened job's derived file builds; deactivating and \
-                     activating it queues them"
-                );
-            }
-        }
         // A check paced out under the old settings must not delay the one
         // that can now complete it -- or wait on racks they unsettled.
         state.finish_checks.rearm_idle(id);
@@ -2945,7 +3080,7 @@ async fn consensus_body(
             job
         }
     };
-    Ok(Json(ConsensusResult { job, config, unsettled_racks: unsettled, reopened, reopened_inactive_reason }))
+    Ok(Json(ConsensusResult { job, config, unsettled_racks: unsettled, reopened }))
 }
 
 /// An edit's request, checked: the job's settings as they stand (`FOR UPDATE`
@@ -3000,7 +3135,7 @@ async fn unchanged_consensus(
     .bind(job.id)
     .fetch_one(&mut *conn)
     .await?;
-    Ok(ConsensusResult { job, config, unsettled_racks: unsettled, reopened: false, reopened_inactive_reason: None })
+    Ok(ConsensusResult { job, config, unsettled_racks: unsettled, reopened: false })
 }
 
 /// What a job is about to lose, as a single line for `audit_log.reason`.
@@ -3087,11 +3222,13 @@ struct PurgeResult {
 /// What each identity earned on this job, to be given back when its claims
 /// are destroyed.
 ///
-/// The counters on `jobs` belong to the job, so a purge simply zeroes them. The
-/// ones on `users` and `anonymous_workers` do not: they span every job an
-/// identity ever worked on, so a job whose claims are about to disappear has to
-/// hand back exactly what it contributed, or the contributor lists read high
-/// for good and nothing says why. Must be read *before* the claims go, since it
+/// The counters on `jobs` belong to the job, so a purge simply zeroes them --
+/// its `movegens` with the rest, which is this same sum over every identity --
+/// and a delete takes them with the row. The ones on `users` and
+/// `anonymous_workers` do not: they span every job an identity ever worked on,
+/// so a job whose claims are about to disappear has to hand back exactly what
+/// it contributed, or the contributor lists read high for good and nothing
+/// says why. Must be read *before* the claims go, since it
 /// counts them; and it is exact up to the commit, because the caller holds the
 /// job's dispatch lock and every open claim (`lock_open_claims`), so no claim
 /// of the job can complete in between.
@@ -3377,18 +3514,24 @@ async fn purge_body(
     // alone, a purged job would restart owing the scheduler every claim it ever
     // had, and reporting progress it no longer has any results for.
     //
-    // A completed job goes back to inactive: it has nothing left to be complete
-    // about, and a completed job cannot be activated, so one purged in place
-    // was an empty job nothing could ever run again -- where the purge is
-    // meant to start it over. Active and inactive jobs keep their state.
+    // And the job starts over as a new one does: inactive at 0%, whatever it
+    // was. A completed job has nothing left to be complete about, and one
+    // purged in place was an empty job nothing could ever run again. An
+    // active one stops too, so a purge leaves every job in the one state a
+    // created job is in, and the emptied job takes no claims until the admin
+    // gives it an allocation again -- which joins it at parity with the jobs
+    // being served then, as any activation does, rather than owed every claim
+    // the jobs beside it have issued.
     sqlx::query(
         "UPDATE jobs SET claims_issued = 0, games_completed = 0, racks_analyzed = 0,
                          racks_settled = 0, racks_without_consensus = 0,
-                         tasks_total = 0, tasks_completed = 0, last_completed_at = NULL,
+                         tasks_total = 0, tasks_completed = 0, movegens = 0, compute_ms = 0,
+                         last_completed_at = NULL,
                          test_decided_status = NULL, test_decided_lower = NULL,
                          test_decided_upper = NULL, test_decided_units = NULL,
-                         status = CASE WHEN status = 'completed' THEN 'inactive'::job_status
-                                       ELSE status END
+                         time_limit_declines = 0, time_limit_streak = 0,
+                         time_limit_streak_since = NULL, set_aside_reason = NULL,
+                         status = 'inactive', allocation = 0, claims_baseline = 0
          WHERE id = $1",
     )
     .bind(id)
@@ -3461,13 +3604,6 @@ async fn purge_body(
         Some(id),
     )
     .await?;
-    // A job back at zero claims would otherwise be first in every candidate
-    // list until it had re-issued as many as the jobs beside it. Last, not
-    // beside the counters it follows: the other jobs go on issuing claims for
-    // the minutes the cascade above takes, and parity taken before it left the
-    // purged job that far behind, heading every candidate list until it had
-    // caught up.
-    crate::scheduler::join_at_parity(&mut tx, id, state.cfg.heartbeat_timeout).await?;
     // One matrix build per pool on the next sweep, which is what the sweep
     // did every time before it had its cheap check. Before the give-back:
     // this can wait out a running fit, and waiting with every contributor's
@@ -3957,8 +4093,8 @@ async fn rebuild_artifacts(
     // declines, and sets the job aside. Deactivate first.
     if query.force && job.status == JobStatus::Active {
         return Err(AppError::conflict(
-            "deactivate the job before forcing a rebuild: workers mid-task would refuse the \
-             rewritten objects",
+            "deactivate the job (0% on the allocation page) before forcing a rebuild: workers \
+             mid-task would refuse the rewritten objects",
         ));
     }
     let job_data = crate::jobs::load_job_data(&mut conn, job.id).await?;
@@ -4420,8 +4556,7 @@ mod tests {
     fn game_pairs(overrides: serde_json::Value) -> CreateJobBody {
         let mut config = serde_json::json!({
             "job_type": "game_pairs",
-            "player1_config_id": Uuid::nil(),
-            "player2_config_id": Uuid::nil(),
+            "player_config_ids": [Uuid::nil()],
             "test_enabled": true,
             "min_pairs": 100,
             "max_pairs": 1000,
@@ -4432,6 +4567,45 @@ mod tests {
 
     fn fields(result: AppResult<()>) -> Vec<String> {
         result.expect_err("should be rejected").fields.into_iter().map(|(f, _)| f).collect()
+    }
+
+    /// A games or pairs request names one config (self-play) or a round robin
+    /// of up to twelve, none twice; nothing else.
+    #[test]
+    fn a_round_robin_names_one_to_twelve_configs_once_each() {
+        let with = |ids: Vec<Uuid>| game_pairs(serde_json::json!({ "player_config_ids": ids }));
+        let ids: Vec<Uuid> = (0..13).map(|_| Uuid::new_v4()).collect();
+        for n in [1, 2, 4, 12] {
+            assert!(validate_job_body(&with(ids[..n].to_vec())).is_ok(), "{n} configs");
+        }
+        for refused in [Vec::new(), ids.clone(), vec![ids[0], ids[1], ids[0]]] {
+            assert_eq!(fields(validate_job_body(&with(refused.clone()))), ["player_config_ids"], "{refused:?}");
+        }
+    }
+
+    /// One config plays itself; n ≥ 2 give C(n, 2) pairings, each once, each
+    /// seated in the order the configs were listed.
+    #[test]
+    fn pairings_are_every_pair_once_in_the_order_given() {
+        let ids: Vec<Uuid> = (0..4).map(|_| Uuid::new_v4()).collect();
+        let pairs = |n: usize| pairings(&game_pairs(serde_json::json!({ "player_config_ids": ids[..n] }))
+            .config);
+        assert_eq!(pairs(1), [(ids[0], ids[0])]);
+        assert_eq!(pairs(2), [(ids[0], ids[1])]);
+        assert_eq!(pairs(3), [(ids[0], ids[1]), (ids[0], ids[2]), (ids[1], ids[2])]);
+        let four = pairs(4);
+        assert_eq!(four.len(), 6);
+        assert_eq!(
+            four,
+            [
+                (ids[0], ids[1]), (ids[0], ids[2]), (ids[0], ids[3]),
+                (ids[1], ids[2]), (ids[1], ids[3]), (ids[2], ids[3]),
+            ]
+        );
+        let opening = body(serde_json::json!({
+            "job_type": "opening_rack", "player_config_id": ids[0],
+        }));
+        assert!(pairings(&opening.config).is_empty(), "only games and pairs are paired");
     }
 
     #[test]
@@ -4446,8 +4620,7 @@ mod tests {
         let target_only = |job_type: &str, target: &str| {
             let mut config = serde_json::json!({
                 "job_type": job_type,
-                "player1_config_id": Uuid::nil(),
-                "player2_config_id": Uuid::nil(),
+                "player_config_ids": [Uuid::nil()],
             });
             config[target] = serde_json::json!(500);
             body(config)
@@ -4478,8 +4651,7 @@ mod tests {
         // Left out, the flag is off too: a pre-flag script's body.
         let unflagged = body(serde_json::json!({
             "job_type": "game_pairs",
-            "player1_config_id": Uuid::nil(),
-            "player2_config_id": Uuid::nil(),
+            "player_config_ids": [Uuid::nil()],
             "min_pairs": 100,
             "max_pairs": 1000,
         }));
@@ -4492,8 +4664,7 @@ mod tests {
     fn the_test_needs_its_floor() {
         let mut config = serde_json::json!({
             "job_type": "game_pairs",
-            "player1_config_id": Uuid::nil(),
-            "player2_config_id": Uuid::nil(),
+            "player_config_ids": [Uuid::nil()],
             "test_enabled": true,
             "max_pairs": 1000,
         });
@@ -4523,8 +4694,7 @@ mod tests {
         let games = |batch: serde_json::Value| {
             let mut config = serde_json::json!({
                 "job_type": "games",
-                "player1_config_id": Uuid::nil(),
-                "player2_config_id": Uuid::nil(),
+                "player_config_ids": [Uuid::nil()],
                 "test_enabled": true,
                 "min_games": 100,
                 "max_games": 1000,
@@ -4551,8 +4721,7 @@ mod tests {
         let games = |batch: i32, capture: bool| {
             body(serde_json::json!({
                 "job_type": "games",
-                "player1_config_id": Uuid::nil(),
-                "player2_config_id": Uuid::nil(),
+                "player_config_ids": [Uuid::nil()],
                 "test_enabled": true,
                 "min_games": 100,
                 "max_games": 100_000,

@@ -4,7 +4,7 @@
   import { api, type JobStats, type RackLookupRow } from '$lib/api';
   import { subscribeToJob } from '$lib/sse';
   import { session } from '$lib/auth';
-  import { datetime, jobTypeLabel, jobTitle } from '$lib/format';
+  import { datetime, exactCount, jobTypeLabel, jobTitle } from '$lib/format';
   import JobStatusCard from '$lib/components/JobStatusCard.svelte';
   import JobStatsRow from '$lib/components/JobStatsRow.svelte';
   import TaskCounts from '$lib/components/TaskCounts.svelte';
@@ -35,17 +35,25 @@
   $: lookupIters = rackMoves ? showsIterations(rackMoves) : false;
   $: seeksConsensus = (config?.opening_racks?.max_results_per_rack ?? 1) > 1;
   let rackError = '';
-  // A few racks the job has analysed, to try the search on: the newest, from
-  // the results feed. Read once, when the page knows it is an opening-rack job.
+  // A few racks the job has analysed, to try the search on, drawn at random
+  // across the job: the newest results' were the tail of one batch, racks a
+  // fixed stride apart in the enumeration and so alphabetically close. Read
+  // once the page knows it is an opening-rack job, and again on "Shuffle".
   let sampleRacks: string[] = [];
   let samplesRequested = false;
+  let shuffling = false;
+  function drawSamples() {
+    shuffling = true;
+    api
+      .rackSamples(jobId)
+      .then((samples) => (sampleRacks = samples.racks))
+      // A failed shuffle keeps the racks shown; a failed first draw shows none.
+      .catch(() => {})
+      .finally(() => (shuffling = false));
+  }
   $: if (stats?.opening_racks && !samplesRequested) {
     samplesRequested = true;
-    api
-      .jobResults(jobId, { per_page: 50 })
-      // One record per rack per accepted claim, so a rack can repeat.
-      .then((page) => (sampleRacks = [...new Set(page.items.map((r) => String(r.rack)))].slice(0, 10)))
-      .catch(() => (sampleRacks = []));
+    drawSamples();
   }
 
   onMount(() => {
@@ -151,37 +159,19 @@
       </p>
     </div>
 
-    {#if config}
-      <JobSettings {config} />
-    {/if}
-
     {#if stats.games}
       <MatchScore games={stats.games} players={config?.players.map((p) => p.name) ?? []} />
     {/if}
     <MatchTestCard {stats} players={config?.players.map((p) => p.name) ?? []} />
 
     {#if config?.games?.capture_positions}
-      {#if $session}
-        <SavedPositions
-          {jobId}
-          players={config.players.map((p) => p.name)}
-          paired={config.job.job_type === 'game_pairs'}
-          firstDivergence={config.games.capture_first_divergence}
-          progress={stats.games?.units_completed ?? 0}
-        />
-      {:else if $session === null}
-        <div class="card space-y-1">
-          <h2 class="text-lg font-medium">Saved positions</h2>
-          <p class="text-sm text-muted-foreground">
-            {#if config.games.capture_first_divergence}
-              This job keeps the turn where each game pair's two games first diverged.
-            {:else}
-              This job keeps the position analysed on every turn of its games.
-            {/if}
-            <a href="/login?next={encodeURIComponent(`/jobs/${jobId}`)}">Sign in</a> to search them.
-          </p>
-        </div>
-      {/if}
+      <SavedPositions
+        {jobId}
+        players={config.players.map((p) => p.name)}
+        paired={config.job.job_type === 'game_pairs'}
+        firstDivergence={config.games.capture_first_divergence}
+        progress={stats.games?.units_completed ?? 0}
+      />
     {/if}
 
     <!-- Ratings are pool-scoped and live on /ratings: a rating is a statement
@@ -243,12 +233,18 @@
               {#each sampleRacks as rack}
                 <button
                   class="rounded border border-border px-2 py-0.5 font-mono text-xs hover:bg-muted"
+                  data-testid="rack-sample"
                   on:click={() => {
                     rackQuery = rack;
                     lookupRack();
                   }}>{rack}</button
                 >
               {/each}
+              <button
+                class="px-1 text-xs text-primary hover:underline disabled:opacity-50"
+                disabled={shuffling}
+                on:click={drawSamples}>Shuffle</button
+              >
             </div>
           {/if}
           {#if rackError}<p class="field-error">{rackError}</p>{/if}
@@ -378,12 +374,16 @@
           and {stats.other_workers.toLocaleString()} more
         </p>
       {/if}
+      <p class="mt-2 text-sm text-muted-foreground" data-testid="job-movegens">
+        <span class="break-all tabular-nums text-foreground">{exactCount(stats.movegens)}</span> movegens
+        for this job
+      </p>
     </div>
 
-    <p class="text-sm text-muted-foreground">
-      Raw results: <a href="/api/jobs/{jobId}/results">paginated JSON</a>. Bulk
-      downloads are an admin operation — a full scan holds a database connection
-      for as long as it runs.
-    </p>
+    <!-- The settings last: what the job is doing comes before how it was
+         set up. -->
+    {#if config}
+      <JobSettings {config} />
+    {/if}
   </div>
 {/if}

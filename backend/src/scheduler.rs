@@ -39,6 +39,32 @@ pub struct TaskClaim {
     /// The wordmap and rack info table hashes this job's tasks must reproduce.
     /// Empty for a job whose players ask for neither.
     pub derived_data: std::sync::Arc<Vec<crate::derived::ExpectedDerived>>,
+    /// What the worker calls the job when it says what it is running: its
+    /// name, or for a job created without one its type and the start of its
+    /// id. Never empty.
+    pub job_name: String,
+    /// How long the worker may run the task: `settings.max_task_seconds` as it
+    /// stood when this claim was made, from which the claim's deadline was
+    /// set. A worker that reaches it stops and declines `time_limit`.
+    pub max_task_seconds: i32,
+}
+
+/// How long past its deadline a claim still stands: what a worker that stopped
+/// at the limit has to say so in, or to land a result it finished just
+/// before it. Past it the claim lapses, heartbeats or not
+/// ([`reclaim_expired_for`]), and its result is refused
+/// (`routes::worker::submit_result`).
+pub const DEADLINE_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// [`TaskClaim::job_name`].
+fn job_name_for_worker(job: &Job) -> String {
+    let name = job.name.trim();
+    if name.is_empty() {
+        let id = job.id.simple().to_string();
+        format!("{} job {}", job.job_type.as_str(), &id[..8])
+    } else {
+        name.to_string()
+    }
 }
 
 /// The four answers a claim can get. One decision, not four checks: `204` and
@@ -153,9 +179,10 @@ const PARITY_TARGET: &str = "(SELECT MIN(p.ratio)
 ///
 /// This is start-time fair queuing's rule: a flow that (re)joins starts at the
 /// system's current virtual time, not at zero. Called wherever a job's
-/// standing changes -- activation (which is also how an allocation is changed)
-/// and purge -- inside that operation's transaction, after it has written the
-/// job's new allocation and counters. From then on the job is simply one more
+/// standing changes -- an allocation change, which is also how a job is
+/// activated (a purge leaves a job inactive, so it rejoins when activated
+/// again) -- inside that operation's transaction, after it has written the
+/// job's new allocation. From then on the job is simply one more
 /// candidate: selection stays deterministic, stays one statement, and still
 /// converges on the configured shares, because every job's numerator counts
 /// from the same moment in the fleet's history.
@@ -202,7 +229,7 @@ pub async fn join_at_parity(
     served_within: std::time::Duration,
 ) -> AppResult<()> {
     // `activated_at` is when the job last joined: activation sets it, and a
-    // purge and a return from a spell unserved are joins too. It starts the
+    // return from a spell unserved is a join too. It starts the
     // settling window, and the rate window of the job's ETA.
     sqlx::query(&format!(
         "UPDATE jobs j
@@ -213,7 +240,7 @@ pub async fn join_at_parity(
                            FROM jobs o
                            WHERE o.status = 'active' AND o.allocation > 0 AND o.id <> $1),
                           0)
-                 * COALESCE(j.allocation, 0)
+                 * j.allocation
              )::bigint
          WHERE j.id = $1"
     ))
@@ -429,6 +456,27 @@ async fn shutdown_or_idle(
 /// process. Each timed-out claim flips to `abandoned`, the task's
 /// `active_claim_count` drops, and the task returns to `available`.
 ///
+/// A claim has timed out when no heartbeat has come for `timeout_secs`, or
+/// when it is past its deadline (`task_claims.deadline_at`) and
+/// [`DEADLINE_GRACE`] -- however recently it heartbeat. A worker that honours
+/// the limit has declined such a claim by then; one that does not (an older
+/// build, a hung solve still heartbeating) would otherwise hold the task's
+/// one slot for as long as it ran.
+///
+/// A claim lapsed at its deadline whose worker was alive when it lapsed --
+/// its last heartbeat within `timeout_secs` of the deadline and the grace,
+/// however late this sweep comes round -- is marked an overrun
+/// (`task_claims.overrun`, `pending`): a task that hit the time limit, which
+/// counts toward setting its job aside as a `time_limit` decline does. A
+/// solve or a build that overruns MAGPIE's stop declines only after the
+/// claim has lapsed, and that decline is a `404`, so without this a job whose
+/// tasks always overrun would be handed out for ever. One whose worker had
+/// gone silent by then is a dead worker's, and is not. Marked here and
+/// counted later, by whoever next holds the job's row for it
+/// ([`count_overruns`], `routes::worker::record_time_limit`): this statement
+/// runs over every candidate job on the claim path, and taking their rows
+/// would serialize every claim behind it.
+///
 /// Safe against a submission for the same claim racing it: the submit path
 /// holds the claim row locked from its lookup to its commit, and this
 /// statement skips a locked claim rather than waiting on it, so a claim is
@@ -452,7 +500,8 @@ pub async fn reclaim_expired(pool: &PgPool, job_id: Uuid, timeout_secs: f64) -> 
 /// The scan is the same either way: the planner reaches the expired claims
 /// through the partial index on open claims -- one entry per claim currently in
 /// flight across the fleet -- and filters by job afterwards, because
-/// no index on `task_claims` leads with the job. Run per job, a claim request
+/// no index on `task_claims` leads with the job (but the overruns', which
+/// holds next to nothing). Run per job, a claim request
 /// therefore paid that scan once per candidate, for a set of rows that does not
 /// depend on the job at all. Run once over all of them it is a single pass and
 /// a single round trip.
@@ -463,17 +512,22 @@ pub async fn reclaim_expired_for(
 ) -> AppResult<u64> {
     let result = sqlx::query(
         "WITH lapsed AS (
-             SELECT c.id
+             SELECT c.id,
+                    c.deadline_at < now() - make_interval(secs => $3)
+                    AND COALESCE(c.last_heartbeat_at, c.claimed_at)
+                        >= c.deadline_at + make_interval(secs => $3 - $2) AS overran
              FROM task_claims c
              JOIN tasks t ON t.id = c.task_id
              WHERE t.job_id = ANY($1)
                AND c.state = 'claimed'
-               AND COALESCE(c.last_heartbeat_at, c.claimed_at) < now() - make_interval(secs => $2)
+               AND (COALESCE(c.last_heartbeat_at, c.claimed_at) < now() - make_interval(secs => $2)
+                    OR c.deadline_at < now() - make_interval(secs => $3))
              FOR UPDATE OF c SKIP LOCKED
          ),
          expired AS (
              UPDATE task_claims c
-             SET state = 'abandoned'
+             SET state = 'abandoned',
+                 overrun = CASE WHEN lapsed.overran THEN 'pending'::claim_overrun END
              FROM lapsed
              WHERE c.id = lapsed.id
              RETURNING c.task_id
@@ -496,6 +550,7 @@ pub async fn reclaim_expired_for(
     )
     .bind(job_ids)
     .bind(timeout_secs)
+    .bind(DEADLINE_GRACE.as_secs_f64())
     .execute(pool)
     .await?;
 
@@ -522,6 +577,13 @@ pub async fn reclaim_expired_for(
 /// chance to speak as any other and is reclaimed as before. What this costs is
 /// that a claim whose worker really did die during the outage is handed out
 /// again up to one timeout later than it might have been.
+///
+/// Deadlines wait out the same grace, for the same reason: a worker that
+/// finished its task during the outage has been retrying the submission it
+/// could not land, and lapsing its claim at the first request after the
+/// restart refused a result computed inside the limit. The submission path
+/// asks [`deadlines_enforced`] before refusing one past its deadline, so a
+/// claim the sweep would spare is not refused there either.
 pub async fn reclaim_lapsed(state: &AppState, job_ids: &[Uuid]) -> AppResult<u64> {
     if std::time::Instant::now() < state.reclaim_from {
         return Ok(0);
@@ -534,6 +596,79 @@ pub async fn reclaim_lapsed(state: &AppState, job_ids: &[Uuid]) -> AppResult<u64
         return Ok(0);
     }
     reclaim_expired_for(&state.pool, &job_ids, state.cfg.heartbeat_timeout.as_secs_f64()).await
+}
+
+/// Whether a claim of `job_id` past its deadline and [`DEADLINE_GRACE`] is
+/// lapsed now: what [`reclaim_lapsed`] would decide, asked by a submission.
+/// Not while this process is in its startup grace, nor while the job's claims
+/// are in the grace after a hold let go of them -- each time the worker could
+/// not reach the claim (an outage, a purge's `503`s), and its result is as
+/// late as the server made it.
+pub fn deadlines_enforced(state: &AppState, job_id: Uuid) -> bool {
+    std::time::Instant::now() >= state.reclaim_from
+        && !state.dispatch_holds.reclaimable(&[job_id]).is_empty()
+}
+
+/// Counts the overruns reclamation marked on the claims of `job_ids`
+/// (`task_claims.overrun`) against their jobs, and returns the jobs that set
+/// aside (`routes::worker::record_time_limit`).
+///
+/// Reclamation marks them without taking any job's row; this is where they
+/// are counted, by the job's next claim, holding the job's dispatch lock as
+/// that claim would: a purge or a delete holds it for all it does, so the two
+/// never meet, and the claims of the job queue behind it rather than hand out
+/// a task of a job about to be set aside. Then the job's row, then its
+/// overruns. Each job in a transaction of its own, before the claim's.
+///
+/// What a claim with nothing to count pays is one statement, through
+/// `task_claims_overrun_idx`: it holds only the overruns nobody has counted
+/// yet -- each lives from the reclamation that marks it to its job's next
+/// claim, decline or late result -- so it is all but always empty, and never
+/// more than the claims that were in flight. A job held by a purge or a
+/// delete (`jobs::DispatchHolds`), or whose dispatch lock does not come within
+/// its bounded wait, is left to the next claim. Not fatal: a failure is
+/// logged, and the overrun counted next time.
+async fn count_overruns(state: &AppState, job_ids: &[Uuid]) -> Vec<Uuid> {
+    let pending: Vec<Uuid> = match sqlx::query_scalar(
+        "SELECT DISTINCT job_id FROM task_claims WHERE overrun = 'pending' AND job_id = ANY($1)",
+    )
+    .bind(job_ids)
+    .fetch_all(&state.pool)
+    .await
+    {
+        Ok(pending) => pending,
+        Err(err) => {
+            tracing::error!(error = %err, "looking for overruns to count failed");
+            return Vec::new();
+        }
+    };
+    let mut set_aside = Vec::new();
+    for job_id in pending {
+        if state.dispatch_holds.is_held(job_id) {
+            continue;
+        }
+        match count_overruns_of(state, job_id).await {
+            Ok(true) => {
+                // No admin action is coming to push this to open pages.
+                crate::routes::worker::push_after_change(state, job_id);
+                set_aside.push(job_id);
+            }
+            Ok(false) => {}
+            Err(err) => tracing::error!(%job_id, error = %err.message, "counting overruns failed"),
+        }
+    }
+    set_aside
+}
+
+/// [`count_overruns`] for one job: whether it set the job aside.
+async fn count_overruns_of(state: &AppState, job_id: Uuid) -> AppResult<bool> {
+    let mut tx = state.pool.begin().await?;
+    if !crate::jobs::try_lock_job_dispatch(&mut tx, job_id).await? {
+        return Ok(false);
+    }
+    let set_aside = crate::routes::worker::record_time_limit(&mut tx, job_id, None).await?;
+    tx.commit().await?;
+    Ok(set_aside)
 }
 
 /// Walk the candidate jobs in deficit order and hand out the first available
@@ -592,6 +727,18 @@ pub async fn claim(
         let job_ids: Vec<Uuid> = jobs.iter().map(|job| job.id).collect();
         if let Err(err) = reclaim_lapsed(state, &job_ids).await {
             tracing::error!(error = %err.message, "reclaiming expired claims failed");
+        }
+        // Then the overruns that reclamation -- this one or an earlier one --
+        // marked and nobody has counted: a job they set aside is offered to
+        // nobody, this worker included, who is handed other work or none.
+        let set_aside = count_overruns(state, &job_ids).await;
+        let jobs: Vec<Job> = if set_aside.is_empty() {
+            jobs
+        } else {
+            jobs.into_iter().filter(|job| !set_aside.contains(&job.id)).collect()
+        };
+        if jobs.is_empty() {
+            return shutdown_or_idle(state, caps).await;
         }
 
         let mut retry_outer = false;
@@ -704,8 +851,8 @@ async fn lift_after_claim(state: &AppState, passed_over: &[Uuid], chosen: &Job) 
 /// at 50/50.
 fn pace_for(jobs: &[Job], i: usize) -> Option<f64> {
     let other = if i == 0 { jobs.get(1)? } else { &jobs[0] };
-    let alloc = f64::from(other.allocation.filter(|a| *a > 0)?);
-    let own = f64::from(jobs[i].allocation.filter(|a| *a > 0)?);
+    let alloc = f64::from(Some(other.allocation).filter(|a| *a > 0)?);
+    let own = f64::from(Some(jobs[i].allocation).filter(|a| *a > 0)?);
     Some((other.claims_issued - other.claims_baseline - 1) as f64 / alloc - 1.0 / own)
 }
 
@@ -746,9 +893,8 @@ fn was_recently_busy(job_id: Uuid) -> bool {
 
 /// A job's deficit ratio as the candidate list read it; `None` at 0%.
 fn ratio(job: &Job) -> Option<f64> {
-    job.allocation
-        .filter(|a| *a > 0)
-        .map(|a| (job.claims_issued - job.claims_baseline) as f64 / f64::from(a))
+    (job.allocation > 0)
+        .then(|| (job.claims_issued - job.claims_baseline) as f64 / f64::from(job.allocation))
 }
 
 enum JobClaimError {
@@ -956,7 +1102,9 @@ async fn try_claim_from_job(
             // job cannot be reactivated. Guarded on `active` as well: an admin
             // may have deactivated the job between selection and here, and
             // that decision stands.
-            let completed = sqlx::query("UPDATE jobs SET status = 'completed' WHERE id = $1 AND status = 'active'")
+            let completed = sqlx::query(
+                "UPDATE jobs SET status = 'completed', allocation = 0 WHERE id = $1 AND status = 'active'",
+            )
                 .bind(job.id)
                 .execute(&mut *tx)
                 .await
@@ -1107,7 +1255,7 @@ async fn try_claim_from_job(
                     let _ = tx.rollback().await;
                     Ok(None)
                 }
-                Ok(Some(claim_token)) => {
+                Ok(Some((claim_token, max_task_seconds))) => {
                     tx.commit().await.map_err(|e| JobClaimError::Fatal(e.into()))?;
                     request_tail_merge(state, job, &template, &request, created);
                     Ok(Some(TaskClaim {
@@ -1120,6 +1268,8 @@ async fn try_claim_from_job(
                         // dispatch lock and the job's row lock on every claim.
                         expected_data: template.expected.clone(),
                         derived_data: derived,
+                        job_name: job_name_for_worker(job),
+                        max_task_seconds,
                     }))
                 }
                 // Including a unique violation. The task was selected while
@@ -1175,7 +1325,8 @@ fn request_tail_merge(
     });
 }
 
-/// Everything a claim writes, inside the claim transaction.
+/// Everything a claim writes, inside the claim transaction: the claim's token
+/// and the task's time limit in seconds.
 ///
 /// `None` when the job is no longer active by the time the claim reaches its
 /// row; the caller rolls everything back.
@@ -1187,7 +1338,7 @@ async fn issue_claim(
     task_id: Uuid,
     task_created: bool,
     standing: Standing,
-) -> AppResult<Option<Uuid>> {
+) -> AppResult<Option<(Uuid, i32)>> {
     // A worker that arrived with no identity becomes a real one only now,
     // when there is a task to attach it to and a response body to return its
     // UUID in.
@@ -1199,11 +1350,19 @@ async fn issue_claim(
     }
 
     let claim_token = Uuid::new_v4();
-    sqlx::query(
+    // The deadline is set from the job's limit as it stands now, in the
+    // statement that writes the claim, and the limit read back from it is the
+    // one the assignment states: the two cannot disagree, whatever an admin
+    // changes meanwhile. A change applies to the claims made after it. Read
+    // from the job's row here, not from `job`, which was read before the
+    // dispatch lock; the row lock is the `UPDATE jobs` below, as before.
+    let max_task_seconds: i32 = sqlx::query_scalar(
         "INSERT INTO task_claims
              (task_id, job_id, claim_token, claimed_by_user_id, claimed_by_anon_uuid,
-              magpie_version)
-         VALUES ($1, $6, $2, $3, $4, $5)",
+              magpie_version, deadline_at)
+         SELECT $1, $6, $2, $3, $4, $5, now() + make_interval(secs => j.max_task_seconds)
+         FROM jobs j WHERE j.id = $6
+         RETURNING EXTRACT(EPOCH FROM deadline_at - claimed_at)::int",
     )
     .bind(task_id)
     .bind(claim_token)
@@ -1211,7 +1370,7 @@ async fn issue_claim(
     .bind(identity.anon_uuid())
     .bind(caps.magpie_version.to_string())
     .bind(job.id)
-    .execute(&mut **tx)
+    .fetch_one(&mut **tx)
     .await?;
 
     sqlx::query(
@@ -1266,7 +1425,7 @@ async fn issue_claim(
          SET claims_issued = claims_issued + 1, tasks_total = tasks_total + $3,
              last_claimed_at = now(),
              claims_baseline = CASE
-                 WHEN NOT COALESCE(allocation > 0, FALSE) THEN claims_baseline
+                 WHEN NOT allocation > 0 THEN claims_baseline
                  WHEN {STALE}
                      THEN LEAST(claims_baseline,
                                 claims_issued - floor({PARITY_TARGET} * allocation)::bigint,
@@ -1276,7 +1435,7 @@ async fn issue_claim(
                  ELSE claims_baseline
              END,
              activated_at = CASE
-                 WHEN COALESCE(allocation > 0, FALSE) AND {STALE} THEN now()
+                 WHEN allocation > 0 AND {STALE} THEN now()
                  ELSE activated_at
              END
          WHERE id = $1 AND status = 'active'"
@@ -1291,7 +1450,7 @@ async fn issue_claim(
     .rows_affected()
         > 0;
 
-    Ok(still_active.then_some(claim_token))
+    Ok(still_active.then_some((claim_token, max_task_seconds)))
 }
 
 /// What a claim needs to keep its job's ratio level with the others: see

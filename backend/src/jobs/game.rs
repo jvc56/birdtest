@@ -201,6 +201,7 @@ pub async fn next_request(
             capture_first_divergence: false,
             bingo_bonus: job_data.bingo_bonus,
             sim_cutoff: job_data.sim_cutoff,
+            threading_mode: config.threading_mode.clone(),
             player1: player1.clone(),
             player2: player2.clone(),
         },

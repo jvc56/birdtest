@@ -6,9 +6,16 @@ state:
 
   calls.log          one line per call, in order ("aws ecs update-service ...")
   s3/<bucket>/<key>  the objects `aws s3 cp` reads and writes
+  s3v/<bucket>.json  a versioned bucket's versions and delete markers, as
+                     [{"Key", "VersionId", "DeleteMarker"}], for
+                     list-object-versions and delete-objects (a bucket with no
+                     file answers the older two-version listing)
   ecr/<repo>:<tag>   the images ECR holds (`docker push` adds one)
-  desired            the service's desired count
-  running_image      the backend image the service runs (set by apply)
+  desired            the backend's service's desired count
+  desired_frontend   the frontend's service's
+  running_image      the backend image the backend's service runs (set by
+                     apply)
+  running_frontend_image   the frontend image the frontend's service runs
   runtask/<n>.json   each `ecs run-task`'s --overrides
   rds/<name>         an instance, holding its DbiResourceId
   ssm/<name>         a parameter's value
@@ -17,8 +24,11 @@ state:
 
 Behaviour switches, from the environment: FAKE_STS_FAIL, FAKE_PLAN_RC (2),
 FAKE_APPLY_RC (0), FAKE_APPLY_TOUCH_S3 (someone else uploads prod.tfvars
-during the apply), FAKE_ROLLBACK (the service keeps running the old image),
-FAKE_CI ("completed success <url>"), FAKE_WORKSPACE (default).
+during the apply), FAKE_ROLLBACK (backend, frontend or 1 for the backend:
+that service keeps running the old image), FAKE_NO_FRONTEND_SERVICE (a stack
+from before the frontend had a service of its own, until an apply makes it:
+frontend_service_made), FAKE_CI ("completed
+success <url>"), FAKE_WORKSPACE (default).
 """
 import base64
 import io
@@ -58,6 +68,7 @@ FLAGS = {
     "--interactive", "--no-publicly-accessible", "--apply-immediately", "--deletion-protection",
     "--no-deletion-protection", "--start-from-head", "--only-show-errors", "--with-decryption",
     "--overwrite", "--enable-execute-command", "--force-new-deployment", "--no-paginate",
+    "--bypass-governance-retention",
 }
 
 
@@ -120,6 +131,11 @@ def aws(args):
         out("2026-10-01 03:10:00        512 2026-10-01T03-00-00Z.manifest.json")
     elif svc == "s3api" and op == "head-bucket":
         pass
+    elif svc == "s3api" and op == "get-bucket-location":
+        out("eu-west-1" if "-dr-" in opt["--bucket"] else "None")
+    elif svc == "s3api" and op in ("list-object-versions", "delete-objects") \
+            and os.path.exists(path("s3v", opt["--bucket"] + ".json")):
+        s3_versions(op, opt)
     elif svc == "s3api" and op == "list-object-versions":
         key = opt["--prefix"]
         out(json.dumps({"Versions": [
@@ -188,27 +204,92 @@ def aws(args):
         sys.exit(2)
 
 
+def s3_versions(op, opt):
+    """A versioned bucket under a governance Object Lock: every version but a
+    delete marker is locked, so deleting one needs the bypass flag. Called in
+    the wrong region, S3 redirects; one DeleteObjects takes 1000 keys at most.
+    FAKE_DUMP_DELETE_FAIL refuses every version deleted."""
+    bucket = opt["--bucket"]
+    p = path("s3v", bucket + ".json")
+    entries = json.loads(read(p))
+    want = "eu-west-1" if "-dr-" in bucket else "us-east-1"
+    if opt.get("--region") != want:
+        sys.stderr.write("An error occurred (PermanentRedirect): the bucket is in %s\n" % want)
+        sys.exit(254)
+    if op == "list-object-versions":
+        prefix = opt.get("--prefix", "")
+        found = [e for e in entries if e["Key"].startswith(prefix)]
+        if "--no-paginate" in opt:
+            # One ListObjectVersions response: MaxKeys 1000, versions and
+            # delete markers together.
+            page = found[:1000]
+            res = {"IsTruncated": len(found) > 1000, "Prefix": prefix}
+        else:
+            page = found
+            res = {}
+            if not page:
+                return  # the CLI, having followed every page, printed nothing
+        v = [{"Key": e["Key"], "VersionId": e["VersionId"], "IsLatest": False}
+             for e in page if not e.get("DeleteMarker")]
+        m = [{"Key": e["Key"], "VersionId": e["VersionId"], "IsLatest": True}
+             for e in page if e.get("DeleteMarker")]
+        if v:
+            res["Versions"] = v
+        if m:
+            res["DeleteMarkers"] = m
+        out(json.dumps(res))
+        return
+    spec = opt["--delete"]
+    assert spec.startswith("file://"), spec
+    objects = json.loads(read(spec[7:]))["Objects"]
+    if len(objects) > 1000:
+        sys.stderr.write("An error occurred (MalformedXML) when calling the DeleteObjects operation\n")
+        sys.exit(254)
+    by_id = {(e["Key"], e["VersionId"]): e for e in entries}
+    errors, gone = [], set()
+    for o in objects:
+        k = (o["Key"], o["VersionId"])
+        e = by_id.get(k)
+        locked = e is not None and not e.get("DeleteMarker")
+        if locked and (os.environ.get("FAKE_DUMP_DELETE_FAIL")
+                       or "--bypass-governance-retention" not in opt):
+            errors.append({"Key": k[0], "VersionId": k[1], "Code": "AccessDenied",
+                           "Message": "Access Denied because object protected by object lock."})
+        else:
+            gone.add(k)
+    write(p, json.dumps([e for e in entries if (e["Key"], e["VersionId"]) not in gone]))
+    out(json.dumps({"Errors": errors}) if errors else "{}")
+
+
 def ecs(op, opt, q):
-    desired = read(path("desired"), "1").strip()
+    # The backend's service is the cluster's name; the frontend's has -frontend.
+    svc = opt.get("--service") or opt.get("--services") or "birdtest"
+    front = svc.endswith("-frontend")
+    desired_file = path("desired_frontend" if front else "desired")
+    desired = read(desired_file, "1").strip()
     if op == "update-service":
         if "--desired-count" in opt:
-            write(path("desired"), opt["--desired-count"])
-        out(opt.get("--desired-count", "birdtest"))
+            write(desired_file, opt["--desired-count"])
+        out(opt.get("--desired-count", svc))
     elif op == "describe-services":
-        if "desiredCount" in q or "runningCount" in q:
+        if front and os.environ.get("FAKE_NO_FRONTEND_SERVICE") \
+                and not os.path.exists(path("frontend_service_made")):
+            out("None")  # services[0] of a MISSING service, as text
+        elif "desiredCount" in q or "runningCount" in q:
             out(desired)
         elif "rolloutState" in q:
             out("PRIMARY\tCOMPLETED")
         elif "taskDefinition" in q:
-            out("arn:aws:ecs:us-east-1:123456789012:task-definition/birdtest:7")
+            out("arn:aws:ecs:us-east-1:123456789012:task-definition/%s:7" % svc)
         elif "events" in q:
-            out("2026-10-06T00:00:00Z\t(service birdtest) has started 1 tasks")
+            out("2026-10-06T00:00:00Z\t(service %s) has started 1 tasks" % svc)
         elif "serviceArn" in q:
-            out("arn:aws:ecs:us-east-1:123456789012:service/birdtest/birdtest")
+            out("arn:aws:ecs:us-east-1:123456789012:service/birdtest/%s" % svc)
         else:
             out("{}")
     elif op == "describe-task-definition":
-        out(read(path("running_image"), "None").strip())
+        front_td = opt.get("--task-definition", "").split("/")[-1].startswith("birdtest-frontend")
+        out(read(path("running_frontend_image" if front_td else "running_image"), "None").strip())
     elif op == "run-task":
         n = runtask_count() + 1
         write(path("runtask", "%d.json" % n), opt.get("--overrides", "{}"))
@@ -282,6 +363,7 @@ def terraform(args):
         raw = {"region": "us-east-1", "cluster_name": "birdtest", "ops_task_definition": "birdtest-ops",
                "log_group_name": "/ecs/birdtest", "service_security_group_id": "sg-service",
                "db_security_group_id": "sg-db", "backups_bucket": "birdtest-backups-123",
+               "backups_dr_bucket": "birdtest-backups-dr-123",
                "artifacts_bucket": "birdtest-artifacts-123", "backup_task_definition": "birdtest-backup"}
         js = {"service_subnet_ids": ["subnet-1", "subnet-2"],
               "ssm_parameter_names": ["/birdtest/DATABASE_URL", "/birdtest/SESSION_SIGNING_KEY"]}
@@ -312,8 +394,13 @@ def terraform(args):
         rc = int(os.environ.get("FAKE_APPLY_RC", "0"))
         if rc:
             sys.exit(rc)
-        if not os.environ.get("FAKE_ROLLBACK"):
-            write(path("running_image"), tfvar(read(os.path.join(chdir, "prod.tfvars")), "backend_image"))
+        tfvars = read(os.path.join(chdir, "prod.tfvars"))
+        rolled_back = os.environ.get("FAKE_ROLLBACK", "")
+        if rolled_back not in ("1", "backend"):
+            write(path("running_image"), tfvar(tfvars, "backend_image"))
+        if rolled_back != "frontend":
+            write(path("running_frontend_image"), tfvar(tfvars, "frontend_image"))
+        write(path("frontend_service_made"), "")
         if os.environ.get("FAKE_APPLY_TOUCH_S3"):
             p = path("s3", "state-bucket", "birdtest", "prod.tfvars")
             write(p, read(p) + "# someone else\n")

@@ -1529,7 +1529,9 @@ pub async fn close_generation(
     // and it stands. Reactivated, its first claim finds the last generation
     // closed and completes it then.
     if generation >= config.generation_count() {
-        let completed = sqlx::query("UPDATE jobs SET status = 'completed' WHERE id = $1 AND status = 'active'")
+        let completed = sqlx::query(
+            "UPDATE jobs SET status = 'completed', allocation = 0 WHERE id = $1 AND status = 'active'",
+        )
             .bind(job_id)
             .execute(&mut *tx)
             .await?

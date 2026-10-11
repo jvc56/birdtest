@@ -77,10 +77,11 @@
   }
 </script>
 
-<div class="space-y-3">
+<!-- The racks and legend as wide as the board, not the column. -->
+<div class="max-w-2xl space-y-3">
   <svg
     viewBox="{-M} {-M} {dim * U + M} {dim * U + M}"
-    class="block h-auto w-full max-w-xl select-none"
+    class="block h-auto w-full max-w-2xl select-none"
     role="img"
     aria-label="The board: {tileCount} tiles{placed.size ? ', the previous move outlined' : ''}{ghosts.size
       ? `, ${played.map((p) => `${p.label} ${p.move}`).join(' and ')} drawn where it goes`
@@ -178,20 +179,29 @@
     {/each}
   </svg>
 
-  <div class="grid gap-2 sm:grid-cols-2">
+  <!-- Side by side, each player's block spans the grid's two rows -- what is
+       said of the player, then the tiles -- through a subgrid, so both racks
+       start at one height whatever is above them: a "to move" badge wrapping
+       under one long name pushed only that player's tiles down. The name has
+       a line of its own, cut short (whole on hover) rather than wrapped. -->
+  <div class="grid gap-x-2 gap-y-3 sm:grid-cols-2 sm:grid-rows-[auto_auto]">
     {#each position.racks as rack, seat}
-      <div class="space-y-1" data-testid="rack">
-        <p class="flex flex-wrap items-baseline gap-x-2 text-sm">
-          <span class="text-muted-foreground">Player {seat + 1}</span>
-          <span class="break-all">{names[seat]}</span>
-          <span class="tabular-nums font-medium" data-testid="score">{position.scores[seat]}</span>
-          {#if toMove === seat}
-            <span class="rounded-full bg-primary px-2 text-xs text-primary-foreground">to move</span>
-          {/if}
-        </p>
+      <div class="grid min-w-0 gap-y-1 sm:row-span-2 sm:grid-rows-subgrid" data-testid="rack">
+        <div class="min-w-0 text-sm">
+          <p class="flex items-baseline gap-x-2 whitespace-nowrap">
+            <span class="text-muted-foreground">Player {seat + 1}</span>
+            <span class="tabular-nums font-medium" data-testid="score">{position.scores[seat]}</span>
+            {#if toMove === seat}
+              <span class="rounded-full bg-primary px-2 text-xs text-primary-foreground">to move</span>
+            {/if}
+          </p>
+          <p class="truncate" title={names[seat]}>{names[seat]}</p>
+        </div>
         <!-- One line, however narrow the board's column: the tiles shrink to
-             fit rather than wrap. -->
-        <div class="flex min-h-8 gap-1">
+             fit rather than wrap, and stay square as they do. At the
+             default `stretch` each tile's height was the line's while its
+             width shrank, and a narrow rack was a row of rectangles. -->
+        <div class="flex min-h-8 items-start gap-1">
           {#each rack as tile}
             {@const points = score(tile)}
             <span
@@ -257,8 +267,11 @@
     display: inline-flex;
     align-items: center;
     justify-content: center;
+    /* At most 2rem, shrinking with the rack's line; the height follows the
+       width (`aspect-ratio`), never the line's. */
     flex: 0 1 2rem;
     min-width: 0;
+    height: auto;
     aspect-ratio: 1;
     border-radius: 0.25rem;
     background: hsl(40 55% 80%);

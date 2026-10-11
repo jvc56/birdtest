@@ -45,13 +45,13 @@ Status values used in the table:
 
 | Status | Meaning | Count |
 |---|---|---:|
-| Stored | A column holds it and every request states it. | 65 |
+| Stored | A column holds it and every request states it. | 66 |
 | Stored (per-player form) | MAGPIE's global option, which sets both players at once. birdtest states the per-player options (`l1`/`l2`, `pl1`/`pl2`, …) instead, so this needs no column of its own. | 18 |
 | Run by a job type | A command that a job type runs. Its arguments come from that job type's config table. | 5 |
 | Recorded | Not a setting, but birdtest records its value (a seed, a version, a builder). | 4 |
-| Not stored | No column. The reason is given in the row. | 83 |
+| Not stored | No column. The reason is given in the row. | 82 |
 
-The 83 "Not stored" rows break down as follows:
+The 82 "Not stored" rows break down as follows:
 
 | Reason | Count |
 |---|---:|
@@ -59,7 +59,7 @@ The 83 "Not stored" rows break down as follows:
 | Display, terminal or CLI-session option | 20 |
 | A setting of the interactive `endgame` / `peg` commands, which a games player's solves do not read | 13 |
 | Worker-local (data path, mmap, threads, transposition-table size) | 4 |
-| Pinned by `contribute`, or read only by a feature it turns off (PlayChooser ×2, overtime ×2, `mtmode`, small plays, heat map) | 7 |
+| Pinned by `contribute`, or read only by a feature it turns off (PlayChooser ×2, overtime ×2, small plays, heat map) | 6 |
 | Other: challenge bonus, write buffer | 2 |
 
 ## Every argument
@@ -139,7 +139,7 @@ The 83 "Not stored" rows break down as follows:
 | 71 | `MOVEGEN_MARGIN` | `mmargin` | option | Stored | `player_configs.movegen_margin` ([L612](backend/migrations/0001_initial.sql#L612)) on each player config. Run-wide in MAGPIE; job creation requires both players to agree on it. |
 | 72 | `MIN_PLAY_ITERATIONS` | `minplayiterations` | option | Stored (per-player form) | Global form of `mi1`/`mi2`: `player_configs.min_play_iterations` ([L598](backend/migrations/0001_initial.sql#L598)) on each player config. |
 | 73 | `USE_GAME_PAIRS` | `gp` | option | Stored | `job_type` ([L382](backend/migrations/0001_initial.sql#L382)) `game_pairs` (MAGPIE `config.c:9200`) |
-| 74 | `USE_SMALL_PLAYS` | `sp` | option | Not stored | Endgame move-list format. `contribute` resets it to false (MAGPIE `config.c:8953`). |
+| 74 | `USE_SMALL_PLAYS` | `sp` | option | Not stored | Endgame move-list format. `contribute` resets it to false (MAGPIE `config.c:9296`). |
 | 75 | `SIM_WITH_INFERENCE` | `sinfer` | option | Stored (per-player form) | Global form of `si1`/`si2`: `player_configs.use_inference` ([L589](backend/migrations/0001_initial.sql#L589)) on each player config. **Opening-rack jobs force it off: see [Fix 2](#fix-2-opening-rack-jobs-ignore-inference).** |
 | 76 | `USE_HEAT_MAP` | `useheatmap` | option | Not stored | Records heat-map data only. `contribute` resets it to false. |
 | 77 | `WRITE_BUFFER_SIZE` | `wb` | option | Not stored | I/O buffer for autoplay's file recorders. `contribute` returns JSON, so this changes no result. |
@@ -237,7 +237,7 @@ The 83 "Not stored" rows break down as follows:
 | 169 | `PEG_NESTED_CAND_CAPS` | `pegncaps` | option | Stored | `player_configs.peg_nested_cand_caps` ([L632](backend/migrations/0001_initial.sql#L632)) on each player config. One option for both players on the CLI; birdtest states it per player. |
 | 170 | `PEG_NESTED_DEPTH` | `pegndepth` | option | Stored | `player_configs.peg_nested_max_depth` ([L633](backend/migrations/0001_initial.sql#L633)) on each player config. One option for both players on the CLI; birdtest states it per player. |
 | 171 | `PEG_NESTED_STRIDES` | `pegnstrides` | option | Stored | `player_configs.peg_nested_strides` ([L634](backend/migrations/0001_initial.sql#L634)) on each player config. One option for both players on the CLI; birdtest states it per player. |
-| 172 | `MULTI_THREADING_MODE` | `mtmode` | option | Not stored | Changes results: `igp` gives a simmer every thread and so changes what it samples. `contribute` resets it to `pgp` before every task (MAGPIE `config.c:8952`). Deliberately omitted. |
+| 172 | `MULTI_THREADING_MODE` | `mtmode` | option | Stored | `job_game_config.threading_mode` ([L777](backend/migrations/0001_initial.sql#L777)) and `job_game_pair_config.threading_mode` ([L813](backend/migrations/0001_initial.sql#L813)), one per job, `igp` (the default) or `pgp`, stated on every games and pairs request as `threading_mode`. It changes results only when a player simulates: `igp` gives one game's simulation every thread, which makes an iteration-bounded simulation reproducible. Opening-rack and leave requests state none. `contribute` resets it to `pgp` before every task (MAGPIE `config.c:9295`, `config_contribute_reset_shared_settings`), then a games or pairs task takes it from the request, `igp` when absent (`config.c:9355`, `config_contribute_apply_threading_mode`). |
 | 173 | `ANALYZE` | `analyze` | command | Not stored | Interactive CLI command; no task runs it. |
 | 174 | `VERSION` | `version` | command | Recorded | Not a setting. Each claim records the worker's version in `task_claims.magpie_version` ([L932](backend/migrations/0001_initial.sql#L932)); each job sets a floor in `jobs.min_magpie_*` ([L441](backend/migrations/0001_initial.sql#L441)). |
 | 175 | `BUILDERS` | `builders` | command | Recorded | Not a setting. The server asks its own MAGPIE and records the answer in `derived_data.builder` ([L314](backend/migrations/0001_initial.sql#L314)). |

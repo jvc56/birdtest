@@ -19,7 +19,7 @@ test('E-8: a finished game-pairs job shows its labelled pentanomial and signific
   await waitUntilSettled(request, job.id);
 
   await page.goto(`/jobs/${job.id}`);
-  await expect(page.getByRole('heading', { name: 'Game Pairs' })).toBeVisible();
+  await expect(page.getByRole('heading', { level: 1, name: job.name, exact: true })).toBeVisible();
   const card = page.getByTestId('significance-test');
   const verdict = card.locator('p', { hasText: 'Completed:' });
   await expect(verdict).toBeVisible();

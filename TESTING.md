@@ -69,12 +69,12 @@ at tier 5 names a symptom.
 | Tier | Tests | Where |
 |---|---|---|
 | 1 Unit | 250 | `#[cfg(test)]` in `jobs::plausibility` (30), `inputdata` (30), `jobs::racks` (17), `stats::bradley_terry` (30), `stats::match_test` (10), `stats::outcomes` (7), `error` (9), `config` (8), `extract` (7), `routes::admin` (16), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (5), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (7), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (8), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `board`, `exports`, `jobs`, `jobs::leave_gen`, `routes` (1 each); `jobs::game_pair` (3), `artifacts` (2) |
-| 1F Frontend unit | 220 | Vitest, `frontend/src/lib/`: `format.test.ts` (46), `jobSettings.test.ts` (13), `matchScore.test.ts` (4), `matchTest.test.ts` (5), `moveList.test.ts` (5), `compare.test.ts` (3), `consensus.test.ts` (8), `cgp.test.ts` (16), `api.test.ts` (18), `auth.test.ts` (17), `accountRules.test.ts` (9), `ratingPool.test.ts` (3), `sse.test.ts` (12), `importWatch.test.ts` (10), `poller.test.ts` (7), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (3), and `charts/`: `ratingDotPlot.test.ts` (19), `labels.test.ts` (2), `residuals.test.ts` (11), `pentanomial.test.ts` (5) |
+| 1F Frontend unit | 218 | Vitest, `frontend/src/lib/`: `format.test.ts` (46), `jobSettings.test.ts` (13), `matchScore.test.ts` (4), `matchTest.test.ts` (5), `moveList.test.ts` (5), `compare.test.ts` (3), `consensus.test.ts` (8), `cgp.test.ts` (16), `api.test.ts` (18), `auth.test.ts` (17), `accountRules.test.ts` (9), `ratingPool.test.ts` (7), `sse.test.ts` (12), `importWatch.test.ts` (10), `poller.test.ts` (7), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (3), and `charts/`: `ratingDotPlot.test.ts` (19), `labels.test.ts` (2), `residuals.test.ts` (5), `pentanomial.test.ts` (5) |
 | 2 Integration | 186 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (33), `scheduler.rs` (19), `jobs.rs` (20), `stats.rs` (19), `input_data.rs` (14), `derived.rs` (9), `leave_generation.rs` (8), `exports.rs` (16), `submissions.rs` (6), `artifacts.rs` (5), `audit.rs` (3) |
 | 3 API | 250 | `backend/tests/`: `worker_api.rs` (52), `admin_api.rs` (59), `auth_routes.rs` (28), `worker_routes.rs` (24), `boundaries.rs` (18), `public_api.rs` (24), `admin_routes.rs` (13), `authz.rs` (7), `account.rs` (10), `auth_api.rs` (5), `finish.rs` (9), `fake_worker.rs` (1) |
 | 4 Contract | 15 | `routes::worker::contract_fixtures`, over 18 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
-| 5 End-to-end | 21 | Playwright journeys `E-1`..`E-18` (`E-11` in three tests, `E-12` in two) in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
-| 6 MAGPIE smoke | 15 cases + 16 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-16` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 16 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (6), `magpie_leave.rs` (7), `magpie_routes.rs` (3) |
+| 5 End-to-end | 22 | Playwright journeys `E-1`..`E-18` (`E-11` in three tests, `E-10` and `E-12` in two each) in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
+| 6 MAGPIE smoke | 16 cases + 16 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-17` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 16 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (6), `magpie_leave.rs` (7), `magpie_routes.rs` (3) |
 
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
@@ -152,8 +152,11 @@ incidentally by higher tiers.
 | `lib/accountRules.ts` | 1F | Covered (`F-ACCOUNT-*`) |
 | `lib/ratingPool.ts` | 1F | Covered (`F-RATE-*`) |
 | `lib/importWatch.ts`, `lib/poller.ts` | 1F | Covered (`F-IMPORT-*`, `F-POLL-*`) |
+| `lib/roundRobin.ts` | 1F | Covered (`F-RR-*`) |
+| `lib/allocation.ts` | 1F | Covered (`F-ALLOC-*`) |
+| `lib/movegens.ts` | 1F | Covered (`F-MOVEGENS-*`) |
 | Chart maths | 1F | Covered (`F-CHART-*`). The arithmetic moved out of the components into `lib/charts/*.ts` so it could be tested; the `.svelte` files that draw it are exercised only by tier 5 |
-| Every page under `routes/` | 5 | Partial — the eighteen journeys (E-10 visits `/users`). `/admin/allocation`, `/admin/backups`, `/admin/derived-data`, `/admin/fleet` and `/admin/users` are in none of them; their endpoints are tier 3 |
+| Every page under `routes/` | 5 | Partial — the eighteen journeys (E-10 visits `/users`). `/admin/backups`, `/admin/derived-data`, `/admin/fleet` and `/admin/users` are in none of them (`/admin/allocation` is E-4's); their endpoints are tier 3 |
 
 ### Scripts and cross-repo
 
@@ -164,7 +167,7 @@ incidentally by higher tiers.
 | `scripts/dev.py` | Manual | Deliberate — see [Not tested](#what-is-deliberately-not-tested) |
 | `scripts/backup.sh`, `restore-drill.sh`, `restore-roundtrip.sh`, `restore-job.sh`, RUNBOOK §1's re-apply step | Nightly | Covered (`S-BACKUP-*`) |
 | `scripts/scrub.sql` | 3 | Covered (`S-SCRUB-1`, `-2`) |
-| `infra/` variable validations, the deploy-failed alert | CI (`terraform`) | Covered (`S-TF-1`, `-2`, `-3`: `terraform test` against mock providers) |
+| `infra/` variable validations, the deploy-failed alert, the split services' deployment settings | CI (`terraform`) | Covered (`S-TF-1`..`-4`: `terraform test` against mock providers) |
 | `scripts/dev-restore.sh` | CI (`scripts`) | Covered (`S-BACKUP-6`: its `SCRUB` rule against a stub `COMPOSE`, and that the scrub is the copy's) |
 | birdtest ↔ MAGPIE wire | 4 + 6 | Covered — `C-1`..`C-9` on both sides, and tier 6 |
 
@@ -186,7 +189,7 @@ and `U-ARCHIVE-11` reads the process's own `/proc/self/status` for its peak memo
 ### Covered before the list
 
 `stats::sprt` (since replaced by `stats::match_test`), `stats::bradley_terry`, `version`, `compat`, `backups`,
-`derived`, `magpie`, `clientip`, `routes::admin`'s settings validation, and the
+`derived`, `magpie`, `clientip`, `routes::admin`'s time-limit validation, and the
 first rules of `jobs::plausibility` and the `inputdata` archive walk had tests
 before the entries below were written; the entries were what was missing, and
 each now names its tests. Every group has since grown (see the status table).
@@ -583,34 +586,42 @@ computed outside the code, in 40-digit decimal from PLAN.md's formulas.
   `match_test::tests::the_fewest_wins_that_decide_and_one_short`,
   `match_test::tests::identical_pairs_alone_never_decide`,
   `match_test::tests::the_floor_holds_until_it_does_not_and_the_cap_applies_below_it`,
-  `match_test::tests::nothing_played_is_an_even_score_with_every_score_possible`,
-  `match_test::tests::elo_is_the_logistic_inverse_within_its_bounds`.)*
+  `match_test::tests::nothing_played_is_an_even_score_with_every_score_possible`.)*
+  The test carries no Elo or rating-point figure: the `elo` fields its result
+  once had are gone, so nothing beside it reads as a pool's rating.
 - `U-STATS-3b` **The error rate and the power, simulated.** Pairs drawn from a
   pentanomial, the test checked after every batch of 50 from a floor of 500 to
   a cap of 10,000 at 95%, as the finish check does: between equal players
   (three pairs in five split) at most α + 0.02 of 1,000 runs name a winner;
-  a player scoring 53.5% per game (about +24 Elo) is found better in at least
+  a player scoring 53.5% per game is found better in at least
   90% of 200 runs, and never the wrong way round. *(Covered:
   `match_test::tests::equal_players_rarely_get_a_winner_however_often_it_is_checked`,
   `match_test::tests::a_better_player_is_found`.)*
-- `U-STATS-4` A Bradley-Terry standard error equals the analytic
-  (400/ln 10)/√(n·p·(1−p)): 49.1348… Elo for an even 50 games, a tenth of that
-  at 5,000, and 1.2687… for 75% over 100,000. *(Covered:
-  `bradley_terry::tests::more_games_narrow_the_standard_error`.)*
+- `U-STATS-4` The ratings are on WESPA's scale, 250 points per logit: a 75%
+  score fits to 250·ln 3 ≈ 274.65 points, over 100,000 games as over 100
+  pairs, and the residuals predict with the same constant (100 points is
+  59.9%). A Bradley-Terry standard error equals the analytic
+  250/√(n·p·(1−p)): 70.7106… points for an even 50 games, a tenth of that at
+  5,000, and 1.8257… for 75% over 100,000. *(Covered:
+  `bradley_terry::tests::a_75_percent_score_is_250_ln_3_points`,
+  `the_residuals_predict_on_the_same_scale`,
+  `a_well_played_head_to_head_is_its_maximum_likelihood`,
+  `more_games_narrow_the_standard_error`.)*
 - `U-STATS-5` The fit returns noiseless evidence's own ratings, within a few
-  Elo, for the shapes that defeated the old one-config-at-a-time solver and
+  points, for the shapes that defeated the old one-config-at-a-time solver and
   its prior toward the anchor (KL-74): a 12-member group joined to the anchor
-  by one 300-pair job (every member's error at least the link's ≈28 Elo), a
+  by one 300-pair job (every member's error at least the link's ≈34 points), a
   30-member group, a disconnected island (unrated, its internal gap intact)
   and a hundred-member pool (under a second in a debug build); a 20-config
   chain and a 12-rung ladder within 0.6 of each config's error (KL-79). And for
   the shapes the audit's adversarial checks found: a config over a gauntlet of
   twenty lightly played opponents within half its error; conceding a quarter
   or half point lowers the conceding config's rating in the cases pinned (the
-  rare exception, under an Elo, is KL-79's); twenty baselines swept by both the
-  anchor and a config 400 above it leave that config within one error; a
+  rare exception, under a point and a half, is KL-79's); twenty baselines
+  swept by both the anchor and a config 400 above it leave that config within
+  one error; a
   strong tier 1,000 above joined by one job within about half its error; two
-  tiers of lightly played configs 600 or 800 Elo apart, joined by one small
+  tiers of lightly played configs 600 or 800 points apart, joined by one small
   job, the upper within 1.5 of its shown error, which includes the prior's
   pull (1.7 and more without it); a
   newcomer's sweep shrunk the same in a young pool as a mature one; a field
@@ -874,8 +885,9 @@ Each entry's tests are the `describe` block named for its id.
   Position Recorder as yes, no or "yes (first divergences)"; an
   opening-rack job's minimum and maximum analyses per rack and its consensus
   share, "—" at a maximum of 1; a leave job's generations and each one's
-  target; then sim cutoff, the test's minimum, batch sizes, the oldest
-  MAGPIE); a job without a test shows none of the test's settings but its
+  target; then sim cutoff, a games or pairs job's Threading, "Intra-game parallelism (all threads on one game)"
+  or "Per-game parallelism (one game per thread)", the test's minimum, batch
+  sizes, the oldest MAGPIE); a job without a test shows none of the test's settings but its
   "no", and a leave job has no sim cutoff and no lexicon or wordmap row of
   its own. Every label is in Title Case, and every job type capitalised. A
   player's settings are one ordered list too, key rows first (Lexicon,
@@ -904,6 +916,14 @@ Each entry's tests are the `describe` block named for its id.
   apart by it. A player's search in a few words leaves out what the job never reads
   (an opening-rack player's inference, the solving where the job never
   reaches the end of a game). *(Covered: `jobSettings.test.ts`.)*
+- `F-SET-2` The player settings table lists, by its mode
+  (`differingSettings`, `settingsFor`, `PlayerSettingsTable.svelte`), the
+  settings two players differ in -- key or not -- as ordinary rows, with no
+  heading, tint or fold; the key rows; or every row. Two players alike, asked
+  for their differences, say "These players' settings are identical." rather
+  than show an empty table; one player lists its key rows with no colour; each
+  of two players is headed by its colour. *(Covered: `jobSettings.test.ts`,
+  and `PlayerSettingsTable.test.ts`, which renders the component to HTML.)*
 - `F-FMT-12` `completionText` says how a job finished: a match test that
   decided, with the confidence, the units and player 1's interval ("its
   significance test found player 1 better at 95% confidence after 1,200
@@ -943,16 +963,52 @@ Each entry's tests are the `describe` block named for its id.
   job's player -- simulating, sorting on anything but equity, a rack info
   table, solving endgames -- before the submit, and accepts a static equity
   player. *(Covered: `format.test.ts`.)*
-- `F-FMT-16` `computeTime` reads a contributor's compute time in its two
-  largest units ("5h 20m", "3d 4h", "2y 17d"), and a dash for anything that is
-  not a time. *(Covered: `format.test.ts`.)*
+- `F-FMT-16` `computeTime` reads a contributor's compute time to the second
+  in every unit that is not zero ("2m 13s", "5h 20m 13s", "3d 4h 5m 6s", "2y
+  17d 1h", "0s"), and a dash for anything that is not a time. *(Covered:
+  `format.test.ts`.)*
 - `F-FMT-18` `targetsText` lists a leave job's targets in generation order
   joined by arrows ("100 → 200 → 1,000"), since a comma list cannot be read
   when the numbers carry thousands separators. *(Covered: `format.test.ts`.)*
-- `F-FMT-19` `bigCount` reads a contributor's movegens in its largest unit to
-  three figures ("12.3K", "4.5M", "1.2B"), rounded down so a count never reads
-  as more than it is or reaches the next unit early, and a dash for anything
-  that is not a count. *(Covered: `format.test.ts`.)*
+- `F-FMT-19` `exactCount` reads a contributor's movegens to the last digit,
+  grouped ("1,234,567,890"), and a dash for anything that is not a count.
+  *(Covered: `format.test.ts`.)*
+- `F-FMT-20` `timeLimitNotice` says how many of a job's tasks hit the job's
+  own time limit, names the limit and the cures ("3 tasks hit this job's 30m
+  time limit — lower the batch size, or raise the limit"), "1 task" for one,
+  and nothing while none has. *(Covered:
+  `format.test.ts`.)*
+- `F-FMT-21` `throughputText` reads a job's pace an hour in its unit
+  ("1,240 games/hour", "8 pairs/hour"): whole units from ten up, a decimal
+  below, "1 game/hour" singular, and a dash with no recent work. *(Covered:
+  `format.test.ts`.)*
+
+### `F-MOVEGENS-*` — `lib/movegens.ts`
+
+- `F-MOVEGENS-1` `movegensLines` lists a breakdown's four job types in one
+  order, labelled as the job list labels them, a type the answer leaves out
+  at 0. *(Covered: `movegens.test.ts`.)*
+- `F-MOVEGENS-2` `contributorKey` names an account by its id and an anonymous
+  worker by its pseudonym, escaped for the path, and nobody for a row with
+  neither. *(Covered: `movegens.test.ts`.)*
+
+### `F-RR-*` — `lib/roundRobin.ts`
+
+- `F-RR-1` `matchups` makes one self-play job of one config under the name as
+  given, every pairing once for more -- seated in the order given (3 → 3,
+  4 → 6) -- and names each "{name}: A vs B", or "A vs B" with no name, as the
+  server does (`I-JOB-15`). *(Covered: `roundRobin.test.ts`.)*
+- `F-RR-2` `matchupSummary` reads "4 configs → 6 jobs", "1 config → 1
+  self-play job", and why none or more than twelve cannot be sent;
+  `matchupsAllowed` is one to twelve. *(Covered: `roundRobin.test.ts`.)*
+
+### `F-ALLOC-*` — `lib/allocation.ts`
+
+- `F-ALLOC-1` `equalShares` ("Share equally") splits 100% in whole numbers,
+  the remainder a point each to the first, among the jobs above 0% **and the
+  jobs just created** -- a round robin at 0% beside a job at 100% gets its
+  share, where it once changed nothing -- every other job at 0%, and every job
+  when none is chosen. *(Covered: `allocation.test.ts`.)*
 
 ### `F-CONS-*` — `lib/consensus.ts`
 
@@ -987,9 +1043,9 @@ Each entry's tests are the `describe` block named for its id.
   point), and keeps a wide interval within the scores that exist. *(Covered:
   `matchTest.test.ts`.)*
 - `F-TEST-2` `testSentence` states player 1's score per game with its range,
-  named for the players and with nothing in Elo ("… scores 53.1% per game (95%
-  interval 51.2% to 55.0%)."), then names the better player
-  once it is decided, or says neither is when it ended inconclusive.
+  named for the players and with no Elo or rating figure ("… scores 53.1% per
+  game (95% interval 51.2% to 55.0%)."), then names the better player once it
+  is decided, or says neither is when it ended inconclusive.
   *(Covered: `matchTest.test.ts`.)*
 - `F-TEST-3` `confidenceProblem` refuses what job creation refuses of a
   test's confidence, and only that: above 50 and below 100, so 50.05 and
@@ -1130,11 +1186,13 @@ Test the pure functions; do not snapshot the SVG.
 - `F-CHART-4`, `F-CHART-5` Retired with the rating history chart they covered
   (its series cap and colour by config identity). The label shortening it
   shared with the dot plot is covered by `charts/labels.test.ts`.
-- `F-CHART-6` `ResidualMatrix` sorts by absolute residual descending, and flags
-  the non-transitive case only when at least three head-to-heads exceed the
-  threshold on enough pairs to be at least three standard errors out — the
-  same misses on ten pairs each do not raise it. *(Covered: `charts/residuals.test.ts`; the component now sorts
-  itself instead of drawing in the order it is handed.)*
+- `F-CHART-6` The ratings page flags the non-transitive case only when at
+  least three head-to-heads exceed the threshold on enough pairs to be at
+  least three standard errors out — the same misses on ten pairs each do not
+  raise it — and states a residual in signed percentage points in a cross
+  table cell's hover. *(Covered: `charts/residuals.test.ts`. The separate
+  residual table, `ResidualMatrix`, and its ordering and bars went with the
+  cross table, which folds the residual into each cell.)*
 - `F-CHART-7` The pair-outcome table reads each player's row from its own side
   — bucket 4 is player 1's "Won both" and player 2's is bucket 0 — and its
   three rows (won both, won one and drew one, even) hold all five buckets. An
@@ -1207,6 +1265,14 @@ server refuses. Each rule mirrors one in `routes/auth.rs`, with its wording.
   first two under "Add", where adding changed nothing, and gave the second no
   Remove button. *(Covered: `ratingPool.test.ts`.)* (Thirty-third audit, pass
   4.)
+- `F-RATE-2` The cross table orders the latest fit's configs best first and
+  then those with no chain to the anchor, finds a cell by (row, column), counts
+  each head-to-head once for the residual checks (the API serves both sides),
+  shows a cell as "58.8% ±6.2" over a signed spread ("+6.8", never "-0.0"),
+  and spells it out in its hover with what the ratings predict and the
+  residual. A cell's record (`recordSide`) is a win, a loss or even by the
+  figure it shows: 50.1% a win, 49.9% a loss, 50.04% and 49.951% even.
+  *(Covered: `ratingPool.test.ts`.)*
 
 ### `F-DOCS-*` — contributor instructions in `routes/`
 
@@ -1240,6 +1306,14 @@ server refuses. Each rule mirrors one in `routes/auth.rs`, with its wording.
   and a page request sent on one as it closed was answered 502. *(Covered:
   `nginxConfig.test.ts`; that it fails at 65 was checked by hand, and the
   template passes `nginx -t` in the image.)* (Thirty-third audit, pass 1.)
+- `F-NGINX-3` Nginx gzips what it serves -- the build's JavaScript, CSS, SVG
+  and JSON, and its HTML -- with `gzip on` once, for the whole server, and
+  never `text/event-stream` or every type; and `gzip off` once, in `location
+  /api/`, whose answers the backend compresses itself (`A-PUBLIC-9`): deployed,
+  the ALB sends `/api/` straight to the backend, so Nginx's compression of it
+  reached the local stacks only. *(Covered: `nginxConfig.test.ts`; the
+  template passes `nginx -t` in the image, and a script and the page came back
+  `Content-Encoding: gzip` through it.)*
 
 ## 2. Integration
 
@@ -1382,11 +1456,12 @@ The single most important group. Every entry is about a decision made in SQL.
   `admin_api::a_newly_activated_job_joins_at_parity_instead_of_taking_everything`,
   which re-shares two jobs to 75/25 and asserts exactly 9/3 of the next twelve
   claims; `worker_api::every_claim_advances_the_dispatch_counter`.)*
-- `I-SCHED-3` A job at 0% is offered to nobody, exactly as an inactive one is:
-  every claim goes to the other active job, and with every active job at 0%
-  the answer is `204`, not a shutdown — including when a parked job is too new
-  for the worker or in its unsupported set, which shuts nobody down until the
-  job is raised above 0% (`a_parked_job_shuts_nobody_down`). There is no
+- `I-SCHED-3` A job at 0% is inactive (`jobs_allocation_is_status`) and
+  offered to nobody: every claim goes to the other active job, and with every
+  job at 0% the answer is `204`, not a shutdown — including when a parked job is
+  too new for the worker or in its unsupported set, which shuts nobody down
+  until the job is raised above 0% (`a_parked_job_shuts_nobody_down`; an active
+  job at 0% once could, and the schema no longer has one). There is no
   priority. *(Covered: `worker_api::a_job_at_zero_allocation_is_offered_to_nobody`,
   `worker_api::a_parked_job_shuts_nobody_down`.)*
 - `I-SCHED-3a` **A job joins at parity.** A job activated beside one with a
@@ -1675,7 +1750,8 @@ job creation touches needs one caller here.
 - `I-JOB-1` Creating each of the four job types inserts its config row with
   every column populated, and reads back identical; a games job created with
   only its target runs no match test, and stores the test's default
-  confidence (95%) and a floor of 0. *(Covered:
+  confidence (95%) and a floor of 0, and the default threading, `igp`.
+  *(Covered:
   `jobs::each_job_type_stores_every_setting_it_was_created_with`,
   `jobs::a_leave_generation_job_stores_every_setting_it_was_created_with`.)*
 - `I-JOB-1b` A `games` job's batch is even (default 2): MAGPIE gives player 1
@@ -1730,9 +1806,10 @@ job creation touches needs one caller here.
   the job follows** (`PATCH /api/admin/jobs/:id/consensus`). A job wanting one
   analysis per rack still keeps a progress row per rack, so raising its
   minimum and maximum after it completed restates every rack unsettled,
-  reopens it active at its allocation (`job.consensus_changed`, "min 1 -> 2,
-  max 1 -> 3; 4 racks unsettled", then `job.activated`), demotes its final
-  export to a snapshot, and reissues the racks from those rows; lowering them
+  reopens it inactive at 0% (`job.consensus_changed`, "min 1 -> 2, max 1 -> 3;
+  4 racks unsettled", then `job.deactivated` from completed), demotes its final
+  export to a snapshot, and, once given an allocation, reissues the racks from
+  those rows; lowering them
   again while a reissue is in flight settles every rack, and that reissue's
   submission completes the job without counting its racks a second time, and
   every line of its corpus then carries its rack's standing, each rack having
@@ -1749,9 +1826,8 @@ job creation touches needs one caller here.
   or below 50%, no analyses, a most below the fewest or above 100, any
   consensus for a static player), and refuses any job but an opening-rack
   one; a change that changes nothing writes no audit row; and a completed job
-  reopened where the other active jobs leave no room for its allocation comes
-  back inactive, with the reason in the response. *(Covered:
-  `worker_api::a_consensus_edit_is_checked_and_reopens_inactive_without_room`.)*
+  it reopens comes back inactive at 0%, the 0% every completed job holds.
+  *(Covered: `worker_api::a_consensus_edit_is_checked_and_reopens_inactive`.)*
 - `I-OR-EDIT-3` **A finish check overtaken by a consensus edit does not
   complete the job.** A check that read every rack settled, completing after
   an edit unsettled them, leaves the job active, and its racks are reissued:
@@ -1778,8 +1854,7 @@ job creation touches needs one caller here.
   `worker_api::a_refused_or_unchanged_consensus_edit_holds_nothing`.)*
   (Thirty-third audit, pass 2.)
 - `I-OR-EDIT-6` **An action that waited on a job's row is told it was purged
-  only when it was.** An activate, deactivate, force-complete or allocation
-  change that took the row before a consensus edit queued on it is refused as
+  only when it was.** A force-complete or allocation change that took the row before a consensus edit queued on it is refused as
   running ("a purge, delete or consensus change of this job is running"): the
   edit's hold is not counted, and it was answered "the job was purged while
   this waited". A purge started meanwhile is still "purged", by count, after
@@ -1805,13 +1880,17 @@ job creation touches needs one caller here.
   first claim starts the seeding of its generation-1 universe. *(Covered:
   `admin_routes::creating_each_job_type_answers_it_inactive_and_unallocated`
   (no task for any type), `leave_gen::generation_ones_universe_is_seeded_by_the_first_claim_too`.)*
-- `I-JOB-6` Activation sets `allocation` and `activated_at`; deactivation clears
-  the schedule without destroying tasks; completion is terminal. *(Covered:
+- `I-JOB-6` A job is created inactive at 0%; an allocation above 0% activates
+  it and sets `activated_at`; 0% deactivates it, at 0%, without destroying
+  tasks; completion is terminal and holds the job at 0%, and no allocation,
+  not even 0%, moves a completed job. *(Covered:
   `jobs::a_job_moves_through_its_lifecycle_and_completion_is_final`,
   `admin_api::a_completed_job_cannot_be_deactivated`.)*
-- `I-JOB-7` An allocation outside 0–100 is rejected. *(Covered:
-  `jobs::an_allocation_outside_0_to_100_is_refused`; the sum across jobs is
-  `A-BOUND-7`.)*
+- `I-JOB-7` An allocation outside 0–100 is rejected, and the schema holds a job
+  active exactly when above 0% (`jobs_allocation_is_status`): neither an active
+  job at 0% nor an inactive or completed one above it can be written.
+  *(Covered: `jobs::an_allocation_outside_0_to_100_is_refused`; the sum across
+  jobs is `A-BOUND-7`.)*
 - `I-JOB-8` `purge_job` deletes tasks and claims, leaves the job row, and lets
   task generation resume cleanly from the right seed -- the start of its
   space, which is what PLAN.md specifies. *(Covered:
@@ -1876,6 +1955,21 @@ job creation touches needs one caller here.
   opening-rack body does. *(Covered:
   `jobs::a_leave_job_refuses_a_player_it_cannot_generate_leaves_with`,
   `routes::admin::tests::a_leave_body_is_read_as_a_leave_config_and_an_opening_rack_body_is_not`.)*
+- `I-JOB-15` **A games or pairs request naming n ≥ 2 configs is a round
+  robin**: C(n, 2) jobs (3 → 3, 4 → 6), every pairing once, seated in the
+  order listed and named "{name}: A vs B" ("A vs B" unnamed), all inactive at
+  0%, each audited `job.created`, and answered together as `{jobs}`; one
+  config is a self-play job under the name as given. *(Covered:
+  `jobs::a_round_robin_creates_a_job_for_every_pairing`,
+  `routes::admin::tests::pairings_are_every_pair_once_in_the_order_given`; the
+  form's preview of the same rules, `roundRobin.test.ts` (F-RR-1, F-RR-2).)*
+- `I-JOB-16` **A round robin is created whole or not at all.** Every pairing
+  is checked before anything is inserted, and one clash (two simmers on
+  different win% models) refuses the request, naming that pairing, with no job
+  written; a config named twice, more than twelve, none, or a name its
+  pairing would push past 100 characters is refused on its field. *(Covered:
+  `jobs::a_round_robin_with_one_bad_pairing_creates_nothing`,
+  `routes::admin::tests::a_round_robin_names_one_to_twelve_configs_once_each`.)*
 
 ### `I-SUBMIT-*` — result submission (`jobs/mod.rs`, `jobs/*.rs`)
 
@@ -2175,6 +2269,19 @@ permanent.
 - `I-RATE-11` A pool with one member (the anchor) and no games produces a run
   rather than an error. *(Covered:
   `ratings::a_pool_of_only_its_anchor_fits_to_an_empty_run`.)*
+- `I-RATE-13` A fit stores each head-to-head's cross-table cell once, from
+  the side of the config whose name sorts first, summing every job between
+  the two whichever seats them: the score, the error from the pairs' score
+  variance in the summed pentanomial (√(491/128000) for [1, 3, 8, 4, 4]) and
+  the games-weighted spread. *(Covered:
+  `ratings::a_head_to_head_is_stored_once_with_both_seatings_summed`.)*
+- `U-RATE-1` to `U-RATE-3` The aggregation, without a database: two jobs
+  seating the configs either way sum to the same pentanomial from one side,
+  with the hand-computed mean 47/80, error √(491/128000) and spread 6.8, and
+  from the other side the mirror image; twenty split pairs have an error of
+  0, where counting games would give ≈7.9 points of win %; and a stored cell
+  is served from both sides, the second its mirror (1 − the score and the
+  prediction, the same error, −the spread). *(Covered: `ratings::tests`.)*
 - `I-RATE-12` A pool deleted after the sweep listed the pools is skipped
   without an error logged, and the sweep goes on to the next. *(Covered:
   `ratings::the_sweep_skips_a_pool_deleted_mid_sweep_quietly`, which deletes
@@ -2255,6 +2362,12 @@ permanent.
   average read six times the real time left. *(Covered:
   `stats::a_new_jobs_eta_is_measured_since_it_was_activated`.)* (Twenty-second
   audit.)
+- `I-STATS-8d` **A job's throughput** is the rate its ETA extrapolates, an
+  hour, in its own unit: claims in the window × the batch, as games (10 a
+  batch, two claims: 20 games/hour), pairs, rack analyses, or a leave job's
+  games (`num_iterations` a task; it has a pace and no ETA). Nothing finished
+  in the last hour, or a job that is not active, has none. *(Covered:
+  `stats::throughput_is_recent_claims_times_the_batch_in_the_jobs_unit`.)*
 - `I-STATS-9` **The finish check** completes a job once its match test
   decides and at the hard cap (inconclusive), and does **not** complete below
   `min_units` even with an interval clear of an even score. There is no
@@ -2439,7 +2552,8 @@ import can be watched) and a per-test MinIO bucket.
   an anchor move that brings a new member in, which writes that addition too.
   The entry first said "exactly one row"; the census is the second on purpose.
   *(Covered: `audit::every_destructive_admin_action_writes_exactly_its_record`,
-  across deactivate, complete, a consensus change, purge and delete of a job,
+  across a deactivation (an allocation change to 0%, its row carrying "50% ->
+  0%"), complete, a consensus change, purge and delete of a job,
   user delete, ban,
   unban, input-file delete, player-config delete, pool-member removal, an
   anchor move and a pool delete. Deleting an input file or a player config
@@ -2894,10 +3008,11 @@ below.
   `use_wordmap` of its own, and pins the player's lexicon and wordmap but not
   its leaves. *(Covered:
   `worker_routes::a_leave_claim_carries_its_player_and_pins_only_its_lexicon`.)*
-- `A-WORKER-8` A decline with an unknown reason is rejected; the five known
-  reasons (`missing_data`, `magpie_version`, `unknown_job_type`,
-  `derived_mismatch`, `task_failed`) are accepted. *(Covered:
-  `worker_routes::only_the_five_known_decline_reasons_are_accepted`.)*
+- `A-WORKER-8` A decline with an unknown reason is rejected, the refusal
+  listing them; the six known reasons (`missing_data`, `magpie_version`,
+  `unknown_job_type`, `derived_mismatch`, `task_failed`, `time_limit`) are
+  accepted, release the claim and are recorded on its audit row. *(Covered:
+  `worker_routes::only_the_six_known_decline_reasons_are_accepted`.)*
 - `A-WORKER-9` Heartbeat extends the claim, and has no effect for a stale
   token — reclaimed, declined, another identity's, or never issued. It is
   still answered `204`, by design rather than as a gap: the heartbeat has one
@@ -3010,6 +3125,59 @@ below.
   the fixture by `contract_fixtures::every_shutdown_reason_matches_what_the_server_sends`;
   MAGPIE's claim body by `test_the_claim_body_matches_the_claim_fixture`.)*
   (Thirty-third audit, pass 1.)
+- `A-WORKER-23` Every assignment names its job (`job_name`: its name, or its
+  type and the start of its id, never empty) and states the time limit its
+  claim was given (`max_task_seconds`): its job's at the claim, which the
+  claim's `deadline_at` is its claim time plus. A change to the job's limit
+  moves later claims' limits and not an earlier one's, and two jobs with
+  different limits, claimed from in one run, give each claim its own job's. *(Covered:
+  `worker_routes::an_assignment_names_its_job_and_states_the_limit_it_was_claimed_under`;
+  the field names by `C-11`.)*
+- `A-WORKER-24` A claim past its deadline and the minute's grace lapses at the
+  next reclamation **even while its worker heartbeats**, and its task goes
+  back out, the claim marked an overrun (`A-WORKER-27`); inside the grace it
+  stands, and a process in its startup grace lapses nothing on a deadline
+  either. *(Covered:
+  `worker_routes::a_claim_past_its_deadline_lapses_even_while_heartbeating`.)*
+- `A-WORKER-25` A result for a claim past its deadline and the grace is
+  answered `accepted: false` whether or not a reclamation got there first,
+  and the claim is released then, its task available and nothing stored (and
+  counted against the job as an overrun, `A-WORKER-29`); inside the grace, or
+  while the process is in its startup grace, the result is accepted. *(Covered:
+  `worker_routes::a_result_past_its_claims_deadline_is_refused_and_frees_the_task`.)*
+- `A-WORKER-26` A `time_limit` decline is counted against its job, which the
+  job's page shows (`job.time_limit_declines`); three in a row with no task of
+  the job completed between set the job aside -- inactive at 0%, the reason
+  on the job and its page, a `job.set_aside` audit row from its share -- and
+  an accepted result between them starts the run again. An allocation puts it
+  back, its reason cleared and its run started afresh. *(Covered:
+  `worker_routes::three_time_limit_declines_in_a_row_set_the_job_aside`.)*
+- `A-WORKER-27` A claim lapsed at its deadline while its worker still
+  heartbeat is an **overrun**: reclamation marks it (`task_claims.overrun`,
+  `pending`) and leaves the job's row alone, and the job's next claim counts
+  it (`counted`, the job's `time_limit_declines` and `time_limit_streak`).
+  Three in a row set the job aside as three `time_limit` declines do, with
+  the same reason and `job.set_aside` row, and the claim that counted the
+  third is handed another job's task. *(Covered:
+  `worker_routes::three_overruns_with_the_worker_alive_set_the_job_aside_at_the_next_claim`.)*
+- `A-WORKER-28` A claim lapsed at its deadline whose worker had gone silent
+  -- never heartbeat, or stopped a heartbeat timeout before the claim lapsed
+  -- counts toward nothing; what decides is whether the worker was alive when
+  the claim lapsed (deadline and grace), not when reclamation came round, so
+  one that heartbeat to the end and went quiet after is an overrun.
+  *(Covered:
+  `worker_routes::a_silent_workers_lapse_at_the_deadline_counts_toward_nothing`.)*
+- `A-WORKER-29` `time_limit` declines, overruns and results refused past
+  their deadline make one run, in the order they happened: an accepted result
+  ends it, and an overrun whose deadline came before that result, counted
+  after it, counts toward the total and not the run
+  (`jobs.time_limit_streak_since`). A refused late result is counted at once;
+  three in a row set the job aside, and nothing more is handed out. *(Covered:
+  `worker_routes::declines_overruns_and_late_results_make_one_run_that_a_completion_ends`.)*
+- `A-WORKER-30` A purge ends the run, deleting the claims an uncounted overrun
+  is marked on; an allocation that puts a job back starts a run that an
+  overrun from before it, counted after, is not part of. *(Covered:
+  `worker_routes::a_purge_or_an_allocation_starts_the_run_afresh`.)*
 - `A-WORKER-15` `client-version` reports the configured floor and a download
   URL. *(Covered:
   `worker_routes::client_version_reports_the_configured_floor_and_download_url`.)*
@@ -3031,8 +3199,8 @@ below.
   is the pool "X" (a conflict). Both took any text, and a pool's name as typed
   (thirty-third audit, pass 1). *(Covered:
   `admin_routes::a_player_config_and_a_pool_take_a_job_names_rule`.)*
-- `A-ADMIN-2` Creating a job of each type returns `{job}` and the
-  job is inactive with no allocation. *(Covered:
+- `A-ADMIN-2` Creating a job of each type returns `{jobs: [job]}` and the
+  job is inactive at 0%. *(Covered:
   `admin_routes::creating_each_job_type_answers_it_inactive_and_unallocated`;
   a leave job, which runs MAGPIE at creation, by the opt-in
   `magpie_routes::a_leave_job_is_created_inactive_with_its_generation_zero_leaves_stored`.)*
@@ -3048,8 +3216,9 @@ below.
   refused at creation, not by every claim as a 500. *(Covered:
   `admin_routes::job_creation_refuses_each_impossible_combination_and_says_which`,
   which asserts the player-config half too.)*
-- `A-ADMIN-4` Activate / deactivate / complete / purge / delete each return the
-  documented shape and are reflected in a subsequent read. *(Covered:
+- `A-ADMIN-4` An allocation change (activating and deactivating) / complete /
+  purge / delete each return the documented shape and are reflected in a
+  subsequent read. *(Covered:
   `admin_routes::each_lifecycle_action_answers_its_shape_and_a_read_agrees`; the
   allocation cap by `A-BOUND-7`.)*
 - `A-ADMIN-5` Import start → poll → confirm over HTTP, including that polling
@@ -3099,8 +3268,8 @@ below.
 - `A-ADMIN-14` `delete_user` over HTTP. *(Covered:
   `admin_api::a_user_with_history_can_be_deleted`; an admin cannot delete
   themself, `A-BOUND-8`.)*
-- `A-ADMIN-15` Purging a completed job returns it to inactive, clears its
-  stored verdict, and it can be activated again. *(Covered:
+- `A-ADMIN-15` Purging a completed job returns it to inactive at 0% (as a purge
+  does every job), clears its stored verdict, and it can be activated again. *(Covered:
   `admin_api::purging_a_completed_job_returns_it_to_inactive`.)* (Eleventh
   audit's fix, twelfth audit's test.)
 - `A-ADMIN-15b` An export's `job.export_started` row is written in the
@@ -3128,8 +3297,8 @@ below.
   fourteenth audit).
 - `A-ADMIN-19` A purge or delete of a job whose purge or delete is already
   running is `409` (checked and held in one step: a double click got two), as
-  are activating, deactivating and completing it; all are allowed once it has
-  finished. *(Covered:
+  are an allocation change (activating or deactivating it) and completing it;
+  all are allowed once it has finished. *(Covered:
   `admin_api::a_second_purge_or_delete_is_refused_while_one_runs`.)* (Fourteenth
   audit.)
 - `A-ADMIN-20` A job cannot pin two different files under one role and name
@@ -3196,9 +3365,10 @@ below.
 - `A-ADMIN-28` **Several jobs' allocations in one request**
   (`PUT /api/admin/jobs/allocations`), checked as a whole: 50/50 becomes 60/40,
   which one job at a time refuses (50 + 60 is over 100). A job named at 0% is
-  deactivated and an inactive one named above 0% activated; each change is
-  audited (`job.allocation_changed` from what to what, `job.activated` /
-  `job.deactivated` for a status change). A request totalling over 100%, naming
+  deactivated, at 0%, and an inactive one named above 0% activated; each change
+  is audited once, from what to what (`job.activated` / `job.deactivated` for a
+  job switched on or off, `job.allocation_changed` for an active job's new
+  share). A request totalling over 100%, naming
   a completed job, a job twice, an allocation outside 0–100, or nothing,
   changes nothing. *(Covered:
   `admin_api::allocations_are_set_together_and_checked_as_a_whole`; the route's
@@ -3209,10 +3379,28 @@ below.
   goes through while the purge waits. (A delete keeps the same order.)
   *(Covered: `admin_api::a_purge_waiting_on_a_rating_fit_holds_up_no_submissions`.)*
   (The test predates the entry, and cited `A-ADMIN-20`; thirty-third audit.)
+- `A-ADMIN-30` The task time limit is each job's: 3600 unless its creation
+  names another (shown in its settings, `/api/jobs/:id/config`), changed by
+  `PATCH /api/admin/jobs/:id/time-limit`, refused on its field below 600 or
+  above 86,400 at creation and after (and by the column's CHECK, so a test
+  moves a claim's deadline rather than the limit; 600 itself accepted), an
+  unknown job a `404`, and each change audited once (`job.time_limit_changed`,
+  "max_task_seconds 3600 -> 1800", the admin as actor, the job as target) --
+  a change to what it already is writes nothing; another job's limit is its
+  own; the claims made after a change are given it. *(Covered:
+  `admin_routes::the_task_time_limit_is_each_jobs_and_each_change_is_audited`,
+  `audit::every_destructive_admin_action_writes_exactly_its_record`; that only
+  an admin may, by `A-AUTHZ`.)*
+- `A-ADMIN-31` A games or pairs job's `threading_mode` is `igp` unless the
+  request says `pgp`, anything else a `400` on the field; its settings show
+  it, and its tasks' requests carry it, beside the job's name. *(Covered:
+  `admin_routes::a_games_jobs_threading_mode_is_on_its_settings_and_every_task`.)*
 
 ### `A-RATE-*` — `routes/ratings.rs`
 
-- `A-RATE-1` Pool list and detail render the latest run, with residuals.
+- `A-RATE-1` Pool list and detail render the latest run, with its cross table
+  from both sides: the score, its error (√11/16 for [2, 0, 1, 0, 1]) and the
+  spread mirrored, beside the predicted score.
   *(Covered: `ratings::the_pool_pages_show_the_latest_run_with_its_residuals`,
   `worker_api::a_pools_residuals_are_the_ones_its_latest_fit_stored`.)*
 - `A-RATE-2` A pool with no run renders empty rather than erroring. *(Covered:
@@ -3352,15 +3540,21 @@ below.
 - `A-PUBLIC-4b` A games job's captured positions (`/api/jobs/:id/positions`)
   with one rack page newest first with their ranked moves, the rack however
   it is typed -- blank first, lower case -- spelt as MAGPIE spells one; a rack
-  the distribution cannot spell is an empty page; no rack is a `400`, signed
-  out a `401`, an opening-rack job a `400`, an unknown job a `404`.
-  *(Covered: `public_api::captured_positions_are_searchable_when_signed_in`.)*
+  the distribution cannot spell is an empty page; signed out reads the same
+  as signed in; no rack is a `400`, an opening-rack job a `400`, an unknown
+  job a `404`. *(Covered: `public_api::captured_positions_are_searchable_by_anyone`.)*
 - `A-PUBLIC-4c` A random position (`/positions/random`) is drawn from the
   tasks that have one, past tasks still being played -- the first captured of
   a task comes back, which the newest-position fallback never returns -- and
-  is `null` for a job with no task, or none returned; signed out is a `401`,
-  an opening-rack job a `400`, an unknown job a `404`. *(Covered:
+  is `null` for a job with no task, or none returned; signed out draws the
+  same; an opening-rack job a `400`, an unknown job a `404`. *(Covered:
   `public_api::a_random_position_is_drawn_from_the_tasks_that_have_one`.)*
+- `A-PUBLIC-4h` `/rack-samples` draws distinct racks an opening-rack job has
+  analysed: none before it has any; from a small job, ten by default, every
+  one when more are asked for, at least one when none are; from a job past a
+  thousand analyses, by probes, ten distinct racks all of the job's. Another
+  job type is a `400`, an unknown job a `404`. *(Covered:
+  `public_api::rack_samples_are_distinct_analysed_racks`.)*
 - `A-PUBLIC-4g` A simulated position's moves carry their win percentage and their
   first two plies' statistics however many more the job recorded (four
   stored, two returned), and the position what its player inferred of the
@@ -3430,12 +3624,36 @@ below.
   `public_api::tied_jobs_and_users_are_each_listed_exactly_once`,
   `worker_api::public_endpoints_name_anonymous_workers_by_pseudonym_only`; tied
   contributors were duplicated and skipped across pages.)*
+- `A-PUBLIC-7a` Contributions by job type -- movegens, compute time and
+  tasks: each accepted claim's movegens and compute time are credited to its
+  job (`jobs.movegens`, the job page's `movegens`, and `jobs.compute_ms`)
+  beside its contributor; `GET /api/workers/movegens` is the jobs' totals by
+  type, every type present at 0 when nothing ran for it; a contributor's
+  breakdown (`/api/workers/user/:id/movegens`,
+  `/api/workers/anon/:anon_id/movegens`) is their claims' by type, its compute
+  time and tasks counted from completed claims only; the jobs' compute time
+  by type is the contributors' together; and all of them add up to the
+  contributor list's columns, before and after a purge or a delete takes a
+  job's out of all three. Only a contributor the list shows is answered -- an
+  anonymous one by pseudonym, never by its UUID -- and anyone else is a `404`.
+  The breakdown is an index-only walk of the contributor's own index, which
+  carries each claim's movegens and claim time. *(Covered:
+  `public_api::contributions_are_broken_down_by_job_type`,
+  `public_api::a_contributors_breakdown_reads_only_their_index`,
+  `public::tests::contributions_are_summed_into_their_own_type`,
+  `admin_api::purging_and_deleting_a_job_give_back_what_it_earned`.)*
 - `A-PUBLIC-8` **A NUL in what a caller sends is a `400`.** Postgres stores no
   NUL in text and refuses the statement (SQLSTATE `22021`, or `22P05` from
   JSON), which was a `500` and an error line: `?worker=%00` on a job's public
   results feed, a login name, a password-reset address. *(Covered:
   `public_api::a_nul_in_a_public_request_is_a_bad_request`; the mapping,
   `U-ERR-8`.)* (Thirty-third audit, pass 3.)
+- `A-PUBLIC-9` The API gzips its JSON for a client that sends
+  `Accept-Encoding: gzip` -- deployed, the ALB sends `/api/*` straight to the
+  backend, past Nginx -- and not for one that does not; never its event
+  stream (`text/event-stream`, whose events gzip would hold back), and never
+  an answer with no body (an idle claim's `204`, a redirect). *(Covered:
+  `public_api::the_api_compresses_its_json_and_never_its_event_stream`.)*
 
 ### `A-ACCOUNT-*` — `routes/account.rs`
 
@@ -3514,7 +3732,7 @@ silent.
   `boundaries::a_decline_list_is_cut_to_its_cap_and_each_field_to_its_bound`,
   `contract_fixtures::decline_gap_fields_are_bounded`.)*
 - `A-BOUND-7` An activation that would take active allocations past 100% is
-  refused, naming the headroom, and two concurrent activations cannot together
+  refused, naming the total and what the other jobs hold, and two concurrent activations cannot together
   exceed it. *(Covered:
   `boundaries::an_activation_past_100_percent_is_refused_naming_the_headroom`,
   `boundaries::two_concurrent_activations_cannot_exceed_100_percent`.)*
@@ -3547,15 +3765,18 @@ request. Server→client fixtures are compared by **field structure, not bytes**
 so fields stay free to move before the first release while a renamed or dropped
 field still fails.
 
-Eighteen fixtures exist, and the set is complete: every message has one. The
+Nineteen fixtures exist, and the set is complete: every message has one. The
 first nine — an assignment of each original request shape (games, opening
 racks, leave generation), a claim, a decline, and each of the four shutdown
-reasons — were written by hand, and so was `result-games-inference.json`
+reasons — were written by hand, and so were `result-games-inference.json`
 (`C-3b`), in MAGPIE's key layout, MAGPIE's own test checking its output
-carries every key; `C-2`..`C-9` were **captured from a real exchange**.
-MAGPIE's `test/birdtest_contract/` carries a byte-identical copy of all
-eighteen, and CI's `magpie-contract` job runs MAGPIE's tests against this
-branch's copy.
+carries every key, and `decline-time-limit.json` (`C-12`); `C-2`..`C-9` were
+**captured from a real exchange** (the two captured assignments were given
+`job_name`, `max_task_seconds` and `threading_mode` by hand when the server
+began sending them, until the next recapture). MAGPIE's
+`test/birdtest_contract/` carries a copy, brought up to date with each MAGPIE
+pin, and CI's `magpie-contract` job runs MAGPIE's tests against this branch's
+copy.
 
 - `C-1` `assignment-opening-rack.json` — exists, and MAGPIE's
   `test/birdtest_contract/` carries a byte-identical copy. *(Covered:
@@ -3594,6 +3815,16 @@ branch's copy.
   `contract_fixtures::the_expected_data_block_matches_what_the_server_sends`.)*
 - `C-9` `anon-uuid-assignment.json`, a first claim that mints a UUID.
   *(Covered: `contract_fixtures::a_first_claim_is_assigned_a_worker_uuid`.)*
+- `C-11` Every assignment fixture names its job (`job_name`, never empty)
+  and states its time limit (`max_task_seconds`, 600 to 86,400), and a games
+  or pairs request its `threading_mode`, `igp` or `pgp` -- no other request
+  type one. *(Covered:
+  `contract_fixtures::every_assignment_names_its_job_its_time_limit_and_a_games_threading_mode`,
+  and each envelope's shape, the opening-rack and leave ones included, by
+  `the_assignment_envelope_matches_what_the_server_sends`.)*
+- `C-12` `decline-time-limit.json`, a task stopped at its time limit: the
+  token and `"reason": "time_limit"`, nothing missing. *(Covered:
+  `contract_fixtures::a_time_limit_decline_parses_as_a_decline_body`.)*
 - `C-10` `decline-missing-data.json`, a decline naming a file not found and one
   found with other bytes, parses as the body the server takes, with `actual`
   left out reading as its `null`; MAGPIE builds the same body key for key.
@@ -3707,8 +3938,12 @@ admin in once and the admin journeys reuse its storage state.
 - `E-1` An anonymous visitor browses the landing page, job list, a job detail
   page — its status on a row of its own, with no description beside an
   active status and "Paused …" or "Finished …" beside any other, then its
-  three headline cards (Allocation, Tasks completed, Estimated time left) — and the contributor
-  leaderboard, ranked by compute time and re-ranked by tasks at a click.
+  four headline cards (Allocation, Tasks completed, Throughput, Estimated
+  time left) — and the Contributions page: the site's totals
+  (movegens, compute time, tasks) and the same by job type, then the
+  contributor leaderboard, ranked by movegens and re-ranked by tasks at a
+  click, with a contributor's own by job type under their row when their name
+  is clicked.
   *(Covered:
   `e1-anonymous-browsing.spec.ts`.)*
 - `E-2` Register → confirm the email → log in → generate an API key → see it
@@ -3717,8 +3952,12 @@ admin in once and the admin journeys reuse its storage state.
   `e2-register-and-api-key.spec.ts`, reading its code from the outbox.)*
 - `E-3` An admin imports input data, reviews the staged diff, and confirms it.
   *(Covered: `e3-input-data-import.spec.ts`, against the fixture tarballs.)*
-- `E-4` An admin creates two player configs and a game-pairs job with
-  **Significance Test** ticked, activates it with an allocation, and watches the dashboard
+- `E-4` An admin creates two player configs and a game-pairs job between them
+  with **Significance Test** ticked -- its players a checklist whose preview
+  says "3 configs → 3 jobs" with a third ticked and "2 configs → 1 job", the
+  job named for its pairing -- lands on `/admin/allocation` with the new job
+  marked and first, activates it there by giving it an allocation (and
+  deactivates it there at the end), and watches the dashboard
   update live over SSE as fake workers contribute; its admin page has the
   match score and Significance Test cards, the latter's sentence giving player 1's
   score per game. **The journey that justifies the tier**: the only place
@@ -3732,8 +3971,12 @@ admin in once and the admin journeys reuse its storage state.
   appear, removes it, and sees the ratings change. Covers the one flow where a
   write is expected to move numbers elsewhere on the page. The pool is created
   through its form, from the ratings list, with only its anchor; membership,
-  the fit and the moved ratings go through the pool's page.
-  *(Covered: `e7-ratings.spec.ts`.)*
+  the fit and the moved ratings go through the pool's page, and with three
+  configs the cross table holds every head-to-head from both sides, each
+  cell's hover what the ratings predict, each cell tinted by its record as it
+  shows it (`data-record`), its last column the table's rating. Signed out,
+  the cross table is the first card, the plot after it, and there is no All
+  configs card. *(Covered: `e7-ratings.spec.ts`.)*
 - `E-8` A job detail page renders the pentanomial table — three rows (Won both,
   Won one, drew one, Even) with a column per player, each read from that
   player's buckets, the higher of a row marked and the even row never — the significance test's verdict in words ("Completed: decided: player 1
@@ -3756,18 +3999,25 @@ admin in once and the admin journeys reuse its storage state.
   list a pseudonym), which the seed does not register; the contributors'
   list shows only its ranked column beside the name — movegens, then compute
   time once ranked by it through its "Rank by" row, since the other
-  columns' headers are not on a phone's screen.)* The screen is the device's width:
+  columns' headers are not on a phone's screen. The site's movegens by job
+  type and a contributor's breakdown, unfolded, at a BIGINT's widest each,
+  stay inside the screen and the ranking's box.)* The screen is the device's width:
   compared with `innerWidth`, as it was, the check could not fail, because a
   phone's browser widens its layout viewport to fit what overflows — and the
   header's links ran to 533 pixels on a 393-pixel screen, "Sign in" and
   "Register" off it (thirty-first audit; the header now wraps). Checked against
   a build of the pages with the API mocked: 533 before, 393 after.
+  `E-10b`: a rating pool's cross table, six long-named configs served from a
+  route, scrolls sideways inside its card while the page does not, and its
+  sticky first column keeps the names in view scrolled to the ratings at its
+  far end.
 - `E-11` An admin job page whose first read fails shows nothing the server
-  did not say: the data gaps it read apart, the job's own allocation (from the
-  stream if the read failed), the failed reads tried again and their error
-  cleared, a value the admin types kept through the retries, and Activate
-  sending it — through an action's read too, since only Activate sends it
-  (the job's own allocation is shown beside the box). And `E-11b`: a read
+  did not say: the data gaps it read apart, the job's own allocation,
+  read-only with a link to `/admin/allocation` and no Activate or Deactivate
+  (the allocation is set only there), and the failed reads tried again and
+  their error cleared; then the job's task time limit, 3600, changed to 1800
+  in the Controls card and shown so in its Job settings ("30m (1,800
+  seconds)"). And `E-11b`: a read
   started before a live payload does not land over it — a slow retry put back
   the status the stream had moved past, on a job that sends nothing more. And
   `E-11c`: a job deleted while its page is open (by another admin) is said to
@@ -3779,7 +4029,7 @@ admin in once and the admin journeys reuse its storage state.
   "No worker has declined this job", showed 100, and Activate sent it
   (thirty-second audit, pass 16).
 - `E-12` A games job between two simmers made through the form with "Position Recorder" ticked
-  (and no significance test, the form's default) shows a signed-out visitor a prompt to sign in, and a signed-in user
+  (and no significance test, the form's default) shows a signed-out visitor
   one position at a time on its board: **Random position** until one follows
   a play, whose tiles are down with the play's outlined, both racks and
   scores with the player to move marked, and its ranked moves, each with its
@@ -3787,8 +4037,8 @@ admin in once and the admin journeys reuse its storage state.
   workers shape each position by its mover's config, as MAGPIE does); a rack search
   for that rack typed backwards in lower case shows a position holding it
   (with **Next** and **Previous** when there are more); a rack nothing has is
-  said to be. `E-12b`: at phone width the board fits the screen and nothing
-  scrolls sideways. *(Covered: `e12-saved-positions.spec.ts`, two tests; the
+  said to be. `E-12b`: at phone width the board fits the screen, nothing
+  scrolls sideways, and the rack tiles stay square. *(Covered: `e12-saved-positions.spec.ts`, two tests; the
   fake workers play synthetic games whose positions are real boards.)*
 - `E-13` An opening-rack job's page offers ten racks it has analysed under the
   search, and clicking one looks it up: a static player's, so its moves show
@@ -3814,7 +4064,7 @@ admin in once and the admin journeys reuse its storage state.
 - `E-17` A game-pairs job made through the form with "Position Recorder" and
   then "Only Where Each Pair First Diverges" ticked (offered only once saving
   is) says "yes (first divergences)" in its settings and shows a
-  signed-in user a pair's two games at one turn, one player's move at a time
+  visitor a pair's two games at one turn, one player's move at a time
   on one board with a toggle between them: "Game 1 of the pair" and "Game 2
   of the pair", the same rack, each player to move in one, each with ranked
   moves; a search for that rack finds the pair once, both
@@ -4024,6 +4274,11 @@ surfacing the mismatch as a red build rather than as a dead job in production.
   found, most drawn first, and draws exactly when leaves were found -- an
   inference can find no leave at all, at the default margin of 0, and is kept
   saying so. *(Covered: `case_inference`, one task.)*
+- `M-17` A worker at 24 threads finishes a games job whose players solve their
+  endgames and pre-endgames, 24 games at once: each game's solves get one
+  thread. When every solve took all 24, the games needed 24 + 24 x 24 move
+  generators of MAGPIE's 512 and magpie exited. *(Covered:
+  `case_solvers_many_threads`, one task.)*
 - `M-13` A job with `use_wit` dispatches only once its word info table is
   built; a worker whose table does not match the recorded hash declines with
   `derived_mismatch` and both digests reach `worker_data_gaps`; with the right
@@ -4228,7 +4483,7 @@ run that breaks one variable expects only that one.
   the single-instance rule (KL-82). Broken on purpose, each side shows: with
   the count's bound at two, `two_tasks_are_refused` fails; with a certificate
   regex that no real ARN matches, the good plan fails. *(Covered:
-  `infra/tests/variables.tftest.hcl`, 57 runs with `S-TF-2`'s and `S-TF-3`'s.)*
+  `infra/tests/variables.tftest.hcl`, 58 runs with `S-TF-2`'s, `S-TF-3`'s and `S-TF-4`'s.)*
   (Thirty-third audit, pass 1: a validation was first evaluated by a real plan,
   since `terraform validate` evaluates none. Pass 2 added the MAGPIE floor, the
   one value the backend refuses at startup that the plan let through.)
@@ -4246,15 +4501,25 @@ run that breaks one variable expects only that one.
   task at start.)
 - `S-TF-3` A deployment the circuit breaker rolls back mails the alerts topic:
   the `-deploy-failed` rule matches `aws.ecs`'s "ECS Deployment State Change"
-  with `eventName` `SERVICE_DEPLOYMENT_FAILED` only, on one resource, and has
-  a target. That the target is the alerts topic (a mock's ARN is unknown at
-  plan on CI's Terraform 1.9.8), that the resource is the web service's ARN,
-  and that the mail arrives, are known only at apply (below; README's "Check
-  that the alarms reach you" checks the pattern against the live service).
+  with `eventName` `SERVICE_DEPLOYMENT_FAILED` only, on two resources (the
+  backend's service and the frontend's), and has a target. That the target is
+  the alerts topic (a mock's ARN is unknown at plan on CI's Terraform 1.9.8),
+  that the resources are the two services' ARNs, and that the mail arrives,
+  are known only at apply (below; README's "Check that the alarms reach you"
+  checks the pattern against each live service).
   *(Covered:
   `infra/tests/variables.tftest.hcl`, `a_failed_deploy_is_alerted`.)*
   (Thirty-third audit, pass 2: a rollback was silent, and the next apply
   redeployed the release it abandoned.)
+- `S-TF-4` The split services: the backend's stops its one task before
+  starting the next (minimum 0%, maximum 100%: the single-instance rule) and
+  the frontend's rolls (100%, 200%), each serves only its own container's
+  target group, and each task definition holds its own container alone, the
+  frontend's running `frontend_image`. *(Covered:
+  `infra/tests/variables.tftest.hcl`,
+  `the_backend_stops_first_and_the_frontend_rolls`.)* (October 2026: a page
+  change stopped the backend, because the two shared one task with minimum
+  0%.)
 
 ---
 
@@ -4279,7 +4544,8 @@ validate`, by the variable validations' plans ([Terraform](#terraform)), and by
 applying it. Asserting what the plan builds tests the plan, not the
 deployment, and the failure mode that matters — an apply that breaks
 production — is not reachable from a test suite. `S-TF-3` reads the one
-alert rule whose pattern the plan knows; that EventBridge delivers ECS's
+alert rule whose pattern the plan knows, and `S-TF-4` the two services'
+deployment settings, which decide whether a deploy has a gap; that EventBridge delivers ECS's
 deployment event to the topic, and the service ARN in its pattern, need a real
 account (a mock apply fails on the random ARNs the mocks make).
 Backup *restores* are covered by the monthly drill, which is the real check.
@@ -4459,8 +4725,8 @@ scripts/seed.py [--api URL] [--job-type TYPE] [--tarball-date YYYYMMDD]
    with `--dev-job` (repeatable), dev.py's named jobs instead -- the two on
    the two-letter test data import it first (`--small-tarball-date`,
    `--small-git-ref`) -- or, with `--no-job`, none.
-6. Activate it with an allocation; dev.py's new jobs share what the active
-   ones leave free.
+6. Give it an allocation (`PUT /api/admin/jobs/allocations`), which activates
+   it; dev.py's new jobs share what the active ones leave free.
 
 Re-running is safe: an unconfirmed account is confirmed, an imported tarball is
 skipped, and an active job of the same type -- and name, for dev.py's -- is

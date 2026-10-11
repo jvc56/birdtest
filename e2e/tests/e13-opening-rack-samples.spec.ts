@@ -4,7 +4,8 @@ import { env } from '../lib/env';
 
 /**
  * E-13: an opening-rack job's page offers racks it has analysed under the
- * search, and one click looks one up. Anyone may: the lookup is public.
+ * search, drawn at random, and one click looks one up. Anyone may: the
+ * lookup is public.
  */
 let api: AdminApi;
 let jobId: string;
@@ -24,28 +25,34 @@ test.beforeAll(async ({ playwright }) => {
     10
   );
   const request = await playwright.request.newContext({ baseURL: env.baseURL });
+  // Ten distinct racks to draw: the job is small enough to be sampled whole,
+  // so the page's own draw finds ten too.
   await expect
     .poll(
-      async () => {
-        const page = await (await request.get(`/api/jobs/${jobId}/results?per_page=50`)).json();
-        return new Set(page.items.map((r: { rack: string }) => r.rack)).size;
-      },
+      async () => (await (await request.get(`/api/jobs/${jobId}/rack-samples?n=10`)).json()).racks.length,
       { timeout: 120_000, intervals: [1000] }
     )
-    .toBeGreaterThanOrEqual(10);
+    .toBe(10);
   await request.dispose();
 });
 
 test.afterAll(async () => {
   // The fixture's rack space is small enough that the job may have finished.
   const stats = await api.get<{ job: { status: string } }>(`/api/jobs/${jobId}`);
-  if (stats.job.status === 'active') await api.post(`/api/admin/jobs/${jobId}/deactivate`);
+  if (stats.job.status === 'active') await api.allocate(jobId, 0);
   await api.dispose();
 });
 
 test('E-13: an opening-rack job offers analysed racks to look up', async ({ page }) => {
   await page.goto(`/jobs/${jobId}`);
-  const samples = page.locator('div', { hasText: /^Analysed racks to try:/ }).getByRole('button');
+  await expect(page.getByText('Analysed racks to try:')).toBeVisible();
+  const samples = page.getByTestId('rack-sample');
+  await expect(samples).toHaveCount(10);
+  // Drawn at random across the job, each once; "Shuffle" draws again.
+  expect(new Set(await samples.allInnerTexts()).size).toBe(10);
+  const drawn = page.waitForResponse((r) => r.url().includes(`/api/jobs/${jobId}/rack-samples`));
+  await page.getByRole('button', { name: 'Shuffle' }).click();
+  await drawn;
   await expect(samples).toHaveCount(10);
   const rack = (await samples.first().innerText()).trim();
   await samples.first().click();

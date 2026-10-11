@@ -10,29 +10,24 @@ test.use({ storageState: ADMIN_STATE });
  * deploy's, or the display pool's) left the data gaps and the allocation
  * unread while the stream filled in the stats: the page said "No worker has
  * declined this job" and showed an allocation of 100, and Activate sent the
- * 100 (thirty-second audit, pass 16). And a retry must not replace what the
- * admin has typed since: one did, and Activate sent the job's old value.
+ * 100 (thirty-second audit, pass 16). The allocation is now set only on the
+ * Allocation page; this page shows the job's own, read-only.
  */
 test('E-11: an admin job page whose first read fails shows only what the server said', async ({ page }) => {
   const api = await AdminApi.open();
   const a = await api.createStaticConfig(`e11-a-${Date.now()}`, 'equity');
   const b = await api.createStaticConfig(`e11-b-${Date.now()}`, 'score');
-  const id = await api.activeJob(
-    {
-      job_type: 'game_pairs',
-      player1_config_id: a,
-      player2_config_id: b,
-      pairs_per_batch: 1,
-      test_enabled: true,
-      min_pairs: 100000,
-      max_pairs: 200000
-    },
-    7
-  );
-  await api.post(`/api/admin/jobs/${id}/deactivate`);
+  const id = await api.inactiveJob({
+    job_type: 'game_pairs',
+    player_config_ids: [a, b],
+    pairs_per_batch: 1,
+    test_enabled: true,
+    min_pairs: 100000,
+    max_pairs: 200000
+  });
 
   // The first read of the job fails once, and of its data gaps twice, so the
-  // page retries while the admin types; a worker has declined it for data.
+  // page retries; a worker has declined it for data.
   let jobReads = 0;
   await page.route(`**/api/jobs/${id}`, async (route) => {
     if (route.request().method() !== 'GET') return route.continue();
@@ -57,38 +52,38 @@ test('E-11: an admin job page whose first read fails shows only what the server 
       ]
     });
   });
-  const activations: string[] = [];
-  await page.route(`**/api/admin/jobs/${id}/activate`, (route) => {
-    activations.push(route.request().postData() ?? '');
-    return route.fulfill({ status: 409, json: { code: 'conflict', message: 'mocked', fields: [] } });
-  });
 
   await page.goto(`/admin/jobs/${id}`);
   await expect(page.getByRole('heading', { name: 'Controls' })).toBeVisible({ timeout: 20_000 });
   const gapsCard = page.locator('.card', { has: page.getByRole('heading', { name: 'Data gaps' }) });
-  // Unread, the gaps are not "none"; the allocation is the job's, not 100.
+  // Unread, the gaps are not "none"; the allocation is the job's own.
   await expect(gapsCard).toContainText('Could not load the data gaps');
-  await expect(page.locator('#alloc')).toHaveValue('7');
+  const allocation = page.getByTestId('job-allocation');
+  await expect(allocation).toContainText('0%');
+  await expect(allocation).toContainText('inactive');
+  await expect(allocation.getByRole('link', { name: /Allocation page/ })).toHaveAttribute(
+    'href',
+    '/admin/allocation'
+  );
+  // Nothing on this page switches the job on or off.
+  await expect(page.getByRole('button', { name: 'Activate', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Deactivate', exact: true })).toHaveCount(0);
 
-  // What the admin types survives the retries (one replaced it with 7).
-  await page.locator('#alloc').fill('55');
   await expect(gapsCard.getByRole('cell', { name: /NWL23/ })).toBeVisible({ timeout: 20_000 });
   expect(gapReads).toBeGreaterThanOrEqual(3);
   expect(jobReads).toBeGreaterThanOrEqual(2);
   await expect(page.getByText(/Could not load all of this job/)).toBeHidden();
-  await expect(page.locator('#alloc')).toHaveValue('55');
 
-  await page.getByRole('button', { name: 'Activate', exact: true }).click();
-  await expect.poll(() => activations.length).toBe(1);
-  expect(JSON.parse(activations[0])).toEqual({ allocation: 55 });
-
-  // And an action's read leaves it too: only Activate sends it (Deactivate's
-  // read put 7 back, and the next Activate sent that).
-  await page.route(`**/api/admin/jobs/${id}/deactivate`, (route) => route.fulfill({ status: 204, body: '' }));
-  await page.getByRole('button', { name: 'Deactivate', exact: true }).click();
-  await expect(page.getByText('Job deactivated.')).toBeVisible();
-  await expect(page.locator('#alloc')).toHaveValue('55');
-  await expect(page.getByText(/Set: 7% \(offered to nobody while inactive\)/)).toBeVisible();
+  // The job's own task time limit, an hour until it is changed here; the
+  // job's settings then show the new one.
+  const limit = page.getByTestId('job-time-limit').getByLabel('Task Time Limit (Seconds)');
+  await expect(limit).toHaveValue('3600');
+  await limit.fill('1800');
+  await page.getByTestId('job-time-limit').getByRole('button', { name: 'Save' }).click();
+  await expect(page.getByText(/Claims made from now on are given the new limit/)).toBeVisible();
+  await expect(page.getByTestId('job-settings').getByRole('row', { name: /Task Time Limit/ })).toContainText(
+    '30m (1,800 seconds)'
+  );
   await api.dispose();
 });
 
@@ -101,21 +96,20 @@ test('E-11b: a slow read does not undo what the stream has since said', async ({
   const api = await AdminApi.open();
   const a = await api.createStaticConfig(`e11b-a-${Date.now()}`, 'equity');
   const b = await api.createStaticConfig(`e11b-b-${Date.now()}`, 'score');
-  const id = await api.activeJob(
-    {
-      job_type: 'game_pairs',
-      player1_config_id: a,
-      player2_config_id: b,
-      pairs_per_batch: 1,
-      test_enabled: true,
-      min_pairs: 100000,
-      max_pairs: 200000
-    },
-    3
-  );
-  await api.post(`/api/admin/jobs/${id}/deactivate`);
+  const id = await api.inactiveJob({
+    job_type: 'game_pairs',
+    player_config_ids: [a, b],
+    pairs_per_batch: 1,
+    test_enabled: true,
+    min_pairs: 100000,
+    max_pairs: 200000
+  });
   const base = await api.get<{ job: Record<string, unknown> }>(`/api/jobs/${id}`);
-  const as = (status: string) => ({ ...base, job: { ...base.job, status, allocation: 7 } });
+  // Active at 7%, or completed at the 0% every completed job holds.
+  const as = (status: string) => ({
+    ...base,
+    job: { ...base.job, status, allocation: status === 'active' ? 7 : 0 }
+  });
   let current = as('active');
 
   // The stream's second connection says the job completed; the page's second
@@ -172,26 +166,22 @@ test('E-11c: a job deleted while its page is open offers nothing more', async ({
   const api = await AdminApi.open();
   const a = await api.createStaticConfig(`e11c-a-${Date.now()}`, 'equity');
   const b = await api.createStaticConfig(`e11c-b-${Date.now()}`, 'score');
-  const id = await api.activeJob(
-    {
-      job_type: 'game_pairs',
-      player1_config_id: a,
-      player2_config_id: b,
-      pairs_per_batch: 1,
-      test_enabled: true,
-      min_pairs: 100000,
-      max_pairs: 200000
-    },
-    3
-  );
-  await api.post(`/api/admin/jobs/${id}/deactivate`);
+  const id = await api.inactiveJob({
+    job_type: 'game_pairs',
+    player_config_ids: [a, b],
+    pairs_per_batch: 1,
+    test_enabled: true,
+    min_pairs: 100000,
+    max_pairs: 200000
+  });
   await page.goto(`/admin/jobs/${id}`);
   await expect(page.getByRole('heading', { name: 'Controls' })).toBeVisible();
 
   await api.delete(`/api/admin/jobs/${id}`);
-  await page.getByRole('button', { name: 'Deactivate', exact: true }).click();
+  page.once('dialog', (dialog) => dialog.accept());
+  await page.getByRole('button', { name: 'Force complete', exact: true }).click();
   await expect(page.getByText('This job no longer exists.')).toBeVisible();
-  await expect(page.getByRole('button', { name: 'Activate', exact: true })).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Force complete', exact: true })).toBeDisabled();
   await expect(page.getByRole('button', { name: 'Delete job', exact: true })).toBeDisabled();
   await api.dispose();
 });

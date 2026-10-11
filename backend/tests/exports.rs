@@ -114,7 +114,7 @@ fn captured_result(i: usize) -> serde_json::Value {
 }
 
 async fn complete(db: &TestDb, job: Uuid) {
-    sqlx::query("UPDATE jobs SET status = 'completed' WHERE id = $1")
+    sqlx::query("UPDATE jobs SET status = 'completed', allocation = 0 WHERE id = $1")
         .bind(job)
         .execute(&db.pool)
         .await
@@ -953,7 +953,7 @@ async fn an_export_finishing_while_its_job_reopens_fails() {
         .await
         .unwrap();
     birdtest::exports::unfinalize(&mut reopen, job).await.unwrap();
-    sqlx::query("UPDATE jobs SET status = 'active' WHERE id = $1")
+    sqlx::query("UPDATE jobs SET status = 'active', allocation = 50 WHERE id = $1")
         .bind(job)
         .execute(&mut *reopen)
         .await
@@ -1022,7 +1022,7 @@ async fn an_export_spanning_a_reopening_and_a_second_completion_fails() {
         .await
         .unwrap();
     birdtest::exports::unfinalize(&mut reopen, job).await.unwrap();
-    sqlx::query("UPDATE jobs SET status = 'active' WHERE id = $1")
+    sqlx::query("UPDATE jobs SET status = 'active', allocation = 50 WHERE id = $1")
         .bind(job)
         .execute(&mut *reopen)
         .await

@@ -349,7 +349,7 @@ pub async fn complete_unless_purged(
     let status = decided.map(|(test, _)| test.status.as_str());
     let mut tx = pool.begin().await?;
     let completed = sqlx::query(
-        "UPDATE jobs SET status = 'completed',
+        "UPDATE jobs SET status = 'completed', allocation = 0,
                          test_decided_status = $3, test_decided_lower = $4,
                          test_decided_upper = $5, test_decided_units = $6
          WHERE id = $1 AND status = 'active' AND claims_issued >= $2
@@ -517,9 +517,13 @@ pub(crate) async fn load_game_request(
     template: &dispatch::JobTemplate,
     task_id: Uuid,
 ) -> AppResult<GameRequest> {
-    let (player1, player2) = match &template.kind {
-        dispatch::JobKind::Games { player1, player2, .. }
-        | dispatch::JobKind::GamePairs { player1, player2, .. } => (player1, player2),
+    // The threading mode is the job's, like the players, and fixed at its
+    // creation: no task row repeats it.
+    let (player1, player2, threading_mode) = match &template.kind {
+        dispatch::JobKind::Games { player1, player2, config } => (player1, player2, &config.threading_mode),
+        dispatch::JobKind::GamePairs { player1, player2, config } => {
+            (player1, player2, &config.threading_mode)
+        }
         _ => return Err(template.mismatch("games")),
     };
     let row = game::load_game_request_row(conn, task_id).await?;
@@ -531,6 +535,7 @@ pub(crate) async fn load_game_request(
         capture_first_divergence: row.get("capture_first_divergence"),
         bingo_bonus: template.data.bingo_bonus,
         sim_cutoff: template.data.sim_cutoff,
+        threading_mode: threading_mode.clone(),
         letter_distribution: row.get("letter_distribution"),
         board_layout: row.get("board_layout"),
         player1: player1.clone(),
