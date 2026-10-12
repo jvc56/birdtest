@@ -75,6 +75,10 @@ pub struct PlayerSpec {
     pub stopping_pct: Option<f64>,
     pub use_inference: Option<bool>,
     pub time_limit_secs: Option<i32>,
+    /// The move generations the player may spend choosing one move; `None`
+    /// is sent as null, which MAGPIE reads as no budget. Stated by every
+    /// player: MAGPIE refuses a player that leaves it out.
+    pub movegens_per_move: Option<i64>,
     pub use_wordmap: bool,
     pub use_rit: bool,
     /// The name this player's rack info table is loaded under, or `None` when
@@ -136,6 +140,7 @@ impl From<NamedPlayerConfig> for PlayerSpec {
             stopping_pct: c.stopping_pct,
             use_inference: c.use_inference,
             time_limit_secs: c.time_limit_secs,
+            movegens_per_move: c.movegens_per_move,
             use_wordmap: c.use_wordmap,
             use_rit: c.use_rit,
             rit_name: c

@@ -624,6 +624,10 @@ struct CreatePlayerConfigBody {
     stopping_pct: Option<f64>,
     use_inference: Option<bool>,
     time_limit_secs: Option<i32>,
+    /// The move generations the player may spend choosing one move; absent or
+    /// null for no budget. Any player may state one.
+    #[serde(default)]
+    movegens_per_move: Option<i64>,
     #[serde(default)]
     use_wordmap: Option<bool>,
     #[serde(default)]
@@ -1001,9 +1005,10 @@ async fn create_player_config(
               utility_spread_scale, movegen_margin, created_by,
               endgame_plies, peg_max_bag, peg_stage_top_k, peg_scenario_stride,
               peg_opp_model, peg_nested, peg_nested_cand_caps, peg_nested_max_depth,
-              peg_nested_strides, use_wit)
+              peg_nested_strides, use_wit, movegens_per_move)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,
-                 $18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36)
+                 $18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,
+                 $37)
          RETURNING *",
     )
     .bind(body.name.trim())
@@ -1053,6 +1058,7 @@ async fn create_player_config(
     // table before any job using it dispatches, once per lexicon: about three
     // seconds and 122 MB for CSW24.
     .bind(body.use_wit.unwrap_or(true))
+    .bind(body.movegens_per_move)
     .fetch_one(&state.pool)
     .await
     .map_err(|e| match body.cloned_from_id {
@@ -1156,6 +1162,14 @@ fn validate_player_config_body(body: &CreatePlayerConfigBody) -> AppResult<()> {
     }
     if body.time_limit_secs.is_some_and(|v| v < 0) {
         err = err.with_field("time_limit_secs", "must not be negative");
+    }
+    // A budget of 0 would stop every search before it began; no budget is
+    // null, not 0.
+    if body.movegens_per_move.is_some_and(|v| v < 1) {
+        err = err.with_field(
+            "movegens_per_move",
+            "must be at least 1, or left empty for no budget",
+        );
     }
     if body.stopping_pct.is_some_and(|v| !(v > 0.0 && v < 100.0)) {
         err = err.with_field("stopping_pct", "must be strictly between 0 and 100");

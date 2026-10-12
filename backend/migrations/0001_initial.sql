@@ -676,6 +676,12 @@ CREATE TABLE player_configs (
     -- games or game-pairs job that captures positions: MAGPIE reads player
     -- 1's for both seats, so job creation requires the two to agree.
     movegen_margin         DOUBLE PRECISION NOT NULL, -- move-gen equity margin for 'equity' recording (-mmargin)
+    -- The move generations the player may spend choosing one move -- its
+    -- inference, simulation and solving together -- or NULL for no budget
+    -- (-mb1 / -mb2). Unlike a time limit it is the same work on any machine.
+    -- Any player may state one; only a simmer or a solver spends more than
+    -- one generation a move, so only for one can it bind.
+    movegens_per_move      BIGINT CHECK (movegens_per_move > 0),
     -- Endgame and pre-endgame (PEG) solving, read only by games and game-pairs
     -- jobs: an opening rack never reaches a small bag, and a leave job's games
     -- end before one (job creation refuses a leave player that solves).

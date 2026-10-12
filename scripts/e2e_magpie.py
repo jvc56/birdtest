@@ -945,6 +945,47 @@ def case_inference(ctx: Context) -> None:
         worker.remove()
 
 
+def case_movegen_budget(ctx: Context) -> None:
+    """M-18: a player's movegen budget per move reaches MAGPIE and binds. The
+    same simmer plays two games against a static player twice: without a
+    budget, its iteration budget runs a few thousand generations a move;
+    with 2,000 a move, the job's reported movegens per game fall well below."""
+    deactivate_everything(ctx)
+    simmer = {
+        "recorder_type": "all", "winpct_id": ctx.winpct, "num_plies": 2, "num_plays": 10,
+        "num_plies_recorded": 2, "num_plays_recorded": 5, "max_iterations": 5000,
+        "stopping_pct": 99, "time_limit_secs": 0, "use_inference": False,
+        "use_wordmap": False, "use_rit": False,
+    }
+    opponent = create_player(ctx, ctx.data, "e2e-budget-opponent", {"use_wordmap": False, "use_rit": False})
+    per_game = {}
+    for label, budget in (("unbudgeted", None), ("budgeted", 2_000)):
+        body = {**simmer, "movegens_per_move": budget}
+        players = {
+            "player1_config_id": create_player(ctx, ctx.data, f"e2e-budget-{label}", body),
+            "player2_config_id": opponent,
+        }
+        job_id = create_and_activate(ctx, ctx.data, games_body(players, 2))
+        worker = Worker(ctx, f"m18-{label}")
+        try:
+            worker.run(tasks=1)
+            movegens, games = ctx.psql(
+                "SELECT COALESCE(SUM(c.movegens), 0), "
+                "       (SELECT COALESCE(SUM(games), 0) FROM game_results "
+                f"        WHERE job_id = '{job_id}') "
+                f"FROM task_claims c WHERE c.job_id = '{job_id}' AND c.state = 'completed'"
+            ).split("|")
+            expect(int(games) > 0, f"the {label} job played no games")
+            per_game[label] = int(movegens) / int(games)
+        finally:
+            delete_job(ctx, job_id)
+            worker.remove()
+    log(f"M-18: {per_game['unbudgeted']:,.0f} movegens a game without a budget, "
+        f"{per_game['budgeted']:,.0f} with 2,000 a move")
+    expect(per_game["budgeted"] < per_game["unbudgeted"] / 2,
+           f"a budget of 2,000 a move did not cut the movegens a game: {per_game}")
+
+
 def case_first_divergences(ctx: Context) -> None:
     """M-14: a game-pairs job keeping first divergences stores, from each pair
     that diverged, both games' positions at one turn of one position, each
@@ -1400,6 +1441,7 @@ CASES = {
     "M-15": case_consensus,
     "M-16": case_inference,
     "M-17": case_solvers_many_threads,
+    "M-18": case_movegen_budget,
     "capture": case_capture,
 }
 DEFAULT_CASES = [name for name in CASES if name.startswith("M-")]

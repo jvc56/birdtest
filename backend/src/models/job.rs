@@ -158,6 +158,9 @@ pub struct PlayerConfig {
     pub stopping_pct: Option<f64>,
     pub use_inference: Option<bool>,
     pub time_limit_secs: Option<i32>,
+    /// The move generations the player may spend choosing one move, or `None`
+    /// for no budget. Sent to MAGPIE as `movegens_per_move` (its -mb1/-mb2).
+    pub movegens_per_move: Option<i64>,
     pub use_wordmap: bool,
     pub use_rit: bool,
     /// Whether the player loads the word info table for its lexicon: a

@@ -4311,6 +4311,7 @@ MAGPIE's per-player settings, where `N` is 1 or 2:
 | `stopping_pct` | `-scN` | |
 | `use_inference` | `-siN` | |
 | `time_limit_secs` | `-tlN` | 0 for a simmer: no limit, so the iteration budget decides |
+| `movegens_per_move` | `-mbN` | The move generations the player may spend choosing one move -- its inference, simulation and solving together -- or null for no budget. Stated by every player, null included: MAGPIE refuses a player that leaves it out. When it is spent the player plays its best move so far; unlike a time limit it is the same work on any machine (`UPDATES_PLAN_2026-10-12.md`) |
 | `use_wordmap` | `-wN` | applied directly against `players_data`, not `-wN`'s own arg parsing, and **before** the task's lexicon loads, which is when MAGPIE decides whether to load a wordmap |
 | `use_rit` | — | applied against `players_data` the same way, and **before** the lexicon loads |
 | `rit_name` | — | The name to load the table under, `<lexicon>.<leaves>`. A table stores precomputed leave values, so it belongs to the pair rather than the lexicon; the server pins a hash for this exact name (see [Wordmap and rack info table provenance](#wordmap-and-rack-info-table-provenance)) |
@@ -4874,6 +4875,7 @@ the worker applies both rather than whatever its own settings last loaded.
               "use_wordmap": false, "use_rit": false, "rit_name": null,
               "win_pct_model": null, "max_iterations": null,
               "stopping_pct": null, "use_inference": null, "time_limit_secs": null,
+              "movegens_per_move": null,
               "min_play_iterations": null, "threshold": null, "sampling_rule": null,
               "inference_margin": null, "utility_w_winpct": null,
               "utility_w_spread": null, "utility_spread_scale": null } }
@@ -7059,6 +7061,7 @@ CREATE TABLE player_configs (
     -- games or game-pairs job that captures positions: MAGPIE reads player
     -- 1's for both seats, so job creation requires the two to agree.
     movegen_margin         DOUBLE PRECISION NOT NULL, -- move-gen equity margin for 'equity' recording (-mmargin)
+    movegens_per_move      BIGINT CHECK (movegens_per_move > 0), -- per-move movegen budget, NULL for none (-mb1 / -mb2)
     -- Endgame and pre-endgame (PEG) solving, read only by games and game-pairs
     -- jobs: an opening rack never reaches a small bag, and a leave job's games
     -- end before one (job creation refuses a leave player that solves).

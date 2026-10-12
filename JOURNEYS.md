@@ -678,6 +678,11 @@ Do this last: it empties the database.
 - [ ] **Do** a simmer: tick **Simming Player**, choose the win% model, **Plies
   (-pl)** 1, **Maximum Total Iterations (-i)** 100. **Expect** it saved and described "1-ply sim, 100
   iterations".
+- [ ] **Do** `tester-sim-budget`: the same simmer with **Movegens per Move
+  (-mb)** 50,000. **Expect** it saved and described "1-ply sim, 100
+  iterations · 50,000 movegens a move", and on its page, under **All
+  settings**, Movegens per Move 50,000 (the other configs "—"). **Do** enter 0.
+  **Expect** "must be at least 1, or left empty for no budget".
 - [ ] **Do** tick **Simming Player** without a win% model. **Expect** the
   browser to insist on one.
 - [ ] **Do** set Stopping % to 100, then 0. **Expect** the browser to hold the

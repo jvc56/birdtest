@@ -512,6 +512,8 @@ export interface PlayerConfig {
   stopping_pct: number | null;
   use_inference: boolean | null;
   time_limit_secs: number | null;
+  /** The move generations the player may spend choosing one move; null is no budget. */
+  movegens_per_move: number | null;
   use_wordmap: boolean;
   use_rit: boolean;
   use_wit: boolean;

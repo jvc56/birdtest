@@ -15,6 +15,8 @@
   let winpctId = '';
   let simming = false;
   let maxIterations = 1000;
+  // Blank is no budget.
+  let movegensPerMove: number | null = null;
   let numPlies = 2;
   let numPlays = 10;
   // MAGPIE's default. A static player's list is sized by it too: an opening-rack
@@ -136,6 +138,8 @@
         // Always 0 for a simmer: a time limit makes results depend on the
         // contributor's hardware, so the iteration budget bounds a simulation.
         time_limit_secs: simming ? 0 : null,
+        // Any player may state one; blank is no budget.
+        movegens_per_move: optional(movegensPerMove),
         use_wordmap: useWordmap,
         use_rit: useRit,
         use_wit: useWit,
@@ -362,6 +366,25 @@
       {/if}
     {/if}
   </fieldset>
+
+  <div>
+    <label class="label" for="movegens">Movegens per Move (-mb)</label>
+    <input
+      id="movegens"
+      type="number"
+      min="1"
+      class="input"
+      placeholder="no budget"
+      bind:value={movegensPerMove}
+    />
+    <p class="mt-1 text-xs text-muted-foreground">
+      The move generations the player may spend choosing one move: its inference, simulation
+      and solving together. When it is spent the player plays its best move so far, even short
+      of the minimum iterations. Unlike a time limit it is the same work on any machine. Leave it
+      empty for no budget. A static player that does not solve generates once a move, so a
+      budget never binds for one.
+    </p>
+  </div>
 
   <button type="button" class="text-sm text-muted-foreground underline" on:click={() => (showAdvanced = !showAdvanced)}>
     {showAdvanced ? 'Hide' : 'Show'} advanced options

@@ -13,7 +13,7 @@ const render = (props: Record<string, unknown>): string =>
 const base: PlayerSettings = {
   role: 'player 1', id: 'p1', name: 'static-equity', lexicon: 'CSW24', leaves: 'CSW24', win_pct: null,
   recorder_type: 'all', sort_strategy: 'equity', num_plies: 0, num_plies_recorded: 0, num_plays: 100,
-  num_plays_recorded: 10, max_iterations: null, stopping_pct: null, use_inference: null, time_limit_secs: null,
+  num_plays_recorded: 10, max_iterations: null, stopping_pct: null, use_inference: null, time_limit_secs: null, movegens_per_move: null,
   use_wordmap: true, use_rit: false, use_wit: false, min_play_iterations: null, threshold: null,
   sampling_rule: null, inference_margin: null, utility_w_winpct: null, utility_w_spread: null,
   utility_spread_scale: null, movegen_margin: 0, endgame_plies: 0, peg_max_bag: 0, peg_stage_top_k: null,

@@ -5,7 +5,7 @@ const staticPlayer: PlayerSettings = {
   role: 'player 1', id: 'p1', name: 'static-NWL23', lexicon: 'NWL23', leaves: 'NWL23', win_pct: null,
   recorder_type: 'best', sort_strategy: 'equity', num_plies: 0, num_plies_recorded: 2,
   num_plays: 100, num_plays_recorded: 10, max_iterations: null, stopping_pct: null,
-  use_inference: null, time_limit_secs: null, use_wordmap: true, use_rit: true,
+  use_inference: null, time_limit_secs: null, movegens_per_move: null, use_wordmap: true, use_rit: true,
   use_wit: false,
   min_play_iterations: null, threshold: null, sampling_rule: null, inference_margin: null,
   utility_w_winpct: null, utility_w_spread: null, utility_spread_scale: null, movegen_margin: 5,
@@ -159,7 +159,7 @@ describe('F-SET-1 job settings', () => {
 
   it('marks the player settings each job never reads', () => {
     expect(muted(playerRows([staticPlayer], unusedPlayerSettings(leave)))).toEqual([
-      'Leaves', 'Move Recorder', 'Moves Generated', 'Uses Preendgame', 'Uses Endgame', 'Moves Recorded',
+      'Leaves', 'Move Recorder', 'Moves Generated', 'Uses Preendgame', 'Uses Endgame', 'Movegens per Move', 'Moves Recorded',
       'Plies Recorded',
       'Movegen Margin', ...SOLVER_LABELS.slice(2)
     ]);
@@ -181,7 +181,7 @@ describe('F-SET-1 job settings', () => {
     // A static opening-rack analysis is the one reader of both.
     const staticOpening = { ...opening, players: [{ ...staticPlayer, role: 'player' }] };
     expect(muted(playerRows([staticPlayer], unusedPlayerSettings(staticOpening)))).toEqual([
-      'Uses Inference', 'Uses Preendgame', 'Uses Endgame', ...SOLVER_LABELS.slice(2)
+      'Uses Inference', 'Uses Preendgame', 'Uses Endgame', 'Movegens per Move', ...SOLVER_LABELS.slice(2)
     ]);
     // A games job generates with MAGPIE's own recorder and a margin of 0, and
     // reads what is recorded only when it records positions.
@@ -198,7 +198,7 @@ describe('F-SET-1 job settings', () => {
     // so does a simmer beside them (its candidates), which keeps it live.
     const twoStatic = { ...config, players: [staticPlayer, { ...staticPlayer, role: 'player 2', id: 'p4' }] };
     expect(muted(playerRows(twoStatic.players, unusedPlayerSettings(twoStatic)))).toEqual([
-      'Move Recorder', 'Moves Generated', 'Moves Recorded', 'Plies Recorded', 'Movegen Margin'
+      'Move Recorder', 'Moves Generated', 'Movegens per Move', 'Moves Recorded', 'Plies Recorded', 'Movegen Margin'
     ]);
     const twoCounts = playerRows([staticPlayer, { ...staticPlayer, num_plays: 15 }], unusedPlayerSettings(twoStatic));
     expect(byLabel(twoCounts, 'Moves Generated').differs).toBe(false);
@@ -216,9 +216,24 @@ describe('F-SET-1 job settings', () => {
     }
   });
 
+  it('shows a movegen budget per move, and greys it where no player can spend one', () => {
+    const budgeted = { ...simPlayer, movegens_per_move: 50000 };
+    expect(byLabel(playerRows([budgeted, staticPlayer]), 'Movegens per Move').values).toEqual(['50,000', '—']);
+    expect(playerSummary(budgeted)).toContain('50,000 movegens a move');
+    expect(playerSummary(simPlayer)).not.toContain('movegens a move');
+    // Only a simulation or a solve spends more than one generation a move.
+    const twoStatic = { ...config, players: [staticPlayer, { ...staticPlayer, role: 'player 2', id: 'p4' }] };
+    expect(unusedPlayerSettings(twoStatic).has('movegens_per_move')).toBe(true);
+    const staticAndSolver = { ...config, players: [staticPlayer, solvingPlayer] };
+    expect(unusedPlayerSettings(staticAndSolver).has('movegens_per_move')).toBe(false);
+    expect(unusedPlayerSettings(config).has('movegens_per_move')).toBe(false);
+    // Greyed, a budget is left out of the summary too.
+    expect(playerSummary({ ...staticPlayer, movegens_per_move: 10 }, unusedPlayerSettings(twoStatic))).not.toContain('movegens');
+  });
+
   it('lists every player setting in one order, the key rows first, in Title Case', () => {
     expect(labels(playerRows([simPlayer, solvingPlayer]))).toEqual([
-      ...KEY_LABELS, 'Win % Model', 'Maximum Total Iterations', 'Stopping %', 'Moves Recorded',
+      ...KEY_LABELS, 'Win % Model', 'Maximum Total Iterations', 'Movegens per Move', 'Stopping %', 'Moves Recorded',
       'Plies Recorded', 'Minimum Iterations per Play', 'Stopping Threshold Rule', 'Sampling Rule',
       'Inference Margin', 'Win % Utility Weight', 'Spread Utility Weight', 'Spread Utility Scale',
       'Time Limit (Seconds)', 'Movegen Margin', ...SOLVER_LABELS.slice(2), 'Wordmap', 'Rack Info Table',
