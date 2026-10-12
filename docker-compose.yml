@@ -145,7 +145,7 @@ services:
       # was silently replaced by the real API.
       GITHUB_API_URL: ${BIRDTEST_GITHUB_API_URL:-https://api.github.com}
       GITHUB_RAW_URL: ${BIRDTEST_GITHUB_RAW_URL:-https://raw.githubusercontent.com}
-      # The fleet-wide floor. `birdtest-contribute` reports 0.1.1, which
+      # The fleet-wide floor. MAGPIE's `main` reports 0.1.1, which
       # meets it; scripts/dev.py reads the version
       # out of your checkout and sets this for you, so a checkout that reports
       # something else still runs locally.

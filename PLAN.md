@@ -2440,7 +2440,7 @@ being able to express once every job depends on the client honouring a protocol,
 so the columns are `NOT NULL` and default to **`0.1.1`**, the same value as the
 server's `MIN_MAGPIE_VERSION`, which `create_job` writes explicitly.
 
-`0.1.1` is the `birdtest-contribute` version the backend image pins. The version
+`0.1.1` is the version of the MAGPIE `main` commit the backend image pins. The version
 was incremented through `0.5.1` as birdtest and MAGPIE changed together during
 development and reset to `0.1.0` when the protocol settled; none of those numbers
 shipped. **The version moves with every change that can alter what a task
@@ -2556,7 +2556,7 @@ release installs it, and check `task_claims.magpie_version` and
 
 **An end-to-end test guards the two constants**, and it runs nightly rather than
 per pull request (`.github/workflows/nightly.yml`, running
-`scripts/e2e_magpie.py`): it compiles MAGPIE `birdtest-contribute` as
+`scripts/e2e_magpie.py`): it compiles MAGPIE `main` as
 `portable_release` (the build the backend image and the MAGPIE release use, so
 the wordmap it builds hashes the same as the server's; MAGPIE's Makefile
 refuses `BUILD=release`, which is a PGO target with its own recipe), installs data

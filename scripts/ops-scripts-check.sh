@@ -98,10 +98,10 @@ git -c init.defaultBranch=main init -q --bare "$WORK/magpie-origin.git"
 git -c init.defaultBranch=main init -q "$WORK/magpie-src"
 git -C "$WORK/magpie-src" commit -q --allow-empty -m pinned
 pin=$(git -C "$WORK/magpie-src" rev-parse HEAD)
-git -C "$WORK/magpie-src" push -q "$WORK/magpie-origin.git" HEAD:refs/heads/birdtest-contribute
+git -C "$WORK/magpie-src" push -q "$WORK/magpie-origin.git" HEAD:refs/heads/main
 git -C "$WORK/magpie-src" commit -q --allow-empty -m unpushed
 unpushed=$(git -C "$WORK/magpie-src" rev-parse HEAD)
-git clone -q -b birdtest-contribute "$WORK/magpie-origin.git" "$WORK/magpie"
+git clone -q -b main "$WORK/magpie-origin.git" "$WORK/magpie"
 git -C "$WORK/magpie" fetch -q "$WORK/magpie-src" "$unpushed"
 
 R="$WORK/repo"
@@ -423,7 +423,7 @@ printf 'ARG MAGPIE_COMMIT=%s\n' "$unpushed" > "$R/docker/Dockerfile"
 git -C "$R" commit -q -am "an unpushed pin" && git -C "$R" push -q origin HEAD:refs/heads/main
 fresh "$A" "$B"
 if run deploy.sh; then fail "deploy.sh deployed an unpushed MAGPIE pin"; fi
-grep -q "birdtest-contribute" "$WORK/out" || fail "the pin refusal does not say why"
+grep -q "MAGPIE [0-9a-f]* is not on origin/main" "$WORK/out" || fail "the pin refusal does not say why"
 git -C "$R" checkout -q "$B"
 pass "deploy.sh refuses red CI and a MAGPIE pin that is not pushed"
 

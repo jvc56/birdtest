@@ -435,8 +435,8 @@ process environment, so no test mutates `std::env` under another.
   files; `scripts/e2e_magpie_native.sh`; `backend/.env.example`, which a
   backend run on the host starts from; the root `.env.example`, which a
   compose user copies to `.env` (its commented value and the version it says
-  the contribute branch reports; thirty-third audit, pass 3); the same
-  "`birdtest-contribute` reports" sentence in `backend/.env.example` and
+  MAGPIE's `main` reports; thirty-third audit, pass 3); the same
+  "MAGPIE's `main` reports" sentence in `backend/.env.example` and
   `docker-compose.yml` (thirty-third audit, pass 4); the `jobs`
   table's three column defaults; and `scripts/dev.py`'s note. A raise that missed Terraform passed
   CI and left production admitting the builds it was meant to keep out
@@ -4222,7 +4222,7 @@ works — the directory it lays out, the names it invokes, the bytes it gets
 back.
 
 **Correctness is established by version and capability probe.**
-`birdtest-contribute` reports `0.1.1`, the shipped `MIN_MAGPIE_VERSION` default; a checkout reporting anything lower is refused. The
+MAGPIE's `main` reports `0.1.1`, the shipped `MIN_MAGPIE_VERSION` default; a checkout reporting anything lower is refused. The
 probe additionally asks the binary what it can do: that `contribute` is a
 registered command, and that it accepts the current required claim body.
 
@@ -4919,7 +4919,7 @@ slower and more environment-sensitive than a pull request should wait on.
 
 **While the pin is unpushed.** GitHub serves a commit only once it is on a
 branch it can reach, so until `docker/Dockerfile`'s `MAGPIE_COMMIT` is pushed to
-`birdtest-contribute`:
+a MAGPIE branch (and, for `deploy.sh`, merged to `main`):
 - `images`, `e2e` and `magpie-contract` fail: the image fetches the commit, and
   the other two check it out.
 - The nightly's `e2e` fails on both legs: the pin leg at its MAGPIE checkout,

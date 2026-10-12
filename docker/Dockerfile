@@ -3,7 +3,7 @@
 # The commit this image's hashes are produced by, declared once for every
 # stage (each takes it with a bare `ARG MAGPIE_COMMIT`). CI reads it from this
 # line. MIN_MAGPIE_VERSION must never exceed the version this commit reports.
-ARG MAGPIE_COMMIT=59b1d2d60d297cd1f5051480f2b5b28763a17cda
+ARG MAGPIE_COMMIT=555917a6cb1803a95b4e47587fd5f96bbe33011d
 #
 # The backend, the derived-data builder, and the end-to-end suite's fake
 # worker.
@@ -35,8 +35,8 @@ FROM debian:bookworm-slim AS magpie-build
 
 # Recorded on the image, so "which MAGPIE built this wordmap" is a `docker
 # inspect` rather than a guess. Pull requests' CI builds and tests this commit;
-# the nightly runs tier 6 against both this commit and the head of
-# `birdtest-contribute` -- the head is what notices a MAGPIE-side change
+# the nightly runs tier 6 against both this commit and the head of MAGPIE's
+# `main` -- the head is what notices a MAGPIE-side change
 # before the pin is moved to it. Moving the pin is a deliberate step.
 ARG MAGPIE_COMMIT
 ARG MAGPIE_REPO=https://github.com/jvc56/MAGPIE.git

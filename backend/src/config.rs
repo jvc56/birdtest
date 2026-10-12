@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use std::time::Duration;
 
-/// `MIN_MAGPIE_VERSION` when unset: the `birdtest-contribute` version the
-/// backend image pins. The branch's version moves whenever a change can alter
+/// `MIN_MAGPIE_VERSION` when unset: the version of the MAGPIE `main` commit
+/// the backend image pins. MAGPIE's version moves whenever a change can alter
 /// what a task computes, and this floor moves with it: it is the only way to
 /// keep a build known to compute something wrong off the fleet. 0.1.0 is below
 /// it because builds reporting it include ones where a capturing static player
@@ -550,8 +550,8 @@ mod tests {
             );
         }
 
-        // What the files that set the floor say the contribute branch reports.
-        const REPORTS: &str = "`birdtest-contribute` reports ";
+        // What the files that set the floor say MAGPIE's main reports.
+        const REPORTS: &str = "MAGPIE's `main` reports ";
         for (path, text, prefix, copies) in [
             ("docker-compose.yml", source!("docker-compose.yml"), "MIN_MAGPIE_VERSION:-", 2),
             ("docker-compose.e2e.yml", source!("docker-compose.e2e.yml"), "MIN_MAGPIE_VERSION: ", 1),

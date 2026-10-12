@@ -274,7 +274,7 @@ magpie BUILD=portable_release`) and set `MAGPIE_ROOT` if the checkout is not at
 server's builder and the fleet's identical.
 
 **The version floor stops an old MAGPIE from contributing.**
-`MIN_MAGPIE_VERSION` defaults to `0.1.1`, the version `birdtest-contribute`
+`MIN_MAGPIE_VERSION` defaults to `0.1.1`, the version MAGPIE's `main`
 reports. A checkout that reports something
 lower has every task declined with "update MAGPIE" until you update it or lower
 the floor — on the server *and* on the job, which records its own floor at
@@ -603,9 +603,9 @@ every one of the 431 leave values.
 ### The pinned binary
 
 - `docker/Dockerfile` has a stage that checks out MAGPIE's
-  `birdtest-contribute` at a pinned commit (`MAGPIE_COMMIT`, recorded as the
+  `main` at a pinned commit (`MAGPIE_COMMIT`, recorded as the
   image label `org.birdtest.magpie-commit`) and builds it; the backend and `derived-builder` targets both carry
-  it. Push MAGPIE first — the image fetches the commit.
+  it. Merge the MAGPIE change first — the image fetches the commit.
 - It is built `BUILD=portable_release`, which targets `-march=nehalem` rather
   than the `-march=native` every other optimised MAGPIE build uses: a binary
   built on a CI runner could otherwise use instructions a Fargate CPU lacks.
@@ -672,7 +672,7 @@ every one of the 431 leave values.
   `/admin/derived-data`, `docker/Dockerfile`, `infra/derived.tf`, and the
   contract fixtures for `expected_data.derived`, `rit_name` and
   `derived_mismatch`.
-- **MAGPIE (`birdtest-contribute`):** `src/def/builder_defs.h` and `magpie
+- **MAGPIE (`main`):** `src/def/builder_defs.h` and `magpie
   builders`, `test/builder_hash_test.c`, contribute's derived-file check and
   build (`config_contribute_ensure_wordmap`,
   `config_contribute_ensure_rack_info_table`,
@@ -685,9 +685,9 @@ A first deployment, in order (each step is described below):
 
 1. Tools: Terraform 1.9, the AWS CLI with the Session Manager plugin, `jq`,
    `openssl`, and `python3` for RUNBOOK.md's procedures.
-2. Build and push the three images (below, "The three images"), and push
-   MAGPIE's `birdtest-contribute` first — the backend image fetches the commit
-   `docker/Dockerfile` pins.
+2. Build and push the three images (below, "The three images"), with the
+   MAGPIE commit `docker/Dockerfile` pins already on MAGPIE's `main` — the
+   backend image fetches it.
 3. Request an ACM certificate for the site's hostname in the stack's region,
    add its validation CNAME, and wait for it: the first apply creates the HTTPS
    listener, which refuses a certificate still pending validation and leaves
@@ -893,7 +893,7 @@ worker set to `http://` fails at once rather than sending its credential in
 the clear on every request. `public_url`, `ses_domain` and `mail_from_address` have
 none: they are what every confirmation and reset mail links to and is sent
 from, and a placeholder left in is refused. `min_magpie_version` defaults to
-`0.1.1`, the `birdtest-contribute` version the backend image pins; raise it
+`0.1.1`, the version of the MAGPIE `main` commit the backend image pins; raise it
 whenever a MAGPIE release changes results, since it is the only way to keep a
 build that computes something wrong off the fleet. `derived_builder_image`
 has no default — it is the backend image built with `--target derived-builder`,
@@ -938,7 +938,7 @@ emulates amd64 as it is; on an arm64 Linux host, register the emulator first
 the emulated release builds to be slow.
 
 The backend image fetches MAGPIE at `docker/Dockerfile`'s `MAGPIE_COMMIT`
-from GitHub, so that commit must be pushed to `birdtest-contribute` first.
+from GitHub, so that commit must be on MAGPIE's `main` first.
 
 A release whose task fails to start three times is rolled back by ECS (each
 service's deployment circuit breaker) to the last task definition that ran
@@ -1090,7 +1090,7 @@ Session Manager plugin for ECS Exec), `terraform`, `jq`, `git`, `gh`,
 
 | Script | Does |
 | --- | --- |
-| `deploy.sh [--all] [--reset-db] [--set KEY=VALUE]` | Deploys the checked-out commit of main, only what it changed: a clean tree, CI green for it (`gh`); then, from the image each service runs (its tag is a commit), `git diff` to HEAD by path -- `frontend/` deploys the frontend; `backend/`, `docker/` (the MAGPIE pin), `Cargo.*` and `.dockerignore` the backend and the derived-data builder with it; `infra/` (and the scripts its task definitions read) a plan; anything else nothing, and it says so. `--all` deploys both. For the backend, the MAGPIE pin pushed to `birdtest-contribute` (`MAGPIE_DIR`, default `~/MAGPIE`). Builds and pushes the images ECR lacks (`linux/amd64`, `CARGO_BUILD_JOBS=2`, `MAKE_JOBS=3`), retags those services in `prod.tfvars`, plans, applies, uploads, waits for both services and target groups. A frontend release never stops the backend. Refuses a backend whose migrations the live backend applied changed (until launch `0001_initial.sql`, edited in place) unless `--reset-db`, and a service ECS's circuit breaker rolled back until `rollback.sh` has run. |
+| `deploy.sh [--all] [--reset-db] [--set KEY=VALUE]` | Deploys the checked-out commit of main, only what it changed: a clean tree, CI green for it (`gh`); then, from the image each service runs (its tag is a commit), `git diff` to HEAD by path -- `frontend/` deploys the frontend; `backend/`, `docker/` (the MAGPIE pin), `Cargo.*` and `.dockerignore` the backend and the derived-data builder with it; `infra/` (and the scripts its task definitions read) a plan; anything else nothing, and it says so. `--all` deploys both. For the backend, the MAGPIE pin on `main` (`MAGPIE_DIR`, default `~/MAGPIE`). Builds and pushes the images ECR lacks (`linux/amd64`, `CARGO_BUILD_JOBS=2`, `MAKE_JOBS=3`), retags those services in `prod.tfvars`, plans, applies, uploads, waits for both services and target groups. A frontend release never stops the backend. Refuses a backend whose migrations the live backend applied changed (until launch `0001_initial.sql`, edited in place) unless `--reset-db`, and a service ECS's circuit breaker rolled back until `rollback.sh` has run. |
 | `reset-prod-db.sh [--no-start]` | RUNBOOK "Resetting the production database": empties it (the hostname typed, in a prompt that names both backup buckets and their dump count): the backend's service stopped, the schema dropped and made again, every version under `pg/` in the backups bucket and its DR replica deleted, the backend started so it applies `0001`. RDS's automated backups are left to expire (30 days). Then: register, `confirm-user.sh --admin`, import the input data. `deploy.sh --reset-db` does the same once its plan is approved and before the new task starts. |
 | `rollback.sh [--to TAG] [--reset-db]` | RUNBOOK "Rolling back a deploy": the previous release from the log (its backend and frontend images, which may be at different tags), or what a circuit breaker went back to. |
 | `set-setting.sh KEY=VALUE...` | Changes `prod.tfvars` values (e.g. `mail_max_per_second=14`) and applies them. The task time limit is not Terraform's, nor the site's: each job has its own, set when it is created and changed on its admin page, and a change takes effect at the job's next claim. |
