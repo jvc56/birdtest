@@ -154,13 +154,18 @@ Open "dev game pairs (first divergences saved)".
   Significance Test card)." Set aside by the server, its reason instead, A-17;
   and under it, once any of its tasks has hit the time limit, "N tasks hit the
   time limit — lower the batch size.")
-- [ ] **Expect** under it four cards, in a row on a wide screen and two by two
-  on a narrower one: Allocation, Tasks completed, Throughput (the job's pace
-  over the last hour in its own unit, "N pairs/hour"; "—" once nothing has
-  finished in the hour) and Estimated time left.
-- [ ] **Expect** a Progress card: a bar of "pairs completed", then **Tasks**
-  with Waiting to be reissued / In progress / Done counts and no explanation
-  under them; then "Created by dev, <date>" and "requires MAGPIE ≥ …".
+- [ ] **Expect** under it a Progress card: the percentage done beside its
+  heading ("Done" in green once finished), a bar, then four figures, in a row
+  on a wide screen and two by two on a narrower one: **Done** ("N" over "of
+  up to M pairs"), **Throughput** (the job's pace over the last hour, "N"
+  over "pairs/hour"; "—" once nothing has finished in the hour), **Time
+  left** ("2.3d" over "about <date, time>") and **Allocation** ("20%" over
+  "of claims"); then "Tasks: N in progress · N waiting to be reissued · N
+  done", and "Created by dev, <date>" and "requires MAGPIE ≥ …". No row of
+  four cards above it.
+- [ ] On a job its significance test finished before its cap, **expect** the
+  bar full and green, "Done", and under it "Stopped at N of up to M pairs:
+  the significance test decided at K."
 - [ ] **Expect** a Contributors table: `dev-contributor-1`,
   `dev-contributor-2` and "Anonymous · <16 characters>" rows, with compute time
   (on a wide screen) and tasks completed, and under it "N movegens for this

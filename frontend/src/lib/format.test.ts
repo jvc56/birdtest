@@ -3,7 +3,7 @@ import {
   blankFields,
   computeTime,
   exactCount,
-  throughputText,
+  throughputParts,
   timeLimitNotice,
   unchosenText,
   datetime,
@@ -467,22 +467,25 @@ describe('F-FMT-19 exactCount', () => {
   });
 });
 
-describe('F-FMT-21 throughputText', () => {
+describe('F-FMT-21 throughputParts', () => {
   it("reads the job's pace an hour in its own unit", () => {
-    expect(throughputText({ per_hour: 1240.4, unit: 'game' })).toBe(`${(1240).toLocaleString()} games/hour`);
-    expect(throughputText({ per_hour: 8, unit: 'pair' })).toBe('8 pairs/hour');
-    expect(throughputText({ per_hour: 10.5, unit: 'rack' })).toBe('11 racks/hour');
+    expect(throughputParts({ per_hour: 1240.4, unit: 'game' })).toEqual({
+      value: (1240).toLocaleString(),
+      unit: 'games/hour'
+    });
+    expect(throughputParts({ per_hour: 8, unit: 'pair' })).toEqual({ value: '8', unit: 'pairs/hour' });
+    expect(throughputParts({ per_hour: 10.5, unit: 'rack' })).toEqual({ value: '11', unit: 'racks/hour' });
   });
 
   it('keeps a decimal below ten, and one unit is singular', () => {
-    expect(throughputText({ per_hour: 2.46, unit: 'rack' })).toBe('2.5 racks/hour');
-    expect(throughputText({ per_hour: 9.96, unit: 'game' })).toBe('10 games/hour');
-    expect(throughputText({ per_hour: 1, unit: 'game' })).toBe('1 game/hour');
+    expect(throughputParts({ per_hour: 2.46, unit: 'rack' })?.value).toBe('2.5');
+    expect(throughputParts({ per_hour: 9.96, unit: 'game' })?.value).toBe('10');
+    expect(throughputParts({ per_hour: 1, unit: 'game' })).toEqual({ value: '1', unit: 'game/hour' });
   });
 
-  it('shows nothing without recent work', () => {
-    expect(throughputText(null)).toBe('—');
-    expect(throughputText({ per_hour: Number.NaN, unit: 'game' })).toBe('—');
+  it('is nothing without recent work', () => {
+    expect(throughputParts(null)).toBeNull();
+    expect(throughputParts({ per_hour: Number.NaN, unit: 'game' })).toBeNull();
   });
 });
 

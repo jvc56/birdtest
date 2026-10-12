@@ -79,14 +79,17 @@ export function exactCount(n: number | null): string {
 }
 
 /**
- * A job's pace in its own unit: "1,240 games/hour", "8 pairs/hour",
- * "2.5 racks/hour". Whole units from ten up and a decimal below, where a
- * rounded slow job read the same at twice the speed. "—" with no recent work.
+ * A job's pace in its own unit, as a figure and its unit: "1,240" and
+ * "games/hour", "8" and "pairs/hour", "2.5" and "racks/hour". Whole units from
+ * ten up and a decimal below, where a rounded slow job read the same at twice
+ * the speed. Null with no recent work.
  */
-export function throughputText(t: { per_hour: number; unit: string } | null): string {
-  if (!t || !isFinite(t.per_hour) || t.per_hour < 0) return '—';
-  const n = t.per_hour >= 10 ? Math.round(t.per_hour).toLocaleString() : String(Math.round(t.per_hour * 10) / 10);
-  return `${n} ${n === '1' ? t.unit : `${t.unit}s`}/hour`;
+export function throughputParts(
+  t: { per_hour: number; unit: string } | null
+): { value: string; unit: string } | null {
+  if (!t || !isFinite(t.per_hour) || t.per_hour < 0) return null;
+  const value = t.per_hour >= 10 ? Math.round(t.per_hour).toLocaleString() : String(Math.round(t.per_hour * 10) / 10);
+  return { value, unit: `${value === '1' ? t.unit : `${t.unit}s`}/hour` };
 }
 
 export function datetime(value: string | null): string {

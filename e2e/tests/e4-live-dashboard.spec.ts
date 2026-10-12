@@ -23,13 +23,12 @@ async function createStaticConfig(page: Page, name: string, sort: 'equity' | 'sc
   await expect(page.locator('tbody tr', { hasText: name })).toContainText(sort);
 }
 
-/** "123 / 40,000" beside the progress bar, as a number. */
+/** The Progress card's Done figure, "1,234" over "of up to 40,000 pairs", as a number. */
 async function pairsCompleted(page: Page): Promise<number> {
-  const text = await page
-    .locator('div.mb-1', { hasText: 'pairs completed' })
-    .locator('span.tabular-nums')
-    .innerText();
-  return Number(text.split('/')[0].replace(/[^0-9]/g, ''));
+  const done = page.getByTestId('progress-done');
+  await expect(done).toContainText(/ pairs$/);
+  const text = await done.locator('dd').first().innerText();
+  return Number(text.replace(/[^0-9]/g, ''));
 }
 
 /**

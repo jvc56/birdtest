@@ -69,7 +69,7 @@ at tier 5 names a symptom.
 | Tier | Tests | Where |
 |---|---|---|
 | 1 Unit | 250 | `#[cfg(test)]` in `jobs::plausibility` (30), `inputdata` (30), `jobs::racks` (17), `stats::bradley_terry` (30), `stats::match_test` (10), `stats::outcomes` (7), `error` (9), `config` (8), `extract` (7), `routes::admin` (16), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (5), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (7), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (8), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `board`, `exports`, `jobs`, `jobs::leave_gen`, `routes` (1 each); `jobs::game_pair` (3), `artifacts` (2) |
-| 1F Frontend unit | 218 | Vitest, `frontend/src/lib/`: `format.test.ts` (46), `jobSettings.test.ts` (13), `matchScore.test.ts` (4), `matchTest.test.ts` (8), `moveList.test.ts` (5), `consensus.test.ts` (8), `cgp.test.ts` (16), `api.test.ts` (18), `auth.test.ts` (17), `accountRules.test.ts` (9), `ratingPool.test.ts` (7), `sse.test.ts` (12), `importWatch.test.ts` (10), `poller.test.ts` (7), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (3), and `charts/`: `ratingDotPlot.test.ts` (19), `labels.test.ts` (2), `residuals.test.ts` (5), `pentanomial.test.ts` (5) |
+| 1F Frontend unit | 224 | Vitest, `frontend/src/lib/`: `format.test.ts` (46), `jobProgress.test.ts` (6), `jobSettings.test.ts` (13), `matchScore.test.ts` (4), `matchTest.test.ts` (8), `moveList.test.ts` (5), `consensus.test.ts` (8), `cgp.test.ts` (16), `api.test.ts` (18), `auth.test.ts` (17), `accountRules.test.ts` (9), `ratingPool.test.ts` (7), `sse.test.ts` (12), `importWatch.test.ts` (10), `poller.test.ts` (7), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (3), and `charts/`: `ratingDotPlot.test.ts` (19), `labels.test.ts` (2), `residuals.test.ts` (5), `pentanomial.test.ts` (5) |
 | 2 Integration | 186 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (33), `scheduler.rs` (19), `jobs.rs` (20), `stats.rs` (19), `input_data.rs` (14), `derived.rs` (9), `leave_generation.rs` (8), `exports.rs` (16), `submissions.rs` (6), `artifacts.rs` (5), `audit.rs` (3) |
 | 3 API | 250 | `backend/tests/`: `worker_api.rs` (52), `admin_api.rs` (59), `auth_routes.rs` (28), `worker_routes.rs` (24), `boundaries.rs` (18), `public_api.rs` (24), `admin_routes.rs` (13), `authz.rs` (7), `account.rs` (10), `auth_api.rs` (5), `finish.rs` (9), `fake_worker.rs` (1) |
 | 4 Contract | 15 | `routes::worker::contract_fixtures`, over 18 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
@@ -976,10 +976,27 @@ Each entry's tests are the `describe` block named for its id.
   time limit — lower the batch size, or raise the limit"), "1 task" for one,
   and nothing while none has. *(Covered:
   `format.test.ts`.)*
-- `F-FMT-21` `throughputText` reads a job's pace an hour in its unit
-  ("1,240 games/hour", "8 pairs/hour"): whole units from ten up, a decimal
-  below, "1 game/hour" singular, and a dash with no recent work. *(Covered:
+- `F-FMT-21` `throughputParts` reads a job's pace an hour in its unit, the
+  figure and the unit apart ("1,240" and "games/hour", "8" and
+  "pairs/hour"): whole units from ten up, a decimal below, "game/hour"
+  singular, and nothing with no recent work. *(Covered:
   `format.test.ts`.)*
+
+### `F-PROG-*` — `lib/jobProgress.ts`
+
+- `F-PROG-1` The Progress card counts each job type's own work: a games or
+  pairs job's against its cap ("of up to" it when a significance test may
+  stop it first), an opening-rack job's settled racks, a leave-generation
+  job's closed generations plus the current one's share of racks at target
+  (so it moves between closings, and the last generation's racks never count
+  twice). A completed job is full and "Done", and one that stopped short of
+  its cap says why: the test decided, or an admin completed it. *(Covered:
+  `jobProgress.test.ts`.)*
+- `F-PROG-2` Its Throughput figure is the pace and its unit apart, or "—"
+  with why (not measured yet, paused while inactive, finished); its Time
+  left the time at the current pace and the clock time it reaches, only
+  while the job is active, and when a completed job finished. *(Covered:
+  `jobProgress.test.ts`.)*
 
 ### `F-MOVEGENS-*` — `lib/movegens.ts`
 
@@ -3938,8 +3955,8 @@ admin in once and the admin journeys reuse its storage state.
 - `E-1` An anonymous visitor browses the landing page, job list, a job detail
   page — its status on a row of its own, with no description beside an
   active status and "Paused …" or "Finished …" beside any other, then its
-  four headline cards (Allocation, Tasks completed, Throughput, Estimated
-  time left) — and the Contributions page: the site's totals
+  Progress card's four figures (Done, Throughput, Time left, Allocation) —
+  and the Contributions page: the site's totals
   (movegens, compute time, tasks) and the same by job type, then the
   contributor leaderboard, ranked by movegens and re-ranked by tasks at a
   click, with a contributor's own by job type under their row when their name

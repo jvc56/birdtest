@@ -92,16 +92,16 @@ test('E-10: a visitor on a phone reads the job list, a job page and the rankings
   await expect(page.getByRole('heading', { name: 'Significance Test' })).toBeVisible();
   await expectNoSidewaysScroll(page);
 
-  // The four headline figures stack in one column rather than squeezing
-  // across: each is as wide as the one above it and sits below it.
-  const cards = page.locator('.grid > .card');
-  await expect(cards).toHaveCount(4);
-  const boxes = await Promise.all((await cards.all()).map((card) => card.boundingBox()));
-  for (let i = 1; i < boxes.length; i++) {
-    expect(boxes[i]!.x).toBeCloseTo(boxes[0]!.x, 0);
-    expect(boxes[i]!.width).toBeCloseTo(boxes[0]!.width, 0);
-    expect(boxes[i]!.y).toBeGreaterThan(boxes[i - 1]!.y);
-  }
+  // The Progress card's four figures sit two to a row rather than squeezing
+  // four across: the second beside the first, the third under the first.
+  const figures = page.getByTestId('progress-figures').locator(':scope > div');
+  await expect(figures).toHaveCount(4);
+  const boxes = await Promise.all((await figures.all()).map((figure) => figure.boundingBox()));
+  expect(boxes[1]!.y).toBeCloseTo(boxes[0]!.y, 0);
+  expect(boxes[1]!.x).toBeGreaterThan(boxes[0]!.x);
+  expect(boxes[2]!.x).toBeCloseTo(boxes[0]!.x, 0);
+  expect(boxes[2]!.y).toBeGreaterThan(boxes[0]!.y);
+  await expectAcrossScreen(page, page.getByTestId('job-progress'));
   // And the header's links are all on screen and reachable.
   for (const name of ['Jobs', 'Ratings', 'Contributions', 'Users', 'Sign in']) {
     const link = page.getByRole('banner').getByRole('link', { name, exact: true });
