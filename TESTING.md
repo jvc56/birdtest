@@ -73,7 +73,7 @@ at tier 5 names a symptom.
 | 2 Integration | 186 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (33), `scheduler.rs` (19), `jobs.rs` (20), `stats.rs` (19), `input_data.rs` (14), `derived.rs` (9), `leave_generation.rs` (8), `exports.rs` (16), `submissions.rs` (6), `artifacts.rs` (5), `audit.rs` (3) |
 | 3 API | 250 | `backend/tests/`: `worker_api.rs` (52), `admin_api.rs` (59), `auth_routes.rs` (28), `worker_routes.rs` (24), `boundaries.rs` (18), `public_api.rs` (24), `admin_routes.rs` (13), `authz.rs` (7), `account.rs` (10), `auth_api.rs` (5), `finish.rs` (9), `fake_worker.rs` (1) |
 | 4 Contract | 15 | `routes::worker::contract_fixtures`, over 18 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
-| 5 End-to-end | 22 | Playwright journeys `E-1`..`E-18` (`E-11` in three tests, `E-10` and `E-12` in two each) in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
+| 5 End-to-end | 23 | Playwright journeys `E-1`..`E-18` (`E-11` in three tests, `E-10`, `E-12` and `E-18` in two each) in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
 | 6 MAGPIE smoke | 17 cases + 16 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-18` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 16 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (6), `magpie_leave.rs` (7), `magpie_routes.rs` (3) |
 
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
@@ -4119,7 +4119,9 @@ admin in once and the admin journeys reuse its storage state.
   Save disabled, a maximum below the minimum is named under the inputs, and 2,
   3 and 80% save with "Saved: 0 racks unsettled."; the public page's settings
   then read Minimum Analyses Per Rack 2, Maximum Analyses Per Rack 3 and
-  Consensus % 80%. *(Covered: `e18-opening-rack-consensus.spec.ts`; the
+  Consensus % 80%. And an opening-rack job made on the new-job form shows
+  Racks Per Task 500 until changed, and created with 7, its settings read
+  Racks Per Task 7. *(Covered: `e18-opening-rack-consensus.spec.ts`; the
   reopening and completing it drives are tier 3's, `I-OR-EDIT-1`, `-2`.)*
 
 ### Reading confirmation codes
