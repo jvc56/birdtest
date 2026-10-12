@@ -208,8 +208,10 @@ async fn a_claim_still_silent_after_the_grace_is_reclaimed() {
     let db = TestDb::new().await;
     db.games_job(2).await;
     let mut state = db.state().await;
-    state.reclaim_from = std::time::Instant::now() + std::time::Duration::from_millis(300);
-    let app = birdtest::app(state);
+    // Database requests may take longer than a short wall-clock grace on CI.
+    // Set the deadline explicitly for each phase instead of racing a timer.
+    state.reclaim_from = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+    let app = birdtest::app(state.clone());
 
     let (assignment, _) = first_claim(&app).await;
     sqlx::query("UPDATE task_claims SET claimed_at = now() - interval '1 hour'")
@@ -220,7 +222,8 @@ async fn a_claim_still_silent_after_the_grace_is_reclaimed() {
     let (during, _) = first_claim(&app).await;
     assert_ne!(during["task_request"]["seed"], assignment["task_request"]["seed"]);
 
-    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    state.reclaim_from = std::time::Instant::now() - std::time::Duration::from_secs(1);
+    let app = birdtest::app(state);
     let (after, _) = first_claim(&app).await;
     assert_eq!(
         after["task_request"]["seed"], assignment["task_request"]["seed"],
