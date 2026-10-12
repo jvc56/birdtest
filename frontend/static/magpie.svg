@@ -1,18 +1,22 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" fill="none">
   <title>Birdtest magpie</title>
-  <!-- Long tail, tucked wing, white shoulder and belly: a magpie in profile. -->
-  <g transform="translate(-6 0)">
-  <path d="M45 51 23 76c-2 2-1 4 2 3l29-16Z" fill="#202d35"/>
-  <path d="M46 57 30 74l22-11Z" fill="#3d777d"/>
-  <path d="m55 71-2 10m17-11 2 11m-25 1h12m7 0h12" stroke="#202d35" stroke-width="3" stroke-linecap="round"/>
-  <path d="M39 52c0-13 7-22 17-25 7-3 20 0 23 12 5 16-1 36-17 37-14 1-23-10-23-24Z" fill="#202d35"/>
-  <path d="M59 40c13-2 21 6 20 17-1 10-7 17-17 17-10 0-18-7-19-17 6 1 11-5 16-17Z" fill="#f6f1e5"/>
-  <path d="M49 38c-7 2-12 9-12 18 0 7 4 10 9 8 10-4 18-13 20-20-5-6-11-8-17-6Z" fill="#202d35"/>
-  <path d="M43 49c1-6 5-10 10-10l8 4c-5 1-10 4-13 9Z" fill="#f6f1e5"/>
-  <path d="M43 56c5-5 12-8 18-9-3 6-9 11-16 14-3 1-4-2-2-5Z" fill="#3d777d"/>
-  <path d="m75 26 15 7-15 3Z" fill="#202d35"/>
-  <path d="M46 28c0-11 8-20 19-20 11 0 19 9 19 20 0 12-9 20-20 20-10 0-18-8-18-20Z" fill="#202d35"/>
-  <circle cx="72" cy="25" r="3.7" fill="#f6f1e5"/>
-  <circle cx="72.6" cy="25.3" r="1.7" fill="#202d35"/>
+  <!-- A round, big-headed yellow-billed magpie in comic-strip ink and flat fills. -->
+  <g transform="translate(-2 -3)" stroke="#11171c" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M34 66c-6 5-12 10-17.5 14.5-2 1.7-1 4.5 1.5 3.7 6-2.2 13-6.2 20-11.2Z" fill="#2a3a45"/>
+    <path d="M31 72.5c-3.5 3-7 5.8-10 8.2 3.6-1 7.2-2.8 11.6-5.6" fill="#3d777d" stroke-width="1"/>
+    <path d="M45 83c0 2-.4 3.6-.7 5m-2.8.5c1.5-.5 4-.5 6 .1M56 83c.3 2 .4 3.6.6 5m-2.8.6c1.7-.6 4-.6 6-.1" stroke-width="2.1"/>
+    <path d="M76.5 29C74 18.5 66 13.5 57 13.8 46 14 36.5 22 36 33c-.3 6.5 2 10.5 3.5 12.5C31 50.5 26.5 57 27 65c.5 11.5 10.5 19 23 19 12.5.4 22.5-7 24.3-18 1.1-7-1.8-12-.7-16.5 1.7-4 4.1-8.5 3.8-14.5-.1-2.2-.4-4.2-.9-6Z" fill="#2a3a45"/>
+    <path d="M51 16c0-5 4-7.5 8.5-6-3 .5-4.5 2.5-4 5.5m0-.5c1.5-3.5 5-4.5 7.5-3-2.5.5-4 1.8-4 3.5" fill="#2a3a45" stroke-width="1.2"/>
+    <path d="M45 66c2-8 9-12.5 17-12 7 1 11 7 10.5 14-.5 8-7.5 14-16 14-7.5 0-12.5-7-11.5-16Z" fill="#f6f1e5"/>
+    <path d="M70.5 72c-2 5.5-7 9-13 9.2 4.5-2.4 8.5-5.5 13-9.2Z" fill="#e2d8c3" stroke="none"/>
+    <path d="M29 58c2-8 9-12 16.5-11 5.5 1 8.5 5 7.5 10-1.5 7-7 12-13 15l1-3-4 3.5.5-3-4 2c-4-2.5-5.5-8-4.5-13.5Z" fill="#3d777d"/>
+    <path d="M34 54c3-4 8-5 12-4 3 1 3 3.5.5 5-4 2-9 2.5-12 1.3-.9-.5-1-1.5-.5-2.3Z" fill="#f6f1e5" stroke-width="1.1"/>
+    <path d="M38 62c3-1 6-3 8-5m-10 9c3-.5 6-2 8-4" fill="none" stroke-width=".9"/>
+    <path d="M41 25c3-3.5 7-5.5 11-6" fill="none" stroke="#4a5f6c" stroke-width="1.3"/>
+    <path d="M73.4 31.8c2.2.4 5 1.3 7.6 2.6 1.7.8 3.4 1.7 4.4 2.4.6.5.4 1.1-.3 1.4-1.6.6-4.3 1.4-6.9 2.1-1.7.5-3.3.9-4.6 1.2.6-1.7.8-3.4.6-5.1-.1-1.5-.4-3.1-.8-4.6Z" fill="#f2c230"/>
+    <path d="M75.3 37.3c1.3.2 2.7 0 4-.3.7-.1 1.3-.3 1.9-.2" fill="none" stroke-width=".8"/>
+    <circle cx="65" cy="31.6" r="6.2" fill="#f6f1e5" stroke-width="1.1"/>
+    <circle cx="65.8" cy="32.2" r="4.2" fill="#11171c" stroke="none"/>
+    <circle cx="64.4" cy="30.6" r="1.4" fill="#ffffff" stroke="none"/>
   </g>
 </svg>

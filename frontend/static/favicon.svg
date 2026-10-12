@@ -1,18 +1,18 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" fill="none">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
   <title>Birdtest magpie</title>
-  <rect width="96" height="96" rx="20" fill="#bac8d0"/>
-  <g transform="translate(-6 0)">
-  <path d="M45 51 23 76c-2 2-1 4 2 3l29-16Z" fill="#202d35"/>
-  <path d="M46 57 30 74l22-11Z" fill="#3d777d"/>
-  <path d="m55 71-2 10m17-11 2 11m-25 1h12m7 0h12" stroke="#202d35" stroke-width="3" stroke-linecap="round"/>
-  <path d="M39 52c0-13 7-22 17-25 7-3 20 0 23 12 5 16-1 36-17 37-14 1-23-10-23-24Z" fill="#202d35"/>
-  <path d="M59 40c13-2 21 6 20 17-1 10-7 17-17 17-10 0-18-7-19-17 6 1 11-5 16-17Z" fill="#f6f1e5"/>
-  <path d="M49 38c-7 2-12 9-12 18 0 7 4 10 9 8 10-4 18-13 20-20-5-6-11-8-17-6Z" fill="#202d35"/>
-  <path d="M43 49c1-6 5-10 10-10l8 4c-5 1-10 4-13 9Z" fill="#f6f1e5"/>
-  <path d="M43 56c5-5 12-8 18-9-3 6-9 11-16 14-3 1-4-2-2-5Z" fill="#3d777d"/>
-  <path d="m75 26 15 7-15 3Z" fill="#202d35"/>
-  <path d="M46 28c0-11 8-20 19-20 11 0 19 9 19 20 0 12-9 20-20 20-10 0-18-8-18-20Z" fill="#202d35"/>
-  <circle cx="72" cy="25" r="3.7" fill="#f6f1e5"/>
-  <circle cx="72.6" cy="25.3" r="1.7" fill="#202d35"/>
+  <!-- Simplified for 16-32 px tabs. A light halo keeps the dark bird visible on dark tab bars
+       and all but disappears on light ones. -->
+  <g fill="#dfe6ea" stroke="#dfe6ea" stroke-width="2.4" stroke-linejoin="round">
+    <path d="M11 20.5 3.6 27.4c-.7.7-.1 1.8.9 1.4L13 24.6Z"/>
+    <circle cx="18" cy="11" r="8"/>
+    <ellipse cx="17" cy="21" rx="9" ry="8"/>
   </g>
+  <path d="M11 20.5 3.6 27.4c-.7.7-.1 1.8.9 1.4L13 24.6Z" fill="#1d2a32"/>
+  <circle cx="18" cy="11" r="8" fill="#1d2a32"/>
+  <ellipse cx="17" cy="21" rx="9" ry="8" fill="#1d2a32"/>
+  <ellipse cx="19.6" cy="22.6" rx="5.4" ry="4.9" fill="#f6f1e5"/>
+  <ellipse cx="12.8" cy="20.2" rx="4.6" ry="3.1" transform="rotate(-28 12.8 20.2)" fill="#3d777d"/>
+  <path d="M25 8.6 30 11.2c.5.3.5.8 0 1.1L25 14.6Z" fill="#f2c230" stroke="#1d2a32" stroke-width="1" stroke-linejoin="round"/>
+  <circle cx="21.4" cy="10.2" r="3.2" fill="#f6f1e5"/>
+  <circle cx="22" cy="10.6" r="2" fill="#1d2a32"/>
 </svg>
