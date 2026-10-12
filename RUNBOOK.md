@@ -1473,7 +1473,7 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
    terraform -chdir=infra workspace select -or-create dr
    # The stack's own settings first, the DR overrides after (a later -var
    # wins): without prod.tfvars every other setting fell back to its default
-   # -- a micro instance, 20 GiB, and the fleet's MAGPIE floor back at 0.1.1.
+   # -- a micro instance, 20 GiB, and the fleet's MAGPIE floor back at its default.
    # Storage sized for the restore in step 3 at creation: autoscaling cannot
    # keep up with a bulk load (a step at most every six hours), and raising
    # the variable later is no quicker. Sized from the replicated dump's

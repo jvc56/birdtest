@@ -378,9 +378,34 @@ jobs:
         if: steps.magpie-data.outputs.cache-hit != 'true'
         working-directory: magpie
         run: ./download_data.sh && ./convert_lexica.sh
-      - name: Build and run MAGPIE's contribute tests
+      # One build serves every check below: optimized, with the tests' asserts
+      # (test_no_pgo_release), on every core. The default dev build -- -O0 and
+      # sanitizers, made serially -- spent ten minutes here; MAGPIE's own CI
+      # runs its tests under the sanitizers. The build is -march=native, so it
+      # is cached per pin and per runner CPU: a pull request that does not move
+      # the pin, on a CPU this cache has seen, builds nothing.
+      - name: Runner CPU
+        id: cpu
+        run: |
+          model=$(grep -m1 'model name' /proc/cpuinfo | sed 's/.*: //' | tr -c 'A-Za-z0-9\n' '-')
+          echo "model=$model" >> "$GITHUB_OUTPUT"
+      - name: Cache the MAGPIE build
+        id: magpie-build
+        uses: actions/cache@v4
+        with:
+          path: |
+            magpie/bin/magpie
+            magpie/bin/magpie_test
+          key: magpie-test-build-${{ steps.magpie-pin.outputs.commit }}-${{ steps.cpu.outputs.model }}
+      - name: Build MAGPIE and its tests
+        if: steps.magpie-build.outputs.cache-hit != 'true'
         working-directory: magpie
-        run: make magpie_test && ./bin/magpie_test contribute
+        run: make magpie magpie_test BUILD=test_no_pgo_release -j"$(nproc)"
+      # The fixtures are read when the tests run, so a cached build tests this
+      # branch's copies.
+      - name: Run MAGPIE's contribute tests
+        working-directory: magpie
+        run: ./bin/magpie_test contribute
       # The derived-file builders, pinned by hash (and the KLV builders, whose
       # version "Check artifacts" reports). birdtest publishes the
       # SHA-256 of the wordmap and rack info table its server built, and every
@@ -399,7 +424,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          make magpie
           magpie="$PWD/bin/magpie"
           # MAGPIE exits 0 on an error, so the output is what says it worked.
           "$magpie" builders | tee /dev/stderr | grep -q '"wit_builder_version"'

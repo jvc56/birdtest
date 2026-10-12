@@ -2992,9 +2992,9 @@ async fn a_games_jobs_captured_positions_can_be_streamed_out() {
 
     let mut result = games_result(2, 1);
     result["positions"] = json!([
-        { "game_index": 0, "turn_number": 0, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "AEINRST", "position": "cgp-0",
+        { "game_index": 0, "turn_number": 0, "player": 1, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "AEINRST", "position": "cgp-0",
           "num_moves": 40, "moves": [{ "move": "8D RETAINS", "score": 74, "equity": 81.2 }] },
-        { "game_index": 1, "turn_number": 3, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "AEINRSU", "position": "cgp-1",
+        { "game_index": 1, "turn_number": 3, "player": 1, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "AEINRSU", "position": "cgp-1",
           "previous_move": "8D DOG", "previous_move_score": 10,
           "num_moves": 30, "moves": [{ "move": "8D URINATES", "score": 70, "equity": 77.0 }] },
     ]);
@@ -3146,7 +3146,7 @@ async fn positions_from_a_job_that_does_not_capture_them_are_refused() {
     let uuid = assignment["worker_uuid"].as_str().unwrap();
     let mut result = games_result(2, 1);
     result["positions"] = json!([{
-        "game_index": 0, "turn_number": 0, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "AEINRST",
+        "game_index": 0, "turn_number": 0, "player": 1, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "AEINRST",
         "position": "15/15/15/15/15/15/15/15/15/15/15/15/15/15/15 AEINRST/ 0/0 0",
         "num_moves": 1, "moves": [{ "move": "8D RETAINS", "score": 70, "equity": 70.0 }]
     }]);
@@ -3170,7 +3170,7 @@ async fn positions_from_a_job_that_does_not_capture_them_are_refused() {
 
 
 fn captured(game: i32, turn: i32) -> serde_json::Value {
-    json!({ "game_index": game, "turn_number": turn, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "AEINRST",
+    json!({ "game_index": game, "turn_number": turn, "player": 1, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "AEINRST",
             "position": "15/15/15/15/15/15/15/15/15/15/15/15/15/15/15 AEINRST/ 0/0 0",
             "num_moves": 1, "moves": [{ "move": "8D RETAINS", "score": 70, "equity": 70.0 }] })
 }
@@ -3260,4 +3260,83 @@ async fn a_decline_holding_a_nul_is_refused_and_the_claim_stays_declinable() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     let (status, body) = send(&app, post_json("/api/worker/decline", &[("x-worker-uuid", &uuid)], decline("NWL23"))).await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+}
+
+/// A captured position is kept to its mover's `num_plays_recorded` and
+/// `num_plies_recorded`: a job's two players may record different numbers,
+/// and each position names the player who moved from it. A seat the task has
+/// no player for is refused.
+#[tokio::test]
+async fn each_captured_position_keeps_its_movers_plays_and_plies() {
+    let db = TestDb::new().await;
+    let job = db.games_job(2).await;
+    sqlx::query("UPDATE job_game_config SET capture_positions = true WHERE job_id = $1")
+        .bind(job)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let (player1, player2): (Uuid, Uuid) = sqlx::query_as(
+        "SELECT player1_config_id, player2_config_id FROM job_game_config WHERE job_id = $1",
+    )
+    .bind(job)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    // Player 1 keeps one play and one ply of each, player 2 two of each.
+    for (player, kept) in [(player1, 1), (player2, 2)] {
+        db.make_simmer(player, false).await;
+        sqlx::query(
+            "UPDATE player_configs SET num_plays_recorded = $2, num_plies_recorded = $2 WHERE id = $1",
+        )
+        .bind(player)
+        .bind(kept)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+    let app = birdtest::app(db.state().await);
+
+    let plies = json!([
+        { "ply": 0, "bingo_percentage": 10.0, "average_score": 30.0 },
+        { "ply": 1, "bingo_percentage": 12.0, "average_score": 31.0 },
+        { "ply": 2, "bingo_percentage": 14.0, "average_score": 32.0 },
+    ]);
+    let moves = json!([
+        { "move": "8D RETAINS", "score": 74, "equity": 81.2, "win_percentage": 55.0, "plies": plies },
+        { "move": "8D STAINER", "score": 70, "equity": 79.0, "win_percentage": 52.0, "plies": plies },
+        { "move": "8D NASTIER", "score": 68, "equity": 78.0, "win_percentage": 51.0, "plies": plies },
+    ]);
+    let position = |game: i64, player: i64| {
+        json!({ "game_index": game, "turn_number": 0, "player": player, "played_move": "8D PLAYED",
+                "played_move_score": 10, "analysis": "sim", "rack": "AEINRST",
+                "position": format!("cgp-{game}"), "num_moves": 40, "moves": moves })
+    };
+
+    // A third player is no player of this task.
+    let mut result = games_result(2, 1);
+    result["positions"] = json!([position(0, 3)]);
+    let (claim, uuid) = first_claim(&app).await;
+    let (status, body) =
+        submit_as(&app, &uuid, claim["claim_token"].as_str().unwrap(), result.clone()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    result["positions"] = json!([position(0, 1), position(1, 2)]);
+    let (status, body) =
+        submit_as(&app, &uuid, claim["claim_token"].as_str().unwrap(), result).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let kept: Vec<(i16, i64, i64)> = sqlx::query_as(
+        "SELECT r.game_index, COUNT(DISTINCT m.id), COUNT(p.move_id)
+         FROM position_analysis_records r
+         JOIN position_analysis_moves m ON m.record_id = r.id
+         LEFT JOIN position_analysis_plies p ON p.move_id = m.id
+         WHERE r.job_id = $1
+         GROUP BY r.game_index ORDER BY r.game_index",
+    )
+    .bind(job)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    // Player 1's: one move with one ply. Player 2's: two moves, two plies each.
+    assert_eq!(kept, vec![(0, 1, 1), (1, 2, 4)]);
 }

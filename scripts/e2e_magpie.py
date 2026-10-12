@@ -1154,7 +1154,7 @@ def case_rack_info_table(ctx: Context) -> None:
         # Not dispatched while the table is unbuilt: an anonymous claim finds
         # no work at all, since this is the only active job.
         claim = requests.post(f"{ctx.args.api}/api/worker/task",
-                              json={"magpie_version": "0.1.1", "board_dim": 15,
+                              json={"magpie_version": "0.1.2", "board_dim": 15,
                                     "rack_size": 7, "unsupported_jobs": []},
                               timeout=30)
         expect(claim.status_code == 204,
@@ -1208,7 +1208,7 @@ def case_word_info_table(ctx: Context) -> None:
                          f"'{data['kwg']}'")
         expect(roles == "wit CSW21_ab pending", f"derived rows before any build: {roles!r}")
         claim = requests.post(f"{ctx.args.api}/api/worker/task",
-                              json={"magpie_version": "0.1.1", "board_dim": 15,
+                              json={"magpie_version": "0.1.2", "board_dim": 15,
                                     "rack_size": 7, "unsupported_jobs": []},
                               timeout=30)
         expect(claim.status_code == 204,

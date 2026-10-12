@@ -441,6 +441,10 @@ pub struct CapturedPosition {
     /// Which game of the batch, and which turn of it.
     pub game_index: i16,
     pub turn_number: i16,
+    /// The player who moved from it: 1 or 2, as the task's `player1` and
+    /// `player2`. Its plays and plies are kept to that player's
+    /// `num_plays_recorded` and `num_plies_recorded`.
+    pub player: i16,
     pub rack: String,
     /// CGP of the position as it stood before the move was played.
     pub position: String,
@@ -553,6 +557,9 @@ pub struct PositionAnalysis {
     /// In-game positions only: which game of the batch, and which turn of it.
     pub game_index: Option<i16>,
     pub turn_number: Option<i16>,
+    /// In-game positions only: the player who moved from it, 1 or 2, whose
+    /// `num_plays_recorded` and `num_plies_recorded` it is kept to.
+    pub player: Option<i16>,
     /// The move played on the previous turn of this game, and its score.
     /// `None` for turn 0 of a game and for opening racks.
     pub previous_move: Option<String>,
@@ -594,6 +601,7 @@ impl PositionAnalysis {
             position: None,
             game_index: None,
             turn_number: None,
+            player: None,
             previous_move: None,
             previous_move_score: None,
             played_move: None,
@@ -758,7 +766,7 @@ mod tests {
 
 
         let position: CapturedPosition = serde_json::from_value(json!({
-            "game_index": 0, "turn_number": 0, "played_move": "8D PLAYED", "played_move_score": 10, "rack": "AEINRST",
+            "game_index": 0, "turn_number": 0, "player": 1, "played_move": "8D PLAYED", "played_move_score": 10, "rack": "AEINRST",
             "position": "15/15/15/15/15/15/15/15/15/15/15/15/15/15/15 AEINRST/ 0/0 0",
             "num_moves": 40, "analysis": "static", "moves": [bare_move],
         }))
@@ -793,7 +801,7 @@ mod tests {
         let ply = extra(json!({ "ply": 0, "bingo_percentage": 1.0, "average_score": 30.0 }));
         let entry = extra(json!({ "move": "8D QI", "score": 22, "equity": 30.5, "plies": [ply] }));
         let position = extra(json!({
-            "game_index": 0, "turn_number": 3, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "sim", "rack": "AEINRST", "position": "cgp",
+            "game_index": 0, "turn_number": 3, "player": 1, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "sim", "rack": "AEINRST", "position": "cgp",
             "num_moves": 40, "moves": [entry.clone()],
         }));
 

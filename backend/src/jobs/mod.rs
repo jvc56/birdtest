@@ -543,6 +543,26 @@ pub(crate) async fn load_game_request(
     })
 }
 
+/// How many ranked moves and plies a stored position keeps: its mover's
+/// `num_plays_recorded` and `num_plies_recorded`. An opening rack has no mover
+/// and keeps its one player's.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RecordedCaps {
+    pub player1: (i32, i32),
+    pub player2: (i32, i32),
+}
+
+impl RecordedCaps {
+    /// One player's, for every position.
+    pub(crate) fn one(plays: i32, plies: i32) -> Self {
+        Self { player1: (plays, plies), player2: (plays, plies) }
+    }
+
+    fn of(&self, position: &PositionAnalysis) -> (i32, i32) {
+        if position.player == Some(2) { self.player2 } else { self.player1 }
+    }
+}
+
 /// Writes analysed positions and their top-ranked moves.
 ///
 /// Shared by opening rack jobs (one position per rack) and by games jobs with
@@ -559,8 +579,7 @@ pub(crate) async fn insert_position_analyses(
     task_id: Uuid,
     claim_id: Uuid,
     positions: &[PositionAnalysis],
-    top_moves: i32,
-    top_plies: i32,
+    caps: RecordedCaps,
 ) -> AppResult<()> {
     if positions.is_empty() {
         return Ok(());
@@ -605,16 +624,17 @@ pub(crate) async fn insert_position_analyses(
         record_ids.extend(ids);
     }
 
-    // `top_moves` is the config's num_plays_recorded, at least 1 by
-    // constraint; clamped anyway rather than trusting the cast, and to i16
-    // because that is what `rank` is stored as.
-    let kept = top_moves.clamp(0, i16::MAX as i32) as usize;
     // Every move to write, across every position, with the record it belongs
-    // to and its rank within that record.
-    let mut pending: Vec<(i64, i16, &MoveEntry)> = Vec::new();
+    // to, its rank within that record, and how many of its plies to keep.
+    let mut pending: Vec<(i64, i16, &MoveEntry, i32)> = Vec::new();
     for (&record_id, position) in record_ids.iter().zip(positions) {
+        // The mover's num_plays_recorded, at least 1 by constraint; clamped
+        // anyway rather than trusting the cast, and to i16 because that is
+        // what `rank` is stored as.
+        let (top_moves, top_plies) = caps.of(position);
+        let kept = top_moves.clamp(0, i16::MAX as i32) as usize;
         for (rank, entry) in position.moves.iter().take(kept).enumerate() {
-            pending.push((record_id, (rank + 1) as i16, entry));
+            pending.push((record_id, (rank + 1) as i16, entry, top_plies));
         }
     }
 
@@ -625,7 +645,7 @@ pub(crate) async fn insert_position_analyses(
                  (record_id, rank, move, score, equity, iterations, win_percentage,
                   blended_utility, mean_spread, fidelity_plies) ",
         );
-        builder.push_values(chunk.iter(), |mut b, (record_id, rank, entry)| {
+        builder.push_values(chunk.iter(), |mut b, (record_id, rank, entry, _)| {
             b.push_bind(*record_id)
                 .push_bind(*rank)
                 .push_bind(entry.play.clone())
@@ -657,11 +677,11 @@ pub(crate) async fn insert_position_analyses(
     let plies: Vec<(i64, &PlyStats)> = move_ids
         .iter()
         .zip(pending.iter())
-        .flat_map(|(move_id, (_, _, entry))| {
+        .flat_map(|(move_id, (_, _, entry, top_plies))| {
             entry
                 .plies
                 .iter()
-                .filter(|ply| i32::from(ply.ply) < top_plies)
+                .filter(move |ply| i32::from(ply.ply) < *top_plies)
                 .map(move |ply| (*move_id, ply))
         })
         .collect();
@@ -772,14 +792,16 @@ pub(crate) async fn insert_game_results(
     if record.positions.is_empty() {
         return Ok(());
     }
-    // How many ranked moves and plies to keep: player 1's num_plays_recorded
-    // and num_plies_recorded, which are what MAGPIE reads for both seats, and
-    // which job creation holds player 2 to whenever capture is on. From the
-    // job's template: they are settings of an immutable player config.
-    let (top_moves, top_plies) = match &template.kind {
-        dispatch::JobKind::Games { player1, .. } | dispatch::JobKind::GamePairs { player1, .. } => {
-            (player1.num_plays_recorded, player1.num_plies_recorded)
-        }
+    // How many ranked moves and plies to keep: each position's mover's
+    // num_plays_recorded and num_plies_recorded, which are what MAGPIE
+    // reported for that seat. From the job's template: they are settings of an
+    // immutable player config.
+    let caps = match &template.kind {
+        dispatch::JobKind::Games { player1, player2, .. }
+        | dispatch::JobKind::GamePairs { player1, player2, .. } => RecordedCaps {
+            player1: (player1.num_plays_recorded, player1.num_plies_recorded),
+            player2: (player2.num_plays_recorded, player2.num_plies_recorded),
+        },
         _ => return Err(template.mismatch("games")),
     };
 
@@ -789,8 +811,7 @@ pub(crate) async fn insert_game_results(
         task_id,
         claim_id,
         &record.positions,
-        top_moves,
-        top_plies,
+        caps,
     )
     .await
 }

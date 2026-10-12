@@ -138,13 +138,13 @@ async fn purging_a_job_removes_its_captured_positions_through_the_record() {
     let uuid = assignment["worker_uuid"].as_str().unwrap();
     let mut result = games_result(2, 1);
     result["positions"] = json!([
-        { "game_index": 0, "turn_number": 0, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "sim", "rack": "AEINRST", "position": "cgp-0",
+        { "game_index": 0, "turn_number": 0, "player": 1, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "sim", "rack": "AEINRST", "position": "cgp-0",
           "num_moves": 40,
           "moves": [{ "move": "8D RETAINS", "score": 74, "equity": 81.2,
                       "win_percentage": 55.0, "blended_utility": 0.6,
                       "plies": [{ "ply": 0, "bingo_percentage": 0.0, "average_score": 24.0 }] }] },
         // A capturing job's result has positions from every game of its batch.
-        { "game_index": 1, "turn_number": 0, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "AEINRST", "position": "cgp-1",
+        { "game_index": 1, "turn_number": 0, "player": 1, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "AEINRST", "position": "cgp-1",
           "num_moves": 1, "moves": [{ "move": "8D RETAINS", "score": 74, "equity": 81.2 }] },
     ]);
     let (_, body) = send(
@@ -1005,13 +1005,13 @@ async fn a_simming_player_config_is_bounded_by_iterations_not_time() {
         ("a-limit", json!({ "max_iterations": 100, "time_limit_secs": 30 }), StatusCode::BAD_REQUEST, Some("time_limit_secs")),
         ("no-budget", json!({ "time_limit_secs": 0 }), StatusCode::BAD_REQUEST, Some("max_iterations")),
         ("bounded", json!({ "max_iterations": 100, "time_limit_secs": 0 }), StatusCode::CREATED, None),
-        // A simmer's candidates are the top plays by equity in a games job
-        // whatever it says, so `score` would mean two players (I-JOB-14b).
+        // A simmer's candidates are its top plays by its own sort, in games and
+        // opening-rack jobs alike, so either sort is a player (I-JOB-14b).
         (
             "score-simmer",
             json!({ "max_iterations": 100, "time_limit_secs": 0, "sort_strategy": "score" }),
-            StatusCode::BAD_REQUEST,
-            Some("sort_strategy"),
+            StatusCode::CREATED,
+            None,
         ),
         (
             "equity-simmer",
@@ -1149,14 +1149,13 @@ async fn a_capture_job_refuses_simmers_that_capture_would_change() {
     assert_eq!(status, StatusCode::CREATED, "a simmer already at the cap: {body}");
 }
 
-/// A-ADMIN-26: how many plays and plies a captured position keeps is one
-/// setting for the whole run in MAGPIE, read from player 1. So a capturing
-/// games or pairs job whose players disagree on either is refused, naming
-/// `capture_positions`; without capture neither is read, and they may differ.
-/// Keeping only first divergences (`capture_first_divergence`) is a pairs
-/// job's, and needs capture: on a games job, or without it, it is refused.
+/// A-ADMIN-26: how many plays and plies a captured position keeps is its
+/// mover's, so a capturing games or pairs job's players may record different
+/// numbers of either, as they may without capture. Keeping only first
+/// divergences (`capture_first_divergence`) is a pairs job's, and needs
+/// capture: on a games job, or without it, it is refused.
 #[tokio::test]
-async fn a_capture_job_refuses_players_that_record_differently() {
+async fn a_capture_jobs_players_may_record_differently() {
     let db = TestDb::new().await;
     let state = db.state().await;
     let app = birdtest::app(state.clone());
@@ -1189,11 +1188,10 @@ async fn a_capture_job_refuses_players_that_record_differently() {
     };
     for job_type in ["games", "game_pairs"] {
         for differing in [&configs[2], &configs[3]] {
-            let (status, body) = send(&app, create(job_type, differing, true)).await;
-            assert_eq!(status, StatusCode::BAD_REQUEST, "{job_type}: {body}");
-            assert_eq!(body["fields"][0]["field"], "capture_positions", "{body}");
-            let (status, body) = send(&app, create(job_type, differing, false)).await;
-            assert_eq!(status, StatusCode::CREATED, "{job_type} without capture: {body}");
+            for capture in [true, false] {
+                let (status, body) = send(&app, create(job_type, differing, capture)).await;
+                assert_eq!(status, StatusCode::CREATED, "{job_type}, capture {capture}: {body}");
+            }
         }
         let (status, body) = send(&app, create(job_type, &configs[1], true)).await;
         assert_eq!(status, StatusCode::CREATED, "{job_type}, agreeing: {body}");

@@ -333,22 +333,25 @@ def _players(request: dict) -> List[dict]:
     return [request.get("player1") or {}, request.get("player2") or {}]
 
 
-def _recorded(request: dict) -> Tuple[int, int]:
-    """How many plays and plies a captured position keeps: player 1's, which
-    MAGPIE reads for the whole run (and job creation holds player 2 to)."""
-    player1 = request.get("player1") or {}
-    return player1.get("num_plays_recorded") or 10, player1.get("num_plies_recorded") or 0
+def _recorded(player: dict) -> Tuple[int, int]:
+    """How many plays and plies a captured position keeps: its mover's, as
+    MAGPIE caps each seat's positions."""
+    return player.get("num_plays_recorded") or 10, player.get("num_plies_recorded") or 0
 
 
 def _synthetic_position(game: "_SyntheticGame", rng: random.Random, game_index: int,
                         turn: int, ranked: List[dict], previous: Optional[dict],
-                        player: dict, plies_recorded: int) -> dict:
+                        player: dict, seat: int) -> dict:
     """One captured position of `game` as it stands, its moves `ranked`, as
-    `player` -- the one on turn -- analysed it: simulated, or statically."""
+    `player` -- the one on turn, in `seat` -- analysed it: simulated, or
+    statically, kept to that player's recorded plays and plies."""
     simulates = _simulates(player)
+    plays_recorded, plies_recorded = _recorded(player)
+    ranked = ranked[:plays_recorded]
     position = {
         "game_index": game_index,
         "turn_number": turn,
+        "player": seat + 1,
         "rack": game.rack_string(game.on_turn),
         "position": game.cgp(),
         "num_moves": rng.randint(len(ranked), 400),
@@ -405,7 +408,7 @@ def _add_first_divergences(result: dict, request: dict, rng: random.Random,
     seat. Its player ranks the moves differently, so the pair diverges here.
     """
     players = _players(request)
-    top_moves, top_plies = _recorded(request)
+    top_moves = max(_recorded(player)[0] for player in players)
     distribution = request.get("letter_distribution", "english")
     positions = []
     for pair in divergent_pairs:
@@ -420,14 +423,15 @@ def _add_first_divergences(result: dict, request: dict, rng: random.Random,
             turn += 1
         # The first game's mover is the player in the seat on turn; in the
         # second, which started from the other seat, the other player.
-        mover, other = players[game.on_turn], players[1 - game.on_turn]
+        mover_seat = game.on_turn
         ranked = game.ranked_moves(top_moves)
-        first = _synthetic_position(game, rng, pair * 2, turn, ranked, previous, mover, top_plies)
+        first = _synthetic_position(game, rng, pair * 2, turn, ranked, previous,
+                                    players[mover_seat], mover_seat)
         # The other game: the same position from the other seat, and another
         # player's ranking, which puts a different move first.
         second_ranked = ranked[1:] + ranked[:1] if len(ranked) > 1 else ranked
         second = _synthetic_position(game, rng, pair * 2 + 1, turn, second_ranked, previous,
-                                     other, top_plies)
+                                     players[1 - mover_seat], 1 - mover_seat)
         board, racks, scores, *rest = second["position"].split(" ")
         swapped_racks = "/".join(reversed(racks.split("/")))
         swapped_scores = "/".join(reversed(scores.split("/")))
@@ -449,7 +453,6 @@ def _add_captured_positions(result: dict, request: dict, rng: random.Random,
     if not request.get("capture_positions"):
         return
     players = _players(request)
-    top_moves, top_plies = _recorded(request)
     distribution = request.get("letter_distribution", "english")
     positions = []
     for game_index in range(games):
@@ -461,9 +464,10 @@ def _add_captured_positions(result: dict, request: dict, rng: random.Random,
         for turn in range(rng.randint(18, 26)):
             if game.over():
                 break
-            ranked = game.ranked_moves(top_moves)
+            seat = game.on_turn
+            ranked = game.ranked_moves(_recorded(players[seat])[0])
             positions.append(_synthetic_position(
-                game, rng, game_index, turn, ranked, previous, players[game.on_turn], top_plies
+                game, rng, game_index, turn, ranked, previous, players[seat], seat
             ))
             # The player plays their top move, as a static player does.
             previous = ranked[0]

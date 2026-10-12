@@ -42,6 +42,12 @@ pub(super) fn validate_positions(
                 position.game_index
             )));
         }
+        if position.player != 1 && position.player != 2 {
+            return Err(AppError::bad_request(format!(
+                "captured position names player {}; a position is player 1's or player 2's",
+                position.player
+            )));
+        }
         if position.turn_number < 0 || position.turn_number > MAX_TURNS_PER_GAME {
             return Err(AppError::bad_request(format!(
                 "captured position has an implausible turn number {}",
@@ -92,6 +98,7 @@ pub(super) fn validate_positions(
             position: Some(position.position),
             game_index: Some(position.game_index),
             turn_number: Some(position.turn_number),
+            player: Some(position.player),
             previous_move: position.previous_move,
             previous_move_score: position.previous_move_score,
             played_move: Some(position.played_move),
@@ -251,7 +258,7 @@ mod tests {
     fn one_captured_position_a_turn() {
         let position = |turn: i16| -> crate::jobs::handler::CapturedPosition {
             serde_json::from_value(serde_json::json!({
-                "game_index": 0, "turn_number": turn, "played_move": "8D PLAYED", "played_move_score": 10, "rack": "AEINRST",
+                "game_index": 0, "turn_number": turn, "player": 1, "played_move": "8D PLAYED", "played_move_score": 10, "rack": "AEINRST",
                 "position": "15/15/15/15/15/15/15/15/15/15/15/15/15/15/15 AEINRST/ 0/0 0",
                 "num_moves": 1, "analysis": "static",
                 "moves": [{ "move": "8D RETAINS", "score": 70, "equity": 70.0 }]

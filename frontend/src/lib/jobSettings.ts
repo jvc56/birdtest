@@ -147,6 +147,8 @@ export function playerSummary(p: PlayerSettings, unused: ReadonlySet<string> = N
     search = `static, by ${p.sort_strategy}`;
   } else {
     const parts = [`${p.num_plies}-ply sim`];
+    // Equity is the usual sort, so only the other is worth saying.
+    if (p.sort_strategy === 'score') parts.push('top plays by score');
     if (p.max_iterations !== null) parts.push(`${p.max_iterations.toLocaleString()} iterations`);
     if (p.stopping_pct !== null) parts.push(`stops at ${p.stopping_pct}%`);
     if (p.use_inference && !unused.has('use_inference')) parts.push('inference');

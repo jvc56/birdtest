@@ -527,8 +527,9 @@ The two that were missing:
   a simulation or an inference only if a player simulates (and infers), a
   pre-endgame solve only if a player has `endgame_plies` and `peg_max_bag`, an
   endgame only if one has `endgame_plies`, and no deeper than the deepest.
-  Checked against either player (a position does not say which seat moved),
-  and only that way round: a simmer's turn can be static. An opening rack from
+  Checked against the player a captured position names as its mover (`player`,
+  1 or 2; a seat the task has no player for is refused), against any player
+  when it names none, and only that way round: a simmer's turn can be static. An opening rack from
   a static player cannot be a simulation. `registry::decode_result` runs it for
   opening racks, games and pairs. *(Covered:
   `plausibility::tests::an_analysis_is_one_the_tasks_players_could_run`.)*
@@ -1968,10 +1969,9 @@ job creation touches needs one caller here.
   is `400` on that field (a limit makes how far a simulation gets depend on the
   contributor's hardware, and a null one is MAGPIE's 60-second default), and
   one with no `max_iterations` is `400` on that; `time_limit_secs: 0` with an
-  iteration budget is created. And one with `sort_strategy = 'score'` is `400`:
-  a simmer's candidates are the top plays by equity in a games job whatever
-  the row says, so `score` would give one config two meanings. A static one
-  may sort by score (twenty-ninth audit). *(Covered:
+  iteration budget is created. Either sort is created for a simmer as for a
+  static player: a simmer's candidates are its top plays by its own
+  `sort_strategy`, in games and opening-rack jobs alike. *(Covered:
   `admin_api::a_simming_player_config_is_bounded_by_iterations_not_time`.)*
 - `I-JOB-14c` An opening-rack job refuses a static player with a `best`
   recorder and more than one recorded play, and any player whose `num_plays` is
@@ -3016,7 +3016,7 @@ below.
 - `A-WORKER-2` A claim with a malformed `magpie_version` is rejected rather than
   assumed. Unparseable text reads as `0.0.0`, below the floor, so the worker is
   handed nothing and told to update (a floor of `0.0.0` would admit it; the
-  shipped floor is `0.1.1`); a version that is not a string is a `400` naming
+  shipped floor is `0.1.2`); a version that is not a string is a `400` naming
   the field. *(Covered:
   `worker_routes::a_malformed_magpie_version_is_refused_rather_than_assumed`.)*
 - `A-WORKER-3` An `unsupported_jobs` list over 200 is **truncated, not
@@ -3388,14 +3388,13 @@ below.
   than the stage before, a zero stride, an unknown opponent model, and nested
   strides that are not one per bag size. *(Covered:
   `admin_api::a_player_config_solves_the_end_of_the_game_only_as_it_states`.)*
-- `A-ADMIN-26` A games or pairs job that captures positions refuses players
-  that disagree on `num_plays_recorded` or `num_plies_recorded`, naming
-  `capture_positions`: MAGPIE keeps one of each for the whole run, player 1's.
-  Without capture they may differ. Keeping only first divergences
+- `A-ADMIN-26` A games or pairs job's players may disagree on
+  `num_plays_recorded` and `num_plies_recorded`, with capture on or off: each
+  captured position is kept to its mover's. Keeping only first divergences
   (`capture_first_divergence`) is refused on a games job and on a pairs job
   that captures nothing, each naming that field, and is stored when a pairs
   job captures. *(Covered:
-  `admin_api::a_capture_job_refuses_players_that_record_differently`,
+  `admin_api::a_capture_jobs_players_may_record_differently`,
   `jobs::each_job_type_stores_every_setting_it_was_created_with`.)*
 - `A-ADMIN-27` A job's bingo bonus and sim cutoff may be stated and are kept
   as stated; left out, they are MAGPIE's 50 and 0.005; a negative bonus or a
@@ -4224,7 +4223,7 @@ works — the directory it lays out, the names it invokes, the bytes it gets
 back.
 
 **Correctness is established by version and capability probe.**
-MAGPIE's `main` reports `0.1.1`, the shipped `MIN_MAGPIE_VERSION` default; a checkout reporting anything lower is refused. The
+MAGPIE's `main` reports `0.1.2`, the shipped `MIN_MAGPIE_VERSION` default; a checkout reporting anything lower is refused. The
 probe additionally asks the binary what it can do: that `contribute` is a
 registered command, and that it accepts the current required claim body.
 
@@ -4887,7 +4886,9 @@ GitHub Actions.
    (`U-FAKE-6`) (five minutes at most).
 7. **magpie-contract** — MAGPIE's half of the contract: check out MAGPIE at the
    commit `docker/Dockerfile` pins, copy this branch's `contract-fixtures/` over its
-   `test/birdtest_contract/`, and run `magpie_test contribute`; then
+   `test/birdtest_contract/`, build it once (`test_no_pgo_release`, asserts on,
+   every core; cached per pin and runner CPU, so a branch that keeps the pin
+   builds nothing), and run `magpie_test contribute`; then
    `magpie_test builderhash` (the wordmap, rack info table, word info table
    and both KLV builders -- `createdata klv` and `rackequity2klv` -- against
    their pinned hashes), and then every command the server invokes (`convert

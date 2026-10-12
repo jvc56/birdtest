@@ -434,8 +434,8 @@ CREATE TABLE jobs (
     --
     -- Not nullable: every job pins input data, and a client too old to
     -- understand expected_data contributes unverified rather than declining,
-    -- so "no floor" is not a state worth being able to express. 0.1.1 is
-    -- the `birdtest-contribute` version the backend image pins; the branch's
+    -- so "no floor" is not a state worth being able to express. 0.1.2 is
+    -- the version of the MAGPIE `main` commit the backend image pins; its
     -- version moves whenever a change can alter what a task computes, and the
     -- floor moves with it. The default here is the same value as the server's
     -- MIN_MAGPIE_VERSION, which create_job writes explicitly; the two are kept
@@ -443,7 +443,7 @@ CREATE TABLE jobs (
     -- floor a job below the server.
     min_magpie_major INT NOT NULL DEFAULT 0 CHECK (min_magpie_major >= 0),
     min_magpie_minor INT NOT NULL DEFAULT 1 CHECK (min_magpie_minor >= 0),
-    min_magpie_patch INT NOT NULL DEFAULT 1 CHECK (min_magpie_patch >= 0),
+    min_magpie_patch INT NOT NULL DEFAULT 2 CHECK (min_magpie_patch >= 0),
     -- The longest one of the job's tasks may run, set at creation (an hour
     -- unless the admin says otherwise) and changed on the job's Manage page.
     -- Every claim is given it (the assignment's `max_task_seconds`) and keeps

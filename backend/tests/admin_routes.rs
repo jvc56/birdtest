@@ -247,7 +247,7 @@ async fn creating_each_job_type_answers_it_inactive_and_unallocated() {
         assert_eq!(job["created_by"], json!(admin.id), "{created}");
         assert_eq!(
             (&job["min_magpie_major"], &job["min_magpie_minor"], &job["min_magpie_patch"]),
-            (&json!(0), &json!(1), &json!(1)),
+            (&json!(0), &json!(1), &json!(2)),
             "the server's floor is the default: {created}"
         );
 

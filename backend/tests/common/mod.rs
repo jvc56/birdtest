@@ -123,7 +123,7 @@ async fn ensure_template() {
 /// and the contract fixtures move together.
 pub fn test_builders() -> birdtest::magpie::Builders {
     birdtest::magpie::Builders {
-        magpie_version: "0.1.1".into(),
+        magpie_version: "0.1.2".into(),
         build_target: "nehalem".into(),
         wmp_builder_version: 1,
         rit_builder_version: 1,
@@ -207,7 +207,7 @@ impl TestDb {
             // endpoint makes an accidental call fail fast rather than reach AWS.
             s3_endpoint: Some("http://127.0.0.1:9".into()),
             s3_public_endpoint: None,
-            min_magpie_version: "0.1.1".into(),
+            min_magpie_version: "0.1.2".into(),
             magpie_download_url: "https://example.invalid/magpie".into(),
             // A path that is not a binary. Nothing below tier 6 runs a
             // conversion, and a test that reached one should fail loudly
@@ -412,7 +412,7 @@ impl TestDb {
     }
 
     /// Makes `player` a 2-ply simmer, inferring or not.
-    async fn make_simmer(&self, player: Uuid, use_inference: bool) {
+    pub async fn make_simmer(&self, player: Uuid, use_inference: bool) {
         let winpct = self.input_data("winpct", &format!("winpct{player}")).await;
         sqlx::query(
             "UPDATE player_configs

@@ -273,7 +273,7 @@ fn position(game_index: i32, num_moves: i32, moves: usize) -> Value {
         .map(|i| json!({ "move": format!("move-{i}"), "score": 60 - i as i32, "equity": 70.0 - i as f64 }))
         .collect();
     json!({
-        "game_index": game_index, "turn_number": 0, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "AEINRST", "position": "cgp",
+        "game_index": game_index, "turn_number": 0, "player": 1, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "AEINRST", "position": "cgp",
         "num_moves": num_moves, "moves": moves,
     })
 }
@@ -341,7 +341,7 @@ async fn solved_positions_keep_their_analysis_spread_and_depth() {
 
     let solved = |index: i32, analysis: &str, moves: Value| {
         json!({
-            "game_index": index, "turn_number": 20, "played_move": "8D PLAYED", "played_move_score": 10, "rack": "AEINRST", "position": "cgp",
+            "game_index": index, "turn_number": 20, "player": 2, "played_move": "8D PLAYED", "played_move_score": 10, "rack": "AEINRST", "position": "cgp",
             "num_moves": 12, "analysis": analysis, "moves": moves,
         })
     };

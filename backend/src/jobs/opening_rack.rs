@@ -106,8 +106,7 @@ impl JobHandler for OpeningRackHandler {
             task_id,
             claim_id,
             &record.positions,
-            player.num_plays_recorded,
-            player.num_plies_recorded,
+            super::RecordedCaps::one(player.num_plays_recorded, player.num_plies_recorded),
         )
         .await?;
 

@@ -13,7 +13,7 @@ use std::time::Duration;
 /// Copied by hand into Terraform's default (the one production runs on), both
 /// compose files, the native e2e script, the jobs table's column defaults and
 /// `scripts/dev.py`; `U-CFG-5` fails when a raise misses one.
-pub const DEFAULT_MIN_MAGPIE_VERSION: &str = "0.1.1";
+pub const DEFAULT_MIN_MAGPIE_VERSION: &str = "0.1.2";
 
 /// Runtime configuration.
 ///

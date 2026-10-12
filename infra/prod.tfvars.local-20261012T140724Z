@@ -1,0 +1,15 @@
+region                = "us-east-1"
+backend_image         = "824858782304.dkr.ecr.us-east-1.amazonaws.com/birdtest-backend:2ea72427bb67"
+derived_builder_image = "824858782304.dkr.ecr.us-east-1.amazonaws.com/birdtest-derived-builder:2ea72427bb67"
+frontend_image        = "824858782304.dkr.ecr.us-east-1.amazonaws.com/birdtest-frontend:2ea72427bb67"
+alert_email           = "joshuacastellano7@gmail.com"
+acm_certificate_arn   = "arn:aws:acm:us-east-1:824858782304:certificate/1ea3b9da-8a62-4618-a0f8-291c8fc21137"
+ses_domain            = "birdtest.org"
+mail_from_address     = "noreply@birdtest.org"
+public_url            = "https://birdtest.org"
+
+# db.t4g.micro (the default) is not offered for PostgreSQL in us-east-1.
+db_instance_class = "db.t3.micro"
+
+azs = ["us-east-1a","us-east-1b"]
+mail_max_per_second = 14
