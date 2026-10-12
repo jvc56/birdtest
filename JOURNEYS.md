@@ -407,8 +407,13 @@ Open "dev game pairs (first divergences saved)".
   absolute level is only where the anchor was pinned. **Do** hover a cell.
   **Expect** "<row> against <column>: … The ratings predict …% (residual …
   percentage points)."
-- [ ] **Expect** after it a dot plot with ±1 standard-error bars and the
-  anchor in amber.
+- [ ] **Expect** after it a dot plot: a key above it ("thick: ±1 standard
+  error · thin: 95% interval", "the anchor, fixed by definition"), each row a
+  dot on a thick ±1 standard-error bar over a thin 95% one, the anchor's dot
+  amber, and at its end its rating and error ("1641.0 ±12.4", the anchor's
+  "fixed"). Under it, "Between any two configs, a gap of 100 points predicts
+  about a 60–40 score, and 275 points 75–25." At phone width the names'
+  margin narrows and the axis labels thin out rather than run together.
 - [ ] As an admin, **expect** after it an "All configs" table (Rating (WESPA
   scale), ± SE, pairs; the anchor tagged), then the Anchor card. Signed out,
   **expect** neither.

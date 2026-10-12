@@ -6080,8 +6080,12 @@ mean anything, and the level is wherever the pool's anchor was pinned — so bar
 length would imply a ratio that does not exist. A dot on a common scale encodes
 position, which is what a rating is. The error bar matters as much as the dot, because a config with two
 hundred pairs and one with two million otherwise produce identical-looking
-numbers and only the interval says which to believe. A config with no path to the
-anchor is listed beneath the chart as **unrated** rather than drawn at a number.
+numbers and only the interval says which to believe. Each bar has two widths, a
+thick ±1 standard error over a thin 95% interval, and each row's rating and true
+error print at its end, so a visitor reads them without hovering; a line under the
+chart says what a gap means (100 points about a 60–40 score, 275 points 75–25). A
+config with no path to the anchor is listed beneath the chart as **unrated**
+rather than drawn at a number.
 
 **A table of every config**, for admins only, after the plot: the
 exact rating to a decimal, ± SE as a number and pairs played per config, with

@@ -1193,7 +1193,11 @@ refuse what it could not have written, rather than draw a wrong board.
 Test the pure functions; do not snapshot the SVG.
 
 - `F-CHART-1` `RatingDotPlot` places the anchor's dot at the anchor rating, and
-  a config one standard error away at the expected offset. *(Covered:
+  a config one standard error away at the expected offset, its thin bar the
+  95% interval (1.96 standard errors) and the domain set by those. On a phone
+  the names' margin narrows, gridlines are labelled only as often as the plot
+  has room for, and each row's rating and true error print at its end
+  ("1600.0 ±50.0", the anchor's "fixed", an unmeasurable one's "±∞"). *(Covered:
   `charts/ratingDotPlot.test.ts`.)*
 - `F-CHART-2` It clamps a runaway error bar rather than letting one
   barely-measured config flatten the scale, and still reports the true number in
