@@ -14,7 +14,7 @@ VERSION = r'wasm-preview-v\d+\.\d+\.\d+(?:-[a-z0-9.]+)?'
 TYPES = {'.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript',
          '.wasm': 'application/wasm', '.css': 'text/css', '.json': 'application/json',
          '.csv': 'text/csv', '.txt': 'text/plain', '.kwg': 'application/octet-stream',
-         '.klv2': 'application/octet-stream'}
+         '.klv2': 'application/octet-stream', '.svg': 'image/svg+xml', '.png': 'image/png'}
 
 
 def run(*args):
