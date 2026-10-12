@@ -84,6 +84,9 @@
   let targetRackCounts = '500';
   $: targets = parseTargetRackCounts(targetRackCounts);
   let racksPerTask = 50;
+  // An opening-rack task's racks, the server's default until changed. Not the
+  // leave job's racksPerTask: the two defaults differ by ten times.
+  let racksPerBatch = 500;
   // An opening-rack job's consensus: one analysis per rack unless asked.
   let minResults = 1;
   let maxResults = 1;
@@ -165,6 +168,7 @@
         return {
           ...common,
           player_config_id: playerConfigId,
+          racks_per_batch: racksPerBatch,
           // A static player's analyses always agree, so it gets one per rack.
           ...(selectedStatic
             ? { min_results_per_rack: 1, max_results_per_rack: 1 }
@@ -419,6 +423,14 @@
         does, or one that records a single play.
       </p>
     {/if}
+    <div>
+      <label class="label" for="rpb">Racks Per Task</label>
+      <input id="rpb" type="number" min="1" max="10000" required class="input" bind:value={racksPerBatch} />
+      <p class="mt-1 text-xs text-muted-foreground">
+        How many racks a contributor analyses before it reports back. Fewer make each task
+        shorter; more cost less overhead per rack.
+      </p>
+    </div>
     <fieldset class="space-y-2" data-testid="consensus">
       <legend class="label">Analyses Per Rack</legend>
       {#if selectedStatic}

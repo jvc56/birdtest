@@ -1,6 +1,6 @@
 import { test, expect } from '@playwright/test';
 import { AdminApi } from '../lib/api';
-import { ADMIN_STATE } from '../lib/env';
+import { ADMIN_STATE, SEEDED_DATA } from '../lib/env';
 
 /**
  * E-18: an admin changes an opening-rack job's consensus settings after
@@ -57,4 +57,33 @@ test("E-18: an opening-rack job's consensus can be changed after it is created",
   await expect(row('Minimum Analyses Per Rack').getByRole('cell')).toHaveText(['Minimum Analyses Per Rack', '2']);
   await expect(row('Maximum Analyses Per Rack').getByRole('cell')).toHaveText(['Maximum Analyses Per Rack', '3']);
   await expect(row('Consensus %').getByRole('cell')).toHaveText(['Consensus %', '80%']);
+});
+
+test("E-18: an opening-rack job made on the form has the Racks Per Task it was given", async ({ page }) => {
+  const suffix = crypto.randomUUID().slice(0, 8);
+  const configId = await api.createSimConfig(`e18-form-${suffix}`);
+  await page.goto('/admin/jobs/new');
+  await page.getByLabel('Job Title').fill(`e18 form ${suffix}`);
+  await page.getByLabel('Job Type').selectOption({ label: 'Opening Rack Analysis' });
+  const letterdist = page.getByLabel('Letter Distribution');
+  const fixtureBag = letterdist.locator('option', { hasText: `english_fixture (${SEEDED_DATA},` });
+  await letterdist.selectOption((await fixtureBag.getAttribute('value'))!);
+  const layout = page.getByLabel('Board', { exact: true });
+  const board = layout.locator('option', { hasText: `standard15 (${SEEDED_DATA},` });
+  await layout.selectOption((await board.getAttribute('value'))!);
+  await page.getByLabel('Player Config').selectOption(configId);
+  // The server's default until changed.
+  const racks = page.getByLabel('Racks Per Task');
+  await expect(racks).toHaveValue('500');
+  await racks.fill('7');
+  await page.getByRole('button', { name: 'Create job' }).click();
+
+  await expect(page).toHaveURL(/\/admin\/jobs\/[0-9a-f-]{36}$/);
+  const created = page.url().split('/').pop()!;
+  await page.goto(`/jobs/${created}`);
+  const row = page
+    .getByTestId('job-settings')
+    .getByRole('row')
+    .filter({ has: page.getByRole('cell', { name: 'Racks Per Task', exact: true }) });
+  await expect(row.getByRole('cell')).toHaveText(['Racks Per Task', '7']);
 });
