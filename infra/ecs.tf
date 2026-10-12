@@ -88,7 +88,7 @@ resource "aws_security_group" "service" {
 # into the database. Egress for the image pull and the log driver.
 resource "aws_security_group" "frontend" {
   name        = "${local.name}-frontend"
-  description = "The frontend's ECS tasks; only the ALB may reach them"
+  description = "Frontend ECS tasks; only the ALB may reach them"
   vpc_id      = aws_vpc.main.id
 
   ingress {
