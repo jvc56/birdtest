@@ -482,11 +482,12 @@ pub fn check_analysis(analysis: Analysis, moves: &[MoveEntry], context: &str) ->
 /// endgame solve searches no deeper than the `endgame_plies` it was given,
 /// and a pre-endgame ranks no deeper than its `peg_stage_top_k` schedule
 /// reaches (`deepest_peg_fidelity`).
-/// Which seat moved is not something a position states, so the rule is
-/// against either player -- what neither could have run is impossible, which
-/// is the bar every rule here meets. The other way round is not: a simming
-/// player's turn can be static (a simulation with nothing to rank), and a
-/// solving one's is whatever its bag decides.
+/// A captured position names the player who moved from it, and is checked
+/// against that player alone; an opening rack has one player. The rule is
+/// what the mover could not have run is impossible, which is the bar every
+/// rule here meets. The other way round is not: a simming player's turn can
+/// be static (a simulation with nothing to rank), and a solving one's is
+/// whatever its bag decides.
 ///
 /// Iterations against `max_iterations` are deliberately not checked: an
 /// empty-bag simulation's sample limit is its number of plays, not the
@@ -496,16 +497,6 @@ pub fn check_analyses_against_players(
     players: &[&PlayerSpec],
     context: &str,
 ) -> AppResult<()> {
-    let simulates = players.iter().any(|p| p.num_plies > 0);
-    // Sent as null for a static player; a simmer states it. Read as "might"
-    // unless it says no.
-    let infers = players.iter().any(|p| p.num_plies > 0 && p.use_inference != Some(false));
-    let deepest_endgame = players.iter().map(|p| p.endgame_plies).filter(|&d| d > 0).max();
-    let deepest_peg = players
-        .iter()
-        .filter(|p| p.endgame_plies > 0 && p.peg_max_bag > 0)
-        .map(|p| deepest_peg_fidelity(p.peg_stage_top_k.as_deref()))
-        .max();
     let refuse = |position: &PositionAnalysis, why: &str| {
         let at = match (position.game_index, position.turn_number) {
             (Some(game), Some(turn)) => format!("game {game}, turn {turn}"),
@@ -514,6 +505,25 @@ pub fn check_analyses_against_players(
         Err(AppError::bad_request(format!("{context} ({at}): {why}")))
     };
     for position in positions {
+        // The player who moved: player 1 or 2 of the task, as the position
+        // names it. A seat the task has no player for is a broken client.
+        let movers: Vec<&PlayerSpec> = match position.player {
+            Some(seat) => match usize::try_from(seat).ok().and_then(|s| s.checked_sub(1)) {
+                Some(index) if index < players.len() => vec![players[index]],
+                _ => return refuse(position, &format!("player {seat}, and the task has no such player")),
+            },
+            None => players.to_vec(),
+        };
+        let simulates = movers.iter().any(|p| p.num_plies > 0);
+        // Sent as null for a static player; a simmer states it. Read as
+        // "might" unless it says no.
+        let infers = movers.iter().any(|p| p.num_plies > 0 && p.use_inference != Some(false));
+        let deepest_endgame = movers.iter().map(|p| p.endgame_plies).filter(|&d| d > 0).max();
+        let deepest_peg = movers
+            .iter()
+            .filter(|p| p.endgame_plies > 0 && p.peg_max_bag > 0)
+            .map(|p| deepest_peg_fidelity(p.peg_stage_top_k.as_deref()))
+            .max();
         match position.analysis {
             Analysis::Static => {}
             Analysis::Sim if !simulates => {
@@ -913,8 +923,9 @@ mod tests {
     /// run -- a simulation or an inference only if a player simulates (and
     /// infers), a pre-endgame or endgame solve only if a player solves one,
     /// and an endgame no deeper than the deepest `endgame_plies` -- checked
-    /// against either player, since a position does not say which seat moved.
-    /// A static analysis passes from any player: a simmer's turn can be static.
+    /// against the player a captured position names as its mover, and
+    /// against any player when it names none. A static analysis passes from
+    /// any player: a simmer's turn can be static.
     #[test]
     fn an_analysis_is_one_the_tasks_players_could_run() {
         use super::Analysis::*;
@@ -934,8 +945,17 @@ mod tests {
         assert!(check(sim(), &[&static_player]).is_err());
         assert!(check(sim(), &[&simmer]).is_ok());
         assert!(check(analysed(Static, vec![move_entry(30, 31.5)]), &[&simmer]).is_ok());
-        // Either seat will do.
+        // Without a mover, either seat will do.
         assert!(check(sim(), &[&static_player, &simmer]).is_ok());
+        // With one, only the mover's settings count: player 1 is static here.
+        let moved_by = |seat| {
+            let mut position = sim();
+            position.player = Some(seat);
+            position
+        };
+        assert!(check(moved_by(1), &[&static_player, &simmer]).is_err());
+        assert!(check(moved_by(2), &[&static_player, &simmer]).is_ok());
+        assert!(check(moved_by(3), &[&static_player, &simmer]).is_err(), "no third player");
 
         let mut inferred = sim();
         inferred.inference = Some(InferenceSummary {

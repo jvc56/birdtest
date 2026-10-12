@@ -104,9 +104,9 @@ async fn completed_capture_job(db: &TestDb, app: &axum::Router, results: usize) 
 fn captured_result(i: usize) -> serde_json::Value {
     let mut result = games_result(2, 1);
     result["positions"] = json!([
-        { "game_index": 0, "turn_number": 0, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "AEINRST", "position": format!("cgp-{i}-0"),
+        { "game_index": 0, "turn_number": 0, "player": 1, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "AEINRST", "position": format!("cgp-{i}-0"),
           "num_moves": 40, "moves": [{ "move": "8D RETAINS", "score": 74, "equity": 81.2 }] },
-        { "game_index": 1, "turn_number": 3, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "AEINRSU", "position": format!("cgp-{i}-1"),
+        { "game_index": 1, "turn_number": 3, "player": 1, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "AEINRSU", "position": format!("cgp-{i}-1"),
           "previous_move": "8D DOG", "previous_move_score": 10,
           "num_moves": 30, "moves": [{ "move": "8D URINATES", "score": 70, "equity": 77.0 }] },
     ]);

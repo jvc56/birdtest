@@ -1789,7 +1789,7 @@ start. The process has no SSM code path of its own.
 | `S3_BUCKET` | `birdtest-artifacts` | |
 | `S3_ENDPOINT` | unset | Set to MinIO's address locally; the AWS SDK works against it unmodified. |
 | `S3_PUBLIC_ENDPOINT` | unset | The object store as a browser reaches it, when that differs from `S3_ENDPOINT`: export download links are signed for it. The compose stack sets `http://localhost:${MINIO_PORT}`, since its backend reaches MinIO as `minio:9000`; production leaves it unset. |
-| `MIN_MAGPIE_VERSION` | `0.1.1` | The enforced global floor, and the default floor for a new job. Also a floor the server's own pinned MAGPIE must clear: startup fails if `MAGPIE_BIN` reports less, since the server would be publishing hashes built by a MAGPIE its workers may not run. The default (`config::DEFAULT_MIN_MAGPIE_VERSION`) is copied into Terraform's `min_magpie_version`, both compose files, `scripts/e2e_magpie_native.sh`, `backend/.env.example`, the root `.env.example`, the `jobs` column defaults and `scripts/dev.py`; `U-CFG-5` fails when a raise misses one. |
+| `MIN_MAGPIE_VERSION` | `0.1.2` | The enforced global floor, and the default floor for a new job. Also a floor the server's own pinned MAGPIE must clear: startup fails if `MAGPIE_BIN` reports less, since the server would be publishing hashes built by a MAGPIE its workers may not run. The default (`config::DEFAULT_MIN_MAGPIE_VERSION`) is copied into Terraform's `min_magpie_version`, both compose files, `scripts/e2e_magpie_native.sh`, `backend/.env.example`, the root `.env.example`, the `jobs` column defaults and `scripts/dev.py`; `U-CFG-5` fails when a raise misses one. |
 | `MAGPIE_BIN` | `/usr/local/bin/magpie` | The pinned MAGPIE the server runs for every derived file and every leave-generation KLV. The backend image builds one in; locally, a checkout's `bin/magpie`. Startup fails without a working one. |
 | `MAGPIE_THREADS` | `1` | Threads given to a conversion. The web task keeps 1; the derived-file builder task sets its vCPU count. |
 | `MAGPIE_SCRATCH_DIR` | the system temp directory | Where a conversion's throwaway data directory goes. The builder task points it at its ephemeral volume, since a rack info table is 1.9 GB. |
@@ -2437,10 +2437,10 @@ WHERE (j.min_magpie_major, j.min_magpie_minor, j.min_magpie_patch)
 distribution and a layout — and a client too old to understand `expected_data`
 will contribute unverified rather than decline. "No floor" is not a state worth
 being able to express once every job depends on the client honouring a protocol,
-so the columns are `NOT NULL` and default to **`0.1.1`**, the same value as the
+so the columns are `NOT NULL` and default to **`0.1.2`**, the same value as the
 server's `MIN_MAGPIE_VERSION`, which `create_job` writes explicitly.
 
-`0.1.1` is the version of the MAGPIE `main` commit the backend image pins. The version
+`0.1.2` is the version of the MAGPIE `main` commit the backend image pins. The version
 was incremented through `0.5.1` as birdtest and MAGPIE changed together during
 development and reset to `0.1.0` when the protocol settled; none of those numbers
 shipped. **The version moves with every change that can alter what a task
@@ -2450,7 +2450,10 @@ something wrong off its jobs. The eleventh audit found that rule had been broken
 — builds from between 16 and 24 September 2026 all reported `0.1.0`, among them
 ones whose capturing static player played its worst move and every one that
 played a leave task after its first with the previous task's KLV — so the branch
-went to `0.1.1` and the floor with it. The
+went to `0.1.1` and the floor with it. `0.1.2` (October 2026) followed a fix to
+the move generator's rack info table cache, which across two lexicons in one
+contributor process crashed or used the other lexicon's leaves, together with
+captured positions naming their mover. The
 one place the floor lives is the server's configuration: the column default,
 the Terraform variable, the compose file and the env examples all carry the
 same value so no path writes a lower one.
@@ -3567,13 +3570,14 @@ or handler regression, at the cost of an index entry per opening-rack record
 (about 3.2 million, over 100 MB, for a full English job) and an index write per
 record on the submit path (thirty-third audit).
 
-How many ranked plays come back per position is player 1's config's
-`num_plays_recorded`, for both players' positions, not a job setting — MAGPIE has
-one cap for the whole run, and the server truncates with the same number. It
-pairs with `num_plays`, which is how many the player simulates; note that with
-capture on, MAGPIE raises each simming player's `num_plays` to at least that cap,
-so job creation refuses a capture job whose simmers would be raised: each must
-already consider at least that many. Per-ply statistics pair the same way:
+How many ranked plays come back per position is its mover's config's
+`num_plays_recorded`, not a job setting: each captured position names the
+player who moved (`player`, 1 or 2), MAGPIE caps each seat's positions at that
+player's number, and the server truncates with the same one. It pairs with
+`num_plays`, which is how many the player simulates; note that with capture on,
+MAGPIE raises each simming player's `num_plays` to at least its own cap, so job
+creation refuses a capture job whose simmers would be raised: each must already
+consider at least that many. Per-ply statistics pair the same way:
 `num_plies_recorded` against `plies`. The saved-positions read returns at most
 the first two plies of each move (P1, the reply, and P2), whatever was
 recorded, since the page never shows more. A position's inference is a row of
@@ -4299,7 +4303,7 @@ MAGPIE's per-player settings, where `N` is 1 or 2:
 | JSON field | Setting | Notes |
 |---|---|---|
 | `recorder_type` | `-rN` | `best` \| `equity` \| `all`. Read only by an opening-rack static analysis: a static opening-rack player that keeps more than one move per rack needs `equity` or `all`, and job creation refuses `best` there. Autoplay ignores it — games, game pairs and leave generation generate with MAGPIE's own record type (`best`, or `all` when capturing positions) — and a simmer ranks every play up to `num_plays` whatever its recorder |
-| `sort_strategy` | `-sN` | `equity` or `score` for a static player. A simmer's candidates are the top plays by equity (autoplay generates them so whatever this says), so a simmer is always `equity` and config creation refuses `score` for one |
+| `sort_strategy` | `-sN` | `equity` or `score`. A static player plays its top play by it; a simmer simulates its top `num_plays` by it, in games and opening-rack jobs alike |
 | `lexicon` | `-lN` | **Required.** Every player names its own; there is no job lexicon to fall back to. |
 | `leaves` | `-kN` | **Required**, for the same reason. |
 | `win_pct_model` | `-winpct` | Null for a static player, which never loads one |
@@ -5858,11 +5862,10 @@ Beyond role matching, creation enforces seven rules the schema cannot express:
   [How much of an analysis is kept](#how-much-of-an-analysis-is-kept).
 - **A capture job's simmers consider at least what is captured.** With
   `capture_positions` on, MAGPIE raises each simming player's `num_plays` to
-  player 1's `num_plays_recorded`, so a smaller `num_plays` would make turning
-  capture on change the games. Refused, naming the player. Both players must
-  also agree on `num_plays_recorded` and `num_plies_recorded`: MAGPIE keeps
-  player 1's for the whole run, so player 2's would be shown on the job page and
-  never applied. Refused on `capture_positions`, giving both pairs.
+  its own `num_plays_recorded`, so a smaller `num_plays` would make turning
+  capture on change the games. Refused, naming the player. The two players may
+  record different numbers: each captured position names its mover and is kept
+  to that player's `num_plays_recorded` and `num_plies_recorded`.
 - **A leave job's player plays statically on equity, with no rack info table.**
   A generation's leave values are the mean equity of the racks the bot drew, as
   MAGPIE's `leavegen` computes them: a simmer ranks on something else and plays
@@ -6833,8 +6836,8 @@ CREATE TABLE jobs (
     --
     -- Not nullable: every job pins input data, and a client too old to
     -- understand expected_data contributes unverified rather than declining,
-    -- so "no floor" is not a state worth being able to express. 0.1.1 is
-    -- the `birdtest-contribute` version the backend image pins; the branch's
+    -- so "no floor" is not a state worth being able to express. 0.1.2 is
+    -- the version of the MAGPIE `main` commit the backend image pins; its
     -- version moves whenever a change can alter what a task computes, and the
     -- floor moves with it. The default here is the same value as the server's
     -- MIN_MAGPIE_VERSION, which create_job writes explicitly; the two are kept
@@ -6842,7 +6845,7 @@ CREATE TABLE jobs (
     -- floor a job below the server.
     min_magpie_major INT NOT NULL DEFAULT 0 CHECK (min_magpie_major >= 0),
     min_magpie_minor INT NOT NULL DEFAULT 1 CHECK (min_magpie_minor >= 0),
-    min_magpie_patch INT NOT NULL DEFAULT 1 CHECK (min_magpie_patch >= 0),
+    min_magpie_patch INT NOT NULL DEFAULT 2 CHECK (min_magpie_patch >= 0),
     -- The longest one of the job's tasks may run: an hour unless the job's
     -- creation names another, changed on its admin page. Every claim keeps
     -- its own deadline, claim time plus this as it stood then. Ten minutes at

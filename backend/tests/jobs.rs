@@ -1036,7 +1036,7 @@ async fn games_history(app: &Router) -> String {
     let uuid = assignment["worker_uuid"].as_str().unwrap().to_string();
     let mut result = games_result(2, 1);
     result["positions"] = json!([{
-        "game_index": 0, "turn_number": 0, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "sim", "rack": "AEINRST", "position": "cgp",
+        "game_index": 0, "turn_number": 0, "player": 1, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "sim", "rack": "AEINRST", "position": "cgp",
         "num_moves": 40, "moves": [
             { "move": "8D RETAINS", "score": 74, "equity": 81.2, "win_percentage": 55.0,
               "plies": [{ "ply": 1, "bingo_percentage": 10.0, "average_score": 30.0 }] },
@@ -1044,7 +1044,7 @@ async fn games_history(app: &Router) -> String {
         ],
     }, {
         // A capturing job's result has positions from every game of its batch.
-        "game_index": 1, "turn_number": 0, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "AEINRST", "position": "cgp",
+        "game_index": 1, "turn_number": 0, "player": 1, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "AEINRST", "position": "cgp",
         "num_moves": 1, "moves": [{ "move": "8D RETAINS", "score": 74, "equity": 81.2 }],
     }]);
     let (status, body) = send(

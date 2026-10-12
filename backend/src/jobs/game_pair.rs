@@ -297,6 +297,7 @@ mod tests {
             position: Some(format!("{board} {scores} 0 lex NWL23;")),
             game_index: Some(game),
             turn_number: Some(turn),
+            player: Some(1),
             previous_move: None,
             previous_move_score: None,
             played_move: Some("8D PLAY".into()),

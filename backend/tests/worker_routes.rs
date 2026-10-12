@@ -161,7 +161,7 @@ async fn a_malformed_magpie_version_is_refused_rather_than_assumed() {
         assert_eq!(status, StatusCode::OK, "{version:?}: {body}");
         let shutdown = &body["shutdown"];
         assert_eq!(shutdown["reason"], "magpie_too_old", "{version:?}: {body}");
-        assert_eq!(shutdown["required_magpie_version"], "0.1.1", "{version:?}: {body}");
+        assert_eq!(shutdown["required_magpie_version"], "0.1.2", "{version:?}: {body}");
         assert_eq!(shutdown["download_url"], json!(state.cfg.magpie_download_url), "{body}");
         assert!(message(shutdown).contains("you are running 0.0.0"), "{version:?}: {body}");
         assert!(body.get("claim_token").is_none(), "{version:?} was handed a task: {body}");
@@ -284,7 +284,7 @@ async fn idle_and_each_shutdown_reason_are_distinct_answers() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let shutdown = &body["shutdown"];
     assert_eq!(shutdown["reason"], "magpie_too_old", "{body}");
-    assert_eq!(shutdown["required_magpie_version"], "0.1.1", "{body}");
+    assert_eq!(shutdown["required_magpie_version"], "0.1.2", "{body}");
     assert_eq!(shutdown["download_url"], download, "{body}");
     assert_eq!(shutdown["required_tarball_dates"], json!([]), "{body}");
 
@@ -717,13 +717,13 @@ async fn assert_each_refused(db: &TestDb, app: &axum::Router, valid: Build, case
 fn games_with_position(_: &Value) -> Value {
     let mut result = games_result(2, 1);
     result["positions"] = json!([{
-        "game_index": 1, "turn_number": 3, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "sim", "rack": "AEINRST", "position": "cgp",
+        "game_index": 1, "turn_number": 3, "player": 1, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "sim", "rack": "AEINRST", "position": "cgp",
         "num_moves": 5,
         "moves": [{ "move": "8D RETAINS", "score": 74, "equity": 81.2,
                     "win_percentage": 61.5, "blended_utility": 0.6 }],
     }, {
         // A capturing job's result has positions from every game of its batch.
-        "game_index": 0, "turn_number": 0, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "AEINRST", "position": "cgp",
+        "game_index": 0, "turn_number": 0, "player": 1, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "AEINRST", "position": "cgp",
         "num_moves": 5,
         "moves": [{ "move": "8D RETAINS", "score": 74, "equity": 81.2 }],
     }]);

@@ -901,18 +901,6 @@ async fn create_player_config(
         return Err(AppError::bad_request("player config is invalid")
             .with_field("num_plies", "a simming player must simulate at least 1 ply"));
     }
-    // A simmer's candidates are the top plays by equity: autoplay's simulating
-    // player generates them that way whatever the config says, so a `score`
-    // simmer would mean equity in a games job and score in an opening-rack one
-    // (whose executor sorts by the player's strategy) -- one config, two
-    // players. Refused rather than given two meanings.
-    if simming && body.sort_strategy.as_deref() == Some("score") {
-        return Err(AppError::bad_request("player config is invalid").with_field(
-            "sort_strategy",
-            "a simming player's candidates are the best plays by equity, in games jobs \
-             whatever the config says; use 'equity' (or leave it out) for a simmer",
-        ));
-    }
     // A simulation stops at whichever comes first, its iteration budget or its
     // time limit, and a time limit makes how far it gets depend on the
     // contributor's hardware: two honest workers would rank the same position
@@ -2222,64 +2210,32 @@ async fn validate_shared_player_options(
     Ok(())
 }
 
-/// A capture job's simmers must already consider at least as many plays as are
-/// captured.
-///
-/// With `capture_positions` on, MAGPIE's autoplay raises each simming player's
-/// candidate count to the capture cap -- player 1's `num_plays_recorded` -- so
-/// there are enough ranked plays to record. A simmer configured for fewer would
-/// then consider more candidates with capture on than off, and turning capture
-/// on, which is meant only to decide what is kept, would change the games.
+/// With capture on, MAGPIE raises each simming player's `num_plays` to that
+/// player's own `num_plays_recorded`, so a simmer that considers fewer would
+/// play different games with capture than without. Refused, naming the player.
+/// The two players may record different numbers: each position is kept to its
+/// mover's.
 async fn validate_capture_play_cap(
     conn: &mut sqlx::PgConnection,
     player1_config_id: Uuid,
     player2_config_id: Uuid,
 ) -> AppResult<()> {
-    // How many plays and plies a captured position keeps is one setting for
-    // the whole run in MAGPIE, which reads both from player 1: player 2's
-    // would be shown on the job page and never applied. So they must agree,
-    // as the win% model must (see `validate_shared_player_options`).
-    let recorded = sqlx::query_as::<_, (Uuid, i32, i32)>(
-        "SELECT id, num_plays_recorded, num_plies_recorded FROM player_configs WHERE id = ANY($1)",
+    let players = sqlx::query_as::<_, (String, i32, i32, i32)>(
+        "SELECT name, num_plies, num_plays, num_plays_recorded FROM player_configs \
+         WHERE id = ANY($1)",
     )
     .bind(vec![player1_config_id, player2_config_id])
     .fetch_all(&mut *conn)
     .await?;
-    let of = |id: Uuid| {
-        recorded
-            .iter()
-            .find(|(row, _, _)| *row == id)
-            .map(|(_, plays, plies)| (*plays, *plies))
-            .ok_or_else(|| AppError::bad_request("player config not found"))
-    };
-    let (cap, plies) = of(player1_config_id)?;
-    let (cap2, plies2) = of(player2_config_id)?;
-    if (cap, plies) != (cap2, plies2) {
-        return Err(AppError::bad_request("job settings are invalid").with_field(
-            "capture_positions",
-            format!(
-                "the players record {cap} and {cap2} plays and {plies} and {plies2} plies per \
-                 position; MAGPIE keeps one number of each for the whole run, player 1's, so \
-                 with capture on both configs must agree on num_plays_recorded and \
-                 num_plies_recorded"
-            ),
-        ));
-    }
-    let players = sqlx::query_as::<_, (String, i32, i32)>(
-        "SELECT name, num_plies, num_plays FROM player_configs WHERE id = ANY($1)",
-    )
-    .bind(vec![player1_config_id, player2_config_id])
-    .fetch_all(&mut *conn)
-    .await?;
-    for (name, plies, plays) in players {
+    for (name, plies, plays, cap) in players {
         if plies > 0 && plays < cap {
             return Err(AppError::bad_request("job settings are invalid").with_field(
                 "capture_positions",
                 format!(
-                    "{name} simulates {plays} candidate plays, fewer than the {cap} captured \
+                    "{name} simulates {plays} candidate plays, fewer than the {cap} it captures \
                      per position; with capture on MAGPIE would raise it and play different \
-                     games. Use a config with num_plays of at least {cap}, or lower player \
-                     1's num_plays_recorded."
+                     games. Use a config with num_plays of at least {cap}, or a lower \
+                     num_plays_recorded."
                 ),
             ));
         }

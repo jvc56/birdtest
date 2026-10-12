@@ -879,7 +879,7 @@ async fn a_simulated_position_shows_its_plies_and_its_inference() {
     let position = |turn: i64, analysis: &str, inference: Option<serde_json::Value>| {
         let simmed = analysis == "sim";
         let mut position = json!({
-            "game_index": 0, "turn_number": turn, "rack": "AABCDE?",
+            "game_index": 0, "turn_number": turn, "player": 1, "rack": "AABCDE?",
             "position": format!("cgp-{turn}"), "played_move": "8D BACCAE",
             "played_move_score": 74, "num_moves": 40, "analysis": analysis,
             "moves": [{
@@ -1004,11 +1004,11 @@ async fn captured_positions_are_searchable_by_anyone() {
     for batch in 0..2 {
         let mut result = games_result(2, 1);
         result["positions"] = json!([
-            { "game_index": 0, "turn_number": 0, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "AABCDE?", "position": format!("cgp-{batch}-0"),
+            { "game_index": 0, "turn_number": 0, "player": 1, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "AABCDE?", "position": format!("cgp-{batch}-0"),
               "num_moves": 40, "moves": [
                   { "move": "8D BACCAE", "score": 74, "equity": 81.2 },
                   { "move": "8D ABACE", "score": 72, "equity": 79.0 } ] },
-            { "game_index": 1, "turn_number": 3, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "ABBCDEE", "position": format!("cgp-{batch}-1"),
+            { "game_index": 1, "turn_number": 3, "player": 1, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "ABBCDEE", "position": format!("cgp-{batch}-1"),
               "previous_move": "8D DAB", "previous_move_score": 10,
               "num_moves": 30, "moves": [{ "move": "8D BEDE", "score": 70, "equity": 77.0 }] },
         ]);
@@ -1127,9 +1127,9 @@ async fn a_random_position_is_drawn_from_the_tasks_that_have_one() {
     let (assignment, uuid) = &claims[2];
     let mut result = games_result(2, 1);
     result["positions"] = json!([
-        { "game_index": 0, "turn_number": 0, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "AABCDE?", "position": "first",
+        { "game_index": 0, "turn_number": 0, "player": 1, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "AABCDE?", "position": "first",
           "num_moves": 3, "moves": [{ "move": "8D BACCAE", "score": 74, "equity": 81.2 }] },
-        { "game_index": 1, "turn_number": 4, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "ABBCDEE", "position": "second",
+        { "game_index": 1, "turn_number": 4, "player": 1, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "ABBCDEE", "position": "second",
           "previous_move": "8D DAB", "previous_move_score": 10,
           "num_moves": 3, "moves": [{ "move": "8D BEDE", "score": 70, "equity": 77.0 }] },
     ]);
@@ -1693,7 +1693,7 @@ fn pairs_result(positions: serde_json::Value) -> serde_json::Value {
 }
 
 fn divergence(game: i32, turn: i32, scores: &str, best: &str) -> serde_json::Value {
-    json!({ "game_index": game, "turn_number": turn, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "ABBCDEE",
+    json!({ "game_index": game, "turn_number": turn, "player": 1, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "ABBCDEE",
             "position": format!("15/15/15/15/15/15/15/7DAB5/15/15/15/15/15/15/15 {scores} 0"),
             "previous_move": "8H DAB", "previous_move_score": 10,
             "num_moves": 30, "moves": [{ "move": best, "score": 70, "equity": 77.0 }] })

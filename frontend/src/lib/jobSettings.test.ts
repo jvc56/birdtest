@@ -28,7 +28,7 @@ const simPlayer: PlayerSettings = {
 const config: JobConfig = {
   job: {
     id: 'j', title: 'n', name: 'n', job_type: 'game_pairs', variant: 'classic', letter_distribution: 'english',
-    layout: 'standard15', bingo_bonus: 50, sim_cutoff: 0, min_magpie_version: '0.1.1',
+    layout: 'standard15', bingo_bonus: 50, sim_cutoff: 0, min_magpie_version: '0.1.2',
     max_task_seconds: 3600
   },
   games: {
