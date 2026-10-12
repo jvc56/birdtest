@@ -2,6 +2,8 @@
   import { onDestroy, onMount } from 'svelte';
   import { api, type DerivedData } from '$lib/api';
   import { datetime, derivedKind as kind } from '$lib/format';
+  import { fileStatus } from '$lib/status';
+  import StatusPill from '$lib/components/StatusPill.svelte';
   import { BUSY_POLL_MS, IDLE_POLL_MS, createPoller } from '$lib/poller';
 
   let rows: DerivedData[] = [];
@@ -128,6 +130,7 @@
       </thead>
       <tbody>
         {#each rows as row (key(row))}
+          {@const status = fileStatus(row.state)}
           <tr class:text-destructive={row.state === 'failed'}>
             <td>{kind(row.role)}</td>
             <td>
@@ -141,7 +144,7 @@
               {/if}
             </td>
             <td>
-              {row.state}
+              <StatusPill tone={status.tone} icon={status.icon}>{status.word}</StatusPill>
               {#if row.attempts > 1}
                 <span class="text-muted-foreground">({row.attempts} attempts)</span>
               {/if}

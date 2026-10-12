@@ -6266,12 +6266,14 @@ birdtest/
 │       │   ├── roundRobin.ts       # a games or pairs request's matchups, previewed as the server makes them
 │       │   ├── jobSettings.ts      # a job's and a player config's settings tables
 │       │   ├── jobProgress.ts      # a job's Progress card: how far along, its pace, time left
+│       │   ├── status.ts           # each state's word, tone and icon, for the status pills
 │       │   ├── charts/             # pentanomial.ts (the pair-outcome bar), ratingDotPlot.ts,
 │       │   │                       # residuals.ts, labels.ts: the arithmetic behind the charts
 │       │   └── components/         # shared UI components
 │       │       ├── JobStatusBadge.svelte
 │       │       ├── JobStatusCard.svelte  # where a job stands, a row above its progress
 │       │       ├── JobProgressCard.svelte # how far along a job is, its pace and time left
+│       │       ├── StatusPill.svelte     # a state as a pill: an icon, then its word
 │       │       ├── JobSettings.svelte    # a job's settings and its players'
 │       │       ├── PlayerSettingsTable.svelte # player configs' settings, a column per player
 │       │       ├── MatchScore.svelte     # the match score (and its diverged-games toggle)

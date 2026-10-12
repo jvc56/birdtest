@@ -2,6 +2,8 @@
   import { onMount } from 'svelte';
   import { api, type BackupStatus } from '$lib/api';
   import { datetime, duration } from '$lib/format';
+  import { backupStatus } from '$lib/status';
+  import StatusPill from '$lib/components/StatusPill.svelte';
 
   let status: BackupStatus | null = null;
   let error = '';
@@ -72,6 +74,7 @@
       </thead>
       <tbody>
         {#each status.recent as run}
+          {@const result = backupStatus(run.ok)}
           <tr>
             <td>{datetime(run.finished_at)}</td>
             <td>{run.kind}</td>
@@ -79,7 +82,9 @@
             <td class="text-right tabular-nums">{duration(run.duration_seconds)}</td>
             <td class="text-right tabular-nums">{mib(run.dump_bytes)}</td>
             <td class="text-right tabular-nums">{run.total_rows.toLocaleString()}</td>
-            <td class={run.ok ? '' : 'text-destructive'}>{run.ok ? 'ok' : 'failed'}</td>
+            <td>
+              <StatusPill tone={result.tone} icon={result.icon}>{result.word}</StatusPill>
+            </td>
           </tr>
         {:else}
           <tr><td colspan="7" class="text-muted-foreground">No backup runs recorded.</td></tr>

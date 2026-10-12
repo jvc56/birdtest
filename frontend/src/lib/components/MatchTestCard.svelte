@@ -12,6 +12,7 @@
   import { testState } from '$lib/format';
   import { testPct, testScale, testVerdict } from '$lib/matchTest';
   import { pairOutcomes } from '$lib/charts/pentanomial';
+  import StatusPill from './StatusPill.svelte';
 
   export let stats: JobStats;
   /** The players' config names, player 1 first, when the page has them. */
@@ -27,11 +28,6 @@
   // A tick at either end is pinned by its own edge, so neither leaves the chart.
   const anchor = (at: number) => `left: ${at}%; transform: translateX(-${at}%)`;
   const text = ['text-player-1', 'text-player-2'] as const;
-  const chip = {
-    running: 'bg-warning/15 text-warning border-warning/30',
-    player: ['bg-player-1/15 text-player-1 border-player-1/40', 'bg-player-2/15 text-player-2 border-player-2/40'],
-    muted: 'bg-muted text-muted-foreground border-border'
-  } as const;
   // Player 1's outcomes in its colour, player 2's in its own, a split pair
   // fainter than a sweep, even pairs grey. Whole class names, for Tailwind to find.
   const tones = {
@@ -47,16 +43,13 @@
   <div class="card space-y-4" data-testid="significance-test">
     <div class="flex flex-wrap items-center justify-between gap-3">
       <h2 class="text-lg font-medium">Significance Test</h2>
-      <span
-        class="inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium {verdict.player !== null
-          ? chip.player[verdict.player]
-          : verdict.running
-            ? chip.running
-            : chip.muted}"
+      <StatusPill
+        tone={verdict.player === 0 ? 'player1' : verdict.player === 1 ? 'player2' : verdict.running ? 'amber' : 'grey'}
+        icon={verdict.player !== null ? 'check' : verdict.running ? 'spin' : verdict.chip === 'paused' ? 'pause' : 'minus'}
         data-testid="test-chip"
       >
         {verdict.player === null ? verdict.chip : `${names[verdict.player]} better`}
-      </span>
+      </StatusPill>
     </div>
 
     <div class="grid grid-cols-[repeat(auto-fit,minmax(10.5rem,1fr))] gap-2.5">

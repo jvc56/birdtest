@@ -3,6 +3,8 @@
   import { api, ApiError, type JobDerivedFile } from '$lib/api';
   import { BUSY_POLL_MS, IDLE_POLL_MS, createPoller } from '$lib/poller';
   import { derivedKind as kind } from '$lib/format';
+  import { fileStatus } from '$lib/status';
+  import StatusPill from './StatusPill.svelte';
 
   /**
    * The wordmaps, rack info tables and word info tables a job waits on. A job that needs one is
@@ -42,13 +44,6 @@
   onMount(() => poller.start());
   onDestroy(() => poller.stop());
 
-  const label: Record<string, string> = {
-    pending: 'queued',
-    building: 'building…',
-    built: 'built',
-    failed: 'failed'
-  };
-
   $: waiting = (files ?? []).filter((f) => f.state === 'pending' || f.state === 'building');
   $: failed = (files ?? []).filter((f) => f.state === 'failed');
 </script>
@@ -82,8 +77,10 @@
     {/if}
     <ul class="space-y-1 text-sm">
       {#each files as file (file.role + ' ' + file.name)}
-        <li class:text-destructive={file.state === 'failed'}>
-          {kind(file.role)} <code>{file.name}</code>: {label[file.state] ?? file.state}
+        {@const status = fileStatus(file.state)}
+        <li class="flex flex-wrap items-center gap-x-2 gap-y-1" class:text-destructive={file.state === 'failed'}>
+          <StatusPill tone={status.tone} icon={status.icon}>{status.word}</StatusPill>
+          <span>{kind(file.role)} <code>{file.name}</code></span>
           {#if file.state === 'failed' && file.error}
             <span class="text-xs">({file.error})</span>
           {/if}

@@ -69,7 +69,7 @@ at tier 5 names a symptom.
 | Tier | Tests | Where |
 |---|---|---|
 | 1 Unit | 250 | `#[cfg(test)]` in `jobs::plausibility` (30), `inputdata` (30), `jobs::racks` (17), `stats::bradley_terry` (30), `stats::match_test` (10), `stats::outcomes` (7), `error` (9), `config` (8), `extract` (7), `routes::admin` (16), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (5), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (7), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (8), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `board`, `exports`, `jobs`, `jobs::leave_gen`, `routes` (1 each); `jobs::game_pair` (3), `artifacts` (2) |
-| 1F Frontend unit | 224 | Vitest, `frontend/src/lib/`: `format.test.ts` (46), `jobProgress.test.ts` (6), `jobSettings.test.ts` (13), `matchScore.test.ts` (4), `matchTest.test.ts` (8), `moveList.test.ts` (5), `consensus.test.ts` (8), `cgp.test.ts` (16), `api.test.ts` (18), `auth.test.ts` (17), `accountRules.test.ts` (9), `ratingPool.test.ts` (7), `sse.test.ts` (12), `importWatch.test.ts` (10), `poller.test.ts` (7), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (3), and `charts/`: `ratingDotPlot.test.ts` (19), `labels.test.ts` (2), `residuals.test.ts` (5), `pentanomial.test.ts` (5) |
+| 1F Frontend unit | 226 | Vitest, `frontend/src/lib/`: `format.test.ts` (46), `jobProgress.test.ts` (6), `status.test.ts` (2), `jobSettings.test.ts` (13), `matchScore.test.ts` (4), `matchTest.test.ts` (8), `moveList.test.ts` (5), `consensus.test.ts` (8), `cgp.test.ts` (16), `api.test.ts` (18), `auth.test.ts` (17), `accountRules.test.ts` (9), `ratingPool.test.ts` (7), `sse.test.ts` (12), `importWatch.test.ts` (10), `poller.test.ts` (7), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (3), and `charts/`: `ratingDotPlot.test.ts` (19), `labels.test.ts` (2), `residuals.test.ts` (5), `pentanomial.test.ts` (5) |
 | 2 Integration | 186 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (33), `scheduler.rs` (19), `jobs.rs` (20), `stats.rs` (19), `input_data.rs` (14), `derived.rs` (9), `leave_generation.rs` (8), `exports.rs` (16), `submissions.rs` (6), `artifacts.rs` (5), `audit.rs` (3) |
 | 3 API | 250 | `backend/tests/`: `worker_api.rs` (52), `admin_api.rs` (59), `auth_routes.rs` (28), `worker_routes.rs` (24), `boundaries.rs` (18), `public_api.rs` (24), `admin_routes.rs` (13), `authz.rs` (7), `account.rs` (10), `auth_api.rs` (5), `finish.rs` (9), `fake_worker.rs` (1) |
 | 4 Contract | 15 | `routes::worker::contract_fixtures`, over 18 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
@@ -1000,6 +1000,15 @@ Each entry's tests are the `describe` block named for its id.
   left the time at the current pace and the clock time it reaches, only
   while the job is active, and when a completed job finished. *(Covered:
   `jobProgress.test.ts`.)*
+
+### `F-STATUS-*` — `lib/status.ts`
+
+- `F-STATUS-1` Every status pill pairs its word with a tone and an icon, so a
+  state reads by shape as well as colour: a job active (green, play),
+  inactive (grey, pause) or completed (grey, a tick: not the links' blue),
+  one the site does not know as itself; a derived file queued, building (a
+  spinning arc), built or failed (red, a cross); a backup ok or failed.
+  *(Covered: `status.test.ts`.)*
 
 ### `F-MOVEGENS-*` — `lib/movegens.ts`
 

@@ -4,6 +4,7 @@
   import { session } from '$lib/auth';
   import { jobTitle, jobTypeLabel } from '$lib/format';
   import JobStatusBadge from '$lib/components/JobStatusBadge.svelte';
+  import StatusPill from '$lib/components/StatusPill.svelte';
   import Pagination from '$lib/components/Pagination.svelte';
 
   let result: Page<JobListItem> | null = null;
@@ -71,15 +72,15 @@
           <tr>
             <td><a href="/jobs/{job.id}">{jobTitle(job)}</a></td>
             <td>{jobTypeLabel(job.job_type)}</td>
-            <td>
+            <td class="space-x-1 whitespace-nowrap">
               <JobStatusBadge status={job.status} />
               {#if job.stalled}
-                <span
-                  class="ml-1 rounded bg-destructive/10 px-1.5 py-0.5 text-xs text-destructive"
+                <StatusPill
+                  tone="red"
+                  icon="warn"
                   title="Workers are declining this job and none has completed one in 24 hours — usually data nobody has yet."
+                  >stalled</StatusPill
                 >
-                  stalled
-                </span>
               {/if}
             </td>
             <td class="tabular-nums">{job.allocation}%</td>
