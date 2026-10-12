@@ -42,7 +42,7 @@
          source order. -->
     <nav class="mx-auto flex max-w-6xl flex-wrap items-center gap-x-6 gap-y-2 px-4 py-3 sm:px-6">
       <a href="/" class="flex items-center gap-2 text-lg font-semibold text-foreground no-underline hover:no-underline">
-        <img src="/magpie.svg" alt="" width="36" height="36" class="rounded-lg bg-[#f6f1e5]" />
+        <img src="/magpie.svg" alt="" width="36" height="36" class="rounded-lg bg-[#bac8d0]" />
         birdtest
       </a>
       <div

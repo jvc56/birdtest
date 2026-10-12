@@ -53,7 +53,7 @@
 
 <section class="space-y-8">
   <div class="space-y-3">
-    <img src="/magpie.svg" alt="Birdtest magpie" width="96" height="96" class="rounded-2xl bg-[#f6f1e5]" />
+    <img src="/magpie.svg" alt="Birdtest magpie" width="96" height="96" class="rounded-2xl bg-[#bac8d0]" />
     <h1 class="text-3xl font-semibold">Crowdsourced Crossword Game Research</h1>
     <div class="max-w-2xl space-y-2 text-muted-foreground" data-testid="intro">
       <p>
