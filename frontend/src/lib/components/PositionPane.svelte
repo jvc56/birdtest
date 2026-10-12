@@ -1,7 +1,8 @@
 <script lang="ts">
   /**
-   * One saved position: what it is, the board -- the previous move outlined,
-   * the move played from here drawn where it goes -- and the moves the player
+   * One saved position: what it is, the board -- the previous move bordered in
+   * its player's colour, the move played from here drawn where it goes in its
+   * own -- and the moves the player
    * to move ranked, the one played marked, each with its win percentage and
    * its first two plies' statistics when it was simulated: the board beside
    * the moves on a wide screen, above them on a narrow one. Under the moves,
@@ -11,7 +12,7 @@
   import type { BoardData, SavedPosition } from '$lib/api';
   import { parseCgp, seatToMove } from '$lib/cgp';
   import { drawShare, inferenceSummary, plyAt, plyColumns, plyHeaders, showsIterations } from '$lib/moveList';
-  import Board, { PLAYED_COLORS } from './Board.svelte';
+  import Board, { PLAYED_COLORS, PLAYED_TINTS } from './Board.svelte';
 
   export let position: SavedPosition;
   export let board: BoardData | null;
@@ -21,8 +22,6 @@
   export let place = '';
   /** A heading naming the position among others, e.g. "Game 1 of the pair". */
   export let heading = '';
-  /** The colour the move played from here is drawn in: its player's. */
-  export let playedColor: string = PLAYED_COLORS[0];
 
   const ANALYSIS: Record<SavedPosition['analysis'], string> = {
     static: 'static equity',
@@ -34,6 +33,16 @@
   $: parsed = position.position ? parseCgp(position.position) : null;
   $: toMove = parsed ? seatToMove(parsed, position.rack) : null;
   $: mover = toMove === null ? '' : (players[toMove] ?? '');
+  // The move played from here is the player to move's, the one before it the
+  // other player's: each marked in its player's colour. With no player to
+  // move known, player 1's.
+  $: seat = toMove ?? 0;
+  $: playedColor = PLAYED_COLORS[seat];
+  $: other = toMove === null ? '' : (players[1 - toMove] ?? `Player ${2 - toMove}`);
+  $: previousLabel = other
+    ? `${other}'s previous move, ${position.previous_move} (${position.previous_move_score})`
+    : 'previous move';
+  $: playedLabel = `${mover || 'played here'}${mover ? ` played ${position.played_move} (${position.played_move_score})` : ''}`;
   $: showWinPct = position.moves.some((m) => m.win_percentage !== null);
   $: solved = position.analysis === 'peg' || position.analysis === 'endgame';
   $: plies = plyColumns(position.moves);
@@ -56,8 +65,10 @@
     {/if}
     {#if position.played_move}
       · played
-      <span class="font-mono" data-testid="played-move" style="text-decoration: underline dashed {playedColor}"
-        >{position.played_move}</span
+      <span
+        class="font-mono underline decoration-2 underline-offset-2"
+        data-testid="played-move"
+        style="text-decoration-color: {playedColor}">{position.played_move}</span
       >
       ({position.played_move_score})
     {/if}
@@ -81,9 +92,8 @@
           {board}
           position={parsed}
           previousMove={position.previous_move}
-          played={position.played_move
-            ? [{ move: position.played_move, label: 'played here', color: playedColor }]
-            : []}
+          {previousLabel}
+          played={position.played_move ? [{ move: position.played_move, label: playedLabel, seat }] : []}
           {toMove}
           {players}
         />
@@ -106,12 +116,12 @@
         <tbody>
           {#each position.moves as move}
             {@const playedHere = move.move === position.played_move}
-            <tr class:played-row={playedHere} data-played={playedHere || undefined}>
+            <tr style={playedHere ? `background: ${PLAYED_TINTS[seat]}` : undefined} data-played={playedHere || undefined}>
               <td class="tabular-nums">{move.rank}</td>
               <td class="font-mono">
                 {move.move}{#if playedHere}<span
                     class="ml-1 rounded px-1 font-sans text-[10px] uppercase"
-                    style="background: {playedColor}; color: white">played</span
+                    style="background: {playedColor}; color: hsl(222 47% 8%)">played</span
                   >{/if}
               </td>
               <td class="text-right tabular-nums">{move.score}</td>
@@ -179,8 +189,5 @@
     white-space: nowrap;
     padding-left: 0.3rem;
     padding-right: 0.3rem;
-  }
-  .played-row {
-    background: hsl(140 45% 50% / 0.12);
   }
 </style>

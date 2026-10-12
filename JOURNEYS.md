@@ -178,7 +178,7 @@ Open "dev game pairs (first divergences saved)".
   parallelism (all threads on one game)", Minimum Pairs (50,000), Pairs Per Task and Oldest MAGPIE,
   and no download link.
 - [ ] **Expect** after it a **Player settings** card: the players side by side,
-  headed "Player 1" and "Player 2", each with its colour dot (green, purple:
+  headed "Player 1" and "Player 2", each with its colour dot (blue, orange:
   the colours their moves are drawn in under Saved positions) and its name
   linking to its config's page, and beside its heading how many settings
   they differ in ("1 of 21 differ"). It lists every setting, the key rows
@@ -341,8 +341,11 @@ Open "dev game pairs (first divergences saved)".
   moves ranked by static equity", the PLAY underlined in its player's colour;
   its board -- premium squares (TW, DW, TL, DL and a star on the centre),
   tiles each with a letter and a score (a blank a red lower-case letter with
-  none), the tiles MOVE placed outlined, the tiles PLAY puts down drawn
-  dashed in its player's colour, both racks and scores with **to move** on the
+  none), the tiles MOVE placed bordered in the other player's colour, the
+  tiles PLAY puts down washed in its player's colour with a solid border
+  (player 1 blue, player 2 orange), a key naming each ("OTHER PLAYER's
+  previous move, MOVE (score)", "PLAYER played PLAY (score)"), the move
+  list's **played** chip in the same colour, both racks and scores with **to move** on the
   player whose rack it is, and no CGP text -- and its ranked moves, the one
   played tinted and marked **played**. **Do** press the other button.
   **Expect** "Game 2 of the pair · OTHER PLAYER to move", the same board and
@@ -365,8 +368,9 @@ Open "dev game pairs (first divergences saved)".
   equity E." and a table of up to ten leaves the opponent may have kept:
   Leave, Draws ("count (share%)") and Equity.
 - [ ] On "dev games (positions saved)", **expect** one game's position: its
-  board with the previous move outlined and the move played drawn dashed in
-  green, both racks and scores under it, "played PLAY (score)" in the summary,
+  board with the previous move bordered in the other player's colour and the
+  move played washed in its player's -- player 2's in orange, not player
+  1's blue -- both racks and scores under it, "played PLAY (score)" in the summary,
   and the played move marked in the list.
 - [ ] **Do** **Random position** a few times. **Expect** another position
   each time (now and then the same one again), the board, racks and scores agreeing with each other; on a turn 1

@@ -1,16 +1,25 @@
 <script context="module" lang="ts">
-  /** The colours a played move is drawn in: player 1's, then player 2's. */
-  export const PLAYED_COLORS = ['hsl(142 70% 32%)', 'hsl(280 60% 50%)'] as const;
+  /**
+   * Each player's colour, player 1's first: a move's border on the board, its
+   * chip in the move list, the player's dot beside its name. The match score
+   * and significance test cards' (`player` in tailwind.config.js).
+   */
+  export const PLAYED_COLORS = ['hsl(199 89% 52%)', 'hsl(28 88% 60%)'] as const;
+  /** The same, as the light wash a move played from here is drawn in: a tile not yet down. */
+  export const PLAYED_WASHES = ['hsl(199 70% 80%)', 'hsl(28 80% 80%)'] as const;
+  /** The same, faint enough to tint a row of text. */
+  export const PLAYED_TINTS = ['hsl(199 89% 52% / 0.12)', 'hsl(28 88% 60% / 0.12)'] as const;
 </script>
 
 <script lang="ts">
   /**
    * A saved position on the job's own board: the premium squares from its
    * layout, the tiles with their letters and scores (a blank in lower case,
-   * in red, scoring nothing), the tiles the previous move placed outlined,
-   * the move played from here drawn on the squares it is about to fill --
-   * green, dashed, apart from the tiles already down -- and below it both
-   * racks and scores, the player to move marked.
+   * in red, scoring nothing), the tiles the previous move placed bordered in
+   * the colour of the player who made it, the move played from here drawn on
+   * the squares it is about to fill -- washed in its player's colour, apart
+   * from the tiles already down -- and below it both racks and scores, the
+   * player to move marked. The key under it says whose each move was.
    *
    * One SVG in board units, so it scales to its box: at phone width the
    * board shrinks rather than pushing the page sideways.
@@ -22,11 +31,13 @@
   export let position: Position;
   /** The move that led here, as MAGPIE names it. */
   export let previousMove: string | null = null;
+  /** What the key calls the previous move. */
+  export let previousLabel = 'previous move';
   /**
    * The moves played from here, as MAGPIE names them, each drawn on the
-   * empty squares it fills in its own colour, and named in the legend.
+   * empty squares it fills in its player's colour, and named in the legend.
    */
-  export let played: { move: string; label: string; color: string }[] = [];
+  export let played: { move: string; label: string; seat: 0 | 1 }[] = [];
   /** The seat to move, when known. */
   export let toMove: 0 | 1 | null = null;
   /** The players' config names, player 1 first, when the page has them. */
@@ -51,15 +62,18 @@
   $: dim = board.squares.length;
   $: scores = new Map(board.letters.map((l) => [l.letter, l.score]));
   $: placed = placedSquares(previousMove);
+  // The previous move was the other player's; with no player to move known,
+  // its border is neutral.
+  $: previousColor = toMove === null ? 'hsl(215 14% 75%)' : PLAYED_COLORS[1 - toMove];
   // Each square a played move fills, with what it puts there; the first move
   // listed wins a square two of them fill (the page shows one at a time then).
-  $: ghosts = played.reduce((squares, { move, color }) => {
+  $: ghosts = played.reduce((squares, { move, seat }) => {
     for (const tile of placedTiles(move)) {
       const key = `${tile.row},${tile.col}`;
-      if (!squares.has(key) && !position.board[tile.row]?.[tile.col]) squares.set(key, { tile, color });
+      if (!squares.has(key) && !position.board[tile.row]?.[tile.col]) squares.set(key, { tile, seat });
     }
     return squares;
-  }, new Map<string, { tile: PlacedTile; color: string }>());
+  }, new Map<string, { tile: PlacedTile; seat: 0 | 1 }>());
   $: used = new Set(board.squares.flat());
   $: legend = (Object.keys(PREMIUM) as BoardSquare[]).filter((s) => s !== 'normal' && used.has(s));
   $: names = [players[0] ?? 'Player 1', players[1] ?? 'Player 2'];
@@ -105,9 +119,9 @@
               width={0.92 * U}
               height={0.92 * U}
               rx={0.1 * U}
-              fill={last ? 'hsl(45 90% 72%)' : 'hsl(40 55% 80%)'}
-              stroke={last ? 'hsl(199 89% 48%)' : 'none'}
-              stroke-width={0.1 * U}
+              fill="hsl(40 55% 80%)"
+              stroke={last ? previousColor : 'none'}
+              stroke-width={0.11 * U}
             />
             <text
               x={(c + (points === undefined ? 0.5 : 0.45)) * U}
@@ -135,10 +149,9 @@
                 width={0.92 * U}
                 height={0.92 * U}
                 rx={0.1 * U}
-                fill="hsl(140 45% 82%)"
-                stroke={ghost.color}
-                stroke-width={0.09 * U}
-                stroke-dasharray="{0.16 * U} {0.1 * U}"
+                fill={PLAYED_WASHES[ghost.seat]}
+                stroke={PLAYED_COLORS[ghost.seat]}
+                stroke-width={0.08 * U}
               />
               <text
                 x={(c + (points === undefined ? 0.5 : 0.45)) * U}
@@ -230,18 +243,18 @@
         </span>
       {/each}
       {#if placed.size}
-        <span class="inline-flex items-center gap-1">
-          <span class="inline-block h-3 w-3 rounded-sm border-2 border-primary" style="background: hsl(45 90% 72%)"
+        <span class="inline-flex items-center gap-1" data-testid="legend-previous">
+          <span class="inline-block h-3 w-3 rounded-sm border-2" style="background: hsl(40 55% 80%); border-color: {previousColor}"
           ></span>
-          previous move
+          {previousLabel}
         </span>
       {/if}
-      {#each played as { label, color, move }}
+      {#each played as { label, seat, move }}
         {#if placedTiles(move).length}
-          <span class="inline-flex items-center gap-1">
+          <span class="inline-flex items-center gap-1" data-testid="legend-played">
             <span
-              class="inline-block h-3 w-3 rounded-sm border-2 border-dashed"
-              style="background: hsl(140 45% 82%); border-color: {color}"
+              class="inline-block h-3 w-3 rounded-sm border-2"
+              style="background: {PLAYED_WASHES[seat]}; border-color: {PLAYED_COLORS[seat]}"
             ></span>
             {label}
           </span>

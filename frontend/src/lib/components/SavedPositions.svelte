@@ -241,7 +241,6 @@
           position={shown}
           {board}
           {players}
-          playedColor={colorOf(movers[selected] ?? null)}
           heading={`Game ${(shown.game_index % 2) + 1} of the pair`}
         />
       {/key}
