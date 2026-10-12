@@ -173,6 +173,13 @@
       {:else}
         <p class="text-xs text-muted-foreground">Never computed.</p>
       {/if}
+      <p class="max-w-3xl text-sm text-muted-foreground" data-testid="wespa-scale">
+        A gap between two ratings predicts the score the same gap does between two established
+        WESPA players. To learn more about how WESPA ratings work, see the
+        <a href="https://wespa.org/docs/WESPA-Ratings-V4-Report.pdf">WESPA ratings report</a>. The
+        absolute level is only where the anchor was pinned, since bot games say nothing about
+        strength against people.
+      </p>
     </div>
 
     {#if error}
@@ -185,10 +192,10 @@
       <h2 class="text-lg font-medium">Cross table</h2>
       {#if table && pool.head_to_heads.length}
         <p class="text-sm text-muted-foreground">
-          Each cell is the row config's score against the column's — (wins + ½ draws) / games —
-          ± its standard error, and beneath it the row's average spread per game. Hover a cell for
-          what the ratings predict. Green is a winning record and red a losing one; amber text is a
-          score the ratings predict badly, on enough pairs that it is not chance.
+          Each cell is the row player's score against the column player's score. The percentage is
+          (wins + ½ draws) / games with ± indicating the standard error. Beneath it are the player's
+          average spread per game. Hover a cell for what the ratings predict. Green is a winning
+          record and red a losing record. Amber text is a score the ratings predict badly.
         </p>
         <!-- Scrolls inside the card on a phone, the row names held in place. -->
         <div class="overflow-x-auto">
@@ -247,20 +254,12 @@
         {#if nonTransitive}
           <p class="text-xs text-warning">
             {misses.length} head-to-heads are more than {(100 * NOTABLE).toFixed(0)} points
-            from what the ratings predict, on enough pairs that it is not chance. That is the signature
-            of a non-transitive pool — configs that beat some opponents and lose to others in a way no
-            single number per config can express. Read the ratings as a summary here, not as a
-            ranking.
+            from what the ratings predict, on enough pairs that it is not a fluke.
           </p>
         {/if}
       {:else}
         <p class="text-sm text-muted-foreground">No head-to-head results in this pool yet.</p>
       {/if}
-      <p class="text-xs text-muted-foreground">
-        A gap between two ratings predicts the score the same gap does between two established
-        WESPA players; the absolute level is only where the anchor was pinned, since bot games say
-        nothing about strength against people.
-      </p>
     </div>
 
     <div class="card space-y-3">

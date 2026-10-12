@@ -126,9 +126,8 @@
     <h2 class="text-lg font-medium">Saved positions</h2>
     <p class="text-sm text-muted-foreground">
       {#if paired && firstDivergence}
-        This job keeps, from each game pair, the turn where its two games first diverged: the one
-        position both players faced, once from each seat, and the moves each ranked. A pair played
-        identically keeps nothing.
+        This job records, from each game pair, the turn where its two games first diverged. Game
+        pairs that were played identically are not recorded.
       {:else if paired}
         This job keeps the position analysed on every turn of every game: the board, both racks, and
         the moves the player to move ranked. A pair's two games are shown at one turn, one player's

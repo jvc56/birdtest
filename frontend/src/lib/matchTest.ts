@@ -79,7 +79,7 @@ export function testVerdict(
   switch (state) {
     case 'running':
       return games.units_completed < games.min_units
-        ? { word: 'Too early', player: null, line: `acts from ${units(games.min_units)}`, chip: 'running', running: true }
+        ? { word: 'Too early', player: null, line: `requires at least ${units(games.min_units)}`, chip: 'running', running: true }
         : { word: 'No verdict yet', player: null, line: 'interval still includes 50%', chip: 'running', running: true };
     case 'player1_better':
       return better(0);

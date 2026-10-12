@@ -69,7 +69,6 @@ test('E-8: a finished game-pairs job shows its labelled pentanomial and signific
       `${((100 * pentanomial[bucket]) / pairs).toFixed(1)}%`
     ]);
   }
-  await expect(outcomes).toContainText(`The test runs on all ${pairs.toLocaleString('en-US')} pairs`);
 
   // Player 1's record is the match score's, in a box of its own above the
   // test, counted in games; the Significance Test card keeps only the test.

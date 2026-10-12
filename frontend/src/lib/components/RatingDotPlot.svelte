@@ -104,7 +104,8 @@
     </svg>
     <p class="mt-1 text-xs text-muted-foreground">
       Between any two configs, a gap of 100 points predicts about a 60–40 score, and 275 points
-      75–25. Where two configs' 95% intervals do not overlap, the games tell them apart.
+      75–25. If two configs' thin bars don't overlap, the difference between them is real, not
+      chance. Overlapping bars don't prove they're equal; it may just need more games.
     </p>
   {:else}
     <p class="text-sm text-muted-foreground">No rated configs yet.</p>

@@ -33,7 +33,7 @@ describe('F-TEST-2 testVerdict', () => {
   const games = { unit: 'pair' as const, units_completed: 1240, min_units: 500, test: { confidence_pct: 95 } };
   it('says too early before the minimum, and no verdict yet after it', () => {
     expect(testVerdict('running', { ...games, units_completed: 300 })).toMatchObject({
-      word: 'Too early', line: 'acts from 500 pairs', chip: 'running', running: true
+      word: 'Too early', line: 'requires at least 500 pairs', chip: 'running', running: true
     });
     expect(testVerdict('running', games)).toMatchObject({ word: 'No verdict yet', running: true });
   });

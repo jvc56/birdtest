@@ -108,21 +108,29 @@ Use a signed-out window for the V journeys unless one says otherwise.
 
 ### V-2 The home page
 
-- [ ] **Expect** "Crowdsourced Crossword Game Research" and the buttons **Browse
-  jobs** and **Create an account**.
+- [ ] **Expect** "Crowdsourced Crossword Game Research", then "birdtest is a
+  distributed task queue for researching crossword games. birdtest hosts the
+  following jobs:", a list of Games, Game Pairs, Opening Rack Analysis and
+  Leave Generation, and "which are created by admins. Workers running MAGPIE
+  claim tasks to work on, and submit the results to birdtest."; then the
+  buttons **Browse jobs** and **Create an account**.
 - [ ] **Expect** next "Active Jobs" listing the seeded jobs still running as
   cards: name, status badge, "25% allocation". Clicking one opens its job page.
 - [ ] **Expect** after it a "Contribute" section (not a card, like "Active
   Jobs") of four numbered steps: **Install MAGPIE** (linking MAGPIE's
   getting-started section), **(Optional) Create an account** (to contribute
   under a username: make an API key and copy it for the next step; else
-  anonymously), **Create a contribute.txt file** (a table of its settings and
-  each one's default -- `server` https://birdtest.org, `apikey` none "(step
-  2)", `threads` every core but one, `maxtasks` 0, `idlewait` 5 -- and a
-  sample. Here, off birdtest.org, the step is not optional and the sample is a
-  `server` line with this site's own address; on birdtest.org the heading
-  starts "(Optional)" and the sample sets `threads`) and **Run the contribute
-  command** (`./bin/magpie contribute`).
+  anonymously), **(Optional) Create a contribute.txt file**, on any site
+  ("Workers can specify certain settings. Any setting not specified in the
+  contribute.txt file uses the default value. If there is no contribute.txt
+  file, all of the defaults are used:", a table of its settings and each
+  one's default -- `server` https://birdtest.org, `apikey` none "(step 2)",
+  `threads` every core but one, `maxtasks` 0, `idlewait` 5 -- where the file
+  goes, and an example naming every setting, its `server` this site's own
+  address) and **Run the contribute command** ("From the top level
+  directory, run `./bin/magpie contribute`. It will run continuously until
+  you stop it with Ctrl-C (or until it completes maxtasks tasks if a nonzero
+  value was specified).").
 - [ ] At phone width, **expect** the settings as a stacked list instead of a
   table -- each name and its default on one line, what it is under them --
   with nothing cut off at the screen's edge.
@@ -226,9 +234,9 @@ On the same job:
   diverged, and the note to read "Over M games: both games of the K pairs
   whose games did not play identically."
 - [ ] **Expect** after it a **Significance Test** card with a "running" badge
-  and three tiles: **Verdict** "Too early", "acts from 50,000 pairs";
+  and three tiles: **Verdict** "Too early", "requires at least 50,000 pairs";
   **static-equity's score** "x%" to two places and "95% interval a% to b%";
-  **Pairs** the pairs played, "of up to N, test acts from 50,000", over a
+  **Pairs** the pairs played, "of up to N, test requires at least 50,000", over a
   small progress bar with an amber mark at the minimum. No Elo or rating
   figure anywhere on the card, and no W/L/D line of its own. Under the
   tiles, a chart with 50% always in the middle: its left half orange, its
@@ -245,9 +253,8 @@ On the same job:
   faint blue, even pairs grey in the middle, then static-score's in faint
   and solid orange, each part's count written in it when it is over 7% of
   the pairs; under it a key of the five, "static-equity won both" to
-  "static-score won both", each with its count and share of the pairs; and
-  a line that the test runs on all N pairs and how many diverged. No red or
-  green.
+  "static-score won both", each with its count and share of the pairs. No
+  line under it on how many pairs diverged, and no red or green.
 - [ ] On "dev games (positions saved)", **expect** the match score with no
   All games / Diverged toggle, the explanation per game (0, ½ or 1), no "both
   games of every pair" note, and no pair-outcome table.
@@ -398,8 +405,12 @@ Open "dev game pairs (first divergences saved)".
   explanation.
 - [ ] After [A-13](#a-13-rating-pools), **do** open **Ratings** → the pool.
   **Expect** "classic · english · standard15 — anchored at 1500", "Last fit
-  <time> (membership) over N pairs from 1 job, K iterations", and a warning
-  if the fit did not converge.
+  <time> (membership) over N pairs from 1 job, K iterations", a warning
+  if the fit did not converge, and then: a gap between two ratings predicts
+  the score the same gap does between two established WESPA players, a link
+  to the WESPA ratings report
+  (https://wespa.org/docs/WESPA-Ratings-V4-Report.pdf), and that the absolute
+  level is only where the anchor was pinned.
 - [ ] **Expect** first a "Cross table": every rated config against
   every other, best first, each cell the row's win % "±" its standard error
   over its average spread ("+6.8"), a blank diagonal, "·" where two never
@@ -408,9 +419,12 @@ Open "dev game pairs (first divergences saved)".
   names beside the plot and in the admin's All configs table. Each pair of cells mirrors across
   the diagonal (100 − the win %, the same error, the spread negated). A cell
   over 50.0% is tinted green, under it red, and one showing 50.0% not at all;
-  a score the ratings predict badly is amber text on that tint. Under the
-  table a line: a gap predicts what it does between WESPA players, and the
-  absolute level is only where the anchor was pinned. **Do** hover a cell.
+  a score the ratings predict badly is amber text on that tint. The line
+  above the table says so: "Each cell is the row player's score against the
+  column player's score. The percentage is (wins + ½ draws) / games with ±
+  indicating the standard error. …" In a non-transitive pool, under it, "N
+  head-to-heads are more than 5 points from what the ratings predict, on
+  enough pairs that it is not a fluke." **Do** hover a cell.
   **Expect** "<row> against <column>: … The ratings predict …% (residual …
   percentage points)."
 - [ ] **Expect** after it a dot plot: a key above it ("thick: ±1 standard

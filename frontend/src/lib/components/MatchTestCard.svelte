@@ -80,7 +80,7 @@
         <div class="text-[11px] uppercase tracking-wider text-muted-foreground">{unit === 'pair' ? 'Pairs' : 'Games'}</div>
         <div class="text-2xl font-semibold tabular-nums">{games.units_completed.toLocaleString()}</div>
         <div class="text-xs tabular-nums text-muted-foreground">
-          of up to {games.max_units.toLocaleString()}, test acts from {games.min_units.toLocaleString()}
+          of up to {games.max_units.toLocaleString()}, test requires at least {games.min_units.toLocaleString()}
         </div>
         <div class="relative mt-1.5 h-1.5 rounded-full bg-muted" aria-hidden="true">
           <div
@@ -154,11 +154,6 @@
             </div>
           {/each}
         </dl>
-        <p class="text-xs text-muted-foreground">
-          The test runs on all {games.units_completed.toLocaleString()} pairs, each scored by its result across
-          the pair. Pairs that played identically count as even.{#if games.divergent_pairs !== undefined}{' '}{games.divergent_pairs.toLocaleString()} of {games.units_completed.toLocaleString()} pairs diverged: a
-            diagnostic of how often these two configs differ at all, not part of the test.{/if}
-        </p>
       </div>
     {/if}
 

@@ -144,14 +144,14 @@
 </script>
 
 <h1 class="mb-2 text-2xl font-semibold">Contributions</h1>
-<p class="mb-6 text-sm text-muted-foreground">
-  What every worker has done for the site, authenticated or anonymous, in three figures: movegens,
-  the move generations MAGPIE performed, summed over every task finished; compute time, how long
-  the claims were held, from claim to result; and the tasks themselves. First the site's totals and
-  the same by job type, then each worker, ranked by movegens. Choose a column to rank by it
-  instead, or a contributor to see their own by job type. The page refreshes itself every 30
-  seconds.
-</p>
+<div class="mb-6 space-y-1 text-sm text-muted-foreground">
+  <p>What every worker has done for the site, authenticated or anonymous, presented as three metrics:</p>
+  <ul class="list-disc space-y-0.5 pl-5">
+    <li>movegens, the move generations MAGPIE performed, summed over every task finished</li>
+    <li>compute time, how long the claims were held, from claim to result</li>
+    <li>tasks, summed across all jobs</li>
+  </ul>
+</div>
 
 {#if siteTotals}
   <!-- Every contributor's work together, then by the type of job it was for:
