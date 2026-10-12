@@ -12,7 +12,7 @@
    * The error bar is the point of the chart as much as the dot: a config with
    * few pairs and one with millions produce identical-looking numbers, and only
    * the interval says which one to believe. Each has two widths: a thick ±1
-   * standard error and a thin 95% interval, the one to read two configs'
+   * standard error and a thin 95% interval, the one to read two players'
    * difference by.
    */
   import type { RatingRow } from '$lib/api';
@@ -103,12 +103,12 @@
       {/each}
     </svg>
     <p class="mt-1 text-xs text-muted-foreground">
-      Between any two configs, a gap of 100 points predicts about a 60–40 score, and 275 points
-      75–25. If two configs' thin bars don't overlap, the difference between them is real, not
+      Between any two players, a gap of 100 points predicts about a 60–40 score, and 275 points
+      75–25. If two players' thin bars don't overlap, the difference between them is real, not
       chance. Overlapping bars don't prove they're equal; it may just need more games.
     </p>
   {:else}
-    <p class="text-sm text-muted-foreground">No rated configs yet.</p>
+    <p class="text-sm text-muted-foreground">No rated players yet.</p>
   {/if}
 
   {#if unrated.length}

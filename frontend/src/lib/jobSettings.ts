@@ -276,7 +276,7 @@ const PLAYER_ROWS: PlayerRowSpec[] = [
   { id: 'recorder_type', label: 'Move Recorder', value: field('recorder_type'), key: true },
   { id: 'num_plays', label: 'Moves Generated', value: field('num_plays'), key: true },
   { id: 'num_plies', label: 'Plies', value: field('num_plies'), key: true },
-  { id: 'use_inference', label: 'Uses Inference', value: field('use_inference'), key: true },
+  { id: 'use_inference', label: 'Uses Inference', value: (p) => (p.use_inference ? 'yes' : 'no'), key: true },
   { id: 'pre_endgame', label: 'Uses Preendgame', value: (p) => preEndgameText(p), key: true },
   { id: 'endgame', label: 'Uses Endgame', value: (p) => endgameText(p), key: true },
   { id: 'win_pct', label: 'Win % Model', value: field('win_pct'), sim: true },

@@ -28,7 +28,7 @@
     <p class="max-w-3xl text-sm text-muted-foreground">
       A rating pool is a set of players whose ratings are comparable. Every rating in a pool is
       informed by every game its members have played, anchored on one player at a fixed rating.
-      This means that ratings are meaningful within a pool and not between pools.
+      This means that ratings are only meaningful within a pool and not between pools.
     </p>
   </div>
 

@@ -235,10 +235,10 @@ describe('F-SET-1 job settings', () => {
     for (const sim of ['Win % Model', 'Maximum Total Iterations', 'Stopping Threshold Rule', 'Time Limit (Seconds)', 'Inference Margin']) {
       expect(rows).not.toContain(sim);
     }
-    // The key rows whatever the player: a static one infers nothing ("—")
-    // and solves nothing ("no").
+    // The key rows whatever the player: a static one infers nothing and
+    // solves nothing ("no" both).
     expect(labels(keySettings([staticPlayer]))).toEqual(KEY_LABELS);
-    expect(byLabel(keySettings([staticPlayer]), 'Uses Inference').values).toEqual(['—']);
+    expect(byLabel(keySettings([staticPlayer]), 'Uses Inference').values).toEqual(['no']);
     expect(byLabel(keySettings([staticPlayer]), 'Uses Endgame').values).toEqual(['no']);
     // Beside a simmer, a static player shows a dash in them.
     expect(byLabel(playerRows([staticPlayer, simPlayer]), 'Win % Model')).toEqual({

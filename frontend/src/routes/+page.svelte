@@ -56,18 +56,30 @@
     <h1 class="text-3xl font-semibold">Crowdsourced Crossword Game Research</h1>
     <div class="max-w-2xl space-y-2 text-muted-foreground" data-testid="intro">
       <p>
-        birdtest is a distributed task queue for researching crossword games. birdtest hosts the
-        following jobs:
+        birdtest is a distributed task queue for researching crossword games which support the following jobs:
       </p>
-      <ul class="list-disc space-y-0.5 pl-5">
-        <li>Games</li>
-        <li>Game Pairs</li>
-        <li>Opening Rack Analysis</li>
-        <li>Leave Generation</li>
+      <ul class="list-disc space-y-1 pl-5">
+        <li>
+          <span class="font-medium text-foreground">Games</span>: two players play a series of
+          games against each other, and their wins, average scores and spread are compared. An
+          optional significance test can decide whether one player is better.
+        </li>
+        <li>
+          <span class="font-medium text-foreground">Game Pairs</span>: like Games, but every game
+          is played twice with the same tiles and the players' seats swapped, which cancels out
+          much of the luck of the draw, so a difference between the players shows up sooner.
+        </li>
+        <li>
+          <span class="font-medium text-foreground">Opening Rack Analysis</span>: every single opening rack for a given distribution is analyzed by a single player and the results are recorded to use as an opening book.
+        </li>
+        <li>
+          <span class="font-medium text-foreground">Leave Generation</span>: many games are played
+          to measure what each leave (the tiles kept after a play) is worth, generation after
+          generation, producing the leave values MAGPIE uses to judge its moves.
+        </li>
       </ul>
       <p>
-        which are created by admins. Workers running MAGPIE claim tasks to work on, and submit the
-        results to birdtest.
+         Admins create jobs while workers running MAGPIE claim tasks to work on and submit the results to birdtest.
       </p>
     </div>
     <div class="flex gap-3">
@@ -111,7 +123,7 @@
         <p class="text-muted-foreground">
           To contribute under a username, <a href="/register">create an account</a>, make an API
           key on your account page, and copy it: you'll put it in contribute.txt in the next step.
-          Otherwise you contribute anonymously, with nothing to sign up for.
+          Otherwise you can contribute anonymously.
         </p>
       </li>
       <li class="space-y-2">
@@ -151,9 +163,7 @@
           </tbody>
         </table>
         <p class="text-muted-foreground">
-          Put contribute.txt in MAGPIE's top level directory, the one holding its
-          <code class="rounded bg-muted px-1">data/</code>, one setting a line: its name, then its
-          value. Don't add a <code class="rounded bg-muted px-1">uuid</code> line yourself: when
+          Put contribute.txt in MAGPIE's top level directory. Don't add a <code class="rounded bg-muted px-1">uuid</code> line yourself: when
           MAGPIE is given an anonymous identity it adds one, creating contribute.txt if there isn't
           one, and uses it from then on. Here's an example contribute.txt with every setting:
         </p>

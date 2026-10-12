@@ -9,6 +9,12 @@
   export const PLAYED_WASHES = ['hsl(199 70% 80%)', 'hsl(28 80% 80%)'] as const;
   /** The same, faint enough to tint a row of text. */
   export const PLAYED_TINTS = ['hsl(199 89% 52% / 0.12)', 'hsl(28 88% 60% / 0.12)'] as const;
+  /**
+   * The previous move's border: a colour of its own, apart from both players',
+   * so the board's three marks -- player 1's move, player 2's and the one
+   * before -- never share one.
+   */
+  export const PREVIOUS_COLOR = 'hsl(258 28% 68%)';
 </script>
 
 <script lang="ts">
@@ -16,7 +22,7 @@
    * A saved position on the job's own board: the premium squares from its
    * layout, the tiles with their letters and scores (a blank in lower case,
    * in red, scoring nothing), the tiles the previous move placed bordered in
-   * the colour of the player who made it, the move played from here drawn on
+   * a colour of its own (a dusty lavender), the move played from here drawn on
    * the squares it is about to fill -- washed in its player's colour, apart
    * from the tiles already down -- and below it both racks and scores, the
    * player to move marked. The key under it says whose each move was.
@@ -62,9 +68,6 @@
   $: dim = board.squares.length;
   $: scores = new Map(board.letters.map((l) => [l.letter, l.score]));
   $: placed = placedSquares(previousMove);
-  // The previous move was the other player's; with no player to move known,
-  // its border is neutral.
-  $: previousColor = toMove === null ? 'hsl(215 14% 75%)' : PLAYED_COLORS[1 - toMove];
   // Each square a played move fills, with what it puts there; the first move
   // listed wins a square two of them fill (the page shows one at a time then).
   $: ghosts = played.reduce((squares, { move, seat }) => {
@@ -120,7 +123,7 @@
               height={0.92 * U}
               rx={0.1 * U}
               fill="hsl(40 55% 80%)"
-              stroke={last ? previousColor : 'none'}
+              stroke={last ? PREVIOUS_COLOR : 'none'}
               stroke-width={0.11 * U}
             />
             <text
@@ -244,7 +247,7 @@
       {/each}
       {#if placed.size}
         <span class="inline-flex items-center gap-1" data-testid="legend-previous">
-          <span class="inline-block h-3 w-3 rounded-sm border-2" style="background: hsl(40 55% 80%); border-color: {previousColor}"
+          <span class="inline-block h-3 w-3 rounded-sm border-2" style="background: hsl(40 55% 80%); border-color: {PREVIOUS_COLOR}"
           ></span>
           {previousLabel}
         </span>

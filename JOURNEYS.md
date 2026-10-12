@@ -109,11 +109,12 @@ Use a signed-out window for the V journeys unless one says otherwise.
 ### V-2 The home page
 
 - [ ] **Expect** "Crowdsourced Crossword Game Research", then "birdtest is a
-  distributed task queue for researching crossword games. birdtest hosts the
+  distributed task queue for researching crossword games which support the
   following jobs:", a list of Games, Game Pairs, Opening Rack Analysis and
-  Leave Generation, and "which are created by admins. Workers running MAGPIE
-  claim tasks to work on, and submit the results to birdtest."; then the
-  buttons **Browse jobs** and **Create an account**.
+  Leave Generation, each with a sentence or two on what it does, and "Admins
+  create jobs while workers running MAGPIE claim tasks to work on and submit
+  the results to birdtest."; then the buttons **Browse jobs** and **Create an
+  account**.
 - [ ] **Expect** next "Active Jobs" listing the seeded jobs still running as
   cards: name, status badge, "25% allocation". Clicking one opens its job page.
 - [ ] **Expect** after it a "Contribute" section (not a card, like "Active
@@ -191,7 +192,7 @@ Open "dev game pairs (first divergences saved)".
   linking to its config's page, and beside its heading how many settings
   they differ in ("1 of 21 differ"). It lists every setting, the key rows
   first -- Lexicon, Leaves, Sorted By, Move Recorder, Moves Generated, Plies,
-  Uses Inference "—", Uses Preendgame "no" and Uses Endgame "no" -- then the
+  Uses Inference "no", Uses Preendgame "no" and Uses Endgame "no" -- then the
   rest (no simulation rows: neither simulates), Moves Recorded, Plies
   Recorded "—" (both are static) and Movegen Margin "—" (neither recorder
   keeps moves by equity). The row they differ in, Sorted By, has an amber
@@ -327,9 +328,8 @@ finishes within minutes.
   1,000 and Racks Per Task, with no lexicon or wordmap row of
   its own; then one column headed "Player", `ab-static-equity-no-rit` linking to its
   config: search "static, by equity", Lexicon CSW21_ab -- and
-  its leaves, recorder, Uses Preendgame and Uses Endgame in grey, under
-  "Settings in grey are the player config's, and this job does not use
-  them." **Do** **All settings** on the player card. **Expect** Wordmap "yes"
+  its leaves, recorder, Uses Preendgame and Uses Endgame in grey, with no
+  note explaining the grey. **Do** **All settings** on the player card. **Expect** Wordmap "yes"
   and Rack Info Table "no", and Moves Recorded, Plies Recorded and Movegen
   Margin grey too.
 
@@ -348,7 +348,7 @@ Open "dev game pairs (first divergences saved)".
   moves ranked by static equity", the PLAY underlined in its player's colour;
   its board -- premium squares (TW, DW, TL, DL and a star on the centre),
   tiles each with a letter and a score (a blank a red lower-case letter with
-  none), the tiles MOVE placed bordered in the other player's colour, the
+  none), the tiles MOVE placed bordered in lavender, the previous move's own colour, the
   tiles PLAY puts down washed in its player's colour with a solid border
   (player 1 blue, player 2 orange), a key naming each ("OTHER PLAYER's
   previous move, MOVE (score)", "PLAYER played PLAY (score)"), the move
@@ -375,7 +375,7 @@ Open "dev game pairs (first divergences saved)".
   equity E." and a table of up to ten leaves the opponent may have kept:
   Leave, Draws ("count (share%)") and Equity.
 - [ ] On "dev games (positions saved)", **expect** one game's position: its
-  board with the previous move bordered in the other player's colour and the
+  board with the previous move bordered in lavender and the
   move played washed in its player's -- player 2's in orange, not player
   1's blue -- both racks and scores under it, "played PLAY (score)" in the summary,
   and the played move marked in the list.
@@ -409,8 +409,7 @@ Open "dev game pairs (first divergences saved)".
   if the fit did not converge, and then: a gap between two ratings predicts
   the score the same gap does between two established WESPA players, a link
   to the WESPA ratings report
-  (https://wespa.org/docs/WESPA-Ratings-V4-Report.pdf), and that the absolute
-  level is only where the anchor was pinned.
+  (https://wespa.org/docs/WESPA-Ratings-V4-Report.pdf).
 - [ ] **Expect** first a "Cross table": every rated config against
   every other, best first, each cell the row's win % "±" its standard error
   over its average spread ("+6.8"), a blank diagonal, "·" where two never
@@ -431,7 +430,7 @@ Open "dev game pairs (first divergences saved)".
   error · thin: 95% interval", "the anchor, fixed by definition"), each row a
   dot on a thick ±1 standard-error bar over a thin 95% one, the anchor's dot
   amber, and at its end its rating and error ("1641.0 ±12.4", the anchor's
-  "fixed"). Under it, "Between any two configs, a gap of 100 points predicts
+  "fixed"). Under it, "Between any two players, a gap of 100 points predicts
   about a 60–40 score, and 275 points 75–25." At phone width the names'
   margin narrows and the axis labels thin out rather than run together.
 - [ ] As an admin, **expect** after it an "All configs" table (Rating (WESPA
@@ -453,7 +452,7 @@ Open "dev game pairs (first divergences saved)".
   created.
 - [ ] **Do** open `static-equity`. **Expect** "static, by equity" beside its
   name, and a table of Lexicon, Leaves, Sorted By, Move Recorder, Moves
-  Generated, Plies, Uses Inference "—", Uses Preendgame "no" and Uses Endgame
+  Generated, Plies, Uses Inference "no", Uses Preendgame "no" and Uses Endgame
   "no", and a JSON download; a simmer's (A-4) has the same rows, Uses
   Inference "yes" or "no". **Do** press **All settings**. **Expect** every
   setting in the same table, Lexicon still first; a simmer's with Win %

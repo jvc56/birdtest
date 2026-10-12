@@ -17,9 +17,10 @@ test('E-1: an anonymous visitor browses the landing page, jobs, a job and the le
 
   await page.goto('/');
   await expect(page.getByRole('heading', { name: 'Crowdsourced Crossword Game Research' })).toBeVisible();
-  // What birdtest is, and the four kinds of job it hosts.
+  // What birdtest is, and the four kinds of job it hosts, each described.
   await expect(page.getByTestId('intro').locator('li')).toHaveText([
-    'Games', 'Game Pairs', 'Opening Rack Analysis', 'Leave Generation'
+    /^\s*Games: two players/, /^\s*Game Pairs: like Games/,
+    /^\s*Opening Rack Analysis: every single opening rack/, /^\s*Leave Generation: many games/
   ]);
   // Step 3 is optional wherever the site is, and its example names every setting.
   await expect(page.getByRole('heading', { name: '(Optional) Create a contribute.txt file' })).toBeVisible();

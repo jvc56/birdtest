@@ -5,8 +5,8 @@
    * job. It lists, by `mode`, the settings the players differ in, the key
    * rows, or every one; the card around it holds the toggle. Two players
    * alike have no differences, and say so rather than show an empty table.
-   * Settings the job never reads (`unused`, by row id) are shown muted, with a
-   * note, and are never a difference. Listed among settings they share, the
+   * Settings the job never reads (`unused`, by row id) are shown muted, and
+   * are never a difference. Listed among settings they share, the
    * ones two players differ in are marked: an amber edge and tint, the label
    * and values in weight; listed alone they are the table, and unmarked. A
    * job's players are headed by their
@@ -27,17 +27,11 @@
   $: headed = players.some((p) => p.role);
   // Two players, each in the colour the saved positions draw their moves in.
   $: colored = players.length === PLAYED_COLORS.length;
-  $: muted = rows.some((r) => r.unused);
   // Only beside settings the players share does a difference need marking.
   $: marking = players.length > 1 && mode !== 'differences';
 </script>
 
 <div class="space-y-2">
-  {#if muted}
-    <p class="text-xs text-muted-foreground">
-      Settings in grey are the player config's, and this job does not use them.
-    </p>
-  {/if}
   {#if mode === 'differences' && !rows.length}
     <p class="text-sm text-muted-foreground" data-testid="settings-identical">
       These players' settings are identical.

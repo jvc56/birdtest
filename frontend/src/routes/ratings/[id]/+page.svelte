@@ -176,9 +176,7 @@
       <p class="max-w-3xl text-sm text-muted-foreground" data-testid="wespa-scale">
         A gap between two ratings predicts the score the same gap does between two established
         WESPA players. To learn more about how WESPA ratings work, see the
-        <a href="https://wespa.org/docs/WESPA-Ratings-V4-Report.pdf">WESPA ratings report</a>. The
-        absolute level is only where the anchor was pinned, since bot games say nothing about
-        strength against people.
+        <a href="https://wespa.org/docs/WESPA-Ratings-V4-Report.pdf">WESPA ratings report</a>.
       </p>
     </div>
 
