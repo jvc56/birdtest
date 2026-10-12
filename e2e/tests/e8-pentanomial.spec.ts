@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { seededJob, waitUntilSettled } from '../lib/api';
+import { jobHeading, seededJob, waitUntilSettled } from '../lib/api';
 
 /**
  * E-8: a game-pairs job's page shows its pentanomial's five pair outcomes as
@@ -20,7 +20,7 @@ test('E-8: a finished game-pairs job shows its labelled pentanomial and signific
   await waitUntilSettled(request, job.id);
 
   await page.goto(`/jobs/${job.id}`);
-  await expect(page.getByRole('heading', { level: 1, name: job.name, exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { level: 1, name: jobHeading(job), exact: true })).toBeVisible();
   const card = page.getByTestId('significance-test');
   const stats = await (await request.get(`/api/jobs/${job.id}`)).json();
   const pairs: number = stats.games.units_completed;

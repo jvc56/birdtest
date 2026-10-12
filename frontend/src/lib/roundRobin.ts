@@ -3,10 +3,11 @@
  * the form's preview of what `POST /api/admin/jobs` will create, by the
  * server's rules (`routes::admin::pairings`, `plan_jobs`):
  *
- * - one config is a self-play job, under the name as given;
+ * - one config is a self-play job, named "{title}: A vs A";
  * - n ≥ 2 configs are a round robin of C(n, 2) jobs, every pairing once,
  *   player 1 the config listed first (on the form, ticked first), each named
- *   "{name}: A vs B" ("A vs B" with no name);
+ *   "{title}: A vs B";
+ * - with no title, a job is named for its players alone, "A vs B";
  * - at most twelve configs (66 jobs).
  */
 
@@ -16,29 +17,30 @@ export const MAX_ROUND_ROBIN_CONFIGS = 12;
 export interface Matchup<T> {
   player1: T;
   player2: T;
-  /** The job's name, as the server will store it. */
+  /** The job's name, as the server will name it: its title and players. */
   name: string;
 }
 
 /**
- * The jobs `players` (in seat order) make under `name`: one self-play job for
+ * The jobs `players` (in seat order) make under `title`: one self-play job for
  * one player, a job per pairing for more, none for none.
  */
 export function matchups<T>(
   players: T[],
-  name: string,
+  title: string,
   nameOf: (player: T) => string
 ): Matchup<T>[] {
-  const trimmed = name.trim();
+  const trimmed = title.trim();
+  const named = (a: T, b: T) => {
+    const pairing = `${nameOf(a)} vs ${nameOf(b)}`;
+    return trimmed ? `${trimmed}: ${pairing}` : pairing;
+  };
   if (players.length === 1) {
-    return [{ player1: players[0], player2: players[0], name: trimmed }];
+    return [{ player1: players[0], player2: players[0], name: named(players[0], players[0]) }];
   }
   const out: Matchup<T>[] = [];
   players.forEach((a, i) => {
-    for (const b of players.slice(i + 1)) {
-      const pairing = `${nameOf(a)} vs ${nameOf(b)}`;
-      out.push({ player1: a, player2: b, name: trimmed ? `${trimmed}: ${pairing}` : pairing });
-    }
+    for (const b of players.slice(i + 1)) out.push({ player1: a, player2: b, name: named(a, b) });
   });
   return out;
 }

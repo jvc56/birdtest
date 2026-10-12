@@ -11,8 +11,9 @@
     type JobStats
   } from '$lib/api';
   import { subscribeToJob } from '$lib/sse';
-  import { computeTime, exactCount, exportSummary, jobTitle, jobTypeLabel } from '$lib/format';
+  import { computeTime, exactCount, exportSummary } from '$lib/format';
   import type { JobConfig } from '$lib/jobSettings';
+  import JobHeader from '$lib/components/JobHeader.svelte';
   import JobStatusCard from '$lib/components/JobStatusCard.svelte';
   import JobProgressCard from '$lib/components/JobProgressCard.svelte';
   import DerivedDataStatus from '$lib/components/DerivedDataStatus.svelte';
@@ -386,13 +387,9 @@
   {#if !gone}<p class="text-muted-foreground">Loading…</p>{/if}
 {:else}
   <div class="space-y-6">
-    <header class="flex flex-wrap items-center gap-3">
-      <h1 class="text-2xl font-semibold">{jobTitle(stats.job)}</h1>
-      {#if stats.job.name}
-        <span class="text-sm text-muted-foreground">{jobTypeLabel(stats.job.job_type)}</span>
-      {/if}
+    <JobHeader job={stats.job} {config}>
       <a href="/jobs/{jobId}" class="text-sm">public view</a>
-    </header>
+    </JobHeader>
     <JobStatusCard {stats} />
     <JobProgressCard {stats} />
     <DerivedDataStatus {jobId} />

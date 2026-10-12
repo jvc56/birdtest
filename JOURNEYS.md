@@ -154,8 +154,13 @@ Use a signed-out window for the V journeys unless one says otherwise.
 
 Open "dev game pairs (first divergences saved)".
 
-- [ ] **Expect** the job's name as the title with "Game Pairs" beside it, then
-  "CSW24 · classic · static, by equity vs static, by score".
+- [ ] **Expect** its title as the heading with its status pill beside it;
+  under it each player on a line of its own -- its seat number in its colour
+  (1 blue, 2 orange), its config's name in the same colour, linking to the
+  config, and what it does ("static-equity static, by equity", "static-score
+  static, by score") -- then "Game Pairs · CSW24 · classic". In the job list
+  the same job is "dev game pairs (first divergences saved): static-equity vs
+  static-score".
 - [ ] **Expect** a full-width Status card: the badge ("active") and nothing
   beside it -- the badge says it plainly, and its allocation has its own card.
   (Inactive: "Paused: no worker is offered its tasks until it is given an
@@ -738,10 +743,11 @@ opening-rack or leave job lands on its admin page; a games or game-pairs job
 lands on **Allocation**, the new job marked "new" and listed first. A games or
 pairs job's players are a checklist, seated in the order ticked: tick the
 first-named player first, so `static-equity` vs `static-score` is equity's
-player-1 side, and each such job is named "{name}: A vs B" (so "tester no test"
-is "tester no test: static-equity vs static-score"; below it is called by its
-name alone). The fields are named as the settings tables
-name them (**Job Name**, **Job Type**, **Letter Distribution**, **Board**,
+player-1 side, and each such job is named for its title and players,
+"{title}: A vs B" (so "tester no test" is "tester no test: static-equity vs
+static-score"; below it is called by its title alone), a self-play job "{title}:
+A vs A". The fields are named as the settings tables
+name them (**Job Title**, **Job Type**, **Letter Distribution**, **Board**,
 **Pairs Per Task**, …), and the job types read "Opening Rack Analysis",
 "Games", "Game Pairs" and "Leave Generation". The letter distribution and
 board start on "Choose…": pick `english` and `standard15` each time.
@@ -1185,8 +1191,9 @@ an allocation above 0% activates it (`200`), 0% deactivates it, and a share
 that would take the active jobs past 100% is `409` — with the seed's games and
 pairs jobs active, 50% is the most left. The allocations endpoint is the only
 switch; it answers `{ "jobs": [...] }`, each named job as it now stands.
-Creation answers `{ "jobs": [...] }` too: the two configs here make one job,
-"cli test: A vs B", and three or more would make a job per pairing. Set `JOB`
+Creation answers `{ "jobs": [...] }` too, each with its `title` and its `name`:
+the two configs here make one job, titled "cli test" and named "cli test: A vs
+B", and three or more would make a job per pairing. Set `JOB`
 to its id. This one runs no significance test and plays its 20 pairs;
 `"test_enabled": true` turns the test on, with `min_pairs` then required (at
 least 1, at most `max_pairs`) and `confidence_pct` optional (95 by default,
@@ -1195,11 +1202,11 @@ it is a `400` naming each.
 
 ```bash
 curl -s -b "$JAR" -H "X-CSRF-Token: $CSRF" -H 'Content-Type: application/json' \
-  -d '{"name":"cli test","job_type":"game_pairs","variant":"classic",
+  -d '{"title":"cli test","job_type":"game_pairs","variant":"classic",
        "letterdist_id":"<letterdist id>","layout_id":"<layout id>",
        "player_config_ids":["<config id>","<other config id>"],
        "pairs_per_batch":10,"max_pairs":20}' \
-  "$SITE/api/admin/jobs" | jq '.jobs[] | {id, name}'
+  "$SITE/api/admin/jobs" | jq '.jobs[] | {id, title, name}'
 curl -s -b "$JAR" -H "X-CSRF-Token: $CSRF" -H 'Content-Type: application/json' -X PUT \
   -d '{"allocations":[{"job_id":"'"$JOB"'","allocation":4}]}' "$SITE/api/admin/jobs/allocations"
 curl -s -b "$JAR" -H "X-CSRF-Token: $CSRF" -H 'Content-Type: application/json' -X PUT \

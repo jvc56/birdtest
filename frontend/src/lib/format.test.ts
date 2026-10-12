@@ -21,7 +21,7 @@ import {
   scorePct,
   completionText,
   exportSummary,
-  jobTitle,
+  jobName,
   workerLabel
 } from './format';
 
@@ -275,11 +275,11 @@ describe('F-FMT-12 completionText', () => {
   });
 });
 
-describe('F-FMT-13 jobTitle', () => {
+describe('F-FMT-13 jobName', () => {
   it("is the job's name, or its type for one given none", () => {
-    expect(jobTitle({ name: 'equity vs static', job_type: 'game_pairs' })).toBe('equity vs static');
-    expect(jobTitle({ name: '', job_type: 'game_pairs' })).toBe('Game Pairs');
-    expect(jobTitle({ name: '   ', job_type: 'games' })).toBe(jobTitle({ name: '', job_type: 'games' }));
+    expect(jobName({ name: 'seat bias: equity vs static', job_type: 'game_pairs' })).toBe('seat bias: equity vs static');
+    expect(jobName({ name: '', job_type: 'game_pairs' })).toBe('Game Pairs');
+    expect(jobName({ name: '   ', job_type: 'games' })).toBe(jobName({ name: '', job_type: 'games' }));
   });
 });
 

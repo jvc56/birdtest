@@ -12,7 +12,7 @@
   import { page } from '$app/stores';
   import { api, errorText, type JobListItem, type JobStatus } from '$lib/api';
   import { equalShares } from '$lib/allocation';
-  import { jobTitle, jobTypeLabel } from '$lib/format';
+  import { jobName, jobTypeLabel } from '$lib/format';
   import JobStatusBadge from '$lib/components/JobStatusBadge.svelte';
   import StatusPill from '$lib/components/StatusPill.svelte';
 
@@ -125,14 +125,14 @@
             {#each listed as job (job.id)}
               <tr class:font-medium={Number(values[job.id]) !== current(job)}>
                 <td>
-                  <a href="/admin/jobs/{job.id}">{jobTitle(job)}</a>
+                  <a href="/admin/jobs/{job.id}">{jobName(job)}</a>
                   {#if fresh.has(job.id)}<span class="ml-1"><StatusPill tone="blue" icon="spark">new</StatusPill></span>{/if}
                 </td>
                 <td>{jobTypeLabel(job.job_type)}</td>
                 <td><JobStatusBadge status={job.status} /></td>
                 <td class="text-right tabular-nums">{current(job)}%</td>
                 <td class="text-right">
-                  <label class="sr-only" for="alloc-{job.id}">Allocation for {jobTitle(job)}</label>
+                  <label class="sr-only" for="alloc-{job.id}">Allocation for {jobName(job)}</label>
                   <input
                     id="alloc-{job.id}"
                     type="number"

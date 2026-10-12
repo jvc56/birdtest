@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { jobSettings, keySettings, playerRows, playersLine, playerSummary, differingSettings, settingsFor, show, unusedPlayerSettings, type JobConfig, type PlayerSettings } from './jobSettings';
+import { jobSettings, keySettings, playerRows, playerSummary, differingSettings, settingsFor, show, unusedPlayerSettings, type JobConfig, type PlayerSettings } from './jobSettings';
 
 const staticPlayer: PlayerSettings = {
   role: 'player 1', id: 'p1', name: 'static-NWL23', lexicon: 'NWL23', leaves: 'NWL23', win_pct: null,
@@ -27,7 +27,7 @@ const simPlayer: PlayerSettings = {
 };
 const config: JobConfig = {
   job: {
-    id: 'j', name: 'n', job_type: 'game_pairs', variant: 'classic', letter_distribution: 'english',
+    id: 'j', title: 'n', name: 'n', job_type: 'game_pairs', variant: 'classic', letter_distribution: 'english',
     layout: 'standard15', bingo_bonus: 50, sim_cutoff: 0, min_magpie_version: '0.1.1',
     max_task_seconds: 3600
   },
@@ -69,10 +69,11 @@ describe('F-SET-1 job settings', () => {
   it('says how each player searches in a few words', () => {
     expect(playerSummary(staticPlayer)).toBe('static, by equity');
     expect(playerSummary(simPlayer)).toBe('4-ply sim, 1,000 iterations, stops at 99%, inference');
-    expect(playersLine(config)).toBe('static, by equity vs 4-ply sim, 1,000 iterations, stops at 99%, inference');
     // An opening rack has no previous play to infer from: the summary does
     // not claim inference it never runs.
-    expect(playersLine(opening)).toBe('4-ply sim, 1,000 iterations, stops at 99%');
+    expect(playerSummary(opening.players[0], unusedPlayerSettings(opening))).toBe(
+      '4-ply sim, 1,000 iterations, stops at 99%'
+    );
   });
 
   it('shows blanks, flags and numbers plainly', () => {

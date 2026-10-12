@@ -17,7 +17,7 @@
 
   let jobType: JobType = 'game_pairs';
   // Shown first wherever jobs are listed, and as the job page's title.
-  let name = '';
+  let title = '';
   // Pre-filled from the server-wide floor rather than left blank: a default
   // nobody sees is how every new job quietly inherits a floor that is too low.
   let minMagpieVersion = '';
@@ -59,7 +59,7 @@
   function tick(id: string, on: boolean) {
     ticked = on ? [...ticked.filter((t) => t !== id), id] : ticked.filter((t) => t !== id);
   }
-  $: matchups = matchupsOf(players, name, (config) => config.name);
+  $: matchups = matchupsOf(players, title, (config) => config.name);
   $: roundRobin = jobType === 'games' || jobType === 'game_pairs';
   let batchSize = 1;
   // Off by default: without a test the job plays its games and stops, and the
@@ -145,7 +145,7 @@
 
   function body(): Record<string, unknown> {
     const common = {
-      name: name.trim(),
+      title: title.trim(),
       job_type: jobType,
       variant,
       letterdist_id: letterdistId,
@@ -278,14 +278,14 @@
      reaches submit(), which is where it was cleared, so it lingered. -->
 <form class="card max-w-2xl space-y-4" on:submit|preventDefault={submit} on:input={() => { if (fromSubmit) { error = ''; fromSubmit = false; } }}>
   <div>
-    <label class="label" for="name">Job Name</label>
+    <label class="label" for="title">Job Title</label>
     <input
-      id="name"
+      id="title"
       class="input"
-      bind:value={name}
+      bind:value={title}
       required
       maxlength="100"
-      placeholder="e.g. simmer 4-ply vs static, NWL23"
+      placeholder="e.g. Does inference pay at 4 plies?"
     />
   </div>
   <div>

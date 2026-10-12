@@ -929,9 +929,9 @@ Each entry's tests are the `describe` block named for its id.
   interval; an admin's force-complete, "before its test decided" only when
   there was a test; a job without a test playing what it was set to; and the
   other job types' own ends. *(Covered: `format.test.ts`.)*
-- `F-FMT-13` `jobTitle` titles a job by the name it was given, or by its
-  type ("Game Pairs") for one given none or only spaces: the job page's
-  heading and the job lists. *(Covered: `format.test.ts`.)*
+- `F-FMT-13` `jobName` is a job's name as the server gives it ("{title}: A vs
+  B"), or its type ("Game Pairs") for one with none or only spaces: the job
+  lists. *(Covered: `format.test.ts`.)*
 - `F-FMT-6` A blank optional number is `null`, never 0 (Svelte binds a cleared
   number box as `null`, and `Number(null)` is 0, which the player-config form
   wrote into configs that cannot be edited), and a request's blank required
@@ -1018,10 +1018,10 @@ Each entry's tests are the `describe` block named for its id.
 
 ### `F-RR-*` — `lib/roundRobin.ts`
 
-- `F-RR-1` `matchups` makes one self-play job of one config under the name as
-  given, every pairing once for more -- seated in the order given (3 → 3,
-  4 → 6) -- and names each "{name}: A vs B", or "A vs B" with no name, as the
-  server does (`I-JOB-15`). *(Covered: `roundRobin.test.ts`.)*
+- `F-RR-1` `matchups` makes one self-play job of one config, named "{title}:
+  A vs A", every pairing once for more -- seated in the order given (3 → 3,
+  4 → 6) -- and names each "{title}: A vs B", or "A vs B" with no title, as
+  the server does (`I-JOB-15`). *(Covered: `roundRobin.test.ts`.)*
 - `F-RR-2` `matchupSummary` reads "4 configs → 6 jobs", "1 config → 1
   self-play job", and why none or more than twelve cannot be sent;
   `matchupsAllowed` is one to twelve. *(Covered: `roundRobin.test.ts`.)*
@@ -1994,17 +1994,17 @@ job creation touches needs one caller here.
   `routes::admin::tests::a_leave_body_is_read_as_a_leave_config_and_an_opening_rack_body_is_not`.)*
 - `I-JOB-15` **A games or pairs request naming n ≥ 2 configs is a round
   robin**: C(n, 2) jobs (3 → 3, 4 → 6), every pairing once, seated in the
-  order listed and named "{name}: A vs B" ("A vs B" unnamed), all inactive at
-  0%, each audited `job.created`, and answered together as `{jobs}`; one
-  config is a self-play job under the name as given. *(Covered:
+  order listed, each storing the title and named "{title}: A vs B" ("A vs B"
+  untitled), all inactive at 0%, each audited `job.created`, and answered
+  together as `{jobs}`; one config is a self-play job named "{title}: A vs A". *(Covered:
   `jobs::a_round_robin_creates_a_job_for_every_pairing`,
   `routes::admin::tests::pairings_are_every_pair_once_in_the_order_given`; the
   form's preview of the same rules, `roundRobin.test.ts` (F-RR-1, F-RR-2).)*
 - `I-JOB-16` **A round robin is created whole or not at all.** Every pairing
   is checked before anything is inserted, and one clash (two simmers on
   different win% models) refuses the request, naming that pairing, with no job
-  written; a config named twice, more than twelve, none, or a name its
-  pairing would push past 100 characters is refused on its field. *(Covered:
+  written; a config named twice, more than twelve, or none is refused on its
+  field. *(Covered:
   `jobs::a_round_robin_with_one_bad_pairing_creates_nothing`,
   `routes::admin::tests::a_round_robin_names_one_to_twelve_configs_once_each`.)*
 
@@ -3162,8 +3162,9 @@ below.
   the fixture by `contract_fixtures::every_shutdown_reason_matches_what_the_server_sends`;
   MAGPIE's claim body by `test_the_claim_body_matches_the_claim_fixture`.)*
   (Thirty-third audit, pass 1.)
-- `A-WORKER-23` Every assignment names its job (`job_name`: its name, or its
-  type and the start of its id, never empty) and states the time limit its
+- `A-WORKER-23` Every assignment names its job (`job_name`: its name -- a
+  games job's title and players, or its players alone -- or an untitled
+  other job's type and the start of its id, never empty) and states the time limit its
   claim was given (`max_task_seconds`): its job's at the claim, which the
   claim's `deadline_at` is its claim time plus. A change to the job's limit
   moves later claims' limits and not an earlier one's, and two jobs with
@@ -3224,12 +3225,13 @@ below.
 - `A-ADMIN-1` Player config create/get/list/delete round-trips, and a config in
   use cannot be deleted. *(Covered:
   `admin_routes::a_player_config_round_trips_and_one_in_use_cannot_be_deleted`.)*
-- `A-ADMIN-2b` A job keeps the name it was created with, trimmed, and the jobs
-  list and the job's page return it; one created without a name has an empty
-  one (titled by its type, `F-FMT-13`); a name past 100 characters or of more
-  than one line is refused on the field. *(Covered:
-  `admin_routes::a_job_keeps_the_name_it_was_created_with`; E-4 creates one
-  through the form and finds it as the title.)*
+- `A-ADMIN-2b` A job keeps the title it was created with, trimmed, and its
+  creation, the jobs list, the job's stats and its config return it with its
+  name, "{title}: A vs B" (here self-play, "A vs A"); one created without a
+  title has an empty one and is named for its players alone; a title past 100
+  characters or of more than one line is refused on the field. *(Covered:
+  `admin_routes::a_job_keeps_the_title_it_was_created_with`; E-4 creates one
+  through the form and finds it as the heading, its players under it.)*
 - `A-ADMIN-2c` A player config's and a rating pool's names take a job name's
   rule: past 100 characters, of more than one line, or with a control
   character is refused on the field; a pool's name is stored trimmed, so "X "

@@ -1355,8 +1355,8 @@ async fn claim_state(db: &TestDb, token: &Value) -> String {
 /// claim was given, which is its job's as it stood at the claim: the claim's
 /// deadline is its claim time plus that, a change to the job's limit moves
 /// later claims' and not an earlier one's, and two jobs with different limits
-/// give each claim its own job's. A job created without a name is named for
-/// its type and id, never "".
+/// give each claim its own job's. A games job is named for its title and its
+/// players, and for its players alone without a title, never "".
 #[tokio::test]
 async fn an_assignment_names_its_job_and_states_the_limit_it_was_claimed_under() {
     let db = TestDb::new().await;
@@ -1364,8 +1364,16 @@ async fn an_assignment_names_its_job_and_states_the_limit_it_was_claimed_under()
     let app = birdtest::app(db.state().await);
 
     let (first, _) = first_claim(&app).await;
-    let unnamed = format!("games job {}", &job.simple().to_string()[..8]);
-    assert_eq!(first["job_name"], json!(unnamed), "{first}");
+    let (p1, p2): (String, String) = sqlx::query_as(
+        "SELECT p1.name, p2.name FROM job_game_config c
+         JOIN player_configs p1 ON p1.id = c.player1_config_id
+         JOIN player_configs p2 ON p2.id = c.player2_config_id WHERE c.job_id = $1",
+    )
+    .bind(job)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(first["job_name"], json!(format!("{p1} vs {p2}")), "{first}");
     assert_eq!(first["max_task_seconds"], json!(3600), "the default: {first}");
     assert_eq!(claim_limit(&db, &first["claim_token"]).await, 3600);
 
@@ -1374,7 +1382,7 @@ async fn an_assignment_names_its_job_and_states_the_limit_it_was_claimed_under()
         .execute(&db.pool)
         .await
         .unwrap();
-    sqlx::query("UPDATE jobs SET name = 'NWL23 static mirror' WHERE id = $1")
+    sqlx::query("UPDATE jobs SET title = 'NWL23 static mirror' WHERE id = $1")
         .bind(job)
         .execute(&db.pool)
         .await
@@ -1382,7 +1390,7 @@ async fn an_assignment_names_its_job_and_states_the_limit_it_was_claimed_under()
     let worker = registered_worker(&db).await;
     let (status, second) = claim_as(&app, &worker).await;
     assert_eq!(status, StatusCode::OK, "{second}");
-    assert_eq!(second["job_name"], "NWL23 static mirror", "{second}");
+    assert_eq!(second["job_name"], json!(format!("NWL23 static mirror: {p1} vs {p2}")), "{second}");
     assert_eq!(second["max_task_seconds"], json!(900), "the job's limit at the claim: {second}");
     assert_eq!(claim_limit(&db, &second["claim_token"]).await, 900);
     assert_eq!(claim_limit(&db, &first["claim_token"]).await, 3600, "an earlier claim keeps its own");

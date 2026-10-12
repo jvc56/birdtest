@@ -292,6 +292,8 @@ export interface CursorPage<T> {
 export interface JobListItem {
   id: string;
   /** What the admin called it; empty for a job created without one. */
+  title: string;
+  /** Its title and, for a games or pairs job, its players: "{title}: A vs B". */
   name: string;
   job_type: JobType;
   status: JobStatus;
@@ -312,7 +314,8 @@ export interface JobListItem {
  */
 export interface JobRow {
   id: string;
-  name: string;
+  /** What the admin called it; empty for a job created without one. */
+  title: string;
   job_type: JobType;
   status: JobStatus;
   allocation: number;
@@ -405,6 +408,8 @@ export interface JobStats {
   job: {
     id: string;
     /** What the admin called it; empty for a job created without one. */
+    title: string;
+    /** Its title and, for a games or pairs job, its players: "{title}: A vs B". */
     name: string;
     job_type: JobType;
     status: JobStatus;
@@ -893,7 +898,8 @@ export const api = {
    * request naming n ≥ 2 player configs, one per pairing.
    */
   createJob: (body: Record<string, unknown>) =>
-    post<{ jobs: JobRow[] }>('/api/admin/jobs', body),
+    // Each with its name: its title and its players.
+    post<{ jobs: (JobRow & { name: string })[] }>('/api/admin/jobs', body),
   /**
    * Several jobs' allocations at once, the active jobs checked against 100%
    * as they will stand: above 0% activates a job, 0% deactivates one, and a

@@ -388,9 +388,11 @@ CREATE TYPE job_status AS ENUM (
 
 CREATE TABLE jobs (
     id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    -- What the admin called it, shown first wherever jobs are listed. '' for
-    -- a job created without one (through the API; the form asks for it).
-    name       TEXT NOT NULL DEFAULT '' CHECK (char_length(name) <= 100),
+    -- What the admin called it. '' for a job created without one (through
+    -- the API; the form asks for it). Not the job's name: a games or pairs
+    -- job is named for its title and its players, "{title}: A vs B", read
+    -- from its config (models::job::job_name).
+    title      TEXT NOT NULL DEFAULT '' CHECK (char_length(title) <= 100),
     job_type   job_type NOT NULL,
     -- Every active job's share of the fleet: the scheduler hands each claim
     -- to the active job furthest behind

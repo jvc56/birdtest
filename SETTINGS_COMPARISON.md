@@ -320,7 +320,7 @@ With capture off, a games job never reads either value.
 5. **Find existing jobs that are affected:**
 
    ```sql
-   SELECT j.id, j.name, 'games' AS kind
+   SELECT j.id, j.title, 'games' AS kind
    FROM jobs j
    JOIN job_game_config c ON c.job_id = j.id
    JOIN player_configs p1 ON p1.id = c.player1_config_id
@@ -329,7 +329,7 @@ With capture off, a games job never reads either value.
      AND (p1.num_plays_recorded <> p2.num_plays_recorded
           OR p1.num_plies_recorded <> p2.num_plies_recorded)
    UNION ALL
-   SELECT j.id, j.name, 'game_pairs'
+   SELECT j.id, j.title, 'game_pairs'
    FROM jobs j
    JOIN job_game_pair_config c ON c.job_id = j.id
    JOIN player_configs p1 ON p1.id = c.player1_config_id

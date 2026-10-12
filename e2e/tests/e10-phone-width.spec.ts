@@ -1,5 +1,5 @@
 import { test, expect, devices, type Locator, type Page } from '@playwright/test';
-import { seededJob } from '../lib/api';
+import { jobHeading, seededJob } from '../lib/api';
 
 // A phone, in Chromium: Pixel 5 is 393 CSS pixels wide.
 test.use({ ...devices['Pixel 5'] });
@@ -88,7 +88,7 @@ test('E-10: a visitor on a phone reads the job list, a job page and the rankings
   await expectNoSidewaysScroll(page);
 
   await page.locator(`a[href="/jobs/${job.id}"]`).tap();
-  await expect(page.getByRole('heading', { level: 1, name: job.name, exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { level: 1, name: jobHeading(job), exact: true })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Significance Test' })).toBeVisible();
   await expectNoSidewaysScroll(page);
 

@@ -292,7 +292,7 @@ def create_and_activate(ctx: Context, data: dict, body: dict) -> str:
     started = time.time()
     response = ctx.client.session.post(
         f"{ctx.client.api}/api/admin/jobs",
-        json={"name": f"tier 6 {body['job_type'].replace('_', ' ')}", "variant": "classic",
+        json={"title": f"tier 6 {body['job_type'].replace('_', ' ')}", "variant": "classic",
               "letterdist_id": data["letterdist"], "layout_id": data["layout"], **body},
         headers=ctx.client._headers(), timeout=1800,
     )

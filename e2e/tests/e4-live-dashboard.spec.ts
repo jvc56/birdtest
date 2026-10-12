@@ -49,7 +49,7 @@ test('E-4: an admin creates configs and a job, activates it, and watches it fill
 
   await page.goto('/admin/jobs/new');
   const jobName = `e2e pairs ${suffix}`;
-  await page.getByLabel('Job Name').fill(jobName);
+  await page.getByLabel('Job Title').fill(jobName);
   await page.getByLabel('Job Type').selectOption({ label: 'Game Pairs' });
   // Neither the bag nor the board is chosen for the admin.
   const letterdist = page.getByLabel('Letter Distribution');
@@ -99,9 +99,12 @@ test('E-4: an admin creates configs and a job, activates it, and watches it fill
   await page.goto(`/admin/jobs/${jobId}`);
   await loaded;
   const header = page.locator('main header');
-  // Titled by the name it was given and its pairing, its type beside it; its
-  // status in the figures below.
-  await expect(header.getByRole('heading', { name: `${jobName}: ${p1} vs ${p2}` })).toBeVisible();
+  // Headed by the title it was given, then its players in their seats, then
+  // its type; its status in the figures below.
+  await expect(header.getByRole('heading', { level: 1, name: jobName, exact: true })).toBeVisible();
+  const players = header.getByTestId('job-players').getByRole('listitem');
+  await expect(players.nth(0).getByRole('link', { name: p1, exact: true })).toBeVisible();
+  await expect(players.nth(1).getByRole('link', { name: p2, exact: true })).toBeVisible();
   await expect(header.getByText('Game Pairs', { exact: true })).toBeVisible();
   const status = page.getByTestId('job-status');
   await expect(status.getByText('active', { exact: true })).toBeVisible();

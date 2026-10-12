@@ -4,7 +4,8 @@
   import { api, type JobStats, type RackLookupRow } from '$lib/api';
   import { subscribeToJob } from '$lib/sse';
   import { session } from '$lib/auth';
-  import { datetime, exactCount, jobTypeLabel, jobTitle } from '$lib/format';
+  import { datetime, exactCount } from '$lib/format';
+  import JobHeader from '$lib/components/JobHeader.svelte';
   import JobStatusCard from '$lib/components/JobStatusCard.svelte';
   import JobProgressCard from '$lib/components/JobProgressCard.svelte';
   import WorkerTable from '$lib/components/WorkerTable.svelte';
@@ -13,7 +14,7 @@
   import MatchScore from '$lib/components/MatchScore.svelte';
   import MatchTestCard from '$lib/components/MatchTestCard.svelte';
   import SavedPositions from '$lib/components/SavedPositions.svelte';
-  import { playersLine, type JobConfig } from '$lib/jobSettings';
+  import type { JobConfig } from '$lib/jobSettings';
   import { analysesPerRack, rackConsensus } from '$lib/consensus';
   import { plyAt, plyColumns, plyHeaders, showsIterations } from '$lib/moveList';
 
@@ -99,21 +100,13 @@
   <p class="text-muted-foreground">Loading…</p>
 {:else}
   <div class="space-y-6">
-    <header class="flex flex-wrap items-center gap-3">
-      <h1 class="text-2xl font-semibold">{jobTitle(stats.job)}</h1>
-      {#if stats.job.name}
-        <span class="text-sm text-muted-foreground">{jobTypeLabel(stats.job.job_type)}</span>
-      {/if}
-      <span class="text-sm text-muted-foreground">
-        {stats.job.lexicon ?? '—'} · {stats.job.variant ?? '—'}{#if config?.players.length}
-          · {playersLine(config)}{/if}
-      </span>
+    <JobHeader job={stats.job} {config}>
       <!-- The admin page (activate, purge, export, artifacts) was reachable
            only by the redirect after creating the job. -->
       {#if $session?.is_admin}
         <a href="/admin/jobs/{stats.job.id}" class="btn-secondary ml-auto no-underline">Manage</a>
       {/if}
-    </header>
+    </JobHeader>
     <JobStatusCard {stats} />
 
     <JobProgressCard {stats}>

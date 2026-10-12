@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { api, type JobListItem } from '$lib/api';
-  import { jobTitle, jobTypeLabel } from '$lib/format';
+  import { jobName, jobTypeLabel } from '$lib/format';
   import JobStatusBadge from '$lib/components/JobStatusBadge.svelte';
 
   let active: JobListItem[] = [];
@@ -95,7 +95,7 @@
         {#each active as job}
           <a href="/jobs/{job.id}" class="card no-underline hover:border-primary/50 hover:no-underline">
             <div class="flex items-center justify-between">
-              <span class="font-medium text-foreground">{jobTitle(job)}</span>
+              <span class="font-medium text-foreground">{jobName(job)}</span>
               <JobStatusBadge status={job.status} />
             </div>
             <p class="mt-1 text-sm text-muted-foreground">

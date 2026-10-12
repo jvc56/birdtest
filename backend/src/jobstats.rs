@@ -88,6 +88,9 @@ pub struct Completion {
 pub struct JobSummary {
     pub id: Uuid,
     /// What the admin called it; empty for a job created without one.
+    pub title: String,
+    /// The title and, for a games or pairs job, its players
+    /// ([`crate::models::job::job_name`]).
     pub name: String,
     pub job_type: JobType,
     pub status: String,
@@ -499,6 +502,8 @@ async fn compute_inner(conn: &mut PgConnection, job: &Job) -> AppResult<JobStats
     };
 
     let (lexicon, variant) = lexicon_and_variant(&mut *conn, job).await?;
+    let players = crate::models::job::player_names(&mut *conn, job.id).await?;
+    let name = crate::models::job::job_name(&job.title, players.as_ref().map(|(a, b)| (a.as_str(), b.as_str())));
 
     let games = game_stats_on(&mut *conn, job).await?;
 
@@ -534,7 +539,8 @@ async fn compute_inner(conn: &mut PgConnection, job: &Job) -> AppResult<JobStats
     Ok(JobStats {
         job: JobSummary {
             id: job.id,
-            name: job.name.clone(),
+            title: job.title.clone(),
+            name,
             job_type: job.job_type,
             status: status_label(job).to_string(),
             allocation: job.allocation,

@@ -337,8 +337,11 @@ export function leavePlayerConflict(p: {
   return `${p.name} ${list}; leave generation plays statically on equity, without a rack info table or endgame solving.`;
 }
 
-/** A job's title: the name it was given, or its type for one given none. */
-export function jobTitle(job: { name?: string | null; job_type: string }): string {
+/**
+ * A job's name as lists show it: its title and, for a games or pairs job, its
+ * players ("{title}: A vs B", the server's), or its type for a job with neither.
+ */
+export function jobName(job: { name?: string | null; job_type: string }): string {
   const name = job.name?.trim();
   return name ? name : jobTypeLabel(job.job_type);
 }

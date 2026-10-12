@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { seededJob, waitForResults } from '../lib/api';
+import { jobHeading, seededJob, waitForResults } from '../lib/api';
 
 /**
  * E-1: an anonymous visitor browses the landing page, the job list, a job's
@@ -40,11 +40,17 @@ test('E-1: an anonymous visitor browses the landing page, jobs, a job and the le
   // fourteenth audit).
   await expect(row).toContainText(/\d[\d,]* \/ [\d,]+ pairs/);
 
-  // Listed, and titled on its page, by its name: a pairs job between two
-  // configs is named for them ("static-equity vs static-score").
+  // Listed by its name: a pairs job is named for its players
+  // ("static-equity vs static-score"). Its page is headed by its title, or
+  // its type without one, with each player under it.
   await row.getByRole('link', { name: job.name, exact: true }).click();
   await expect(page).toHaveURL(new RegExp(`/jobs/${job.id}$`));
-  await expect(page.getByRole('heading', { level: 1, name: job.name, exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { level: 1, name: jobHeading(job), exact: true })).toBeVisible();
+  const players = page.getByTestId('job-players').getByRole('listitem');
+  await expect(players).toHaveCount(2);
+  for (const [i, player] of job.name.slice(job.title ? job.title.length + 2 : 0).split(' vs ').entries()) {
+    await expect(players.nth(i).getByRole('link', { name: player, exact: true })).toBeVisible();
+  }
   await expect(page.getByRole('heading', { name: 'Significance Test' })).toBeVisible();
   // The status on a row of its own, saying what it means for this job unless
   // it is active (the badge says that plainly), then the headline figures.

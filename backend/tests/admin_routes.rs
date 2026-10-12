@@ -268,39 +268,46 @@ async fn creating_each_job_type_answers_it_inactive_and_unallocated() {
     assert_eq!((status, body), (StatusCode::NO_CONTENT, Value::Null), "an inactive job is offered to nobody");
 }
 
-/// A-ADMIN-2b: a job keeps the name it was created with -- trimmed, and shown
-/// by the jobs list and the job's own page -- and one created without a name
-/// has an empty one; a name past 100 characters or of more than one line is
-/// refused, on the field.
+/// A-ADMIN-2b: a job keeps the title it was created with, trimmed, and is
+/// named for it and its players -- "{title}: A vs B" -- by its creation, the
+/// jobs list and the job's own page; one created without a title has an empty
+/// one and is named for its players alone. A title past 100 characters or of
+/// more than one line is refused, on the field.
 #[tokio::test]
-async fn a_job_keeps_the_name_it_was_created_with() {
+async fn a_job_keeps_the_title_it_was_created_with() {
     let db = TestDb::new().await;
     let admin = Admin::new(&db).await;
     let files = files(&db).await;
     let player = created_config(&admin, static_config("namer", &files)).await;
-    let body = |name: Value| {
+    let body = |title: Value| {
         let mut body = games_job_body(&files, &player["id"], &player["id"]);
-        body["name"] = name;
+        body["title"] = title;
         body
     };
 
-    let (status, created) = admin.post("/api/admin/jobs", body(json!("  equity vs static  "))).await;
+    let (status, created) = admin.post("/api/admin/jobs", body(json!("  seat bias  "))).await;
     assert_eq!(status, StatusCode::CREATED, "{created}");
-    assert_eq!(created["jobs"][0]["name"], "equity vs static");
+    assert_eq!(created["jobs"][0]["title"], "seat bias");
+    assert_eq!(created["jobs"][0]["name"], "seat bias: namer vs namer");
     let id = created["jobs"][0]["id"].as_str().unwrap();
     let (_, list) = admin.get("/api/jobs").await;
-    assert_eq!(list["items"][0]["name"], "equity vs static", "{list}");
+    assert_eq!(list["items"][0]["title"], "seat bias", "{list}");
+    assert_eq!(list["items"][0]["name"], "seat bias: namer vs namer", "{list}");
     let (_, detail) = admin.get(&format!("/api/jobs/{id}")).await;
-    assert_eq!(detail["job"]["name"], "equity vs static", "{detail}");
+    assert_eq!(detail["job"]["title"], "seat bias", "{detail}");
+    assert_eq!(detail["job"]["name"], "seat bias: namer vs namer", "{detail}");
+    let (_, config) = admin.get(&format!("/api/jobs/{id}/config")).await;
+    assert_eq!(config["job"]["name"], "seat bias: namer vs namer", "{config}");
 
-    let (status, unnamed) = admin.post("/api/admin/jobs", games_job_body(&files, &player["id"], &player["id"])).await;
-    assert_eq!(status, StatusCode::CREATED, "{unnamed}");
-    assert_eq!(unnamed["jobs"][0]["name"], "");
+    let (status, untitled) = admin.post("/api/admin/jobs", games_job_body(&files, &player["id"], &player["id"])).await;
+    assert_eq!(status, StatusCode::CREATED, "{untitled}");
+    assert_eq!(untitled["jobs"][0]["title"], "");
+    assert_eq!(untitled["jobs"][0]["name"], "namer vs namer");
 
-    for name in [json!("x".repeat(101)), json!("two\nlines")] {
-        let (status, refused) = admin.post("/api/admin/jobs", body(name)).await;
+    for title in [json!("x".repeat(101)), json!("two\nlines")] {
+        let (status, refused) = admin.post("/api/admin/jobs", body(title)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
-        assert_eq!(refused["fields"][0]["field"], "name", "{refused}");
+        assert_eq!(refused["fields"][0]["field"], "title", "{refused}");
     }
 }
 
@@ -986,7 +993,7 @@ async fn a_games_jobs_threading_mode_is_on_its_settings_and_every_task() {
         .post(
             "/api/admin/jobs",
             json!({
-                "name": "parallel mirror", "job_type": "game_pairs", "variant": "classic",
+                "title": "parallel mirror", "job_type": "game_pairs", "variant": "classic",
                 "letterdist_id": files.letterdist, "layout_id": files.layout,
                 "player_config_ids": [player["id"]], "max_pairs": 100, "threading_mode": "pgp",
             }),
@@ -1006,6 +1013,9 @@ async fn a_games_jobs_threading_mode_is_on_its_settings_and_every_task() {
     let (status, assignment) = claim(&admin.app, &[], "1.0.0", &[]).await;
     assert_eq!(status, StatusCode::OK, "{assignment}");
     assert_eq!(assignment["job_id"], json!(pairs), "{assignment}");
-    assert_eq!(assignment["job_name"], "parallel mirror", "{assignment}");
+    assert!(
+        assignment["job_name"].as_str().unwrap().starts_with("parallel mirror: "),
+        "named for its title and players: {assignment}"
+    );
     assert_eq!(assignment["task_request"]["threading_mode"], "pgp", "{assignment}");
 }

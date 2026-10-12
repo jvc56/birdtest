@@ -61,6 +61,8 @@ export interface PublicPlayerConfig extends PlayerSettings {
 export interface JobConfig {
   job: {
     id: string;
+    /** What the admin called it, and its name: the title and its players. */
+    title: string;
     name: string;
     job_type: JobType;
     variant: string;
@@ -503,10 +505,4 @@ export type SettingsMode = 'differences' | 'key' | 'all';
 export function settingsFor(players: PlayerSettings[], mode: SettingsMode, unused = NONE): SettingRow[] {
   if (mode === 'differences') return differingSettings(players, unused);
   return mode === 'key' ? keySettings(players, unused) : playerRows(players, unused);
-}
-
-/** The players' searches in one line, for beside a job's lexicon and variant. */
-export function playersLine(c: JobConfig): string {
-  const unused = unusedPlayerSettings(c);
-  return c.players.map((p) => playerSummary(p, unused)).join(' vs ');
 }
