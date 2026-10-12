@@ -204,35 +204,49 @@ Open "dev game pairs (first divergences saved)".
 
 On the same job:
 
-- [ ] **Expect**, after the settings, a **Match score** card with two tables,
-  **All games** and **Games that diverged**, each a column per player
-  (`static-equity`, `static-score`) and rows Wins, Losses (each player's are
-  the other's wins), Draws, Average score and Average spread (signed, "+3.2"
-  and "-3.2"); in each row the better value green and the worse red -- the
-  fewer losses green -- equal values (Draws) neither; no chart. Under the
-  first "Over N games, both games of every pair.", under the second just
-  "Over M games: both games of the K pairs whose games did not play
-  identically." The figures count games, not pairs.
-- [ ] **Expect** after it a **Significance Test** card with a "running" badge and
-  one sentence: "static-equity scores x% per game (95% interval a% to b%)." --
-  no Elo or rating figure anywhere on the card. Then "The test is not acted on until 50,000 pairs
-  are complete." and a bar: the interval shaded on a scale of player 1's
-  score, a dashed line at 50% and a mark at the score, labelled "even at
-  50%, static-equity's score x%". No W/L/D line of its own.
+- [ ] **Expect**, after the settings, a **Match score** card: the players'
+  names (`static-equity` in blue, `static-score` in orange), under each its
+  share of the points to two places ("57.73%") and "of points", the leader's
+  in bold; a bar of the games each won, `static-equity`'s count in its blue
+  part on the left, `static-score`'s in its orange part on the right, the
+  draws a grey sliver between, labelled underneath "static-equity wins", "N
+  draws", "static-score wins"; then "Average score" ("431.20 to 411.53") and
+  "Average spread per game" ("+19.67 to static-equity", or "Even"), each to
+  two places; and "Over N games, both games of every pair. A draw counts as
+  half a point." The figures count games, not pairs. No red or green.
+- [ ] **Do** switch the card's toggle from **All games · N** to **Diverged ·
+  M**. **Expect** every figure to change to the games of the pairs that
+  diverged, and the note to read "Over M games: both games of the K pairs
+  whose games did not play identically."
+- [ ] **Expect** after it a **Significance Test** card with a "running" badge
+  and three tiles: **Verdict** "Too early", "acts from 50,000 pairs";
+  **static-equity's score** "x%" to two places and "95% interval a% to b%";
+  **Pairs** the pairs played, "of up to N, test acts from 50,000", over a
+  small progress bar with an amber mark at the minimum. No Elo or rating
+  figure anywhere on the card, and no W/L/D line of its own. Under the
+  tiles, a chart with 50% always in the middle: its left half orange, its
+  right half blue, the interval shaded with a mark at the score, five ticks
+  under it with 50% the middle one, and "← static-score better" and
+  "static-equity better →" under its ends.
 - [ ] **Do** open **What does the interval mean?**. **Expect** the question
   -- is one player better, at 95% confidence -- each pair one observation,
   scored by player 1's result across its two games, that the interval stays
   valid however often it is checked, and that the chance of naming a winner
   between two equal players is at most about 5%.
-- [ ] **Expect** the pair-outcome table in the Significance Test card, a column per player:
-  "Won both", "Won one, drew one", "Even", each cell "count (share%)", the
-  higher of a row green and the lower red, "Even" the same for both; and a
-  line on how many pairs diverged.
-- [ ] On "dev games (positions saved)", **expect** one match-score table (no
-  divergent one), the explanation per game (0, ½ or 1), no "both games of
-  every pair" note, and no pair-outcome table.
-- [ ] On a job an admin has deactivated (A-8), **expect** "paused while the job
-  is inactive: no pairs are being played, so the test is not moving".
+- [ ] **Expect** **Pair outcomes** in the Significance Test card: one bar,
+  static-equity's sweeps in solid blue on the left, its won-one-drew-one in
+  faint blue, even pairs grey in the middle, then static-score's in faint
+  and solid orange, each part's count written in it when it is over 7% of
+  the pairs; under it a key of the five, "static-equity won both" to
+  "static-score won both", each with its count and share of the pairs; and
+  a line that the test runs on all N pairs and how many diverged. No red or
+  green.
+- [ ] On "dev games (positions saved)", **expect** the match score with no
+  All games / Diverged toggle, the explanation per game (0, ½ or 1), no "both
+  games of every pair" note, and no pair-outcome table.
+- [ ] On a job an admin has deactivated (A-8), **expect** a "paused" badge and
+  the Verdict tile "Paused", "no pairs are being played while the job is
+  inactive".
 - [ ] On "tester no test" (A-7), **expect** the Match score card and no
   Significance Test card, and settings rows "Pairs To Play 20" and
   "Significance Test no" in place of the test's settings.

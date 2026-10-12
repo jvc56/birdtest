@@ -125,12 +125,11 @@ test('E-4: an admin creates configs and a job, activates it, and watches it fill
   // The rest of the dashboard moves with it.
   // The admin page has the public page's match score and Significance Test boxes,
   // where it had a one-line summary.
-  await expect(page.getByTestId('significance-test-sentence')).toContainText(/ scores \d+\.\d% per game /);
-  const score = page.locator('.card', { has: page.getByRole('heading', { name: 'Match score' }) });
-  await expect(score.getByTestId('match-all').locator('tbody td:first-child')).toHaveText([
-    'Wins', 'Losses', 'Draws', 'Average score', 'Average spread'
-  ]);
-  await expect(score.getByTestId('match-divergent')).toContainText('Games that diverged');
+  await expect(page.getByTestId('test-score')).toContainText(/^.+'s score\s*\d+\.\d\d%\s*95% interval \d+\.\d\d% to \d+\.\d\d%/);
+  const score = page.getByTestId('match-score');
+  await expect(score.getByTestId('match-share')).toHaveText([/^\d+\.\d\d%$/, /^\d+\.\d\d%$/]);
+  await expect(score.getByTestId('match-bar')).toHaveAttribute('aria-label', /^.+ won [\d,]+, [\d,]+ draws?, .+ won [\d,]+$/);
+  await expect(score.getByTestId('match-scope-divergent')).toHaveText(/^Diverged · [\d,]+$/);
   await expect(page.getByText('No contributions yet.')).toHaveCount(0);
   await expect(
     page.locator('.card', { has: page.getByRole('heading', { name: 'Contributors' }) }).getByText(/^Anonymous · /).first()

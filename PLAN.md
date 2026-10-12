@@ -509,9 +509,9 @@ every score. The status is one of `running`, `player1_better`,
 nothing on a rating scale is derived from it: the Elo figures the API once
 carried beside them are gone, so no number on a job's page can be mistaken for
 a pool's rating, whose scale is WESPA's ([The scale is
-WESPA's](#the-scale-is-wespas)). The job page's Significance Test card says it in
-one sentence ("static-equity scores 53.1% per game (95% interval 51.2% to
-55.0%).") over a bar of the interval around 50%.
+WESPA's](#the-scale-is-wespas)). The job page's Significance Test card shows it in
+a tile ("static-equity's score 57.42%, 95% interval 53.51% to 61.29%") over a
+chart of the interval with 50% in the middle.
 
 #### The pentanomial, and why pairs are the unit
 
@@ -1078,9 +1078,9 @@ Shows all jobs with: job type, status, allocation, and a completion counter (tas
 
 **Games / Game pairs**
 
-- A **Significance Test** card, for a job that runs the test (one without has none, and `games.test` is `null`): a status badge (`running`, `player 1 better`, `player 2 better`, `inconclusive`, or paused or undecided from the job's own status), one sentence — "static-equity scores 53.1% per game (95% interval 51.2% to 55.0%)." (nothing on a rating scale) and, once decided, which player is better at that confidence — a bar of the interval on a scale of player 1's score with 50% marked, and a folded explanation with the job's own confidence.
-- The pentanomial (game pairs only), in the Significance Test card: the pair outcomes the test is computed from, as three rows (won both, won one and drew one, even) with a column per player and each count's share of the pairs (`lib/charts/pentanomial.ts` `PAIR_OUTCOMES`). Ratings are not here — they are pool-scoped and live on the [ratings page](#the-ratings-page).
-- A **match score** card, after the settings and before the Significance Test card: a table with a column per player and a row each for wins, losses, draws, average score per game and average spread, the better figure of each row green and the worse red (`MatchScore.svelte`, `lib/matchScore.ts`). A pairs job has a second table beside it, **Games that diverged**, over only the games of the pairs whose two games did not play identically (`games.divergent`). It counts games for a pairs job too. For a job without a test it is the job's result. The averages are the batches' `p1_score_mean` / `p2_score_mean` weighted by their games, over every result of the job (one per task; `jobstats::SCORE_MEANS`).
+- A **Significance Test** card, for a job that runs the test (one without has none, and `games.test` is `null`) (`MatchTestCard.svelte`, `lib/matchTest.ts`): a badge (`running`, the better player by name in its colour, `inconclusive`, or paused or not decided from the job's own status), then three tiles — **Verdict** ("Too early" before the minimum, "No verdict yet", the better player's name with when it was decided, or why there is none), **player 1's score** to two places with its interval (nothing on a rating scale; for a decided job, how many pairs finished after the decision), and the **pairs** (or games) played of the cap over a progress bar marking the minimum — a chart of the interval with 50% always in the middle, its left half player 2's colour and its right half player 1's, and a folded explanation with the job's own confidence. It uses the match score card's player colours and no green or red.
+- The pentanomial (game pairs only), in the Significance Test card: the pair outcomes the test is computed from, as one bar from player 1's sweeps (solid blue) through even pairs (grey) to player 2's (solid orange), a split pair fainter than a sweep, and a key giving each part's count and share of the pairs (`lib/charts/pentanomial.ts` `pairOutcomes`). Ratings are not here — they are pool-scoped and live on the [ratings page](#the-ratings-page).
+- A **match score** card, after the settings and before the Significance Test card (`MatchScore.svelte`, `lib/matchScore.ts`): each player's name in its own colour (player 1 blue, player 2 orange) over its share of the points to two places, a draw counting half, the leader's in bold; a bar of the games each won, its count written in its player's part and the draws a grey part between; then each player's average score and the average spread, as what the player ahead leads by, to two places. Colour tells the players apart and marks neither as better. A pairs job's card has a toggle, **All games · N** / **Diverged · M**, that switches every figure to only the games of the pairs whose two games did not play identically (`games.divergent`). It counts games for a pairs job too. For a job without a test it is the job's result. The averages are the batches' `p1_score_mean` / `p2_score_mean` weighted by their games, over every result of the job (one per task; `jobstats::SCORE_MEANS`).
 - **Saved positions**, for a job with `capture_positions` set: one captured position at a time, drawn on the job's own board (`Board.svelte`) — its premium squares from the layout, the tiles with their letters and scores (a blank in lower case, scoring nothing), both racks and scores with the player to move marked, and the tiles the move before it placed outlined — beside its ranked moves — each with its win percentage, how often the simulation played it out (**Iters**), and its first two plies' average score and bingo percentage (P1-S, P1-BP, P2-S, P2-BP, P1 the reply) when it was simulated, and a solved move's depth as **Solved Plies** — and its CGP as text. A simulated position past turn 0 whose player inferred the opponent's leave first (its previous move not a pass) shows that inference under the moves: "Inferred from MOVE: N possible leaves, average equity E", and up to ten of the leaves the opponent most likely kept, with their draws and equity. **Random position** draws another (`GET /api/jobs/:id/positions/random`); a rack search shows that rack's positions newest first, one at a time with **Next** and **Previous** (`GET /api/jobs/:id/positions?rack=`). On a game-pairs job each position comes with its `partner`, the same turn of the pair's other game, and one of the two is drawn at a time ("Game 1 of the pair", "Game 2 of the pair"), with a toggle between them naming each game's player to move ("static-equity's move"); a rack both games hold finds the pair once. A job keeping only first divergences (`capture_first_divergence`) shows exactly the turn each pair's players first chose differently. There is no list of the newest positions: a job that captures holds millions, and one at a time on a board is what the section is for. The CGP and the move notation are read by `lib/cgp.ts` as MAGPIE writes them (`game_get_cgp_string`, `move_get_string`: `8G HUH` across, `E9 (E)RUVIM` down, letters played through in parentheses, `[L·L]` for a multi-letter tile); a position it cannot read is shown as text. The board scales to its box, so a phone shows it whole. From an `lg` screen up the pane is a grid of `minmax(24rem,1fr) minmax(0,1fr)`: the board and the moves share it equally, the board never under 24rem and never over 42rem (`max-w-2xl`), and the moves start right beside it and fill the rest of the row, every cell on one line with tight padding (as in the opening-rack lookup's table), the inference's leaves as wide as the moves above them; narrower, the moves go under the board. The rack tiles stay square, shrinking to fit one line rather than deforming. Anyone may see them, signed in or not: an account only makes API keys. Clicking a ranked move to preview it on the board is a follow-up.
 
 **Opening rack analysis**
@@ -6252,13 +6252,12 @@ birdtest/
 │       │   ├── format.ts           # shared display formatting (job type labels, durations)
 │       │   ├── cgp.ts              # reading MAGPIE's CGP and move strings for the board
 │       │   ├── moveList.ts         # a move list's simulation columns and inference
-│       │   ├── compare.ts          # a two-player table row, better green and worse red
-│       │   ├── matchScore.ts       # the match score's rows
+│       │   ├── matchScore.ts       # the match score card's figures
 │       │   ├── matchTest.ts        # the significance test card's interval and sentence
 │       │   ├── consensus.ts        # an opening-rack job's consensus settings and standing
 │       │   ├── roundRobin.ts       # a games or pairs request's matchups, previewed as the server makes them
 │       │   ├── jobSettings.ts      # a job's and a player config's settings tables
-│       │   ├── charts/             # pentanomial.ts (the pair-outcome table), ratingDotPlot.ts,
+│       │   ├── charts/             # pentanomial.ts (the pair-outcome bar), ratingDotPlot.ts,
 │       │   │                       # residuals.ts, labels.ts: the arithmetic behind the charts
 │       │   └── components/         # shared UI components
 │       │       ├── JobStatusBadge.svelte
@@ -6267,7 +6266,7 @@ birdtest/
 │       │       ├── JobSettings.svelte    # a job's settings and its players'
 │       │       ├── PlayerSettingsTable.svelte # player configs' settings, a column per player
 │       │       ├── TaskCounts.svelte     # a job's tasks by state
-│       │       ├── MatchScore.svelte     # the match score (and its divergent-games table)
+│       │       ├── MatchScore.svelte     # the match score (and its diverged-games toggle)
 │       │       ├── MatchTestCard.svelte  # the significance test
 │       │       ├── SavedPositions.svelte # captured positions, one at a time
 │       │       ├── PositionPane.svelte   # one position: board, ranked moves, CGP
@@ -6277,8 +6276,7 @@ birdtest/
 │       │       ├── WorkerTable.svelte
 │       │       ├── Pagination.svelte
 │       │       ├── ProgressBar.svelte
-│       │       ├── RatingDotPlot.svelte  # ratings with error bars (not a bar chart: a rating has no zero)
-│       │       └── PlayerCompareTable.svelte # two players side by side, higher green
+│       │       └── RatingDotPlot.svelte  # ratings with error bars (not a bar chart: a rating has no zero)
 │       └── routes/
 │           ├── +layout.svelte      # global layout (nav bar, footer)
 │           ├── +layout.ts          # a static SPA: no SSR, no prerendering

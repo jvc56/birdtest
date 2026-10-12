@@ -69,7 +69,7 @@ at tier 5 names a symptom.
 | Tier | Tests | Where |
 |---|---|---|
 | 1 Unit | 250 | `#[cfg(test)]` in `jobs::plausibility` (30), `inputdata` (30), `jobs::racks` (17), `stats::bradley_terry` (30), `stats::match_test` (10), `stats::outcomes` (7), `error` (9), `config` (8), `extract` (7), `routes::admin` (16), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (5), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (7), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (8), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `board`, `exports`, `jobs`, `jobs::leave_gen`, `routes` (1 each); `jobs::game_pair` (3), `artifacts` (2) |
-| 1F Frontend unit | 218 | Vitest, `frontend/src/lib/`: `format.test.ts` (46), `jobSettings.test.ts` (13), `matchScore.test.ts` (4), `matchTest.test.ts` (5), `moveList.test.ts` (5), `compare.test.ts` (3), `consensus.test.ts` (8), `cgp.test.ts` (16), `api.test.ts` (18), `auth.test.ts` (17), `accountRules.test.ts` (9), `ratingPool.test.ts` (7), `sse.test.ts` (12), `importWatch.test.ts` (10), `poller.test.ts` (7), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (3), and `charts/`: `ratingDotPlot.test.ts` (19), `labels.test.ts` (2), `residuals.test.ts` (5), `pentanomial.test.ts` (5) |
+| 1F Frontend unit | 218 | Vitest, `frontend/src/lib/`: `format.test.ts` (46), `jobSettings.test.ts` (13), `matchScore.test.ts` (4), `matchTest.test.ts` (8), `moveList.test.ts` (5), `consensus.test.ts` (8), `cgp.test.ts` (16), `api.test.ts` (18), `auth.test.ts` (17), `accountRules.test.ts` (9), `ratingPool.test.ts` (7), `sse.test.ts` (12), `importWatch.test.ts` (10), `poller.test.ts` (7), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (3), and `charts/`: `ratingDotPlot.test.ts` (19), `labels.test.ts` (2), `residuals.test.ts` (5), `pentanomial.test.ts` (5) |
 | 2 Integration | 186 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (33), `scheduler.rs` (19), `jobs.rs` (20), `stats.rs` (19), `input_data.rs` (14), `derived.rs` (9), `leave_generation.rs` (8), `exports.rs` (16), `submissions.rs` (6), `artifacts.rs` (5), `audit.rs` (3) |
 | 3 API | 250 | `backend/tests/`: `worker_api.rs` (52), `admin_api.rs` (59), `auth_routes.rs` (28), `worker_routes.rs` (24), `boundaries.rs` (18), `public_api.rs` (24), `admin_routes.rs` (13), `authz.rs` (7), `account.rs` (10), `auth_api.rs` (5), `finish.rs` (9), `fake_worker.rs` (1) |
 | 4 Contract | 15 | `routes::worker::contract_fixtures`, over 18 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
@@ -868,16 +868,14 @@ Each entry's tests are the `describe` block named for its id.
   (0.53125 is "53.1%", 0.5 "50.0%"). The `signedElo` this entry once also
   named no longer exists: no page shows an Elo difference. *(Covered:
   `format.test.ts`, `F-FMT-5c scores`.)*
-- `F-MATCH-1` The match score table's rows, a column per player: wins,
-  losses (player 2's wins and losses are player 1's losses and wins, and
-  fewer losses are better), draws, the average scores to a decimal place and
-  the spread signed from each player's side ("+13.4" / "-13.4", never
-  "-0.0"); before any game, no average rather than 0 or NaN. The same rows
-  serve a pairs job's divergent-games table. *(Covered: `matchScore.test.ts`.)*
-- `F-CMP-1` A two-player table marks the better value of a row better (green)
-  and the other worse (red) -- the higher, or the lower where the row says
-  fewer is better (losses) -- and neither when they are equal or one is
-  missing. *(Covered: `compare.test.ts`.)*
+- `F-MATCH-1` The match score card's figures: the games each player won
+  (player 2's are player 1's losses) and the draws once, each player's share
+  of the points to two places with a draw half ("59.52%" / "40.48%"), the
+  player ahead (neither when level), the average scores to two places, and
+  the spread as what the player ahead leads by ("13.39", never "-0.00", and
+  neither ahead when it rounds to nothing); before any game, no share or
+  average rather than 0 or NaN. The same figures serve a pairs job's
+  diverged games. *(Covered: `matchScore.test.ts`.)*
 - `F-SET-1` The settings tables (`lib/jobSettings.ts`), in SETTINGS_COMPARISON.md's
   orders. A job's settings are one ordered list, every row shown (type,
   variant, letter distribution, board, bingo bonus; a games job's target or
@@ -1038,15 +1036,17 @@ Each entry's tests are the `describe` block named for its id.
 
 ### `F-TEST-*` — `lib/matchTest.ts`
 
-- `F-TEST-1` `testBar` scales the match test's bar to the interval and an
-  even score, with a margin of a tenth of that span either side (at least a
-  point), and keeps a wide interval within the scores that exist. *(Covered:
-  `matchTest.test.ts`.)*
-- `F-TEST-2` `testSentence` states player 1's score per game with its range,
-  named for the players and with no Elo or rating figure ("… scores 53.1% per
-  game (95% interval 51.2% to 55.0%)."), then names the better player once it
-  is decided, or says neither is when it ended inconclusive.
-  *(Covered: `matchTest.test.ts`.)*
+- `F-TEST-1` `testScale` puts an even score in the middle of the
+  Significance Test card's chart, whatever side the interval is on, snapped
+  to a round half-width wide enough for the interval (0.51 to 0.55 is 40% to
+  60%, ticks every 5%), its ticks at whole fractions of the chart, and stops
+  at the scores that exist; `testPct` prints a score to two places
+  ("57.42%"). *(Covered: `matchTest.test.ts`.)*
+- `F-TEST-2` `testVerdict` words the verdict tile: "Too early" before the
+  minimum and "No verdict yet" after it, the better player by index with
+  when it was decided ("is better, decided at 500 pairs") or, found between
+  finish checks, at what confidence, and "Neither better", "Paused" or "Not
+  decided" with the reason. *(Covered: `matchTest.test.ts`.)*
 - `F-TEST-3` `confidenceProblem` refuses what job creation refuses of a
   test's confidence, and only that: above 50 and below 100, so 50.05 and
   99.995 pass and 50, 100, a non-number and a cleared input do not. The job
@@ -1193,11 +1193,11 @@ Test the pure functions; do not snapshot the SVG.
   table cell's hover. *(Covered: `charts/residuals.test.ts`. The separate
   residual table, `ResidualMatrix`, and its ordering and bars went with the
   cross table, which folds the residual into each cell.)*
-- `F-CHART-7` The pair-outcome table reads each player's row from its own side
-  — bucket 4 is player 1's "Won both" and player 2's is bucket 0 — and its
-  three rows (won both, won one and drew one, even) hold all five buckets. An
-  off-by-one here inverts the reading of every paired job. *(Covered:
-  `charts/pentanomial.test.ts`.)*
+- `F-CHART-7` The pair-outcome bar reads each part from the side it favours
+  — bucket 4 is player 1's "won both" and bucket 0 player 2's — running from
+  player 1's sweeps to player 2's with even pairs in the middle, all five
+  buckets once. An off-by-one here inverts the reading of every paired job.
+  *(Covered: `charts/pentanomial.test.ts`.)*
 - `F-CHART-8` Percentages are computed against pairs, not games, and a zero
   denominator renders 0.0% rather than `NaN`. *(Covered:
   `charts/pentanomial.test.ts`.)*
@@ -2307,7 +2307,7 @@ permanent.
   means weighted by their games, for games and pairs jobs alike (10 games at
   400-380 and 30 at 440-450 are 430-432.5, spread -2.5; unweighted, 420-415).
   *(Covered: `stats::average_scores_weight_each_batch_by_its_games`; how the
-  match score table prints them, `matchScore.test.ts`, `F-MATCH-1`.)*
+  match score card prints them, `matchScore.test.ts`, `F-MATCH-1`.)*
 - `I-STATS-4` A job with no results reports zeros and an even score whose
   interval is every score (0 to 1), not an error or a NaN, and no average
   score (null, not 0). *(Covered:
@@ -3959,8 +3959,9 @@ admin in once and the admin journeys reuse its storage state.
   marked and first, activates it there by giving it an allocation (and
   deactivates it there at the end), and watches the dashboard
   update live over SSE as fake workers contribute; its admin page has the
-  match score and Significance Test cards, the latter's sentence giving player 1's
-  score per game. **The journey that justifies the tier**: the only place
+  match score and Significance Test cards, the former's shares to two places,
+  its bar's record and its Diverged toggle, the latter's score tile giving player 1's
+  score per game and its interval to two places. **The journey that justifies the tier**: the only place
   SSE, the built Svelte app, the scheduler and a worker are exercised together.
   *(Covered: `e4-live-dashboard.spec.ts`.)*
 - `E-5` An admin bans a worker and that worker can no longer claim. *(Covered:
@@ -3977,13 +3978,16 @@ admin in once and the admin journeys reuse its storage state.
   shows it (`data-record`), its last column the table's rating. Signed out,
   the cross table is the first card, the plot after it, and there is no All
   configs card. *(Covered: `e7-ratings.spec.ts`.)*
-- `E-8` A job detail page renders the pentanomial table — three rows (Won both,
-  Won one, drew one, Even) with a column per player, each read from that
-  player's buckets, the higher of a row marked and the even row never — the significance test's verdict in words ("Completed: decided: player 1
-  is better, player 1 at … to … after … pairs", or inconclusive at the cap),
-  its sentence (player 1's score per game and its 95% interval) and its
+- `E-8` A job detail page renders the pentanomial as the pair-outcome key —
+  five parts from "static-equity won both" to "static-score won both", each
+  read from its bucket with its count and share of the pairs — the
+  significance test's verdict (the chip "static-equity better" and "is
+  better, decided at … pairs", or "inconclusive" at the cap), player 1's
+  score and its 95% interval to two places, the pairs played, and its
   folded explanation, and player 1's record in the match score card, not the
-  Significance Test card. *(Covered: `e8-pentanomial.spec.ts`.)*
+  Significance Test card: each player's share of the points to two places,
+  the games each won on its bar, and the same for the diverged games once
+  its toggle is switched. *(Covered: `e8-pentanomial.spec.ts`.)*
 - `E-9` The password reset flow end to end, `a@b` refused under the field
   first. *(Covered:
   `e9-password-reset.spec.ts`, reading its link from the outbox.)*
