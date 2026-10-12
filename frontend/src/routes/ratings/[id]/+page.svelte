@@ -206,10 +206,16 @@
               {#each table.configs as row}
                 <tr>
                   <th scope="row" class="sticky left-0 z-10 bg-card">
-                    <!-- Held to a third of a phone, so the cells have the rest. -->
-                    <span class="block max-w-[8rem] truncate sm:max-w-xs" title={row.name}>
+                    <!-- Held to a third of a phone, so the cells have the rest.
+                         A link to the config that looks as the name did,
+                         underlined only on hover. -->
+                    <a
+                      href="/player-configs/{row.player_config_id}"
+                      class="block max-w-[8rem] truncate text-foreground sm:max-w-xs"
+                      title={row.name}
+                    >
                       {row.name}
-                    </span>
+                    </a>
                   </th>
                   {#each table.configs as col}
                     {@const cell = table.cell(row.player_config_id, col.player_config_id)}
@@ -282,7 +288,7 @@
             {#each pool.ratings as row}
               <tr>
                 <td>
-                  {row.name}
+                  <a href="/player-configs/{row.player_config_id}">{row.name}</a>
                   {#if row.is_anchor}
                     <span class="ml-1 text-xs text-warning">anchor</span>
                   {/if}
@@ -310,7 +316,7 @@
             {#each membership?.unrated ?? [] as member}
               <tr>
                 <td>
-                  {member.name}
+                  <a href="/player-configs/{member.player_config_id}">{member.name}</a>
                   {#if member.player_config_id === pool.anchor_player_config_id}
                     <span class="ml-1 text-xs text-warning">anchor</span>
                   {/if}

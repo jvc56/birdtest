@@ -79,10 +79,13 @@
 
       {#each rated as { row, cx, cy, x1, x2, w1, w2 }, i}
         {@const figure = ratingFigure(row)}
-        <text x={pad.left - 10} y={cy + 4} text-anchor="end" class="fill-foreground text-[12px]">
-          <title>{row.name}{row.is_anchor ? ' (anchor)' : ''}</title>
-          {labels[i]}
-        </text>
+        <!-- Each name links to its config, looking as it did until hovered. -->
+        <a href="/player-configs/{row.player_config_id}">
+          <text x={pad.left - 10} y={cy + 4} text-anchor="end" class="fill-foreground text-[12px] hover:underline">
+            <title>{row.name}{row.is_anchor ? ' (anchor)' : ''}</title>
+            {labels[i]}
+          </text>
+        </a>
 
         <!-- The 95% interval thin, the ±1 standard error thick over it. -->
         <line x1={w1} x2={w2} y1={cy} y2={cy} stroke="hsl(215 14% 60%)" stroke-width="1.5" stroke-linecap="round" />

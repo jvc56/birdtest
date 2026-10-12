@@ -164,6 +164,12 @@ test('E-7: an admin builds a rating pool and watches membership move the ratings
   await expect(visitor.locator('.card > h2')).toHaveText(['Cross table', 'Ratings']);
   await expect(visitor.getByRole('heading', { name: 'All configs' })).toHaveCount(0);
   await expect(visitor.getByText('WESPA players')).toBeVisible();
+  // Each config's name, in the cross table and the plot, links to its page.
+  await expect(visitor.getByTestId('cross-table').locator('tbody th a')).toHaveCount(3);
+  await expect(visitor.locator('svg a[href^="/player-configs/"]')).toHaveCount(3);
+  await visitor.getByTestId('cross-table').getByRole('link', { name: RATED, exact: true }).click();
+  await expect(visitor).toHaveURL(/\/player-configs\/[0-9a-f-]+$/);
+  await expect(visitor.getByRole('heading', { name: RATED })).toBeVisible();
   await signedOut.close();
 
   // Remove it again: the refit takes its games back out, and the rating it

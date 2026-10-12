@@ -150,8 +150,8 @@ Open "dev game pairs (first divergences saved)".
 - [ ] **Expect** a full-width Status card: the badge ("active") and nothing
   beside it -- the badge says it plainly, and its allocation has its own card.
   (Inactive: "Paused: no worker is offered its tasks until it is given an
-  allocation." and "Its significance test is paused while the job is inactive (see the
-  Significance Test card)." Set aside by the server, its reason instead, A-17;
+  allocation.", and nothing about its significance test, whose own card says
+  where it stands. Set aside by the server, its reason instead, A-17;
   and under it, once any of its tasks has hit the time limit, "N tasks hit the
   time limit — lower the batch size.")
 - [ ] **Expect** under it a Progress card: the percentage done beside its
@@ -403,7 +403,9 @@ Open "dev game pairs (first divergences saved)".
 - [ ] **Expect** first a "Cross table": every rated config against
   every other, best first, each cell the row's win % "±" its standard error
   over its average spread ("+6.8"), a blank diagonal, "·" where two never
-  played, and the rating in the last column. Each pair of cells mirrors across
+  played, and the rating in the last column. Each row's config name links to
+  its config's page, looking like the other text until hovered, as do the
+  names beside the plot and in the admin's All configs table. Each pair of cells mirrors across
   the diagonal (100 − the win %, the same error, the spread negated). A cell
   over 50.0% is tinted green, under it red, and one showing 50.0% not at all;
   a score the ratings predict badly is amber text on that tint. Under the

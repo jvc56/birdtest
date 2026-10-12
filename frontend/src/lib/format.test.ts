@@ -17,7 +17,6 @@ import {
   targetsText,
   MAX_LEAVE_GENERATIONS,
   MAX_TARGET_RACK_COUNT,
-  testLabel,
   testState,
   scorePct,
   completionText,
@@ -147,7 +146,6 @@ describe('F-FMT-5b testState', () => {
   const running = { test: { status: 'running' } };
   it("says paused, not running, while the job is inactive", () => {
     expect(testState('inactive', running)).toBe('paused');
-    expect(testLabel(testState('inactive', running))).toBe('paused while the job is inactive');
   });
   it('is the test while the job is active', () => {
     expect(testState('active', running)).toBe('running');
@@ -163,21 +161,6 @@ describe('F-FMT-5b testState', () => {
     for (const status of ['active', 'inactive', 'completed']) {
       expect(testState(status, { test: null })).toBe('off');
     }
-    expect(testLabel('off')).toBe('not run: the job plays to its target');
-  });
-});
-
-describe('F-FMT-5 testLabel', () => {
-  it('covers every status', () => {
-    expect(testLabel('running')).toBe('running');
-    expect(testLabel('player1_better')).toBe('decided: player 1 is better');
-    expect(testLabel('player2_better')).toBe('decided: player 2 is better');
-    expect(testLabel('inconclusive')).toBe('inconclusive: the job reached its cap first');
-  });
-
-  it('falls back to the raw status for an unknown one', () => {
-    expect(testLabel('abandoned')).toBe('abandoned');
-    expect(testLabel('constructor')).toBe('constructor');
   });
 });
 

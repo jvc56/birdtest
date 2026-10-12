@@ -128,22 +128,8 @@ export function derivedKind(role: string): string {
   return lookup(DERIVED_KIND_LABELS, role);
 }
 
-const TEST_LABELS: Record<string, string> = {
-  running: 'running',
-  paused: 'paused while the job is inactive',
-  undecided: 'not decided: the job was completed before the test was',
-  player1_better: 'decided: player 1 is better',
-  player2_better: 'decided: player 2 is better',
-  inconclusive: 'inconclusive: the job reached its cap first',
-  off: 'not run: the job plays to its target'
-};
-
-export function testLabel(status: string): string {
-  return lookup(TEST_LABELS, status);
-}
-
 /**
- * Where a games or pairs job's significance test stands, for its badge and label.
+ * Where a games or pairs job's significance test stands, for its card's badge and verdict.
  * The test itself says `running` whenever its interval has not left an even
  * score behind, which read as work going on while the job was inactive and
  * nothing was being played: the job's status comes first. A completed job
