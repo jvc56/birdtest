@@ -26,7 +26,7 @@ async function createStaticConfig(page: Page, name: string, sort: 'equity' | 'sc
 /** The Progress card's Done figure, "1,234" over "of up to 40,000 pairs", as a number. */
 async function pairsCompleted(page: Page): Promise<number> {
   const done = page.getByTestId('progress-done');
-  await expect(done).toContainText(/ pairs$/);
+  await expect(done).toContainText(/ pairs\s*$/);
   const text = await done.locator('dd').first().innerText();
   return Number(text.replace(/[^0-9]/g, ''));
 }

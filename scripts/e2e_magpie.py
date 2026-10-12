@@ -120,6 +120,10 @@ SMALL_FILES = (
 # gives up after repeated failures, so the output is checked too.
 FAILURE_SIGNS = ("task failed", "rejected the result", "gave up", "declining this task",
                  "declining a job", "Cannot contribute")
+# What a finished task's line says it took: "[14:03:07] finished task #3: dev
+# pairs in 2m 13s (5 started, 4 completed)".
+FINISHED_LINE = re.compile(
+    r"finished task #\d+: .* in \d+[dhms]( \d+[dhms])* \(\d+ started, \d+ completed\)")
 
 
 def log(message: str) -> None:
@@ -457,6 +461,9 @@ class Worker:
         if succeed:
             for sign in FAILURE_SIGNS:
                 expect(sign not in output, f"a task failed ({sign!r}):\n{output[-3000:]}")
+            if "started task #" in output:
+                expect(FINISHED_LINE.search(output) is not None,
+                       f"no finished line says how long its task took:\n{output[-3000:]}")
         return output
 
     def remove(self) -> None:
