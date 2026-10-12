@@ -917,7 +917,10 @@ Each entry's tests are the `describe` block named for its id.
 - `F-SET-2` The player settings table lists, by its mode
   (`differingSettings`, `settingsFor`, `PlayerSettingsTable.svelte`), the
   settings two players differ in -- key or not -- as ordinary rows, with no
-  heading, tint or fold; the key rows; or every row. Two players alike, asked
+  heading, tint or fold; the key rows; or every row, where the settings two
+  players differ in are marked (`data-differs`, an amber edge and tint, and
+  "(the players differ)" to a screen reader) and a setting the job never
+  reads never is. Two players alike, asked
   for their differences, say "These players' settings are identical." rather
   than show an empty table; one player lists its key rows with no colour; each
   of two players is headed by its colour. *(Covered: `jobSettings.test.ts`,

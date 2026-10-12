@@ -112,8 +112,9 @@ test('E-10: a visitor on a phone reads the job list, a job page and the rankings
   const jobSettings = page.locator('.card', { has: page.getByRole('heading', { name: 'Job settings' }) });
   await expect(jobSettings.getByText('Oldest MAGPIE')).toBeVisible();
   const settings = page.locator('.card', { has: page.getByRole('heading', { name: 'Player settings' }) });
-  await settings.getByRole('button', { name: 'All settings' }).tap();
+  // Every setting by default, the ones the players differ in marked.
   await expect(settings.getByText('Movegen Margin')).toBeVisible();
+  await expect(settings.getByTestId('settings-differ-count')).toContainText(/^\d+ of \d+ differ$|^identical$/);
   await expectNoSidewaysScroll(page);
 
   // The same page with the widest name as its creator and as a contributor:

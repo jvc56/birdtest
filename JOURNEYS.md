@@ -180,19 +180,21 @@ Open "dev game pairs (first divergences saved)".
 - [ ] **Expect** after it a **Player settings** card: the players side by side,
   headed "Player 1" and "Player 2", each with its colour dot (green, purple:
   the colours their moves are drawn in under Saved positions) and its name
-  linking to its config's page. It lists only the settings they differ in, as
-  ordinary rows (Sorted By), with no block heading, tint or fold. (Two players
-  alike say "These players' settings are identical."; one player lists its key
-  rows.)
-- [ ] **Do** press **All settings** on the Player settings card. **Expect**
-  every setting, the key rows first -- Lexicon, Leaves, Sorted By, Move
-  Recorder, Moves Generated, Plies, Uses Inference "—", Uses Preendgame "no"
-  and Uses Endgame "no" -- then the rest (no simulation rows: neither
-  simulates), Moves Recorded, Plies Recorded "—" (both are static) and Movegen
-  Margin "—" (neither recorder keeps moves by equity). The button now reads
-  **Different settings only** and puts the card back. On a job that records no
-  positions ("tester no test", A-7), Moves Recorded is in grey: it never reads
-  it.
+  linking to its config's page, and beside its heading how many settings
+  they differ in ("1 of 21 differ"). It lists every setting, the key rows
+  first -- Lexicon, Leaves, Sorted By, Move Recorder, Moves Generated, Plies,
+  Uses Inference "—", Uses Preendgame "no" and Uses Endgame "no" -- then the
+  rest (no simulation rows: neither simulates), Moves Recorded, Plies
+  Recorded "—" (both are static) and Movegen Margin "—" (neither recorder
+  keeps moves by equity). The row they differ in, Sorted By, has an amber
+  edge and tint, its label and values in bold; no other row does. On a job
+  that records no positions ("tester no test", A-7), Moves Recorded is in
+  grey: it never reads it, and it is never marked. (One player lists its key
+  rows, with an **All settings** toggle.)
+- [ ] **Do** press **Different settings only** on the Player settings card.
+  **Expect** only Sorted By, as an ordinary row with no tint (two players
+  alike say "These players' settings are identical."). The button now reads
+  **All settings** and puts the card back.
 - [ ] At phone width, **expect** the tables to wrap (or scroll inside the
   card), never the page.
 - [ ] **Do** open `/jobs/00000000-0000-4000-8000-000000000000`. **Expect** "no

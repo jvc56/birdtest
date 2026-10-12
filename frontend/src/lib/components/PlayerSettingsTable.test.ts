@@ -33,9 +33,10 @@ describe('F-SET-2 the player settings table lists differences, key rows or every
   it('lists only what two players differ in, key or not, as ordinary rows', () => {
     const html = render({ players: [base, other], mode: 'differences' });
     expect(rows(html)).toEqual(['sort_strategy', 'use_wit']);
-    // No group header, no tint, no fold: the rows are the table.
+    // No group header, no tint, no fold: listed alone, the rows are the table.
     expect(html).not.toContain('Differences (');
     expect(html).not.toContain('bg-warning');
+    expect(html).not.toContain('data-differs');
     expect(html).not.toContain('shared setting');
     // Each player headed by the colour its moves are drawn in.
     expect(html.match(/data-testid="player-color"/g)).toHaveLength(2);
@@ -45,6 +46,16 @@ describe('F-SET-2 the player settings table lists differences, key rows or every
     const listed = rows(render({ players: [base, other], mode: 'all' }))!;
     expect(listed).toEqual(expect.arrayContaining(['lexicon', 'sort_strategy', 'use_wit', 'movegen_margin', 'use_wordmap']));
     expect(listed[0]).toBe('lexicon');
+  });
+
+  it('marks the settings two players differ in among those they share, and says so to a screen reader', () => {
+    const html = render({ players: [base, other], mode: 'all' });
+    const marked = [...html.matchAll(/data-setting="([^"]+)"[^>]*data-differs="true"/g)].map((m) => m[1]);
+    expect(marked).toEqual(['sort_strategy', 'use_wit']);
+    expect(html.match(/\(the players differ\)/g)).toHaveLength(2);
+    // A setting the job never reads is never a difference, however it differs.
+    const unused = render({ players: [base, other], mode: 'all', unused: new Set(['sort_strategy']) });
+    expect([...unused.matchAll(/data-setting="([^"]+)"[^>]*data-differs="true"/g)].map((m) => m[1])).toEqual(['use_wit']);
   });
 
   it('says two players alike are identical rather than show an empty table', () => {
