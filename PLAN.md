@@ -4,7 +4,7 @@
 
 ### Overview
 
-birdtest is a crowdsourced crossword game research platform, modeled after Fishnet (which crowdsources chess game analysis for Lichess). It runs MAGPIE, a crossword board game engine, on volunteers' computers to play test matches between versions, tune its settings and study openings. Users contribute compute by running tasks locally and submitting results back to the site. Admins define jobs and allocate work; the site aggregates results and presents them on a polished dashboard.
+birdtest is a crowdsourced crossword game research platform, modeled after Fishtest (which crowdsources test matches between Stockfish versions). It runs MAGPIE, a crossword board game engine, on volunteers' computers to play test matches between versions, tune its settings and study openings. Users contribute compute by running tasks locally and submitting results back to the site. Admins define jobs and allocate work; the site aggregates results and presents them on a polished dashboard.
 
 ---
 
@@ -119,23 +119,28 @@ Workers are the clients that perform tasks and submit results. Two types are sup
 
 #### Why impossibility, and not per-worker anomaly detection
 
-The obvious design — the one fishnet uses — is a per-worker statistical test
-against the population: flag the worker whose results deviate, without needing
-to trust any individual submission. **That does not transfer to birdtest**, and
-building it would be worse than building nothing.
+The obvious design — the one fishtest uses — is a per-worker statistical test
+against the population: a chi-square residual of each worker's results against
+the rest of the run, flagging the worker whose results deviate, without needing
+to trust any individual submission. **That does not transfer to birdtest as a
+check on submissions**, and building it as one would be worse than building
+nothing.
 
-It works for fishnet because chess analysis is **replicated**: two honest
-clients at the same depth on the same position return the same evaluation, so
-disagreement is proof. birdtest has no ground truth to compare against. Workers
-are handed *different* seeds — that is how the seed space tiles without gaps or
-overlaps — so no two workers ever play the same games. The only cross-worker
-statistic available is the win rate, and that is precisely what the match
-test is measuring. A test on it cannot separate "this worker is broken" from "these
-seeds favoured player 2", so it would flag honest contributors at its own alpha
-rate while an attacker biasing results by a percent passed straight through.
-Two further problems compound it: opening-rack analysis by a simming player is
-non-deterministic by construction, so honest repeat runs disagree; and anonymous
-identities are free, so a per-worker score is defeated by requesting a new UUID.
+Fishtest uses its residuals as a prompt for review, not as proof: a flagged
+worker is one an admin looks at, on a run of millions of games where each
+worker contributes thousands. birdtest has no ground truth to compare a
+worker against either. Workers are handed *different* seeds — that is how the
+seed space tiles without gaps or overlaps — so no two workers ever play the
+same games, and the only cross-worker statistic available is the win rate,
+which is precisely what the match test is measuring. A test on it cannot
+separate "this worker is broken" from "these seeds favoured player 2", so used
+to reject results it would reject honest contributors at its own alpha rate
+while an attacker biasing results by a percent passed straight through. Two
+further problems compound it: opening-rack analysis by a simming player is
+non-deterministic by construction, so honest repeat runs disagree; and
+anonymous identities are free, so a per-worker score is defeated by requesting
+a new UUID. As fishtest uses it, a flag for an admin on registered accounts, it
+could come later; as a gate on submissions it cannot.
 
 What is left is the failure that actually happens: a **broken client**. Those do
 not produce subtly shifted distributions — they produce garbage. So the checks

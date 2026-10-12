@@ -8,16 +8,15 @@
 //! them, so there is no false-positive rate to trade against.
 //!
 //! This is deliberately **not** the population-comparison anomaly detection
-//! (per-worker chi-square) that fishnet uses. That approach depends on
-//! replication: two honest chess clients analysing the same position at the
-//! same depth return the same evaluation, so disagreement is proof. birdtest
-//! has no such ground truth. Workers are handed *different* seeds, so no two
-//! workers ever play the same games, and the only cross-worker statistic
-//! available is the win rate — which is exactly what the match test is measuring. A test
-//! on it cannot separate "this worker is broken" from "these seeds favoured
-//! player 2", so it would flag honest contributors at its own alpha rate while
-//! missing an attacker biasing results by a percent. See PLAN.md, "Worker
-//! Integrity".
+//! (a per-worker chi-square residual) that fishtest uses, where a flagged
+//! worker is one an admin reviews rather than a result rejected. birdtest has
+//! no ground truth to compare a worker against. Workers are handed *different*
+//! seeds, so no two workers ever play the same games, and the only
+//! cross-worker statistic available is the win rate — which is exactly what
+//! the match test is measuring. A test on it cannot separate "this worker is
+//! broken" from "these seeds favoured player 2", so as a check on submissions
+//! it would reject honest contributors at its own alpha rate while missing an
+//! attacker biasing results by a percent. See PLAN.md, "Worker Integrity".
 //!
 //! What is caught here instead is the failure that actually happens in
 //! practice: a **broken client**. Those do not produce subtly shifted
