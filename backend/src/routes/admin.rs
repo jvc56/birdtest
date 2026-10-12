@@ -5,7 +5,7 @@ use crate::extract::ApiJson;
 use crate::error::{AppError, AppResult};
 use crate::jobs::leave_gen::RACK_SIZE;
 use crate::jobs::registry;
-use crate::models::job::{ConsensusSettings, Job, JobStatus, JobType, OpeningRackConfig, PlayerConfig};
+use crate::models::job::{job_name, ConsensusSettings, Job, JobStatus, JobType, OpeningRackConfig, PlayerConfig};
 use crate::state::AppState;
 use crate::extract::{ApiPath as Path, ApiQuery as Query};
 use axum::extract::State;
@@ -624,6 +624,10 @@ struct CreatePlayerConfigBody {
     stopping_pct: Option<f64>,
     use_inference: Option<bool>,
     time_limit_secs: Option<i32>,
+    /// The move generations the player may spend choosing one move; absent or
+    /// null for no budget. Any player may state one.
+    #[serde(default)]
+    movegens_per_move: Option<i64>,
     #[serde(default)]
     use_wordmap: Option<bool>,
     #[serde(default)]
@@ -1001,9 +1005,10 @@ async fn create_player_config(
               utility_spread_scale, movegen_margin, created_by,
               endgame_plies, peg_max_bag, peg_stage_top_k, peg_scenario_stride,
               peg_opp_model, peg_nested, peg_nested_cand_caps, peg_nested_max_depth,
-              peg_nested_strides, use_wit)
+              peg_nested_strides, use_wit, movegens_per_move)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,
-                 $18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36)
+                 $18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,
+                 $37)
          RETURNING *",
     )
     .bind(body.name.trim())
@@ -1053,6 +1058,7 @@ async fn create_player_config(
     // table before any job using it dispatches, once per lexicon: about three
     // seconds and 122 MB for CSW24.
     .bind(body.use_wit.unwrap_or(true))
+    .bind(body.movegens_per_move)
     .fetch_one(&state.pool)
     .await
     .map_err(|e| match body.cloned_from_id {
@@ -1156,6 +1162,14 @@ fn validate_player_config_body(body: &CreatePlayerConfigBody) -> AppResult<()> {
     }
     if body.time_limit_secs.is_some_and(|v| v < 0) {
         err = err.with_field("time_limit_secs", "must not be negative");
+    }
+    // A budget of 0 would stop every search before it began; no budget is
+    // null, not 0.
+    if body.movegens_per_move.is_some_and(|v| v < 1) {
+        err = err.with_field(
+            "movegens_per_move",
+            "must be at least 1, or left empty for no budget",
+        );
     }
     if body.stopping_pct.is_some_and(|v| !(v > 0.0 && v < 100.0)) {
         err = err.with_field("stopping_pct", "must be strictly between 0 and 100");
@@ -1295,10 +1309,11 @@ pub(crate) async fn require_role(
 
 #[derive(Deserialize)]
 struct CreateJobBody {
-    /// What to call the job: shown first wherever jobs are listed. Optional
-    /// here, for scripts; the creation form asks for it.
+    /// What to call the job. A games or pairs job's name is this and its
+    /// players, "{title}: A vs B" ([`job_name`]). Optional here, for scripts;
+    /// the creation form asks for it.
     #[serde(default)]
-    name: Option<String>,
+    title: Option<String>,
     job_type: JobType,
     /// Rules setting shared by every job type.
     variant: String,
@@ -1482,14 +1497,23 @@ fn default_rack_size() -> i32 {
 /// request open for the tens of seconds 3.2 million rows take.
 #[derive(Serialize)]
 struct CreatedJobs {
-    /// Every job the request created, as stored: one, or for a games or
-    /// pairs request naming n ≥ 2 configs, one per pairing in the order of
-    /// [`pairings`].
-    jobs: Vec<Job>,
+    /// Every job the request created, as stored, with its name: one, or for
+    /// a games or pairs request naming n ≥ 2 configs, one per pairing in the
+    /// order of [`pairings`].
+    jobs: Vec<CreatedJob>,
+}
+
+#[derive(Serialize)]
+struct CreatedJob {
+    #[serde(flatten)]
+    job: Job,
+    /// Its title and its players ([`job_name`]).
+    name: String,
 }
 
 /// One job a request makes: its name and, for games and pairs, its seating.
 struct PlannedJob {
+    /// The title and the players ([`job_name`]); the row stores the title.
     name: String,
     pair: Option<(Uuid, Uuid)>,
     /// "A vs B", for an error to name the pairing it is about; `None` for a
@@ -1512,21 +1536,18 @@ impl PlannedJob {
 }
 
 /// The jobs `body` asks for: one, or for a games or pairs request naming
-/// n ≥ 2 configs, one per pairing, named "{name}: {A} vs {B}" (or "A vs B"
-/// with no name), A and B the configs' names -- two configs too, so a job's
-/// name says who plays whom however many were asked for. A self-play job (one
-/// config) and every other type keep the name as given.
+/// n ≥ 2 configs, one per pairing. Every one stores the title as given; a
+/// games or pairs job is named "{title}: {A} vs {B}" (or "A vs B" with no
+/// title), A and B its configs' names -- "A vs A" for self-play -- so a job's
+/// name says who plays whom however many were asked for.
 async fn plan_jobs(conn: &mut sqlx::PgConnection, body: &CreateJobBody) -> AppResult<Vec<PlannedJob>> {
-    let name = job_name(body);
+    let title = job_title(body);
     let pairs = pairings(&body.config);
-    let one_job = match pairs.as_slice() {
-        [] => true,
-        [(a, b)] => a == b,
-        _ => false,
-    };
-    if one_job {
-        return Ok(vec![PlannedJob { name, pair: pairs.first().copied(), pairing: None }]);
+    if pairs.is_empty() {
+        return Ok(vec![PlannedJob { name: title, pair: None, pairing: None }]);
     }
+    // A self-play job is one job, whose errors need no pairing named.
+    let one_job = matches!(pairs.as_slice(), [(a, b)] if a == b);
     let ids: Vec<Uuid> = pairs.iter().flat_map(|(a, b)| [*a, *b]).collect();
     let names: std::collections::HashMap<Uuid, String> =
         sqlx::query_as::<_, (Uuid, String)>("SELECT id, name FROM player_configs WHERE id = ANY($1)")
@@ -1539,19 +1560,14 @@ async fn plan_jobs(conn: &mut sqlx::PgConnection, body: &CreateJobBody) -> AppRe
         return Err(AppError::bad_request("player config not found")
             .with_field("player_config_ids", format!("no such player config: {missing}")));
     }
-    let mut planned = Vec::with_capacity(pairs.len());
-    for (a, b) in pairs {
-        let pairing = format!("{} vs {}", names[&a], names[&b]);
-        let full = if name.is_empty() { pairing.clone() } else { format!("{name}: {pairing}") };
-        if let Some(problem) = name_problem(&full) {
-            return Err(AppError::bad_request("job settings are invalid").with_field(
-                "name",
-                format!("named for its pairing, {full:?} breaks a job name's rule ({problem}): shorten the name"),
-            ));
-        }
-        planned.push(PlannedJob { name: full, pair: Some((a, b)), pairing: Some(pairing) });
-    }
-    Ok(planned)
+    Ok(pairs
+        .into_iter()
+        .map(|(a, b)| PlannedJob {
+            name: job_name(&title, Some((&names[&a], &names[&b]))),
+            pair: Some((a, b)),
+            pairing: (!one_job).then(|| format!("{} vs {}", names[&a], names[&b])),
+        })
+        .collect())
 }
 
 /// Jobs are always created inactive at 0%. The allocation is set later, on
@@ -1633,11 +1649,11 @@ async fn create_job(
         let job = insert_job(&mut tx, &body, &admin, floor, plan, &letterdist_name, blanks)
             .await
             .map_err(|e| plan.qualify(e))?;
-        jobs.push(job);
+        jobs.push(CreatedJob { job, name: plan.name.clone() });
     }
     tx.commit().await?;
 
-    for job in &jobs {
+    for CreatedJob { job, .. } in &jobs {
         // The zeroed KLV generation 1 starts from (stored as generation 0): a
         // multi-megabyte build and an object-store
         // write, so it happens after the transaction commits rather than inside it.
@@ -1669,7 +1685,7 @@ async fn insert_job(
         "INSERT INTO jobs
              (job_type, variant, letterdist_id, layout_id,
               min_magpie_major, min_magpie_minor, min_magpie_patch, bingo_bonus,
-              sim_cutoff, created_by, name, created_at, max_task_seconds)
+              sim_cutoff, created_by, title, created_at, max_task_seconds)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, clock_timestamp(), $12)
          RETURNING *",
     )
@@ -1691,7 +1707,7 @@ async fn insert_job(
     // carry it.
     .bind(body.sim_cutoff.unwrap_or(crate::magpie_defaults::SIM_CUTOFF))
     .bind(admin.0.id)
-    .bind(&plan.name)
+    .bind(job_title(body))
     .bind(body.max_task_seconds.unwrap_or(DEFAULT_TASK_SECONDS))
     .fetch_one(&mut *tx)
     .await?;
@@ -1775,9 +1791,9 @@ pub(crate) fn name_problem(name: &str) -> Option<String> {
     }
 }
 
-/// The job's name as stored: trimmed, empty when none was given.
-fn job_name(body: &CreateJobBody) -> String {
-    body.name.as_deref().unwrap_or("").trim().to_string()
+/// The job's title as stored: trimmed, empty when none was given.
+fn job_title(body: &CreateJobBody) -> String {
+    body.title.as_deref().unwrap_or("").trim().to_string()
 }
 
 /// An opening-rack job's consensus settings, checked alike at creation and
@@ -1871,8 +1887,8 @@ fn pairings(config: &JobTypeConfig) -> Vec<(Uuid, Uuid)> {
 
 fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
     let mut err = AppError::bad_request("job settings are invalid");
-    if let Some(problem) = name_problem(&job_name(body)) {
-        err = err.with_field("name", problem);
+    if let Some(problem) = name_problem(&job_title(body)) {
+        err = err.with_field("title", problem);
     }
     if !matches!(body.variant.as_str(), "classic" | "wordsmog") {
         err = err.with_field("variant", "must be 'classic' or 'wordsmog'");

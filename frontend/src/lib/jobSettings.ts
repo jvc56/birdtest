@@ -25,6 +25,8 @@ export interface PlayerSettings {
   stopping_pct: number | null;
   use_inference: boolean | null;
   time_limit_secs: number | null;
+  /** The move generations the player may spend choosing one move; null is no budget. */
+  movegens_per_move: number | null;
   use_wordmap: boolean;
   use_rit: boolean;
   use_wit: boolean;
@@ -59,6 +61,8 @@ export interface PublicPlayerConfig extends PlayerSettings {
 export interface JobConfig {
   job: {
     id: string;
+    /** What the admin called it, and its name: the title and its players. */
+    title: string;
     name: string;
     job_type: JobType;
     variant: string;
@@ -148,10 +152,14 @@ export function playerSummary(p: PlayerSettings, unused: ReadonlySet<string> = N
     if (p.use_inference && !unused.has('use_inference')) parts.push('inference');
     search = parts.join(', ');
   }
-  if (unused.has('endgame') || !solves(p)) return search;
+  const budget =
+    p.movegens_per_move && !unused.has('movegens_per_move')
+      ? [`${p.movegens_per_move.toLocaleString()} movegens a move`]
+      : [];
+  if (unused.has('endgame') || !solves(p)) return [search, ...budget].join(' · ');
   const solving = [`${p.endgame_plies}-ply endgame`];
   if (p.peg_max_bag > 0) solving.push(`PEG ≤${p.peg_max_bag}`);
-  return [search, ...solving].join(' · ');
+  return [search, ...solving, ...budget].join(' · ');
 }
 
 /** One of a job's settings. `id` names the setting whatever its label says. */
@@ -276,11 +284,14 @@ const PLAYER_ROWS: PlayerRowSpec[] = [
   { id: 'recorder_type', label: 'Move Recorder', value: field('recorder_type'), key: true },
   { id: 'num_plays', label: 'Moves Generated', value: field('num_plays'), key: true },
   { id: 'num_plies', label: 'Plies', value: field('num_plies'), key: true },
-  { id: 'use_inference', label: 'Uses Inference', value: field('use_inference'), key: true },
+  { id: 'use_inference', label: 'Uses Inference', value: (p) => (p.use_inference ? 'yes' : 'no'), key: true },
   { id: 'pre_endgame', label: 'Uses Preendgame', value: (p) => preEndgameText(p), key: true },
   { id: 'endgame', label: 'Uses Endgame', value: (p) => endgameText(p), key: true },
   { id: 'win_pct', label: 'Win % Model', value: field('win_pct'), sim: true },
   { id: 'max_iterations', label: 'Maximum Total Iterations', value: field('max_iterations'), sim: true },
+  // Any player's: a static one may state it too, though only a simmer or a
+  // solver spends more than one generation a move (see unusedPlayerSettings).
+  { id: 'movegens_per_move', label: 'Movegens per Move', value: field('movegens_per_move') },
   { id: 'stopping_pct', label: 'Stopping %', value: field('stopping_pct'), sim: true },
   { id: 'num_plays_recorded', label: 'Moves Recorded', value: field('num_plays_recorded') },
   {
@@ -410,19 +421,30 @@ const UNCAPTURED_UNUSED: ReadonlySet<string> = new Set([
  */
 const UNCAPTURED_STATIC_UNUSED: ReadonlySet<string> = new Set([...UNCAPTURED_UNUSED, 'num_plays']);
 
+/**
+ * `unused`, and the movegen budget too when no player of the job can spend
+ * it: only a simulation or a solve generates more than once a move.
+ */
+function withBudget(unused: ReadonlySet<string>, canSpend: boolean): ReadonlySet<string> {
+  return canSpend ? unused : new Set([...unused, 'movegens_per_move']);
+}
+
 /** The player settings, by row id, that a job never reads. */
 export function unusedPlayerSettings(c: JobConfig): ReadonlySet<string> {
   const simulates = c.players.some((p) => p.num_plies > 0);
-  if (c.job.job_type === 'leave_generation') return LEAVE_UNUSED;
+  const solves = c.players.some((p) => p.endgame_plies > 0);
+  // A leave job refuses a player that solves, and an opening rack never
+  // reaches a small bag: in either only a simulation can spend a budget.
+  if (c.job.job_type === 'leave_generation') return withBudget(LEAVE_UNUSED, simulates);
   if (c.job.job_type === 'opening_rack') {
-    return simulates ? OPENING_RACK_SIM_UNUSED : OPENING_RACK_UNUSED;
+    return withBudget(simulates ? OPENING_RACK_SIM_UNUSED : OPENING_RACK_UNUSED, simulates);
   }
   if (c.games && !c.games.capture_positions) {
     // The rows are the job's, not each player's: a simmer's candidate count
     // is read, so the row stays live beside one.
-    return simulates ? UNCAPTURED_UNUSED : UNCAPTURED_STATIC_UNUSED;
+    return withBudget(simulates ? UNCAPTURED_UNUSED : UNCAPTURED_STATIC_UNUSED, simulates || solves);
   }
-  return CAPTURED_UNUSED;
+  return withBudget(CAPTURED_UNUSED, simulates || solves);
 }
 
 function marked(rows: SettingRow[], unused: ReadonlySet<string>): SettingRow[] {
@@ -483,10 +505,4 @@ export type SettingsMode = 'differences' | 'key' | 'all';
 export function settingsFor(players: PlayerSettings[], mode: SettingsMode, unused = NONE): SettingRow[] {
   if (mode === 'differences') return differingSettings(players, unused);
   return mode === 'key' ? keySettings(players, unused) : playerRows(players, unused);
-}
-
-/** The players' searches in one line, for beside a job's lexicon and variant. */
-export function playersLine(c: JobConfig): string {
-  const unused = unusedPlayerSettings(c);
-  return c.players.map((p) => playerSummary(p, unused)).join(' vs ');
 }

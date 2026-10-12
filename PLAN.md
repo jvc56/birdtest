@@ -4,7 +4,7 @@
 
 ### Overview
 
-birdtest is a crowdsourced crossword game research platform, modeled after Fishnet (which crowdsources chess game analysis for Lichess). It runs MAGPIE, a crossword board game engine, on volunteers' computers to play test matches between versions, tune its settings and study openings. Users contribute compute by running tasks locally and submitting results back to the site. Admins define jobs and allocate work; the site aggregates results and presents them on a polished dashboard.
+birdtest is a crowdsourced crossword game research platform, modeled after Fishtest (which crowdsources test matches between Stockfish versions). It runs MAGPIE, a crossword board game engine, on volunteers' computers to play test matches between versions, tune its settings and study openings. Users contribute compute by running tasks locally and submitting results back to the site. Admins define jobs and allocate work; the site aggregates results and presents them on a polished dashboard.
 
 ---
 
@@ -119,23 +119,28 @@ Workers are the clients that perform tasks and submit results. Two types are sup
 
 #### Why impossibility, and not per-worker anomaly detection
 
-The obvious design — the one fishnet uses — is a per-worker statistical test
-against the population: flag the worker whose results deviate, without needing
-to trust any individual submission. **That does not transfer to birdtest**, and
-building it would be worse than building nothing.
+The obvious design — the one fishtest uses — is a per-worker statistical test
+against the population: a chi-square residual of each worker's results against
+the rest of the run, flagging the worker whose results deviate, without needing
+to trust any individual submission. **That does not transfer to birdtest as a
+check on submissions**, and building it as one would be worse than building
+nothing.
 
-It works for fishnet because chess analysis is **replicated**: two honest
-clients at the same depth on the same position return the same evaluation, so
-disagreement is proof. birdtest has no ground truth to compare against. Workers
-are handed *different* seeds — that is how the seed space tiles without gaps or
-overlaps — so no two workers ever play the same games. The only cross-worker
-statistic available is the win rate, and that is precisely what the match
-test is measuring. A test on it cannot separate "this worker is broken" from "these
-seeds favoured player 2", so it would flag honest contributors at its own alpha
-rate while an attacker biasing results by a percent passed straight through.
-Two further problems compound it: opening-rack analysis by a simming player is
-non-deterministic by construction, so honest repeat runs disagree; and anonymous
-identities are free, so a per-worker score is defeated by requesting a new UUID.
+Fishtest uses its residuals as a prompt for review, not as proof: a flagged
+worker is one an admin looks at, on a run of millions of games where each
+worker contributes thousands. birdtest has no ground truth to compare a
+worker against either. Workers are handed *different* seeds — that is how the
+seed space tiles without gaps or overlaps — so no two workers ever play the
+same games, and the only cross-worker statistic available is the win rate,
+which is precisely what the match test is measuring. A test on it cannot
+separate "this worker is broken" from "these seeds favoured player 2", so used
+to reject results it would reject honest contributors at its own alpha rate
+while an attacker biasing results by a percent passed straight through. Two
+further problems compound it: opening-rack analysis by a simming player is
+non-deterministic by construction, so honest repeat runs disagree; and
+anonymous identities are free, so a per-worker score is defeated by requesting
+a new UUID. As fishtest uses it, a flag for an admin on registered accounts, it
+could come later; as a gate on submissions it cannot.
 
 What is left is the failure that actually happens: a **broken client**. Those do
 not produce subtly shifted distributions — they produce garbage. So the checks
@@ -509,9 +514,9 @@ every score. The status is one of `running`, `player1_better`,
 nothing on a rating scale is derived from it: the Elo figures the API once
 carried beside them are gone, so no number on a job's page can be mistaken for
 a pool's rating, whose scale is WESPA's ([The scale is
-WESPA's](#the-scale-is-wespas)). The job page's Significance Test card says it in
-one sentence ("static-equity scores 53.1% per game (95% interval 51.2% to
-55.0%).") over a bar of the interval around 50%.
+WESPA's](#the-scale-is-wespas)). The job page's Significance Test card shows it in
+a tile ("static-equity's score 57.42%, 95% interval 53.51% to 61.29%") over a
+chart of the interval with 50% in the middle.
 
 #### The pentanomial, and why pairs are the unit
 
@@ -1078,10 +1083,10 @@ Shows all jobs with: job type, status, allocation, and a completion counter (tas
 
 **Games / Game pairs**
 
-- A **Significance Test** card, for a job that runs the test (one without has none, and `games.test` is `null`): a status badge (`running`, `player 1 better`, `player 2 better`, `inconclusive`, or paused or undecided from the job's own status), one sentence — "static-equity scores 53.1% per game (95% interval 51.2% to 55.0%)." (nothing on a rating scale) and, once decided, which player is better at that confidence — a bar of the interval on a scale of player 1's score with 50% marked, and a folded explanation with the job's own confidence.
-- The pentanomial (game pairs only), in the Significance Test card: the pair outcomes the test is computed from, as three rows (won both, won one and drew one, even) with a column per player and each count's share of the pairs (`lib/charts/pentanomial.ts` `PAIR_OUTCOMES`). Ratings are not here — they are pool-scoped and live on the [ratings page](#the-ratings-page).
-- A **match score** card, after the settings and before the Significance Test card: a table with a column per player and a row each for wins, losses, draws, average score per game and average spread, the better figure of each row green and the worse red (`MatchScore.svelte`, `lib/matchScore.ts`). A pairs job has a second table beside it, **Games that diverged**, over only the games of the pairs whose two games did not play identically (`games.divergent`). It counts games for a pairs job too. For a job without a test it is the job's result. The averages are the batches' `p1_score_mean` / `p2_score_mean` weighted by their games, over every result of the job (one per task; `jobstats::SCORE_MEANS`).
-- **Saved positions**, for a job with `capture_positions` set: one captured position at a time, drawn on the job's own board (`Board.svelte`) — its premium squares from the layout, the tiles with their letters and scores (a blank in lower case, scoring nothing), both racks and scores with the player to move marked, and the tiles the move before it placed outlined — beside its ranked moves — each with its win percentage, how often the simulation played it out (**Iters**), and its first two plies' average score and bingo percentage (P1-S, P1-BP, P2-S, P2-BP, P1 the reply) when it was simulated, and a solved move's depth as **Solved Plies** — and its CGP as text. A simulated position past turn 0 whose player inferred the opponent's leave first (its previous move not a pass) shows that inference under the moves: "Inferred from MOVE: N possible leaves, average equity E", and up to ten of the leaves the opponent most likely kept, with their draws and equity. **Random position** draws another (`GET /api/jobs/:id/positions/random`); a rack search shows that rack's positions newest first, one at a time with **Next** and **Previous** (`GET /api/jobs/:id/positions?rack=`). On a game-pairs job each position comes with its `partner`, the same turn of the pair's other game, and one of the two is drawn at a time ("Game 1 of the pair", "Game 2 of the pair"), with a toggle between them naming each game's player to move ("static-equity's move"); a rack both games hold finds the pair once. A job keeping only first divergences (`capture_first_divergence`) shows exactly the turn each pair's players first chose differently. There is no list of the newest positions: a job that captures holds millions, and one at a time on a board is what the section is for. The CGP and the move notation are read by `lib/cgp.ts` as MAGPIE writes them (`game_get_cgp_string`, `move_get_string`: `8G HUH` across, `E9 (E)RUVIM` down, letters played through in parentheses, `[L·L]` for a multi-letter tile); a position it cannot read is shown as text. The board scales to its box, so a phone shows it whole. From an `lg` screen up the pane is a grid of `minmax(24rem,1fr) minmax(0,1fr)`: the board and the moves share it equally, the board never under 24rem and never over 42rem (`max-w-2xl`), and the moves start right beside it and fill the rest of the row, every cell on one line with tight padding (as in the opening-rack lookup's table), the inference's leaves as wide as the moves above them; narrower, the moves go under the board. The rack tiles stay square, shrinking to fit one line rather than deforming. Anyone may see them, signed in or not: an account only makes API keys. Clicking a ranked move to preview it on the board is a follow-up.
+- A **Significance Test** card, for a job that runs the test (one without has none, and `games.test` is `null`) (`MatchTestCard.svelte`, `lib/matchTest.ts`): a badge (`running`, the better player by name in its colour, `inconclusive`, or paused or not decided from the job's own status), then three tiles — **Verdict** ("Too early" before the minimum, "No verdict yet", the better player's name with when it was decided, or why there is none), **player 1's score** to two places with its interval (nothing on a rating scale; for a decided job, how many pairs finished after the decision), and the **pairs** (or games) played of the cap over a progress bar marking the minimum — a chart of the interval with 50% always in the middle, its left half player 2's colour and its right half player 1's, and a folded explanation with the job's own confidence. It uses the match score card's player colours and no green or red.
+- The pentanomial (game pairs only), in the Significance Test card: the pair outcomes the test is computed from, as one bar from player 1's sweeps (solid blue) through even pairs (grey) to player 2's (solid orange), a split pair fainter than a sweep, and a key giving each part's count and share of the pairs (`lib/charts/pentanomial.ts` `pairOutcomes`). Ratings are not here — they are pool-scoped and live on the [ratings page](#the-ratings-page).
+- A **match score** card, after the settings and before the Significance Test card (`MatchScore.svelte`, `lib/matchScore.ts`): each player's name in its own colour (player 1 blue, player 2 orange) over its share of the points to two places, a draw counting half, the leader's in bold; a bar of the games each won, its count written in its player's part and the draws a grey part between; then each player's average score and the average spread, as what the player ahead leads by, to two places. Colour tells the players apart and marks neither as better. A pairs job's card has a toggle, **All games · N** / **Diverged · M**, that switches every figure to only the games of the pairs whose two games did not play identically (`games.divergent`). It counts games for a pairs job too. For a job without a test it is the job's result. The averages are the batches' `p1_score_mean` / `p2_score_mean` weighted by their games, over every result of the job (one per task; `jobstats::SCORE_MEANS`).
+- **Saved positions**, for a job with `capture_positions` set: one captured position at a time, drawn on the job's own board (`Board.svelte`) — its premium squares from the layout, the tiles with their letters and scores (a blank in lower case, scoring nothing), both racks and scores with the player to move marked, the tiles the move before it placed bordered in a colour of its own (a dusty lavender, apart from both players'), and the move played from here washed in its player's colour (player 1 blue, player 2 orange: the match score card's), a key naming whose each was — beside its ranked moves — each with its win percentage, how often the simulation played it out (**Iters**), and its first two plies' average score and bingo percentage (P1-S, P1-BP, P2-S, P2-BP, P1 the reply) when it was simulated, and a solved move's depth as **Solved Plies** — and its CGP as text. A simulated position past turn 0 whose player inferred the opponent's leave first (its previous move not a pass) shows that inference under the moves: "Inferred from MOVE: N possible leaves, average equity E", and up to ten of the leaves the opponent most likely kept, with their draws and equity. **Random position** draws another (`GET /api/jobs/:id/positions/random`); a rack search shows that rack's positions newest first, one at a time with **Next** and **Previous** (`GET /api/jobs/:id/positions?rack=`). On a game-pairs job each position comes with its `partner`, the same turn of the pair's other game, and one of the two is drawn at a time ("Game 1 of the pair", "Game 2 of the pair"), with a toggle between them naming each game's player to move ("static-equity's move"); a rack both games hold finds the pair once. A job keeping only first divergences (`capture_first_divergence`) shows exactly the turn each pair's players first chose differently. There is no list of the newest positions: a job that captures holds millions, and one at a time on a board is what the section is for. The CGP and the move notation are read by `lib/cgp.ts` as MAGPIE writes them (`game_get_cgp_string`, `move_get_string`: `8G HUH` across, `E9 (E)RUVIM` down, letters played through in parentheses, `[L·L]` for a multi-letter tile); a position it cannot read is shown as text. The board scales to its box, so a phone shows it whole. From an `lg` screen up the pane is a grid of `minmax(24rem,1fr) minmax(0,1fr)`: the board and the moves share it equally, the board never under 24rem and never over 42rem (`max-w-2xl`), and the moves start right beside it and fill the rest of the row, every cell on one line with tight padding (as in the opening-rack lookup's table), the inference's leaves as wide as the moves above them; narrower, the moves go under the board. The rack tiles stay square, shrinking to fit one line rather than deforming. Anyone may see them, signed in or not: an account only makes API keys. Clicking a ranked move to preview it on the board is a follow-up.
 
 **Opening rack analysis**
 
@@ -1261,7 +1266,11 @@ demand, so "remaining tasks" was only what was in flight — a 3.2-million-rack
 job 1% done read three minutes left — and the job list's progress bar likewise
 counts each type's own units (games or pairs, racks settled, generations
 closed) rather than tasks handed out so far, as do the job pages (a leave job's
-`generations_closed`, not `current_generation`, which stops at the last).
+`generations_closed`, not `current_generation`, which stops at the last; the
+job pages' Progress card adds the current generation's share of racks at
+target, so it moves between closings, and is full once a job is completed --
+a job its significance test finished early is done, not a few percent of its
+cap).
 
 #### Live updates
 
@@ -2431,7 +2440,7 @@ being able to express once every job depends on the client honouring a protocol,
 so the columns are `NOT NULL` and default to **`0.1.1`**, the same value as the
 server's `MIN_MAGPIE_VERSION`, which `create_job` writes explicitly.
 
-`0.1.1` is the `birdtest-contribute` version the backend image pins. The version
+`0.1.1` is the version of the MAGPIE `main` commit the backend image pins. The version
 was incremented through `0.5.1` as birdtest and MAGPIE changed together during
 development and reset to `0.1.0` when the protocol settled; none of those numbers
 shipped. **The version moves with every change that can alter what a task
@@ -2547,7 +2556,7 @@ release installs it, and check `task_claims.magpie_version` and
 
 **An end-to-end test guards the two constants**, and it runs nightly rather than
 per pull request (`.github/workflows/nightly.yml`, running
-`scripts/e2e_magpie.py`): it compiles MAGPIE `birdtest-contribute` as
+`scripts/e2e_magpie.py`): it compiles MAGPIE `main` as
 `portable_release` (the build the backend image and the MAGPIE release use, so
 the wordmap it builds hashes the same as the server's; MAGPIE's Makefile
 refuses `BUILD=release`, which is a PGO target with its own recipe), installs data
@@ -4302,6 +4311,7 @@ MAGPIE's per-player settings, where `N` is 1 or 2:
 | `stopping_pct` | `-scN` | |
 | `use_inference` | `-siN` | |
 | `time_limit_secs` | `-tlN` | 0 for a simmer: no limit, so the iteration budget decides |
+| `movegens_per_move` | `-mbN` | The move generations the player may spend choosing one move -- its inference, simulation and solving together -- or null for no budget. Stated by every player, null included: MAGPIE refuses a player that leaves it out. When it is spent the player plays its best move so far; unlike a time limit it is the same work on any machine (`UPDATES_PLAN_2026-10-12.md`) |
 | `use_wordmap` | `-wN` | applied directly against `players_data`, not `-wN`'s own arg parsing, and **before** the task's lexicon loads, which is when MAGPIE decides whether to load a wordmap |
 | `use_rit` | — | applied against `players_data` the same way, and **before** the lexicon loads |
 | `rit_name` | — | The name to load the table under, `<lexicon>.<leaves>`. A table stores precomputed leave values, so it belongs to the pair rather than the lexicon; the server pins a hash for this exact name (see [Wordmap and rack info table provenance](#wordmap-and-rack-info-table-provenance)) |
@@ -4865,6 +4875,7 @@ the worker applies both rather than whatever its own settings last loaded.
               "use_wordmap": false, "use_rit": false, "rit_name": null,
               "win_pct_model": null, "max_iterations": null,
               "stopping_pct": null, "use_inference": null, "time_limit_secs": null,
+              "movegens_per_move": null,
               "min_play_iterations": null, "threshold": null, "sampling_rule": null,
               "inference_margin": null, "utility_w_winpct": null,
               "utility_w_spread": null, "utility_spread_scale": null } }
@@ -5680,7 +5691,7 @@ Every action on a job below — allocations, complete, consensus, purge, delete,
 | `POST` | `/api/admin/player-configs` | Create a new player configuration, named as a job is (at most 100 characters, one line, stored trimmed). Refuses what MAGPIE would refuse or cut short: more than 25 plies (`MAX_PLIES`), more than 10 recorded plies (what a captured position keeps), more than 200,000 plays generated (MAGPIE allocates every one up front, and a static player ranking every opening play needs up to some 64,000) or 32,767 recorded (a stored rank is a `SMALLINT`), a margin that is negative, not finite or past MAGPIE's largest equity (2,147,483.645), as well as non-positive counts. |
 | `GET` | `/api/admin/player-configs/:id` | Get a single player configuration. |
 | `DELETE` | `/api/admin/player-configs/:id` | Delete a player configuration. Rejected if any job, rating pool, rating history or clone references it. |
-| `POST` | `/api/admin/jobs` | Create a new job, with an optional `name` (at most 100 characters, one line; the form asks for it) shown first wherever jobs are listed and as the job page's title. An optional `max_task_seconds`, 600 to 86,400 (a `400` on the field otherwise), is the job's task time limit; left out, an hour. A games or pairs job names its players as `player_config_ids`: one is self-play, n ≥ 2 (at most 12, none twice) a round robin of C(n, 2) jobs named "{name}: A vs B", created all or none. A games or pairs job may state `threading_mode`, `igp` (the default) or `pgp`, which every task's request carries (see [Task Request Types](#task-request-types)); anything else is a `400` on the field. Answers `201` with `{ "jobs": [...] }`, each created job as stored. Created inactive at 0% — `PUT /api/admin/jobs/allocations` sets its allocation and starts dispatching work. Refuses a board layout that is not 15×15 (the fleet's MAGPIE builds are 15×15 -- a claim from any other is answered `unsupported_build` -- so every worker would fail every task) and a match-test confidence outside (50, 100) (at 100% the interval never closes). |
+| `POST` | `/api/admin/jobs` | Create a new job, with an optional `title` (at most 100 characters, one line; the form asks for it), the job page's heading. A games or pairs job's name, which every list shows and a worker is told, is its title and its players, "{title}: A vs B" ("A vs B" untitled, "A vs A" for self-play); another job's is its title. An optional `max_task_seconds`, 600 to 86,400 (a `400` on the field otherwise), is the job's task time limit; left out, an hour. A games or pairs job names its players as `player_config_ids`: one is self-play, n ≥ 2 (at most 12, none twice) a round robin of C(n, 2) jobs, each titled as given and named for its pairing, created all or none. A games or pairs job may state `threading_mode`, `igp` (the default) or `pgp`, which every task's request carries (see [Task Request Types](#task-request-types)); anything else is a `400` on the field. Answers `201` with `{ "jobs": [...] }`, each created job as stored with its `name`. Created inactive at 0% — `PUT /api/admin/jobs/allocations` sets its allocation and starts dispatching work. Refuses a board layout that is not 15×15 (the fleet's MAGPIE builds are 15×15 -- a claim from any other is answered `unsupported_build` -- so every worker would fail every task) and a match-test confidence outside (50, 100) (at 100% the interval never closes). |
 | `PUT` | `/api/admin/jobs/allocations` | Set several jobs' allocations at once. Body: `{ "allocations": [{ "job_id": uuid, "allocation": int }] }`. Checked as a whole -- the active jobs must sum to at most 100% as the request leaves them -- under the activation lock, every named row locked in id order first. The only way an admin activates or deactivates a job: above 0% a job is active (activated if it was not), and a job the server set aside for its time-limit declines starts a new run of them, its reason cleared; 0% leaves it inactive at 0% (deactivated if it was active). A completed job (even at 0%), a job named twice or an allocation outside 0–100 refuses the whole request. Audited once per job that changes, from what to what in `reason`: `job.activated` / `job.deactivated` for a job switched on or off, `job.allocation_changed` for an active job's new share. Answers `{ "jobs": [...] }`, the named jobs as they now stand. The `/admin/allocation` page sends it. |
 | `PATCH` | `/api/admin/jobs/:id/consensus` | Change an opening-rack job's consensus settings. Body: any of `{ "min_results_per_rack", "max_results_per_rack", "consensus_pct" }`; only those sent change. Refuses (`400`) what creation refuses, and any other job type. Restates every rack, then reopens a completed job left with unsettled racks (inactive at 0%, for the admin to give an allocation) and completes an active one left with none. Answers `{ job, config, unsettled_racks, reopened }`. `409` while a purge, delete or another consensus change of the job is running. Audited as `job.consensus_changed`. See [Editing the consensus](#opening-rack-consensus). |
 | `PATCH` | `/api/admin/jobs/:id/time-limit` | Change a job's task time limit, any type and any status: `{ "max_task_seconds": int }`, 600 to 86,400 (ten minutes to a day — a first claim may build a rack info table that cannot be stopped; anything else is a `400` on the field, and the column's CHECK refuses it too). The limit applies to the job's claims made after the change; every claim keeps the deadline it was given. Audited as `job.time_limit_changed`, from what to what; a change to what it already is writes nothing. Answers `{ max_task_seconds }`. The job's admin page sends it. |
@@ -5867,11 +5878,13 @@ Beyond role matching, creation enforces seven rules the schema cannot express:
 
 **Round robins.** A games or game-pairs request names its players as
 `player_config_ids`, a list, rather than a player 1 and a player 2. One config
-is a self-play job, under the name as given. **n ≥ 2 configs are a round
-robin**: C(n, 2) jobs, every pairing once, each seated in the order the configs
-were listed (player 1 the earlier) and named "{name}: A vs B" — or "A vs B" with
-no name — after the configs' names; two configs are the one job between them,
-named the same way. The seat matters little (a pair swaps seats within itself,
+is a self-play job. **n ≥ 2 configs are a round robin**: C(n, 2) jobs, every
+pairing once, each seated in the order the configs were listed (player 1 the
+earlier); two configs are the one job between them. Every job stores the title
+as given, and a games or pairs job is named for it and its configs' names,
+"{title}: A vs B" — "A vs B" with no title, "A vs A" for self-play — built
+when it is shown (`models::job::job_name`) rather than stored, so a job page
+can head itself with the title and list the players under it. The seat matters little (a pair swaps seats within itself,
 and a games batch is even, so each player moves first in half of every task's
 games), but a fixed rule keeps "A vs B" A's player-1 side wherever it is shown.
 At most twelve configs (66 jobs), none named twice — a config twice would pair
@@ -5998,7 +6011,7 @@ SvelteKit uses file-based routing under `frontend/src/routes/`. Each directory w
 |---|---|
 | `/` | Landing page — brief description of birdtest, links to the job list and the worker setup guide. |
 | `/jobs` | Job list — all jobs with type, status, allocation, and completion counter. Loaded on visit rather than live: there is no job-list stream, only a per-job one. |
-| `/jobs/[id]` | Job detail — four headline cards (allocation, tasks completed, throughput -- units finished an hour over the last hour or since activation, in the job's own unit: games, pairs, rack analyses, or a leave job's games (`JobStats.throughput`), the rate the ETA extrapolates -- and estimated time left; the admin page has the same), job-type-specific stats and per-worker contribution table with the job's movegens under it, then the settings cards last. Live-updated via SSE. The status card says nothing beside an active job's badge; an inactive job's says "Paused: …" (and where its significance test stands), a completed job's "Finished …: …" and why. Beside the lexicon and variant, how each player searches ("4-ply sim, 1,000 iterations vs static, by equity"); a Job settings card — the job's settings and its type's, every row, with no toggle, the significance test one row ("no" or "yes (95%)") — then a Player settings card, the players side by side (`PlayerSettingsTable`: one column per player, each name linking to its config), showing two players only the settings they differ in ("These players' settings are identical." when none) and one player its key rows (Lexicon, Leaves, Sorted By, Move Recorder, Moves Generated, Plies, Uses Inference, Uses Preendgame, Uses Endgame), with an "All settings" toggle for every row, and a JSON download (`GET /api/jobs/:id/config`). Which player rows are key is `jobSettings.ts`'s (`PLAYER_ROWS`, `keySettings`). The admin job page has the same cards. |
+| `/jobs/[id]` | Job detail — a Progress card (`JobProgressCard.svelte`, `lib/jobProgress.ts`): the percentage done ("Done" once completed, with why a job stopped short of its cap) over a bar, then four figures -- done (in the job's own unit, of its cap), throughput (units finished an hour over the last hour or since activation, in the job's own unit: games, pairs, rack analyses, or a leave job's games (`JobStats.throughput`), the rate the ETA extrapolates), time left with the clock time it reaches, and allocation -- and the tasks by state in a line; the admin page has the same, job-type-specific stats and per-worker contribution table with the job's movegens under it, then the settings cards last. Live-updated via SSE. The status card says nothing beside an active job's badge; an inactive job's says "Paused: …" (where its significance test stands is that card's to say), a completed job's "Finished …: …" and why. Beside the lexicon and variant, how each player searches ("4-ply sim, 1,000 iterations vs static, by equity"); a Job settings card — the job's settings and its type's, every row, with no toggle, the significance test one row ("no" or "yes (95%)") — then a Player settings card, the players side by side (`PlayerSettingsTable`: one column per player, each name linking to its config), showing two players every setting, those they differ in marked with an amber edge and tint and counted beside the heading ("3 of 33 differ"), with a "Different settings only" toggle ("These players' settings are identical." when none), and one player its key rows (Lexicon, Leaves, Sorted By, Move Recorder, Moves Generated, Plies, Uses Inference, Uses Preendgame, Uses Endgame), with an "All settings" toggle for every row, and a JSON download (`GET /api/jobs/:id/config`). Which player rows are key is `jobSettings.ts`'s (`PLAYER_ROWS`, `keySettings`). The admin job page has the same cards. |
 | `/users` | Registered user list — all user accounts with contribution stats. |
 | `/workers` | **Contributions** (the nav's and the heading's name; the URL stays) — the site's totals (movegens, compute time, tasks) and the same by job type, then the contributor leaderboard — all workers (anonymous and authenticated) ranked by movegens (shown as "1.2M"; the exact count on hover), or by compute time or tasks at a click on the column; on a phone only the ranked column is shown beside the name, and a "Rank by" row above the list chooses it. |
 | `/ratings` | Rating pool list — each pool's conditions, member count and last fit. |
@@ -6034,7 +6047,7 @@ Protected by a layout guard (`/admin/+layout.svelte`) that requires `is_admin = 
 | `/admin` | Admin overview — redirects to `/jobs`, the job list; a job's page links ("Manage") to its admin page, `/admin/jobs/:id`. There is no `/admin/jobs` list; `/admin/jobs/new` creates a job. |
 | `/admin/allocation` | Every active and inactive job with its allocation, set together and saved in one request (`PUT /api/admin/jobs/allocations`): a running total that turns red above 100% and holds the save, "Share equally" (among the jobs above 0% and those the creation form just made, `?new=`), and only the jobs changed are sent. |
 | `/admin/jobs/new` | Create job form — job type selector, then type-specific config fields; a games or pairs job's players are a checklist — one ticked is a self-play job, several a [round robin](#admin-api-semantics) of a job per pairing, seated in the order ticked — with a live preview of the matchups ("4 configs → 6 jobs" and each job's name), and creating one goes to `/admin/allocation` with the new jobs marked, where they are started (any other job type goes to its own page); a games or pairs job can be set to save the positions it plays (`capture_positions`), which caps its batch at 1,000 games or 500 pairs, and a pairs job saving them to keep only where each pair first diverges (`capture_first_divergence`); a games or pairs job's **Threading** is "Intra-game parallelism (all threads on one game)" (`igp`, the default: every thread on one game's simulation, which makes an iteration-bounded simulation reproducible) or "Per-game parallelism (one game per thread)" (`pgp`), which matters only when a player simulates. The letter distribution and board layout start empty ("Choose…") and must be picked, here and on the rating-pool form: the first of each imported is no default worth having. A games or pairs job's **Significance Test** checkbox, ticked, shows its **Confidence %** (95) and minimum; an opening-rack job's consensus is three fields, Minimum and Maximum Analyses Per Rack and Consensus %. Every job type has a **Task Time Limit (Seconds)** beside Oldest MAGPIE, 3600 until changed, saying how long that is ("1h") and what reaching it does. Every field is named as the settings tables name it, in Title Case. |
-| `/admin/jobs/[id]` | Admin job view — the public page's four headline cards, a Controls card with the job's **Task Time Limit (Seconds)** and its Save (`PATCH .../time-limit`: claims already made keep their deadlines), the job's progress, its settings, match score and Significance Test cards as the public page has them, for an opening-rack job a Consensus card that changes its consensus settings (`PATCH .../consensus`), contributors and data gaps (what workers declined it for) plus the job's allocation, read-only with a link to `/admin/allocation` (the only place a job is switched on or off), and controls: force-complete, purge, delete (each asks first: none can be taken back), an artifact check and "merge progress now" for leave generation, and the export panel — a completed job's final export or a snapshot of a running one; start, poll, download. |
+| `/admin/jobs/[id]` | Admin job view — the public page's Progress card, after the status, a Controls card with the job's **Task Time Limit (Seconds)** and its Save (`PATCH .../time-limit`: claims already made keep their deadlines), its settings, match score and Significance Test cards as the public page has them, for an opening-rack job a Consensus card that changes its consensus settings (`PATCH .../consensus`), contributors and data gaps (what workers declined it for) plus the job's allocation, read-only with a link to `/admin/allocation` (the only place a job is switched on or off), and controls: force-complete, purge, delete (each asks first: none can be taken back), an artifact check and "merge progress now" for leave generation, and the export panel — a completed job's final export or a snapshot of a running one; start, poll, download. |
 | `/admin/player-configs` | Player config list — name, recorder type, sort strategy, sim parameters. |
 | `/admin/player-configs/new` | Create player config form, each field named as the settings tables name it with its MAGPIE argument beside it ("Move Recorder (-r)", "Sorted By (-s)"). No number box on either form has spinner arrows. |
 | `/admin/rating-pools/new` | Create rating pool form — name, variant, letter distribution, board layout, anchor config and rating, and optionally the other members to add once it exists. Linked from `/ratings` for an admin; membership is managed on the pool's page after that. |
@@ -6076,8 +6089,12 @@ mean anything, and the level is wherever the pool's anchor was pinned — so bar
 length would imply a ratio that does not exist. A dot on a common scale encodes
 position, which is what a rating is. The error bar matters as much as the dot, because a config with two
 hundred pairs and one with two million otherwise produce identical-looking
-numbers and only the interval says which to believe. A config with no path to the
-anchor is listed beneath the chart as **unrated** rather than drawn at a number.
+numbers and only the interval says which to believe. Each bar has two widths, a
+thick ±1 standard error over a thin 95% interval, and each row's rating and true
+error print at its end, so a visitor reads them without hovering; a line under the
+chart says what a gap means (100 points about a 60–40 score, 275 points 75–25). A
+config with no path to the anchor is listed beneath the chart as **unrated**
+rather than drawn at a number.
 
 **A table of every config**, for admins only, after the plot: the
 exact rating to a decimal, ± SE as a number and pairs played per config, with
@@ -6252,22 +6269,23 @@ birdtest/
 │       │   ├── format.ts           # shared display formatting (job type labels, durations)
 │       │   ├── cgp.ts              # reading MAGPIE's CGP and move strings for the board
 │       │   ├── moveList.ts         # a move list's simulation columns and inference
-│       │   ├── compare.ts          # a two-player table row, better green and worse red
-│       │   ├── matchScore.ts       # the match score's rows
+│       │   ├── matchScore.ts       # the match score card's figures
 │       │   ├── matchTest.ts        # the significance test card's interval and sentence
 │       │   ├── consensus.ts        # an opening-rack job's consensus settings and standing
 │       │   ├── roundRobin.ts       # a games or pairs request's matchups, previewed as the server makes them
 │       │   ├── jobSettings.ts      # a job's and a player config's settings tables
-│       │   ├── charts/             # pentanomial.ts (the pair-outcome table), ratingDotPlot.ts,
+│       │   ├── jobProgress.ts      # a job's Progress card: how far along, its pace, time left
+│       │   ├── status.ts           # each state's word, tone and icon, for the status pills
+│       │   ├── charts/             # pentanomial.ts (the pair-outcome bar), ratingDotPlot.ts,
 │       │   │                       # residuals.ts, labels.ts: the arithmetic behind the charts
 │       │   └── components/         # shared UI components
 │       │       ├── JobStatusBadge.svelte
-│       │       ├── JobStatusCard.svelte  # where a job stands, a row above the headline figures
-│       │       ├── JobStatsRow.svelte    # the four headline figures
+│       │       ├── JobStatusCard.svelte  # where a job stands, a row above its progress
+│       │       ├── JobProgressCard.svelte # how far along a job is, its pace and time left
+│       │       ├── StatusPill.svelte     # a state as a pill: an icon, then its word
 │       │       ├── JobSettings.svelte    # a job's settings and its players'
 │       │       ├── PlayerSettingsTable.svelte # player configs' settings, a column per player
-│       │       ├── TaskCounts.svelte     # a job's tasks by state
-│       │       ├── MatchScore.svelte     # the match score (and its divergent-games table)
+│       │       ├── MatchScore.svelte     # the match score (and its diverged-games toggle)
 │       │       ├── MatchTestCard.svelte  # the significance test
 │       │       ├── SavedPositions.svelte # captured positions, one at a time
 │       │       ├── PositionPane.svelte   # one position: board, ranked moves, CGP
@@ -6277,8 +6295,7 @@ birdtest/
 │       │       ├── WorkerTable.svelte
 │       │       ├── Pagination.svelte
 │       │       ├── ProgressBar.svelte
-│       │       ├── RatingDotPlot.svelte  # ratings with error bars (not a bar chart: a rating has no zero)
-│       │       └── PlayerCompareTable.svelte # two players side by side, higher green
+│       │       └── RatingDotPlot.svelte  # ratings with error bars (not a bar chart: a rating has no zero)
 │       └── routes/
 │           ├── +layout.svelte      # global layout (nav bar, footer)
 │           ├── +layout.ts          # a static SPA: no SSR, no prerendering
@@ -7046,6 +7063,7 @@ CREATE TABLE player_configs (
     -- games or game-pairs job that captures positions: MAGPIE reads player
     -- 1's for both seats, so job creation requires the two to agree.
     movegen_margin         DOUBLE PRECISION NOT NULL, -- move-gen equity margin for 'equity' recording (-mmargin)
+    movegens_per_move      BIGINT CHECK (movegens_per_move > 0), -- per-move movegen budget, NULL for none (-mb1 / -mb2)
     -- Endgame and pre-endgame (PEG) solving, read only by games and game-pairs
     -- jobs: an opening rack never reaches a small bag, and a leave job's games
     -- end before one (job creation refuses a leave player that solves).

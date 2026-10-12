@@ -5,8 +5,11 @@
    * job. It lists, by `mode`, the settings the players differ in, the key
    * rows, or every one; the card around it holds the toggle. Two players
    * alike have no differences, and say so rather than show an empty table.
-   * Settings the job never reads (`unused`, by row id) are shown muted, with a
-   * note, and are never a difference. A job's players are headed by their
+   * Settings the job never reads (`unused`, by row id) are shown muted, and
+   * are never a difference. Listed among settings they share, the
+   * ones two players differ in are marked: an amber edge and tint, the label
+   * and values in weight; listed alone they are the table, and unmarked. A
+   * job's players are headed by their
    * part in it, their colour -- the one their moves are drawn in on a saved
    * position's board -- and their name, which links to the config's page.
    */
@@ -24,15 +27,11 @@
   $: headed = players.some((p) => p.role);
   // Two players, each in the colour the saved positions draw their moves in.
   $: colored = players.length === PLAYED_COLORS.length;
-  $: muted = rows.some((r) => r.unused);
+  // Only beside settings the players share does a difference need marking.
+  $: marking = players.length > 1 && mode !== 'differences';
 </script>
 
 <div class="space-y-2">
-  {#if muted}
-    <p class="text-xs text-muted-foreground">
-      Settings in grey are the player config's, and this job does not use them.
-    </p>
-  {/if}
   {#if mode === 'differences' && !rows.length}
     <p class="text-sm text-muted-foreground" data-testid="settings-identical">
       These players' settings are identical.
@@ -67,9 +66,20 @@
         {/if}
         <tbody data-testid="setting-rows">
           {#each rows as row}
-            <tr class:text-muted-foreground={row.unused} data-setting={row.id}>
-              <td class="w-1/3 text-muted-foreground">{row.label}</td>
-              {#each row.values as value}<td class="break-words tabular-nums">{value}</td>{/each}
+            {@const marked = marking && row.differs}
+            <tr
+              class="{row.unused ? 'text-muted-foreground' : ''} {marked ? 'bg-warning/10' : ''}"
+              data-setting={row.id}
+              data-differs={marked || undefined}
+            >
+              <td
+                class="w-1/3 {marked
+                  ? 'font-medium text-foreground shadow-[inset_3px_0_0_hsl(38_92%_50%)]'
+                  : 'text-muted-foreground'}"
+              >
+                {row.label}{#if marked}<span class="sr-only"> (the players differ)</span>{/if}
+              </td>
+              {#each row.values as value}<td class="break-words tabular-nums" class:font-semibold={marked}>{value}</td>{/each}
             </tr>
           {/each}
         </tbody>

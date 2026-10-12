@@ -120,6 +120,10 @@ SMALL_FILES = (
 # gives up after repeated failures, so the output is checked too.
 FAILURE_SIGNS = ("task failed", "rejected the result", "gave up", "declining this task",
                  "declining a job", "Cannot contribute")
+# What a finished task's line says it took: "[14:03:07] finished task #3: dev
+# pairs in 2m 13s (5 started, 4 completed)".
+FINISHED_LINE = re.compile(
+    r"finished task #\d+: .* in \d+[dhms]( \d+[dhms])* \(\d+ started, \d+ completed\)")
 
 
 def log(message: str) -> None:
@@ -288,7 +292,7 @@ def create_and_activate(ctx: Context, data: dict, body: dict) -> str:
     started = time.time()
     response = ctx.client.session.post(
         f"{ctx.client.api}/api/admin/jobs",
-        json={"name": f"tier 6 {body['job_type'].replace('_', ' ')}", "variant": "classic",
+        json={"title": f"tier 6 {body['job_type'].replace('_', ' ')}", "variant": "classic",
               "letterdist_id": data["letterdist"], "layout_id": data["layout"], **body},
         headers=ctx.client._headers(), timeout=1800,
     )
@@ -457,6 +461,9 @@ class Worker:
         if succeed:
             for sign in FAILURE_SIGNS:
                 expect(sign not in output, f"a task failed ({sign!r}):\n{output[-3000:]}")
+            if "started task #" in output:
+                expect(FINISHED_LINE.search(output) is not None,
+                       f"no finished line says how long its task took:\n{output[-3000:]}")
         return output
 
     def remove(self) -> None:
@@ -938,6 +945,47 @@ def case_inference(ctx: Context) -> None:
         worker.remove()
 
 
+def case_movegen_budget(ctx: Context) -> None:
+    """M-18: a player's movegen budget per move reaches MAGPIE and binds. The
+    same simmer plays two games against a static player twice: without a
+    budget, its iteration budget runs a few thousand generations a move;
+    with 2,000 a move, the job's reported movegens per game fall well below."""
+    deactivate_everything(ctx)
+    simmer = {
+        "recorder_type": "all", "winpct_id": ctx.winpct, "num_plies": 2, "num_plays": 10,
+        "num_plies_recorded": 2, "num_plays_recorded": 5, "max_iterations": 5000,
+        "stopping_pct": 99, "time_limit_secs": 0, "use_inference": False,
+        "use_wordmap": False, "use_rit": False,
+    }
+    opponent = create_player(ctx, ctx.data, "e2e-budget-opponent", {"use_wordmap": False, "use_rit": False})
+    per_game = {}
+    for label, budget in (("unbudgeted", None), ("budgeted", 2_000)):
+        body = {**simmer, "movegens_per_move": budget}
+        players = {
+            "player1_config_id": create_player(ctx, ctx.data, f"e2e-budget-{label}", body),
+            "player2_config_id": opponent,
+        }
+        job_id = create_and_activate(ctx, ctx.data, games_body(players, 2))
+        worker = Worker(ctx, f"m18-{label}")
+        try:
+            worker.run(tasks=1)
+            movegens, games = ctx.psql(
+                "SELECT COALESCE(SUM(c.movegens), 0), "
+                "       (SELECT COALESCE(SUM(games), 0) FROM game_results "
+                f"        WHERE job_id = '{job_id}') "
+                f"FROM task_claims c WHERE c.job_id = '{job_id}' AND c.state = 'completed'"
+            ).split("|")
+            expect(int(games) > 0, f"the {label} job played no games")
+            per_game[label] = int(movegens) / int(games)
+        finally:
+            delete_job(ctx, job_id)
+            worker.remove()
+    log(f"M-18: {per_game['unbudgeted']:,.0f} movegens a game without a budget, "
+        f"{per_game['budgeted']:,.0f} with 2,000 a move")
+    expect(per_game["budgeted"] < per_game["unbudgeted"] / 2,
+           f"a budget of 2,000 a move did not cut the movegens a game: {per_game}")
+
+
 def case_first_divergences(ctx: Context) -> None:
     """M-14: a game-pairs job keeping first divergences stores, from each pair
     that diverged, both games' positions at one turn of one position, each
@@ -1393,6 +1441,7 @@ CASES = {
     "M-15": case_consensus,
     "M-16": case_inference,
     "M-17": case_solvers_many_threads,
+    "M-18": case_movegen_budget,
     "capture": case_capture,
 }
 DEFAULT_CASES = [name for name in CASES if name.startswith("M-")]

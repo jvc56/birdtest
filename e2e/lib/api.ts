@@ -161,7 +161,9 @@ export class AdminApi {
 
 export interface JobSummary {
   id: string;
-  /** A games or pairs job between two configs is named "A vs B" for them. */
+  /** What the admin called it; empty for a job created without one. */
+  title: string;
+  /** A games or pairs job is named "{title}: A vs B", or "A vs B" untitled. */
   name: string;
   job_type: string;
   status: string;
@@ -169,6 +171,17 @@ export interface JobSummary {
 }
 
 /** The game-pairs job scripts/seed.py created: the first one there is. */
+/** A job page's heading: its title, or its type for a job without one. */
+export function jobHeading(job: JobSummary): string {
+  const types: Record<string, string> = {
+    games: 'Games',
+    game_pairs: 'Game Pairs',
+    opening_rack: 'Opening Rack Analysis',
+    leave_generation: 'Leave Generation'
+  };
+  return job.title || types[job.job_type];
+}
+
 export async function seededJob(api: APIRequestContext): Promise<JobSummary> {
   const page = await body<{ items: JobSummary[] }>(await api.get('/api/jobs?per_page=500'), 'list jobs');
   const pairs = page.items

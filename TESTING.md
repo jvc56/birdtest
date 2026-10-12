@@ -69,12 +69,12 @@ at tier 5 names a symptom.
 | Tier | Tests | Where |
 |---|---|---|
 | 1 Unit | 250 | `#[cfg(test)]` in `jobs::plausibility` (30), `inputdata` (30), `jobs::racks` (17), `stats::bradley_terry` (30), `stats::match_test` (10), `stats::outcomes` (7), `error` (9), `config` (8), `extract` (7), `routes::admin` (16), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (5), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (7), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (8), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `board`, `exports`, `jobs`, `jobs::leave_gen`, `routes` (1 each); `jobs::game_pair` (3), `artifacts` (2) |
-| 1F Frontend unit | 218 | Vitest, `frontend/src/lib/`: `format.test.ts` (46), `jobSettings.test.ts` (13), `matchScore.test.ts` (4), `matchTest.test.ts` (5), `moveList.test.ts` (5), `compare.test.ts` (3), `consensus.test.ts` (8), `cgp.test.ts` (16), `api.test.ts` (18), `auth.test.ts` (17), `accountRules.test.ts` (9), `ratingPool.test.ts` (7), `sse.test.ts` (12), `importWatch.test.ts` (10), `poller.test.ts` (7), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (3), and `charts/`: `ratingDotPlot.test.ts` (19), `labels.test.ts` (2), `residuals.test.ts` (5), `pentanomial.test.ts` (5) |
+| 1F Frontend unit | 224 | Vitest, `frontend/src/lib/`: `format.test.ts` (44), `jobProgress.test.ts` (6), `status.test.ts` (2), `jobSettings.test.ts` (13), `matchScore.test.ts` (4), `matchTest.test.ts` (8), `moveList.test.ts` (5), `consensus.test.ts` (8), `cgp.test.ts` (16), `api.test.ts` (18), `auth.test.ts` (17), `accountRules.test.ts` (9), `ratingPool.test.ts` (7), `sse.test.ts` (12), `importWatch.test.ts` (10), `poller.test.ts` (7), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (3), and `charts/`: `ratingDotPlot.test.ts` (19), `labels.test.ts` (2), `residuals.test.ts` (5), `pentanomial.test.ts` (5) |
 | 2 Integration | 186 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (33), `scheduler.rs` (19), `jobs.rs` (20), `stats.rs` (19), `input_data.rs` (14), `derived.rs` (9), `leave_generation.rs` (8), `exports.rs` (16), `submissions.rs` (6), `artifacts.rs` (5), `audit.rs` (3) |
 | 3 API | 250 | `backend/tests/`: `worker_api.rs` (52), `admin_api.rs` (59), `auth_routes.rs` (28), `worker_routes.rs` (24), `boundaries.rs` (18), `public_api.rs` (24), `admin_routes.rs` (13), `authz.rs` (7), `account.rs` (10), `auth_api.rs` (5), `finish.rs` (9), `fake_worker.rs` (1) |
 | 4 Contract | 15 | `routes::worker::contract_fixtures`, over 18 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
 | 5 End-to-end | 22 | Playwright journeys `E-1`..`E-18` (`E-11` in three tests, `E-10` and `E-12` in two each) in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
-| 6 MAGPIE smoke | 16 cases + 16 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-17` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 16 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (6), `magpie_leave.rs` (7), `magpie_routes.rs` (3) |
+| 6 MAGPIE smoke | 17 cases + 16 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-18` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 16 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (6), `magpie_leave.rs` (7), `magpie_routes.rs` (3) |
 
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
@@ -435,8 +435,8 @@ process environment, so no test mutates `std::env` under another.
   files; `scripts/e2e_magpie_native.sh`; `backend/.env.example`, which a
   backend run on the host starts from; the root `.env.example`, which a
   compose user copies to `.env` (its commented value and the version it says
-  the contribute branch reports; thirty-third audit, pass 3); the same
-  "`birdtest-contribute` reports" sentence in `backend/.env.example` and
+  MAGPIE's `main` reports; thirty-third audit, pass 3); the same
+  "MAGPIE's `main` reports" sentence in `backend/.env.example` and
   `docker-compose.yml` (thirty-third audit, pass 4); the `jobs`
   table's three column defaults; and `scripts/dev.py`'s note. A raise that missed Terraform passed
   CI and left production admitting the builds it was meant to keep out
@@ -861,23 +861,18 @@ Each entry's tests are the `describe` block named for its id.
   the decision it stopped on (`player1_better`, `player2_better`,
   `inconclusive`); a job without a test is `off` whatever its status.
   *(Covered: `format.test.ts`, `F-FMT-5b testState`.)*
-- `F-FMT-5` `testLabel` covers every status ("decided: player 1 is better",
-  "inconclusive: the job reached its cap first", …). *(Covered:
-  `format.test.ts`.)*
 - `F-FMT-5c` `scorePct` shows a score per game as a percentage to a tenth
   (0.53125 is "53.1%", 0.5 "50.0%"). The `signedElo` this entry once also
   named no longer exists: no page shows an Elo difference. *(Covered:
   `format.test.ts`, `F-FMT-5c scores`.)*
-- `F-MATCH-1` The match score table's rows, a column per player: wins,
-  losses (player 2's wins and losses are player 1's losses and wins, and
-  fewer losses are better), draws, the average scores to a decimal place and
-  the spread signed from each player's side ("+13.4" / "-13.4", never
-  "-0.0"); before any game, no average rather than 0 or NaN. The same rows
-  serve a pairs job's divergent-games table. *(Covered: `matchScore.test.ts`.)*
-- `F-CMP-1` A two-player table marks the better value of a row better (green)
-  and the other worse (red) -- the higher, or the lower where the row says
-  fewer is better (losses) -- and neither when they are equal or one is
-  missing. *(Covered: `compare.test.ts`.)*
+- `F-MATCH-1` The match score card's figures: the games each player won
+  (player 2's are player 1's losses) and the draws once, each player's share
+  of the points to two places with a draw half ("59.52%" / "40.48%"), the
+  player ahead (neither when level), the average scores to two places, and
+  the spread as what the player ahead leads by ("13.39", never "-0.00", and
+  neither ahead when it rounds to nothing); before any game, no share or
+  average rather than 0 or NaN. The same figures serve a pairs job's
+  diverged games. *(Covered: `matchScore.test.ts`.)*
 - `F-SET-1` The settings tables (`lib/jobSettings.ts`), in SETTINGS_COMPARISON.md's
   orders. A job's settings are one ordered list, every row shown (type,
   variant, letter distribution, board, bingo bonus; a games job's target or
@@ -919,7 +914,10 @@ Each entry's tests are the `describe` block named for its id.
 - `F-SET-2` The player settings table lists, by its mode
   (`differingSettings`, `settingsFor`, `PlayerSettingsTable.svelte`), the
   settings two players differ in -- key or not -- as ordinary rows, with no
-  heading, tint or fold; the key rows; or every row. Two players alike, asked
+  heading, tint or fold; the key rows; or every row, where the settings two
+  players differ in are marked (`data-differs`, an amber edge and tint, and
+  "(the players differ)" to a screen reader) and a setting the job never
+  reads never is. Two players alike, asked
   for their differences, say "These players' settings are identical." rather
   than show an empty table; one player lists its key rows with no colour; each
   of two players is headed by its colour. *(Covered: `jobSettings.test.ts`,
@@ -931,9 +929,9 @@ Each entry's tests are the `describe` block named for its id.
   interval; an admin's force-complete, "before its test decided" only when
   there was a test; a job without a test playing what it was set to; and the
   other job types' own ends. *(Covered: `format.test.ts`.)*
-- `F-FMT-13` `jobTitle` titles a job by the name it was given, or by its
-  type ("Game Pairs") for one given none or only spaces: the job page's
-  heading and the job lists. *(Covered: `format.test.ts`.)*
+- `F-FMT-13` `jobName` is a job's name as the server gives it ("{title}: A vs
+  B"), or its type ("Game Pairs") for one with none or only spaces: the job
+  lists. *(Covered: `format.test.ts`.)*
 - `F-FMT-6` A blank optional number is `null`, never 0 (Svelte binds a cleared
   number box as `null`, and `Number(null)` is 0, which the player-config form
   wrote into configs that cannot be edited), and a request's blank required
@@ -978,10 +976,36 @@ Each entry's tests are the `describe` block named for its id.
   time limit — lower the batch size, or raise the limit"), "1 task" for one,
   and nothing while none has. *(Covered:
   `format.test.ts`.)*
-- `F-FMT-21` `throughputText` reads a job's pace an hour in its unit
-  ("1,240 games/hour", "8 pairs/hour"): whole units from ten up, a decimal
-  below, "1 game/hour" singular, and a dash with no recent work. *(Covered:
+- `F-FMT-21` `throughputParts` reads a job's pace an hour in its unit, the
+  figure and the unit apart ("1,240" and "games/hour", "8" and
+  "pairs/hour"): whole units from ten up, a decimal below, "game/hour"
+  singular, and nothing with no recent work. *(Covered:
   `format.test.ts`.)*
+
+### `F-PROG-*` — `lib/jobProgress.ts`
+
+- `F-PROG-1` The Progress card counts each job type's own work: a games or
+  pairs job's against its cap ("of up to" it when a significance test may
+  stop it first), an opening-rack job's settled racks, a leave-generation
+  job's closed generations plus the current one's share of racks at target
+  (so it moves between closings, and the last generation's racks never count
+  twice). A completed job is full and "Done", and one that stopped short of
+  its cap says why: the test decided, or an admin completed it. *(Covered:
+  `jobProgress.test.ts`.)*
+- `F-PROG-2` Its Throughput figure is the pace and its unit apart, or "—"
+  with why (not measured yet, paused while inactive, finished); its Time
+  left the time at the current pace and the clock time it reaches, only
+  while the job is active, and when a completed job finished. *(Covered:
+  `jobProgress.test.ts`.)*
+
+### `F-STATUS-*` — `lib/status.ts`
+
+- `F-STATUS-1` Every status pill pairs its word with a tone and an icon, so a
+  state reads by shape as well as colour: a job active (green, play),
+  inactive (grey, pause) or completed (grey, a tick: not the links' blue),
+  one the site does not know as itself; a derived file queued, building (a
+  spinning arc), built or failed (red, a cross); a backup ok or failed.
+  *(Covered: `status.test.ts`.)*
 
 ### `F-MOVEGENS-*` — `lib/movegens.ts`
 
@@ -994,10 +1018,10 @@ Each entry's tests are the `describe` block named for its id.
 
 ### `F-RR-*` — `lib/roundRobin.ts`
 
-- `F-RR-1` `matchups` makes one self-play job of one config under the name as
-  given, every pairing once for more -- seated in the order given (3 → 3,
-  4 → 6) -- and names each "{name}: A vs B", or "A vs B" with no name, as the
-  server does (`I-JOB-15`). *(Covered: `roundRobin.test.ts`.)*
+- `F-RR-1` `matchups` makes one self-play job of one config, named "{title}:
+  A vs A", every pairing once for more -- seated in the order given (3 → 3,
+  4 → 6) -- and names each "{title}: A vs B", or "A vs B" with no title, as
+  the server does (`I-JOB-15`). *(Covered: `roundRobin.test.ts`.)*
 - `F-RR-2` `matchupSummary` reads "4 configs → 6 jobs", "1 config → 1
   self-play job", and why none or more than twelve cannot be sent;
   `matchupsAllowed` is one to twelve. *(Covered: `roundRobin.test.ts`.)*
@@ -1038,15 +1062,17 @@ Each entry's tests are the `describe` block named for its id.
 
 ### `F-TEST-*` — `lib/matchTest.ts`
 
-- `F-TEST-1` `testBar` scales the match test's bar to the interval and an
-  even score, with a margin of a tenth of that span either side (at least a
-  point), and keeps a wide interval within the scores that exist. *(Covered:
-  `matchTest.test.ts`.)*
-- `F-TEST-2` `testSentence` states player 1's score per game with its range,
-  named for the players and with no Elo or rating figure ("… scores 53.1% per
-  game (95% interval 51.2% to 55.0%)."), then names the better player once it
-  is decided, or says neither is when it ended inconclusive.
-  *(Covered: `matchTest.test.ts`.)*
+- `F-TEST-1` `testScale` puts an even score in the middle of the
+  Significance Test card's chart, whatever side the interval is on, snapped
+  to a round half-width wide enough for the interval (0.51 to 0.55 is 40% to
+  60%, ticks every 5%), its ticks at whole fractions of the chart, and stops
+  at the scores that exist; `testPct` prints a score to two places
+  ("57.42%"). *(Covered: `matchTest.test.ts`.)*
+- `F-TEST-2` `testVerdict` words the verdict tile: "Too early" before the
+  minimum and "No verdict yet" after it, the better player by index with
+  when it was decided ("is better, decided at 500 pairs") or, found between
+  finish checks, at what confidence, and "Neither better", "Paused" or "Not
+  decided" with the reason. *(Covered: `matchTest.test.ts`.)*
 - `F-TEST-3` `confidenceProblem` refuses what job creation refuses of a
   test's confidence, and only that: above 50 and below 100, so 50.05 and
   99.995 pass and 50, 100, a non-number and a cleared input do not. The job
@@ -1173,7 +1199,11 @@ refuse what it could not have written, rather than draw a wrong board.
 Test the pure functions; do not snapshot the SVG.
 
 - `F-CHART-1` `RatingDotPlot` places the anchor's dot at the anchor rating, and
-  a config one standard error away at the expected offset. *(Covered:
+  a config one standard error away at the expected offset, its thin bar the
+  95% interval (1.96 standard errors) and the domain set by those. On a phone
+  the names' margin narrows, gridlines are labelled only as often as the plot
+  has room for, and each row's rating and true error print at its end
+  ("1600.0 ±50.0", the anchor's "fixed", an unmeasurable one's "±∞"). *(Covered:
   `charts/ratingDotPlot.test.ts`.)*
 - `F-CHART-2` It clamps a runaway error bar rather than letting one
   barely-measured config flatten the scale, and still reports the true number in
@@ -1193,11 +1223,11 @@ Test the pure functions; do not snapshot the SVG.
   table cell's hover. *(Covered: `charts/residuals.test.ts`. The separate
   residual table, `ResidualMatrix`, and its ordering and bars went with the
   cross table, which folds the residual into each cell.)*
-- `F-CHART-7` The pair-outcome table reads each player's row from its own side
-  — bucket 4 is player 1's "Won both" and player 2's is bucket 0 — and its
-  three rows (won both, won one and drew one, even) hold all five buckets. An
-  off-by-one here inverts the reading of every paired job. *(Covered:
-  `charts/pentanomial.test.ts`.)*
+- `F-CHART-7` The pair-outcome bar reads each part from the side it favours
+  — bucket 4 is player 1's "won both" and bucket 0 player 2's — running from
+  player 1's sweeps to player 2's with even pairs in the middle, all five
+  buckets once. An off-by-one here inverts the reading of every paired job.
+  *(Covered: `charts/pentanomial.test.ts`.)*
 - `F-CHART-8` Percentages are computed against pairs, not games, and a zero
   denominator renders 0.0% rather than `NaN`. *(Covered:
   `charts/pentanomial.test.ts`.)*
@@ -1926,6 +1956,13 @@ job creation touches needs one caller here.
   more than 10 recorded plies (what a captured position keeps) is `400`.
   *(Covered: `jobs::a_player_config_past_magpies_limits_is_refused`.)*
   (Fifteenth audit.)
+- `I-JOB-14c` A player config takes a movegen budget per move, any player's,
+  a static one's too: 0 or below is `400` on `movegens_per_move` (no budget is
+  null), a stated budget is stored, returned and named in the player spec a
+  task sends MAGPIE, and an unstated one is sent as null rather than left out,
+  which MAGPIE would refuse. *(Covered:
+  `admin_api::a_player_config_takes_a_movegen_budget_per_move`,
+  `worker_api` (the assignment's player keys).)*
 - `I-JOB-14b` A simming player config is bounded by its iteration budget,
   never by a time limit: one that states no `time_limit_secs`, or one above 0,
   is `400` on that field (a limit makes how far a simulation gets depend on the
@@ -1957,17 +1994,17 @@ job creation touches needs one caller here.
   `routes::admin::tests::a_leave_body_is_read_as_a_leave_config_and_an_opening_rack_body_is_not`.)*
 - `I-JOB-15` **A games or pairs request naming n ≥ 2 configs is a round
   robin**: C(n, 2) jobs (3 → 3, 4 → 6), every pairing once, seated in the
-  order listed and named "{name}: A vs B" ("A vs B" unnamed), all inactive at
-  0%, each audited `job.created`, and answered together as `{jobs}`; one
-  config is a self-play job under the name as given. *(Covered:
+  order listed, each storing the title and named "{title}: A vs B" ("A vs B"
+  untitled), all inactive at 0%, each audited `job.created`, and answered
+  together as `{jobs}`; one config is a self-play job named "{title}: A vs A". *(Covered:
   `jobs::a_round_robin_creates_a_job_for_every_pairing`,
   `routes::admin::tests::pairings_are_every_pair_once_in_the_order_given`; the
   form's preview of the same rules, `roundRobin.test.ts` (F-RR-1, F-RR-2).)*
 - `I-JOB-16` **A round robin is created whole or not at all.** Every pairing
   is checked before anything is inserted, and one clash (two simmers on
   different win% models) refuses the request, naming that pairing, with no job
-  written; a config named twice, more than twelve, none, or a name its
-  pairing would push past 100 characters is refused on its field. *(Covered:
+  written; a config named twice, more than twelve, or none is refused on its
+  field. *(Covered:
   `jobs::a_round_robin_with_one_bad_pairing_creates_nothing`,
   `routes::admin::tests::a_round_robin_names_one_to_twelve_configs_once_each`.)*
 
@@ -2307,7 +2344,7 @@ permanent.
   means weighted by their games, for games and pairs jobs alike (10 games at
   400-380 and 30 at 440-450 are 430-432.5, spread -2.5; unweighted, 420-415).
   *(Covered: `stats::average_scores_weight_each_batch_by_its_games`; how the
-  match score table prints them, `matchScore.test.ts`, `F-MATCH-1`.)*
+  match score card prints them, `matchScore.test.ts`, `F-MATCH-1`.)*
 - `I-STATS-4` A job with no results reports zeros and an even score whose
   interval is every score (0 to 1), not an error or a NaN, and no average
   score (null, not 0). *(Covered:
@@ -3125,8 +3162,9 @@ below.
   the fixture by `contract_fixtures::every_shutdown_reason_matches_what_the_server_sends`;
   MAGPIE's claim body by `test_the_claim_body_matches_the_claim_fixture`.)*
   (Thirty-third audit, pass 1.)
-- `A-WORKER-23` Every assignment names its job (`job_name`: its name, or its
-  type and the start of its id, never empty) and states the time limit its
+- `A-WORKER-23` Every assignment names its job (`job_name`: its name -- a
+  games job's title and players, or its players alone -- or an untitled
+  other job's type and the start of its id, never empty) and states the time limit its
   claim was given (`max_task_seconds`): its job's at the claim, which the
   claim's `deadline_at` is its claim time plus. A change to the job's limit
   moves later claims' limits and not an earlier one's, and two jobs with
@@ -3187,12 +3225,13 @@ below.
 - `A-ADMIN-1` Player config create/get/list/delete round-trips, and a config in
   use cannot be deleted. *(Covered:
   `admin_routes::a_player_config_round_trips_and_one_in_use_cannot_be_deleted`.)*
-- `A-ADMIN-2b` A job keeps the name it was created with, trimmed, and the jobs
-  list and the job's page return it; one created without a name has an empty
-  one (titled by its type, `F-FMT-13`); a name past 100 characters or of more
-  than one line is refused on the field. *(Covered:
-  `admin_routes::a_job_keeps_the_name_it_was_created_with`; E-4 creates one
-  through the form and finds it as the title.)*
+- `A-ADMIN-2b` A job keeps the title it was created with, trimmed, and its
+  creation, the jobs list, the job's stats and its config return it with its
+  name, "{title}: A vs B" (here self-play, "A vs A"); one created without a
+  title has an empty one and is named for its players alone; a title past 100
+  characters or of more than one line is refused on the field. *(Covered:
+  `admin_routes::a_job_keeps_the_title_it_was_created_with`; E-4 creates one
+  through the form and finds it as the heading, its players under it.)*
 - `A-ADMIN-2c` A player config's and a rating pool's names take a job name's
   rule: past 100 characters, of more than one line, or with a control
   character is refused on the field; a pool's name is stored trimmed, so "X "
@@ -3938,8 +3977,8 @@ admin in once and the admin journeys reuse its storage state.
 - `E-1` An anonymous visitor browses the landing page, job list, a job detail
   page — its status on a row of its own, with no description beside an
   active status and "Paused …" or "Finished …" beside any other, then its
-  four headline cards (Allocation, Tasks completed, Throughput, Estimated
-  time left) — and the Contributions page: the site's totals
+  Progress card's four figures (Done, Throughput, Time left, Allocation) —
+  and the Contributions page: the site's totals
   (movegens, compute time, tasks) and the same by job type, then the
   contributor leaderboard, ranked by movegens and re-ranked by tasks at a
   click, with a contributor's own by job type under their row when their name
@@ -3959,8 +3998,9 @@ admin in once and the admin journeys reuse its storage state.
   marked and first, activates it there by giving it an allocation (and
   deactivates it there at the end), and watches the dashboard
   update live over SSE as fake workers contribute; its admin page has the
-  match score and Significance Test cards, the latter's sentence giving player 1's
-  score per game. **The journey that justifies the tier**: the only place
+  match score and Significance Test cards, the former's shares to two places,
+  its bar's record and its Diverged toggle, the latter's score tile giving player 1's
+  score per game and its interval to two places. **The journey that justifies the tier**: the only place
   SSE, the built Svelte app, the scheduler and a worker are exercised together.
   *(Covered: `e4-live-dashboard.spec.ts`.)*
 - `E-5` An admin bans a worker and that worker can no longer claim. *(Covered:
@@ -3976,14 +4016,18 @@ admin in once and the admin journeys reuse its storage state.
   cell's hover what the ratings predict, each cell tinted by its record as it
   shows it (`data-record`), its last column the table's rating. Signed out,
   the cross table is the first card, the plot after it, and there is no All
-  configs card. *(Covered: `e7-ratings.spec.ts`.)*
-- `E-8` A job detail page renders the pentanomial table — three rows (Won both,
-  Won one, drew one, Even) with a column per player, each read from that
-  player's buckets, the higher of a row marked and the even row never — the significance test's verdict in words ("Completed: decided: player 1
-  is better, player 1 at … to … after … pairs", or inconclusive at the cap),
-  its sentence (player 1's score per game and its 95% interval) and its
+  configs card; each config's name in the cross table and beside the plot
+  links to its config's page. *(Covered: `e7-ratings.spec.ts`.)*
+- `E-8` A job detail page renders the pentanomial as the pair-outcome key —
+  five parts from "static-equity won both" to "static-score won both", each
+  read from its bucket with its count and share of the pairs — the
+  significance test's verdict (the chip "static-equity better" and "is
+  better, decided at … pairs", or "inconclusive" at the cap), player 1's
+  score and its 95% interval to two places, the pairs played, and its
   folded explanation, and player 1's record in the match score card, not the
-  Significance Test card. *(Covered: `e8-pentanomial.spec.ts`.)*
+  Significance Test card: each player's share of the points to two places,
+  the games each won on its bar, and the same for the diverged games once
+  its toggle is switched. *(Covered: `e8-pentanomial.spec.ts`.)*
 - `E-9` The password reset flow end to end, `a@b` refused under the field
   first. *(Covered:
   `e9-password-reset.spec.ts`, reading its link from the outbox.)*
@@ -4178,7 +4222,7 @@ works — the directory it lays out, the names it invokes, the bytes it gets
 back.
 
 **Correctness is established by version and capability probe.**
-`birdtest-contribute` reports `0.1.1`, the shipped `MIN_MAGPIE_VERSION` default; a checkout reporting anything lower is refused. The
+MAGPIE's `main` reports `0.1.1`, the shipped `MIN_MAGPIE_VERSION` default; a checkout reporting anything lower is refused. The
 probe additionally asks the binary what it can do: that `contribute` is a
 registered command, and that it accepts the current required claim body.
 
@@ -4279,6 +4323,12 @@ surfacing the mismatch as a red build rather than as a dead job in production.
   thread. When every solve took all 24, the games needed 24 + 24 x 24 move
   generators of MAGPIE's 512 and magpie exited. *(Covered:
   `case_solvers_many_threads`, one task.)*
+- `M-18` A player's movegen budget per move reaches MAGPIE and binds: the same
+  2-ply simmer, with an iteration budget of 5,000, plays two games against a
+  static player without a budget and again with 2,000 movegens a move, and
+  the budgeted job reports less than half the movegens a game. Every run
+  that started a task also prints how long it took ("finished task #N: … in
+  …"). *(Covered: `case_movegen_budget`, one task each.)*
 - `M-13` A job with `use_wit` dispatches only once its word info table is
   built; a worker whose table does not match the recorded hash declines with
   `derived_mismatch` and both digests reach `worker_data_gaps`; with the right
@@ -4869,7 +4919,7 @@ slower and more environment-sensitive than a pull request should wait on.
 
 **While the pin is unpushed.** GitHub serves a commit only once it is on a
 branch it can reach, so until `docker/Dockerfile`'s `MAGPIE_COMMIT` is pushed to
-`birdtest-contribute`:
+a MAGPIE branch (and, for `deploy.sh`, merged to `main`):
 - `images`, `e2e` and `magpie-contract` fail: the image fetches the commit, and
   the other two check it out.
 - The nightly's `e2e` fails on both legs: the pin leg at its MAGPIE checkout,

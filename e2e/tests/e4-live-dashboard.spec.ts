@@ -23,13 +23,12 @@ async function createStaticConfig(page: Page, name: string, sort: 'equity' | 'sc
   await expect(page.locator('tbody tr', { hasText: name })).toContainText(sort);
 }
 
-/** "123 / 40,000" beside the progress bar, as a number. */
+/** The Progress card's Done figure, "1,234" over "of up to 40,000 pairs", as a number. */
 async function pairsCompleted(page: Page): Promise<number> {
-  const text = await page
-    .locator('div.mb-1', { hasText: 'pairs completed' })
-    .locator('span.tabular-nums')
-    .innerText();
-  return Number(text.split('/')[0].replace(/[^0-9]/g, ''));
+  const done = page.getByTestId('progress-done');
+  await expect(done).toContainText(/ pairs\s*$/);
+  const text = await done.locator('dd').first().innerText();
+  return Number(text.replace(/[^0-9]/g, ''));
 }
 
 /**
@@ -50,7 +49,7 @@ test('E-4: an admin creates configs and a job, activates it, and watches it fill
 
   await page.goto('/admin/jobs/new');
   const jobName = `e2e pairs ${suffix}`;
-  await page.getByLabel('Job Name').fill(jobName);
+  await page.getByLabel('Job Title').fill(jobName);
   await page.getByLabel('Job Type').selectOption({ label: 'Game Pairs' });
   // Neither the bag nor the board is chosen for the admin.
   const letterdist = page.getByLabel('Letter Distribution');
@@ -100,9 +99,12 @@ test('E-4: an admin creates configs and a job, activates it, and watches it fill
   await page.goto(`/admin/jobs/${jobId}`);
   await loaded;
   const header = page.locator('main header');
-  // Titled by the name it was given and its pairing, its type beside it; its
-  // status in the figures below.
-  await expect(header.getByRole('heading', { name: `${jobName}: ${p1} vs ${p2}` })).toBeVisible();
+  // Headed by the title it was given, then its players in their seats, then
+  // its type; its status in the figures below.
+  await expect(header.getByRole('heading', { level: 1, name: jobName, exact: true })).toBeVisible();
+  const players = header.getByTestId('job-players').getByRole('listitem');
+  await expect(players.nth(0).getByRole('link', { name: p1, exact: true })).toBeVisible();
+  await expect(players.nth(1).getByRole('link', { name: p2, exact: true })).toBeVisible();
   await expect(header.getByText('Game Pairs', { exact: true })).toBeVisible();
   const status = page.getByTestId('job-status');
   await expect(status.getByText('active', { exact: true })).toBeVisible();
@@ -125,12 +127,11 @@ test('E-4: an admin creates configs and a job, activates it, and watches it fill
   // The rest of the dashboard moves with it.
   // The admin page has the public page's match score and Significance Test boxes,
   // where it had a one-line summary.
-  await expect(page.getByTestId('significance-test-sentence')).toContainText(/ scores \d+\.\d% per game /);
-  const score = page.locator('.card', { has: page.getByRole('heading', { name: 'Match score' }) });
-  await expect(score.getByTestId('match-all').locator('tbody td:first-child')).toHaveText([
-    'Wins', 'Losses', 'Draws', 'Average score', 'Average spread'
-  ]);
-  await expect(score.getByTestId('match-divergent')).toContainText('Games that diverged');
+  await expect(page.getByTestId('test-score')).toContainText(/^.+'s score\s*\d+\.\d\d%\s*95% interval \d+\.\d\d% to \d+\.\d\d%/);
+  const score = page.getByTestId('match-score');
+  await expect(score.getByTestId('match-share')).toHaveText([/^\d+\.\d\d%$/, /^\d+\.\d\d%$/]);
+  await expect(score.getByTestId('match-bar')).toHaveAttribute('aria-label', /^.+ won [\d,]+, [\d,]+ draws?, .+ won [\d,]+$/);
+  await expect(score.getByTestId('match-scope-divergent')).toHaveText(/^Diverged · [\d,]+$/);
   await expect(page.getByText('No contributions yet.')).toHaveCount(0);
   await expect(
     page.locator('.card', { has: page.getByRole('heading', { name: 'Contributors' }) }).getByText(/^Anonymous · /).first()

@@ -3,7 +3,7 @@ import {
   blankFields,
   computeTime,
   exactCount,
-  throughputText,
+  throughputParts,
   timeLimitNotice,
   unchosenText,
   datetime,
@@ -17,12 +17,11 @@ import {
   targetsText,
   MAX_LEAVE_GENERATIONS,
   MAX_TARGET_RACK_COUNT,
-  testLabel,
   testState,
   scorePct,
   completionText,
   exportSummary,
-  jobTitle,
+  jobName,
   workerLabel
 } from './format';
 
@@ -147,7 +146,6 @@ describe('F-FMT-5b testState', () => {
   const running = { test: { status: 'running' } };
   it("says paused, not running, while the job is inactive", () => {
     expect(testState('inactive', running)).toBe('paused');
-    expect(testLabel(testState('inactive', running))).toBe('paused while the job is inactive');
   });
   it('is the test while the job is active', () => {
     expect(testState('active', running)).toBe('running');
@@ -163,21 +161,6 @@ describe('F-FMT-5b testState', () => {
     for (const status of ['active', 'inactive', 'completed']) {
       expect(testState(status, { test: null })).toBe('off');
     }
-    expect(testLabel('off')).toBe('not run: the job plays to its target');
-  });
-});
-
-describe('F-FMT-5 testLabel', () => {
-  it('covers every status', () => {
-    expect(testLabel('running')).toBe('running');
-    expect(testLabel('player1_better')).toBe('decided: player 1 is better');
-    expect(testLabel('player2_better')).toBe('decided: player 2 is better');
-    expect(testLabel('inconclusive')).toBe('inconclusive: the job reached its cap first');
-  });
-
-  it('falls back to the raw status for an unknown one', () => {
-    expect(testLabel('abandoned')).toBe('abandoned');
-    expect(testLabel('constructor')).toBe('constructor');
   });
 });
 
@@ -292,11 +275,11 @@ describe('F-FMT-12 completionText', () => {
   });
 });
 
-describe('F-FMT-13 jobTitle', () => {
+describe('F-FMT-13 jobName', () => {
   it("is the job's name, or its type for one given none", () => {
-    expect(jobTitle({ name: 'equity vs static', job_type: 'game_pairs' })).toBe('equity vs static');
-    expect(jobTitle({ name: '', job_type: 'game_pairs' })).toBe('Game Pairs');
-    expect(jobTitle({ name: '   ', job_type: 'games' })).toBe(jobTitle({ name: '', job_type: 'games' }));
+    expect(jobName({ name: 'seat bias: equity vs static', job_type: 'game_pairs' })).toBe('seat bias: equity vs static');
+    expect(jobName({ name: '', job_type: 'game_pairs' })).toBe('Game Pairs');
+    expect(jobName({ name: '   ', job_type: 'games' })).toBe(jobName({ name: '', job_type: 'games' }));
   });
 });
 
@@ -467,22 +450,25 @@ describe('F-FMT-19 exactCount', () => {
   });
 });
 
-describe('F-FMT-21 throughputText', () => {
+describe('F-FMT-21 throughputParts', () => {
   it("reads the job's pace an hour in its own unit", () => {
-    expect(throughputText({ per_hour: 1240.4, unit: 'game' })).toBe(`${(1240).toLocaleString()} games/hour`);
-    expect(throughputText({ per_hour: 8, unit: 'pair' })).toBe('8 pairs/hour');
-    expect(throughputText({ per_hour: 10.5, unit: 'rack' })).toBe('11 racks/hour');
+    expect(throughputParts({ per_hour: 1240.4, unit: 'game' })).toEqual({
+      value: (1240).toLocaleString(),
+      unit: 'games/hour'
+    });
+    expect(throughputParts({ per_hour: 8, unit: 'pair' })).toEqual({ value: '8', unit: 'pairs/hour' });
+    expect(throughputParts({ per_hour: 10.5, unit: 'rack' })).toEqual({ value: '11', unit: 'racks/hour' });
   });
 
   it('keeps a decimal below ten, and one unit is singular', () => {
-    expect(throughputText({ per_hour: 2.46, unit: 'rack' })).toBe('2.5 racks/hour');
-    expect(throughputText({ per_hour: 9.96, unit: 'game' })).toBe('10 games/hour');
-    expect(throughputText({ per_hour: 1, unit: 'game' })).toBe('1 game/hour');
+    expect(throughputParts({ per_hour: 2.46, unit: 'rack' })?.value).toBe('2.5');
+    expect(throughputParts({ per_hour: 9.96, unit: 'game' })?.value).toBe('10');
+    expect(throughputParts({ per_hour: 1, unit: 'game' })).toEqual({ value: '1', unit: 'game/hour' });
   });
 
-  it('shows nothing without recent work', () => {
-    expect(throughputText(null)).toBe('—');
-    expect(throughputText({ per_hour: Number.NaN, unit: 'game' })).toBe('—');
+  it('is nothing without recent work', () => {
+    expect(throughputParts(null)).toBeNull();
+    expect(throughputParts({ per_hour: Number.NaN, unit: 'game' })).toBeNull();
   });
 });
 

@@ -35,7 +35,7 @@
 #      know takes its service. Nothing to deploy, no --set and no --reset-db:
 #      it says so and stops;
 #   5. MAGPIE, when the backend is deployed: the commit docker/Dockerfile pins
-#      is on MAGPIE's origin/birdtest-contribute (MAGPIE_DIR, default
+#      is on MAGPIE's origin/main (MAGPIE_DIR, default
 #      ~/MAGPIE), since the backend image fetches it from GitHub;
 #   6. the schema, when the backend is deployed: a migration the live backend
 #      applied and this commit changed (0001_initial.sql, edited in place
@@ -191,9 +191,9 @@ if [[ "$deploying" == *" backend "* ]]; then
   magpie=${MAGPIE_DIR:-$HOME/MAGPIE}
   [[ -d "$magpie/.git" ]] || ops_die "no MAGPIE checkout at $magpie (set MAGPIE_DIR)"
   git -C "$magpie" fetch -q origin || ops_die "git fetch in $magpie failed"
-  git -C "$magpie" branch -r --contains "$pin" 2>/dev/null | grep -qx '[[:space:]]*origin/birdtest-contribute' \
-    || ops_die "MAGPIE $pin is not on origin/birdtest-contribute: push it first (the backend image fetches it)"
-  ops_say "MAGPIE pin ${pin:0:12} is on birdtest-contribute"
+  git -C "$magpie" branch -r --contains "$pin" 2>/dev/null | grep -qx '[[:space:]]*origin/main' \
+    || ops_die "MAGPIE $pin is not on origin/main: merge it first (the backend image fetches it)"
+  ops_say "MAGPIE pin ${pin:0:12} is on main"
 fi
 
 # 6. The schema, which only a new backend meets.

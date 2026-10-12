@@ -17,7 +17,10 @@ export default {
         primary: { DEFAULT: 'hsl(199 89% 48%)', foreground: 'hsl(222 47% 8%)' },
         destructive: { DEFAULT: 'hsl(0 72% 51%)', foreground: 'hsl(210 20% 98%)' },
         success: { DEFAULT: 'hsl(142 71% 45%)', foreground: 'hsl(222 47% 8%)' },
-        warning: { DEFAULT: 'hsl(38 92% 50%)', foreground: 'hsl(222 47% 8%)' }
+        warning: { DEFAULT: 'hsl(38 92% 50%)', foreground: 'hsl(222 47% 8%)' },
+        // A match's two sides, where a card tells them apart by colour rather
+        // than marking one better: blue and orange stay apart for colour-blind eyes.
+        player: { 1: 'hsl(199 89% 52%)', 2: 'hsl(28 88% 60%)' }
       },
       borderRadius: { lg: '0.5rem', md: '0.375rem', sm: '0.25rem' }
     }

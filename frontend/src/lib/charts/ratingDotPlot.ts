@@ -7,7 +7,22 @@ import type { RatingRow } from '$lib/api';
 import { fitLabel, fitLabels } from './labels';
 
 export const ROW_HEIGHT = 28;
-export const PAD = { top: 8, right: 24, bottom: 28, left: 180 };
+/**
+ * The margins around the plot at full width: the names on the left, each
+ * row's rating and its error on the right.
+ */
+export const PAD = { top: 8, right: 96, bottom: 28, left: 180 };
+/** Below this width the names get a narrower margin, so the plot keeps room on a phone. */
+export const NARROW_WIDTH = 520;
+const NARROW_LEFT = 108;
+
+/** The margins for a chart `width` pixels wide. */
+export function padFor(width: number): typeof PAD {
+  return width < NARROW_WIDTH ? { ...PAD, left: NARROW_LEFT } : PAD;
+}
+
+/** Standard errors either side of a rating that make its 95% interval. */
+export const Z95 = 1.96;
 
 /**
  * The widest error bar drawn, in rating points. A config with a handful of
@@ -38,20 +53,21 @@ export function splitByAnchorConnection(ratings: RatingRow[]): {
 }
 
 /** Clamp runaway intervals so one barely-measured config cannot flatten the
- *  scale for everyone else; the table still reports the real number. */
-export function visibleError(row: RatingRow): number {
+ *  scale for everyone else; the table still reports the real number. `k`
+ *  standard errors either side: 1 for the thick bar, `Z95` for the thin. */
+export function visibleError(row: RatingRow, k = 1): number {
   // The anchor is fixed by definition. Runs before the thirty-second audit
   // stored the fit's own error for it -- f64::MAX with no games -- which,
   // drawn at the cap, stretched the scale; newer runs store 0.
   if (row.is_anchor) return 0;
-  return Math.min(row.stderr, MAX_VISIBLE_ERROR);
+  return Math.min(k * row.stderr, MAX_VISIBLE_ERROR);
 }
 
-/** The rating range drawn: every visible interval, plus a margin. */
+/** The rating range drawn: every visible 95% interval, plus a margin. */
 export function dotPlotBounds(rated: RatingRow[]): Bounds {
   if (!rated.length) return { lo: 0, hi: 1 };
-  const los = rated.map((r) => r.rating - visibleError(r));
-  const his = rated.map((r) => r.rating + visibleError(r));
+  const los = rated.map((r) => r.rating - visibleError(r, Z95));
+  const his = rated.map((r) => r.rating + visibleError(r, Z95));
   const lo = Math.min(...los);
   const hi = Math.max(...his);
   const pad = Math.max(10, (hi - lo) * 0.08);
@@ -60,7 +76,8 @@ export function dotPlotBounds(rated: RatingRow[]): Bounds {
 
 /** Rating to horizontal pixel position, for a chart `width` pixels wide. */
 export function dotPlotX(value: number, bounds: Bounds, width: number): number {
-  return PAD.left + ((value - bounds.lo) / (bounds.hi - bounds.lo)) * (width - PAD.left - PAD.right);
+  const pad = padFor(width);
+  return pad.left + ((value - bounds.lo) / (bounds.hi - bounds.lo)) * (width - pad.left - pad.right);
 }
 
 export function dotPlotHeight(ratedCount: number): number {
@@ -70,6 +87,15 @@ export function dotPlotHeight(ratedCount: number): number {
 /** Vertical centre of the `index`th rated row. */
 export function dotPlotRowY(index: number): number {
   return PAD.top + index * ROW_HEIGHT + ROW_HEIGHT / 2;
+}
+
+/**
+ * How often a gridline is labelled, for `count` gridlines across a plot
+ * `plotWidth` pixels wide: every one where there is room, every second or
+ * third on a phone, where four-digit labels ran together.
+ */
+export function tickLabelStep(count: number, plotWidth: number): number {
+  return Math.max(1, Math.ceil((count * 46) / Math.max(plotWidth, 1)));
 }
 
 /** Gridline positions: a 1/2/5 × 10^k step giving at most six intervals. */
@@ -87,9 +113,12 @@ export interface DotPlotRow {
   /** The dot. */
   cx: number;
   cy: number;
-  /** The error bar's ends, after clamping. */
+  /** The ±1 standard error bar's ends, after clamping. */
   x1: number;
   x2: number;
+  /** The 95% interval's ends, after clamping. */
+  w1: number;
+  w2: number;
 }
 
 /** Everything the component draws, in pixels. Unrated configs get no position. */
@@ -101,25 +130,36 @@ export function layoutDotPlot(
   unrated: RatingRow[];
   bounds: Bounds;
   ticks: number[];
+  /** Label every this many gridlines. */
+  tickStep: number;
   height: number;
+  pad: typeof PAD;
 } {
   const { rated, unrated } = splitByAnchorConnection(ratings);
   const bounds = dotPlotBounds(rated);
+  const pad = padFor(width);
+  const ticks = dotPlotTicks(bounds);
+  const x = (value: number) => dotPlotX(value, bounds, width);
   return {
     rated: rated.map((row, i) => {
       const err = visibleError(row);
+      const wide = visibleError(row, Z95);
       return {
         row,
-        cx: dotPlotX(row.rating, bounds, width),
+        cx: x(row.rating),
         cy: dotPlotRowY(i),
-        x1: dotPlotX(row.rating - err, bounds, width),
-        x2: dotPlotX(row.rating + err, bounds, width)
+        x1: x(row.rating - err),
+        x2: x(row.rating + err),
+        w1: x(row.rating - wide),
+        w2: x(row.rating + wide)
       };
     }),
     unrated,
     bounds,
-    ticks: dotPlotTicks(bounds),
-    height: dotPlotHeight(rated.length)
+    ticks,
+    tickStep: tickLabelStep(ticks.length, width - pad.left - pad.right),
+    height: dotPlotHeight(rated.length),
+    pad
   };
 }
 
@@ -152,6 +192,8 @@ export function stderrCell(row: RatingRow): string {
  * mixed case; wide capitals can still run past (KL-76).
  */
 export const NAME_CHARS = 20;
+/** The same in the narrower margin a phone gets (`padFor`). */
+export const NARROW_NAME_CHARS = 13;
 
 const ANCHOR = ' (anchor)';
 
@@ -159,9 +201,14 @@ const ANCHOR = ' (anchor)';
  * Each row's label, told apart from the others drawn (see `fitLabels`), the
  * anchor marked.
  */
-export function rowLabels(rows: RatingRow[]): string[] {
-  const labels = fitLabels(rows.map((r) => r.name), NAME_CHARS);
+export function rowLabels(rows: RatingRow[], chars: number = NAME_CHARS): string[] {
+  const labels = fitLabels(rows.map((r) => r.name), chars);
   return labels.map((label, i) =>
-    rows[i].is_anchor ? fitLabel(label, NAME_CHARS - ANCHOR.length) + ANCHOR : label
+    rows[i].is_anchor ? fitLabel(label, chars - ANCHOR.length) + ANCHOR : label
   );
+}
+
+/** The rating and its error as the column right of a row prints them: "1641.0", "±12.4" or "fixed". */
+export function ratingFigure(row: RatingRow): { rating: string; error: string } {
+  return { rating: row.rating.toFixed(1), error: row.is_anchor ? 'fixed' : `±${errorText(row.stderr)}` };
 }

@@ -4,17 +4,17 @@
   import { api, type JobStats, type RackLookupRow } from '$lib/api';
   import { subscribeToJob } from '$lib/sse';
   import { session } from '$lib/auth';
-  import { datetime, exactCount, jobTypeLabel, jobTitle } from '$lib/format';
+  import { datetime, exactCount } from '$lib/format';
+  import JobHeader from '$lib/components/JobHeader.svelte';
   import JobStatusCard from '$lib/components/JobStatusCard.svelte';
-  import JobStatsRow from '$lib/components/JobStatsRow.svelte';
-  import TaskCounts from '$lib/components/TaskCounts.svelte';
+  import JobProgressCard from '$lib/components/JobProgressCard.svelte';
   import WorkerTable from '$lib/components/WorkerTable.svelte';
   import ProgressBar from '$lib/components/ProgressBar.svelte';
   import JobSettings from '$lib/components/JobSettings.svelte';
   import MatchScore from '$lib/components/MatchScore.svelte';
   import MatchTestCard from '$lib/components/MatchTestCard.svelte';
   import SavedPositions from '$lib/components/SavedPositions.svelte';
-  import { playersLine, type JobConfig } from '$lib/jobSettings';
+  import type { JobConfig } from '$lib/jobSettings';
   import { analysesPerRack, rackConsensus } from '$lib/consensus';
   import { plyAt, plyColumns, plyHeaders, showsIterations } from '$lib/moveList';
 
@@ -100,64 +100,23 @@
   <p class="text-muted-foreground">Loading…</p>
 {:else}
   <div class="space-y-6">
-    <header class="flex flex-wrap items-center gap-3">
-      <h1 class="text-2xl font-semibold">{jobTitle(stats.job)}</h1>
-      {#if stats.job.name}
-        <span class="text-sm text-muted-foreground">{jobTypeLabel(stats.job.job_type)}</span>
-      {/if}
-      <span class="text-sm text-muted-foreground">
-        {stats.job.lexicon ?? '—'} · {stats.job.variant ?? '—'}{#if config?.players.length}
-          · {playersLine(config)}{/if}
-      </span>
+    <JobHeader job={stats.job} {config}>
       <!-- The admin page (activate, purge, export, artifacts) was reachable
            only by the redirect after creating the job. -->
       {#if $session?.is_admin}
         <a href="/admin/jobs/{stats.job.id}" class="btn-secondary ml-auto no-underline">Manage</a>
       {/if}
-    </header>
+    </JobHeader>
     <JobStatusCard {stats} />
 
-    <JobStatsRow {stats} />
-
-    <div class="card space-y-4">
-      <h2 class="text-lg font-medium">Progress</h2>
-      {#if stats.games}
-        <ProgressBar
-          value={stats.games.units_completed}
-          max={stats.games.max_units}
-          label="{stats.games.unit}s completed"
-        />
-      {:else if stats.opening_racks}
-        <!-- Tasks are made on demand, so a task count is only what has been
-             handed out so far: a job 1% through its racks read 99%. A rack is
-             done once settled, which for a consensus job may take several
-             analyses. -->
-        <ProgressBar
-          value={stats.opening_racks.racks_settled}
-          max={stats.opening_racks.racks_total}
-          label="racks settled"
-        />
-      {:else if stats.leave_generation}
-        <ProgressBar
-          value={stats.leave_generation.generations_closed}
-          max={stats.leave_generation.generation_count}
-          label="generations closed"
-        />
-      {:else}
-        <ProgressBar
-          value={stats.tasks_completed}
-          max={stats.tasks_total}
-          label="tasks completed"
-        />
-      {/if}
-      <TaskCounts {stats} />
+    <JobProgressCard {stats}>
       <p class="text-xs text-muted-foreground">
         Created by <span class="break-all">{stats.job.created_by ?? 'unknown'}</span>, {datetime(
           stats.job.created_at
         )}{#if stats.job.min_magpie_version}
           · requires MAGPIE ≥ {stats.job.min_magpie_version}{/if}
       </p>
-    </div>
+    </JobProgressCard>
 
     {#if stats.games}
       <MatchScore games={stats.games} players={config?.players.map((p) => p.name) ?? []} />

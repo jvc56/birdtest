@@ -432,7 +432,7 @@ variable "acm_certificate_arn" {
 variable "min_magpie_version" {
   description = <<-EOT
     The oldest MAGPIE that may contribute (MIN_MAGPIE_VERSION). 0.1.1 is the
-    `birdtest-contribute` version the backend image pins, and a build reporting
+    version of the MAGPIE `main` commit the backend image pins, and a build reporting
     a lower version is offered nothing. Raise it whenever a MAGPIE release
     changes results: it is the only way to keep a build known to compute
     something wrong off the fleet. Must not exceed the version the backend image's own

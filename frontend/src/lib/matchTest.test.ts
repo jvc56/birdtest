@@ -1,39 +1,56 @@
 import { describe, expect, it } from 'vitest';
-import { confidenceProblem, testBar, testSentence } from './matchTest';
-import type { TestResult } from './api';
+import { confidenceProblem, testPct, testScale, testVerdict } from './matchTest';
 
-const result = (over: Partial<TestResult>): TestResult => ({
-  mean: 0.53, lower: 0.51, upper: 0.55, confidence_pct: 95, status: 'running', ...over
+describe('F-TEST-1 testScale', () => {
+  it('puts an even score in the middle, wide enough for the interval, snapped to a round width', () => {
+    // 0.51 to 0.55 reaches 5 points from even; with room that is 0.056, so a
+    // tenth a side: 40% to 60%.
+    const scale = testScale({ lower: 0.51, upper: 0.55, mean: 0.53 });
+    expect(scale.ticks.map((t) => t.label)).toEqual(['40%', '45%', '50%', '55%', '60%']);
+    expect(scale.ticks.map((t) => t.at)).toEqual([0, 25, 50, 75, 100]);
+    expect(scale.lower).toBeCloseTo(55);
+    expect(scale.mean).toBeCloseTo(65);
+    expect(scale.upper).toBeCloseTo(75);
+  });
+  it('keeps 50% in the middle when the interval is all on one side, or straddles it', () => {
+    expect(testScale({ lower: 0.4, upper: 0.45, mean: 0.425 }).ticks[2]).toEqual({ at: 50, label: '50%' });
+    const scale = testScale({ lower: 0.47, upper: 0.53, mean: 0.5 });
+    expect(scale.ticks.map((t) => t.label)).toEqual(['45%', '47.5%', '50%', '52.5%', '55%']);
+    expect(scale.mean).toBeCloseTo(50);
+  });
+  it('stops at the scores that exist', () => {
+    const scale = testScale({ lower: 0, upper: 1, mean: 0.5 });
+    expect([scale.lower, scale.upper, scale.mean]).toEqual([0, 100, 50]);
+    expect(scale.ticks.map((t) => t.label)).toEqual(['0%', '25%', '50%', '75%', '100%']);
+  });
+  it('prints scores to two places', () => {
+    expect(testPct(0.57416)).toBe('57.42%');
+    expect(testPct(0.5)).toBe('50.00%');
+  });
 });
 
-describe('F-TEST-1 testBar', () => {
-  it('scales the bar to the interval and an even score, with a margin', () => {
-    const bar = testBar({ lower: 0.51, upper: 0.55, mean: 0.53 });
-    // The span is 0.50 to 0.55; a tenth of it is under a point, so a point a side.
-    expect(bar.from).toBeCloseTo(0.49);
-    expect(bar.to).toBeCloseTo(0.56);
-    expect(bar.even).toBeCloseTo((0.01 / 0.07) * 100);
-    expect(bar.lower).toBeLessThan(bar.mean);
-    expect(bar.mean).toBeLessThan(bar.upper);
-    expect(bar.even).toBeLessThan(bar.lower);
+describe('F-TEST-2 testVerdict', () => {
+  const games = { unit: 'pair' as const, units_completed: 1240, min_units: 500, test: { confidence_pct: 95 } };
+  it('says too early before the minimum, and no verdict yet after it', () => {
+    expect(testVerdict('running', { ...games, units_completed: 300 })).toMatchObject({
+      word: 'Too early', line: 'requires at least 500 pairs', chip: 'running', running: true
+    });
+    expect(testVerdict('running', games)).toMatchObject({ word: 'No verdict yet', running: true });
   });
-  it('keeps a wide interval within the scores that exist', () => {
-    const bar = testBar({ lower: 0, upper: 1, mean: 0.5 });
-    expect([bar.from, bar.to, bar.lower, bar.upper, bar.even]).toEqual([0, 1, 0, 100, 50]);
+  it('names the better player, and when it was decided', () => {
+    const decided = { status: 'player1_better' as const, lower: 0.534, upper: 0.614, units: 500 };
+    expect(testVerdict('player1_better', { ...games, decided })).toMatchObject({
+      word: null, player: 0, line: 'is better, decided at 500 pairs', chip: null
+    });
+    // Found between finish checks: not decided yet, but the test has it.
+    expect(testVerdict('player2_better', games)).toMatchObject({ player: 1, line: 'is better at 95% confidence' });
   });
-});
-
-describe('F-TEST-2 testSentence', () => {
-  const names: [string, string] = ['simmer', 'static'];
-  it('states the score and its range, and nothing in Elo', () => {
-    expect(testSentence(result({}), names)).toBe('simmer scores 53.0% per game (95% interval 51.0% to 55.0%).');
-  });
-  it('names the better player once it is decided, and says when neither is', () => {
-    expect(testSentence(result({ status: 'player1_better' }), names)).toMatch(/ simmer is better at 95% confidence\.$/);
-    expect(testSentence(result({ status: 'player2_better', mean: 0.47 }), names)).toMatch(
-      / static is better at 95% confidence\.$/
-    );
-    expect(testSentence(result({ status: 'inconclusive' }), names)).toMatch(/Neither is better at 95% confidence/);
+  it('says why there is none: the cap, a pause, or a job completed first', () => {
+    expect(testVerdict('inconclusive', games)).toMatchObject({ word: 'Neither better', chip: 'inconclusive' });
+    expect(testVerdict('paused', games)).toMatchObject({
+      word: 'Paused', line: 'no pairs are being played while the job is inactive', running: false
+    });
+    expect(testVerdict('undecided', games)).toMatchObject({ word: 'Not decided', chip: 'not decided' });
   });
 });
 

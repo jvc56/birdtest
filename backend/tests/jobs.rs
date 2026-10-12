@@ -789,11 +789,11 @@ async fn claim(app: &Router) -> StatusCode {
     send(app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await.0
 }
 
-/// Every games and pairs job with its name and seating, oldest first and in
+/// Every games and pairs job with its title and seating, oldest first and in
 /// creation order within a request.
 async fn seatings(db: &TestDb) -> Vec<(String, Uuid, Uuid, String, i32)> {
     sqlx::query_as(
-        "SELECT j.name, COALESCE(g.player1_config_id, p.player1_config_id),
+        "SELECT j.title, COALESCE(g.player1_config_id, p.player1_config_id),
                 COALESCE(g.player2_config_id, p.player2_config_id), j.status::text, j.allocation
          FROM jobs j
          LEFT JOIN job_game_config g ON g.job_id = j.id
@@ -808,8 +808,9 @@ async fn seatings(db: &TestDb) -> Vec<(String, Uuid, Uuid, String, i32)> {
 
 /// I-JOB-15: a games or pairs request naming n ≥ 2 player configs is a round
 /// robin: C(n, 2) jobs, every pairing once, seated in the order the configs
-/// were listed and named "{name}: A vs B", all inactive at 0% and answered
-/// together. One config is a self-play job under the name as given.
+/// were listed, each storing the title and named "{title}: A vs B", all
+/// inactive at 0% and answered together. One config is a self-play job, named
+/// "{title}: A vs A".
 #[tokio::test]
 async fn a_round_robin_creates_a_job_for_every_pairing() {
     let db = TestDb::new().await;
@@ -824,20 +825,21 @@ async fn a_round_robin_creates_a_job_for_every_pairing() {
     let (a, b, c, d) = (configs[0], configs[1], configs[2], configs[3]);
     let request = |job_type: &str, name: &str, ids: &[Uuid]| {
         let mut body = if job_type == "games" { games_body(ld, layout, a, a) } else { pairs_body(ld, layout, a, a) };
-        body["name"] = json!(name);
+        body["title"] = json!(name);
         body["player_config_ids"] = json!(ids);
         body
+    };
+    let names = |created: &Value| -> Vec<String> {
+        created["jobs"].as_array().unwrap().iter().map(|j| j["name"].as_str().unwrap().to_string()).collect()
     };
 
     let (status, created) = admin.create_job(request("games", "trio", &[c, a, b])).await;
     assert_eq!(status, StatusCode::CREATED, "{created}");
-    let answered: Vec<&str> =
-        created["jobs"].as_array().unwrap().iter().map(|j| j["name"].as_str().unwrap()).collect();
-    assert_eq!(answered, ["trio: c vs a", "trio: c vs b", "trio: a vs b"], "{created}");
-    let inactive = |name: &str, p1: Uuid, p2: Uuid| (name.to_string(), p1, p2, "inactive".to_string(), 0);
+    assert_eq!(names(&created), ["trio: c vs a", "trio: c vs b", "trio: a vs b"], "{created}");
+    let inactive = |title: &str, p1: Uuid, p2: Uuid| (title.to_string(), p1, p2, "inactive".to_string(), 0);
     assert_eq!(
         seatings(&db).await,
-        [inactive("trio: c vs a", c, a), inactive("trio: c vs b", c, b), inactive("trio: a vs b", a, b)]
+        [inactive("trio", c, a), inactive("trio", c, b), inactive("trio", a, b)]
     );
     let audited: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE action = 'job.created'")
         .fetch_one(&db.pool)
@@ -848,22 +850,25 @@ async fn a_round_robin_creates_a_job_for_every_pairing() {
     sqlx::query("DELETE FROM jobs").execute(&db.pool).await.unwrap();
     let (status, created) = admin.create_job(request("game_pairs", "", &[a, b, c, d])).await;
     assert_eq!(status, StatusCode::CREATED, "{created}");
-    assert_eq!(created["jobs"].as_array().unwrap().len(), 6, "{created}");
+    assert_eq!(
+        names(&created),
+        ["a vs b", "a vs c", "a vs d", "b vs c", "b vs d", "c vs d"],
+        "untitled, each job is named for its pairing alone"
+    );
     let pairs: Vec<(String, Uuid, Uuid)> =
-        seatings(&db).await.into_iter().map(|(name, p1, p2, _, _)| (name, p1, p2)).collect();
+        seatings(&db).await.into_iter().map(|(title, p1, p2, _, _)| (title, p1, p2)).collect();
     assert_eq!(
         pairs,
         [
-            ("a vs b".to_string(), a, b), ("a vs c".to_string(), a, c), ("a vs d".to_string(), a, d),
-            ("b vs c".to_string(), b, c), ("b vs d".to_string(), b, d), ("c vs d".to_string(), c, d),
-        ],
-        "unnamed, each job is named for its pairing alone"
+            (String::new(), a, b), (String::new(), a, c), (String::new(), a, d),
+            (String::new(), b, c), (String::new(), b, d), (String::new(), c, d),
+        ]
     );
 
     sqlx::query("DELETE FROM jobs").execute(&db.pool).await.unwrap();
     let (status, created) = admin.create_job(request("games", "solo", &[b])).await;
     assert_eq!(status, StatusCode::CREATED, "{created}");
-    assert_eq!(created["jobs"].as_array().unwrap().len(), 1, "{created}");
+    assert_eq!(names(&created), ["solo: b vs b"], "{created}");
     assert_eq!(seatings(&db).await, [inactive("solo", b, b)], "one config plays itself");
 }
 
@@ -884,7 +889,7 @@ async fn a_round_robin_with_one_bad_pairing_creates_nothing() {
     let sim_other = admin.simmer("sim-other", kwg, klv, other_winpct).await;
     let with = |ids: Vec<Uuid>| {
         let mut body = pairs_body(ld, layout, plain, plain);
-        body["name"] = json!("rr");
+        body["title"] = json!("rr");
         body["player_config_ids"] = json!(ids);
         body
     };
@@ -903,15 +908,6 @@ async fn a_round_robin_with_one_bad_pairing_creates_nothing() {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{ids:?}: {refused}");
         assert_eq!(refused["fields"][0]["field"], "player_config_ids", "{refused}");
     }
-    assert_eq!(job_count(&db).await, 0);
-
-    // A pairing whose name would pass a job name's length is refused too,
-    // before anything is written.
-    let mut long = with(vec![plain, sim_a]);
-    long["name"] = json!("x".repeat(95));
-    let (status, refused) = admin.create_job(long).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
-    assert_eq!(refused["fields"][0]["field"], "name", "{refused}");
     assert_eq!(job_count(&db).await, 0);
 }
 

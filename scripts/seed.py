@@ -464,10 +464,7 @@ def existing_active_job(client: Client, job_type: str, name: str = "") -> Option
     worker is feeding.
     """
     for job in active_jobs(client):
-        # A games or pairs job between two configs is stored as
-        # "{name}: A vs B".
-        named = job["name"] == name or job["name"].startswith(f"{name}: ")
-        if job["job_type"] == job_type and (not name or named):
+        if job["job_type"] == job_type and (not name or job["title"] == name):
             return job["id"]
     return None
 
@@ -485,7 +482,7 @@ def create_job(client: Client, args, data: dict, players: list,
             return already
 
     body = {
-        "name": name,
+        "title": name,
         "job_type": job_type,
         "variant": args.variant,
         "letterdist_id": data["letterdist"],

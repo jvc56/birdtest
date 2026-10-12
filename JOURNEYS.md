@@ -108,21 +108,30 @@ Use a signed-out window for the V journeys unless one says otherwise.
 
 ### V-2 The home page
 
-- [ ] **Expect** "Crowdsourced Crossword Game Research" and the buttons **Browse
-  jobs** and **Create an account**.
+- [ ] **Expect** "Crowdsourced Crossword Game Research", then "birdtest is a
+  distributed task queue for researching crossword games which support the
+  following jobs:", a list of Games, Game Pairs, Opening Rack Analysis and
+  Leave Generation, each with a sentence or two on what it does, and "Admins
+  create jobs while workers running MAGPIE claim tasks to work on and submit
+  the results to birdtest."; then the buttons **Browse jobs** and **Create an
+  account**.
 - [ ] **Expect** next "Active Jobs" listing the seeded jobs still running as
   cards: name, status badge, "25% allocation". Clicking one opens its job page.
 - [ ] **Expect** after it a "Contribute" section (not a card, like "Active
   Jobs") of four numbered steps: **Install MAGPIE** (linking MAGPIE's
   getting-started section), **(Optional) Create an account** (to contribute
   under a username: make an API key and copy it for the next step; else
-  anonymously), **Create a contribute.txt file** (a table of its settings and
-  each one's default -- `server` https://birdtest.org, `apikey` none "(step
-  2)", `threads` every core but one, `maxtasks` 0, `idlewait` 5 -- and a
-  sample. Here, off birdtest.org, the step is not optional and the sample is a
-  `server` line with this site's own address; on birdtest.org the heading
-  starts "(Optional)" and the sample sets `threads`) and **Run the contribute
-  command** (`./bin/magpie contribute`).
+  anonymously), **(Optional) Create a contribute.txt file**, on any site
+  ("Workers can specify certain settings. Any setting not specified in the
+  contribute.txt file uses the default value. If there is no contribute.txt
+  file, all of the defaults are used:", a table of its settings and each
+  one's default -- `server` https://birdtest.org, `apikey` none "(step 2)",
+  `threads` every core but one, `maxtasks` 0, `idlewait` 5 -- where the file
+  goes, and an example naming every setting, its `server` this site's own
+  address) and **Run the contribute command** ("From the top level
+  directory, run `./bin/magpie contribute`. It will run continuously until
+  you stop it with Ctrl-C (or until it completes maxtasks tasks if a nonzero
+  value was specified).").
 - [ ] At phone width, **expect** the settings as a stacked list instead of a
   table -- each name and its default on one line, what it is under them --
   with nothing cut off at the screen's edge.
@@ -145,22 +154,32 @@ Use a signed-out window for the V journeys unless one says otherwise.
 
 Open "dev game pairs (first divergences saved)".
 
-- [ ] **Expect** the job's name as the title with "Game Pairs" beside it, then
-  "CSW24 · classic · static, by equity vs static, by score".
+- [ ] **Expect** its title as the heading with its status pill beside it;
+  under it each player on a line of its own -- its seat number in its colour
+  (1 blue, 2 orange), its config's name in the same colour, linking to the
+  config, and what it does ("static-equity static, by equity", "static-score
+  static, by score") -- then "Game Pairs · CSW24 · classic". In the job list
+  the same job is "dev game pairs (first divergences saved): static-equity vs
+  static-score".
 - [ ] **Expect** a full-width Status card: the badge ("active") and nothing
   beside it -- the badge says it plainly, and its allocation has its own card.
   (Inactive: "Paused: no worker is offered its tasks until it is given an
-  allocation." and "Its significance test is paused while the job is inactive (see the
-  Significance Test card)." Set aside by the server, its reason instead, A-17;
+  allocation.", and nothing about its significance test, whose own card says
+  where it stands. Set aside by the server, its reason instead, A-17;
   and under it, once any of its tasks has hit the time limit, "N tasks hit the
   time limit — lower the batch size.")
-- [ ] **Expect** under it four cards, in a row on a wide screen and two by two
-  on a narrower one: Allocation, Tasks completed, Throughput (the job's pace
-  over the last hour in its own unit, "N pairs/hour"; "—" once nothing has
-  finished in the hour) and Estimated time left.
-- [ ] **Expect** a Progress card: a bar of "pairs completed", then **Tasks**
-  with Waiting to be reissued / In progress / Done counts and no explanation
-  under them; then "Created by dev, <date>" and "requires MAGPIE ≥ …".
+- [ ] **Expect** under it a Progress card: the percentage done beside its
+  heading ("Done" in green once finished), a bar, then four figures, in a row
+  on a wide screen and two by two on a narrower one: **Done** ("N" over "of
+  up to M pairs"), **Throughput** (the job's pace over the last hour, "N"
+  over "pairs/hour"; "—" once nothing has finished in the hour), **Time
+  left** ("2.3d" over "about <date, time>") and **Allocation** ("20%" over
+  "of claims"); then "Tasks: N in progress · N waiting to be reissued · N
+  done", and "Created by dev, <date>" and "requires MAGPIE ≥ …". No row of
+  four cards above it.
+- [ ] On a job its significance test finished before its cap, **expect** the
+  bar full and green, "Done", and under it "Stopped at N of up to M pairs:
+  the significance test decided at K."
 - [ ] **Expect** a Contributors table: `dev-contributor-1`,
   `dev-contributor-2` and "Anonymous · <16 characters>" rows, with compute time
   (on a wide screen) and tasks completed, and under it "N movegens for this
@@ -173,21 +192,23 @@ Open "dev game pairs (first divergences saved)".
   parallelism (all threads on one game)", Minimum Pairs (50,000), Pairs Per Task and Oldest MAGPIE,
   and no download link.
 - [ ] **Expect** after it a **Player settings** card: the players side by side,
-  headed "Player 1" and "Player 2", each with its colour dot (green, purple:
+  headed "Player 1" and "Player 2", each with its colour dot (blue, orange:
   the colours their moves are drawn in under Saved positions) and its name
-  linking to its config's page. It lists only the settings they differ in, as
-  ordinary rows (Sorted By), with no block heading, tint or fold. (Two players
-  alike say "These players' settings are identical."; one player lists its key
-  rows.)
-- [ ] **Do** press **All settings** on the Player settings card. **Expect**
-  every setting, the key rows first -- Lexicon, Leaves, Sorted By, Move
-  Recorder, Moves Generated, Plies, Uses Inference "—", Uses Preendgame "no"
-  and Uses Endgame "no" -- then the rest (no simulation rows: neither
-  simulates), Moves Recorded, Plies Recorded "—" (both are static) and Movegen
-  Margin "—" (neither recorder keeps moves by equity). The button now reads
-  **Different settings only** and puts the card back. On a job that records no
-  positions ("tester no test", A-7), Moves Recorded is in grey: it never reads
-  it.
+  linking to its config's page, and beside its heading how many settings
+  they differ in ("1 of 21 differ"). It lists every setting, the key rows
+  first -- Lexicon, Leaves, Sorted By, Move Recorder, Moves Generated, Plies,
+  Uses Inference "no", Uses Preendgame "no" and Uses Endgame "no" -- then the
+  rest (no simulation rows: neither simulates), Moves Recorded, Plies
+  Recorded "—" (both are static) and Movegen Margin "—" (neither recorder
+  keeps moves by equity). The row they differ in, Sorted By, has an amber
+  edge and tint, its label and values in bold; no other row does. On a job
+  that records no positions ("tester no test", A-7), Moves Recorded is in
+  grey: it never reads it, and it is never marked. (One player lists its key
+  rows, with an **All settings** toggle.)
+- [ ] **Do** press **Different settings only** on the Player settings card.
+  **Expect** only Sorted By, as an ordinary row with no tint (two players
+  alike say "These players' settings are identical."). The button now reads
+  **All settings** and puts the card back.
 - [ ] At phone width, **expect** the tables to wrap (or scroll inside the
   card), never the page.
 - [ ] **Do** open `/jobs/00000000-0000-4000-8000-000000000000`. **Expect** "no
@@ -204,35 +225,48 @@ Open "dev game pairs (first divergences saved)".
 
 On the same job:
 
-- [ ] **Expect**, after the settings, a **Match score** card with two tables,
-  **All games** and **Games that diverged**, each a column per player
-  (`static-equity`, `static-score`) and rows Wins, Losses (each player's are
-  the other's wins), Draws, Average score and Average spread (signed, "+3.2"
-  and "-3.2"); in each row the better value green and the worse red -- the
-  fewer losses green -- equal values (Draws) neither; no chart. Under the
-  first "Over N games, both games of every pair.", under the second just
-  "Over M games: both games of the K pairs whose games did not play
-  identically." The figures count games, not pairs.
-- [ ] **Expect** after it a **Significance Test** card with a "running" badge and
-  one sentence: "static-equity scores x% per game (95% interval a% to b%)." --
-  no Elo or rating figure anywhere on the card. Then "The test is not acted on until 50,000 pairs
-  are complete." and a bar: the interval shaded on a scale of player 1's
-  score, a dashed line at 50% and a mark at the score, labelled "even at
-  50%, static-equity's score x%". No W/L/D line of its own.
+- [ ] **Expect**, after the settings, a **Match score** card: the players'
+  names (`static-equity` in blue, `static-score` in orange), under each its
+  share of the points to two places ("57.73%") and "of points", the leader's
+  in bold; a bar of the games each won, `static-equity`'s count in its blue
+  part on the left, `static-score`'s in its orange part on the right, the
+  draws a grey sliver between, labelled underneath "static-equity wins", "N
+  draws", "static-score wins"; then "Average score" ("431.20 to 411.53") and
+  "Average spread per game" ("+19.67 to static-equity", or "Even"), each to
+  two places; and "Over N games, both games of every pair. A draw counts as
+  half a point." The figures count games, not pairs. No red or green.
+- [ ] **Do** switch the card's toggle from **All games · N** to **Diverged ·
+  M**. **Expect** every figure to change to the games of the pairs that
+  diverged, and the note to read "Over M games: both games of the K pairs
+  whose games did not play identically."
+- [ ] **Expect** after it a **Significance Test** card with a "running" badge
+  and three tiles: **Verdict** "Too early", "requires at least 50,000 pairs";
+  **static-equity's score** "x%" to two places and "95% interval a% to b%";
+  **Pairs** the pairs played, "of up to N, test requires at least 50,000", over a
+  small progress bar with an amber mark at the minimum. No Elo or rating
+  figure anywhere on the card, and no W/L/D line of its own. Under the
+  tiles, a chart with 50% always in the middle: its left half orange, its
+  right half blue, the interval shaded with a mark at the score, five ticks
+  under it with 50% the middle one, and "← static-score better" and
+  "static-equity better →" under its ends.
 - [ ] **Do** open **What does the interval mean?**. **Expect** the question
   -- is one player better, at 95% confidence -- each pair one observation,
   scored by player 1's result across its two games, that the interval stays
   valid however often it is checked, and that the chance of naming a winner
   between two equal players is at most about 5%.
-- [ ] **Expect** the pair-outcome table in the Significance Test card, a column per player:
-  "Won both", "Won one, drew one", "Even", each cell "count (share%)", the
-  higher of a row green and the lower red, "Even" the same for both; and a
-  line on how many pairs diverged.
-- [ ] On "dev games (positions saved)", **expect** one match-score table (no
-  divergent one), the explanation per game (0, ½ or 1), no "both games of
-  every pair" note, and no pair-outcome table.
-- [ ] On a job an admin has deactivated (A-8), **expect** "paused while the job
-  is inactive: no pairs are being played, so the test is not moving".
+- [ ] **Expect** **Pair outcomes** in the Significance Test card: one bar,
+  static-equity's sweeps in solid blue on the left, its won-one-drew-one in
+  faint blue, even pairs grey in the middle, then static-score's in faint
+  and solid orange, each part's count written in it when it is over 7% of
+  the pairs; under it a key of the five, "static-equity won both" to
+  "static-score won both", each with its count and share of the pairs. No
+  line under it on how many pairs diverged, and no red or green.
+- [ ] On "dev games (positions saved)", **expect** the match score with no
+  All games / Diverged toggle, the explanation per game (0, ½ or 1), no "both
+  games of every pair" note, and no pair-outcome table.
+- [ ] On a job an admin has deactivated (A-8), **expect** a "paused" badge and
+  the Verdict tile "Paused", "no pairs are being played while the job is
+  inactive".
 - [ ] On "tester no test" (A-7), **expect** the Match score card and no
   Significance Test card, and settings rows "Pairs To Play 20" and
   "Significance Test no" in place of the test's settings.
@@ -299,9 +333,8 @@ finishes within minutes.
   1,000 and Racks Per Task, with no lexicon or wordmap row of
   its own; then one column headed "Player", `ab-static-equity-no-rit` linking to its
   config: search "static, by equity", Lexicon CSW21_ab -- and
-  its leaves, recorder, Uses Preendgame and Uses Endgame in grey, under
-  "Settings in grey are the player config's, and this job does not use
-  them." **Do** **All settings** on the player card. **Expect** Wordmap "yes"
+  its leaves, recorder, Uses Preendgame and Uses Endgame in grey, with no
+  note explaining the grey. **Do** **All settings** on the player card. **Expect** Wordmap "yes"
   and Rack Info Table "no", and Moves Recorded, Plies Recorded and Movegen
   Margin grey too.
 
@@ -320,8 +353,11 @@ Open "dev game pairs (first divergences saved)".
   moves ranked by static equity", the PLAY underlined in its player's colour;
   its board -- premium squares (TW, DW, TL, DL and a star on the centre),
   tiles each with a letter and a score (a blank a red lower-case letter with
-  none), the tiles MOVE placed outlined, the tiles PLAY puts down drawn
-  dashed in its player's colour, both racks and scores with **to move** on the
+  none), the tiles MOVE placed bordered in lavender, the previous move's own colour, the
+  tiles PLAY puts down washed in its player's colour with a solid border
+  (player 1 blue, player 2 orange), a key naming each ("OTHER PLAYER's
+  previous move, MOVE (score)", "PLAYER played PLAY (score)"), the move
+  list's **played** chip in the same colour, both racks and scores with **to move** on the
   player whose rack it is, and no CGP text -- and its ranked moves, the one
   played tinted and marked **played**. **Do** press the other button.
   **Expect** "Game 2 of the pair · OTHER PLAYER to move", the same board and
@@ -344,8 +380,9 @@ Open "dev game pairs (first divergences saved)".
   equity E." and a table of up to ten leaves the opponent may have kept:
   Leave, Draws ("count (share%)") and Equity.
 - [ ] On "dev games (positions saved)", **expect** one game's position: its
-  board with the previous move outlined and the move played drawn dashed in
-  green, both racks and scores under it, "played PLAY (score)" in the summary,
+  board with the previous move bordered in lavender and the
+  move played washed in its player's -- player 2's in orange, not player
+  1's blue -- both racks and scores under it, "played PLAY (score)" in the summary,
   and the played move marked in the list.
 - [ ] **Do** **Random position** a few times. **Expect** another position
   each time (now and then the same one again), the board, racks and scores agreeing with each other; on a turn 1
@@ -373,21 +410,34 @@ Open "dev game pairs (first divergences saved)".
   explanation.
 - [ ] After [A-13](#a-13-rating-pools), **do** open **Ratings** → the pool.
   **Expect** "classic · english · standard15 — anchored at 1500", "Last fit
-  <time> (membership) over N pairs from 1 job, K iterations", and a warning
-  if the fit did not converge.
+  <time> (membership) over N pairs from 1 job, K iterations", a warning
+  if the fit did not converge, and then: a gap between two ratings predicts
+  the score the same gap does between two established WESPA players, a link
+  to the WESPA ratings report
+  (https://wespa.org/docs/WESPA-Ratings-V4-Report.pdf).
 - [ ] **Expect** first a "Cross table": every rated config against
   every other, best first, each cell the row's win % "±" its standard error
   over its average spread ("+6.8"), a blank diagonal, "·" where two never
-  played, and the rating in the last column. Each pair of cells mirrors across
+  played, and the rating in the last column. Each row's config name links to
+  its config's page, looking like the other text until hovered, as do the
+  names beside the plot and in the admin's All configs table. Each pair of cells mirrors across
   the diagonal (100 − the win %, the same error, the spread negated). A cell
   over 50.0% is tinted green, under it red, and one showing 50.0% not at all;
-  a score the ratings predict badly is amber text on that tint. Under the
-  table a line: a gap predicts what it does between WESPA players, and the
-  absolute level is only where the anchor was pinned. **Do** hover a cell.
+  a score the ratings predict badly is amber text on that tint. The line
+  above the table says so: "Each cell is the row player's score against the
+  column player's score. The percentage is (wins + ½ draws) / games with ±
+  indicating the standard error. …" In a non-transitive pool, under it, "N
+  head-to-heads are more than 5 points from what the ratings predict, on
+  enough pairs that it is not a fluke." **Do** hover a cell.
   **Expect** "<row> against <column>: … The ratings predict …% (residual …
   percentage points)."
-- [ ] **Expect** after it a dot plot with ±1 standard-error bars and the
-  anchor in amber.
+- [ ] **Expect** after it a dot plot: a key above it ("thick: ±1 standard
+  error · thin: 95% interval", "the anchor, fixed by definition"), each row a
+  dot on a thick ±1 standard-error bar over a thin 95% one, the anchor's dot
+  amber, and at its end its rating and error ("1641.0 ±12.4", the anchor's
+  "fixed"). Under it, "Between any two players, a gap of 100 points predicts
+  about a 60–40 score, and 275 points 75–25." At phone width the names'
+  margin narrows and the axis labels thin out rather than run together.
 - [ ] As an admin, **expect** after it an "All configs" table (Rating (WESPA
   scale), ± SE, pairs; the anchor tagged), then the Anchor card. Signed out,
   **expect** neither.
@@ -407,7 +457,7 @@ Open "dev game pairs (first divergences saved)".
   created.
 - [ ] **Do** open `static-equity`. **Expect** "static, by equity" beside its
   name, and a table of Lexicon, Leaves, Sorted By, Move Recorder, Moves
-  Generated, Plies, Uses Inference "—", Uses Preendgame "no" and Uses Endgame
+  Generated, Plies, Uses Inference "no", Uses Preendgame "no" and Uses Endgame
   "no", and a JSON download; a simmer's (A-4) has the same rows, Uses
   Inference "yes" or "no". **Do** press **All settings**. **Expect** every
   setting in the same table, Lexicon still first; a simmer's with Win %
@@ -633,6 +683,11 @@ Do this last: it empties the database.
 - [ ] **Do** a simmer: tick **Simming Player**, choose the win% model, **Plies
   (-pl)** 1, **Maximum Total Iterations (-i)** 100. **Expect** it saved and described "1-ply sim, 100
   iterations".
+- [ ] **Do** `tester-sim-budget`: the same simmer with **Movegens per Move
+  (-mb)** 50,000. **Expect** it saved and described "1-ply sim, 100
+  iterations · 50,000 movegens a move", and on its page, under **All
+  settings**, Movegens per Move 50,000 (the other configs "—"). **Do** enter 0.
+  **Expect** "must be at least 1, or left empty for no budget".
 - [ ] **Do** tick **Simming Player** without a win% model. **Expect** the
   browser to insist on one.
 - [ ] **Do** set Stopping % to 100, then 0. **Expect** the browser to hold the
@@ -688,10 +743,11 @@ opening-rack or leave job lands on its admin page; a games or game-pairs job
 lands on **Allocation**, the new job marked "new" and listed first. A games or
 pairs job's players are a checklist, seated in the order ticked: tick the
 first-named player first, so `static-equity` vs `static-score` is equity's
-player-1 side, and each such job is named "{name}: A vs B" (so "tester no test"
-is "tester no test: static-equity vs static-score"; below it is called by its
-name alone). The fields are named as the settings tables
-name them (**Job Name**, **Job Type**, **Letter Distribution**, **Board**,
+player-1 side, and each such job is named for its title and players,
+"{title}: A vs B" (so "tester no test" is "tester no test: static-equity vs
+static-score"; below it is called by its title alone), a self-play job "{title}:
+A vs A". The fields are named as the settings tables
+name them (**Job Title**, **Job Type**, **Letter Distribution**, **Board**,
 **Pairs Per Task**, …), and the job types read "Opening Rack Analysis",
 "Games", "Game Pairs" and "Leave Generation". The letter distribution and
 board start on "Choose…": pick `english` and `standard15` each time.
@@ -1135,8 +1191,9 @@ an allocation above 0% activates it (`200`), 0% deactivates it, and a share
 that would take the active jobs past 100% is `409` — with the seed's games and
 pairs jobs active, 50% is the most left. The allocations endpoint is the only
 switch; it answers `{ "jobs": [...] }`, each named job as it now stands.
-Creation answers `{ "jobs": [...] }` too: the two configs here make one job,
-"cli test: A vs B", and three or more would make a job per pairing. Set `JOB`
+Creation answers `{ "jobs": [...] }` too, each with its `title` and its `name`:
+the two configs here make one job, titled "cli test" and named "cli test: A vs
+B", and three or more would make a job per pairing. Set `JOB`
 to its id. This one runs no significance test and plays its 20 pairs;
 `"test_enabled": true` turns the test on, with `min_pairs` then required (at
 least 1, at most `max_pairs`) and `confidence_pct` optional (95 by default,
@@ -1145,11 +1202,11 @@ it is a `400` naming each.
 
 ```bash
 curl -s -b "$JAR" -H "X-CSRF-Token: $CSRF" -H 'Content-Type: application/json' \
-  -d '{"name":"cli test","job_type":"game_pairs","variant":"classic",
+  -d '{"title":"cli test","job_type":"game_pairs","variant":"classic",
        "letterdist_id":"<letterdist id>","layout_id":"<layout id>",
        "player_config_ids":["<config id>","<other config id>"],
        "pairs_per_batch":10,"max_pairs":20}' \
-  "$SITE/api/admin/jobs" | jq '.jobs[] | {id, name}'
+  "$SITE/api/admin/jobs" | jq '.jobs[] | {id, title, name}'
 curl -s -b "$JAR" -H "X-CSRF-Token: $CSRF" -H 'Content-Type: application/json' -X PUT \
   -d '{"allocations":[{"job_id":"'"$JOB"'","allocation":4}]}' "$SITE/api/admin/jobs/allocations"
 curl -s -b "$JAR" -H "X-CSRF-Token: $CSRF" -H 'Content-Type: application/json' -X PUT \

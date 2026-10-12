@@ -12,8 +12,9 @@
   import { page } from '$app/stores';
   import { api, errorText, type JobListItem, type JobStatus } from '$lib/api';
   import { equalShares } from '$lib/allocation';
-  import { jobTitle, jobTypeLabel } from '$lib/format';
+  import { jobName, jobTypeLabel } from '$lib/format';
   import JobStatusBadge from '$lib/components/JobStatusBadge.svelte';
+  import StatusPill from '$lib/components/StatusPill.svelte';
 
   let jobs: JobListItem[] = [];
   // The jobs the creation form just made (`?new=id,id`): a round robin's
@@ -106,7 +107,7 @@
     {#if fresh.size}
       <p class="text-sm" data-testid="new-jobs">
         {fresh.size === 1 ? 'The new job is' : `The ${fresh.size} new jobs are`} marked
-        <span class="rounded-full border border-primary/30 bg-primary/15 px-2 py-0.5 text-xs font-medium text-primary">new</span> and listed first, inactive at 0%: give
+        <StatusPill tone="blue" icon="spark">new</StatusPill> and listed first, inactive at 0%: give
         {fresh.size === 1 ? 'it an allocation' : 'them allocations'} to start
         {fresh.size === 1 ? 'it' : 'them'}.
       </p>
@@ -124,14 +125,14 @@
             {#each listed as job (job.id)}
               <tr class:font-medium={Number(values[job.id]) !== current(job)}>
                 <td>
-                  <a href="/admin/jobs/{job.id}">{jobTitle(job)}</a>
-                  {#if fresh.has(job.id)}<span class="ml-1 rounded-full border border-primary/30 bg-primary/15 px-2 py-0.5 text-xs font-medium text-primary">new</span>{/if}
+                  <a href="/admin/jobs/{job.id}">{jobName(job)}</a>
+                  {#if fresh.has(job.id)}<span class="ml-1"><StatusPill tone="blue" icon="spark">new</StatusPill></span>{/if}
                 </td>
                 <td>{jobTypeLabel(job.job_type)}</td>
                 <td><JobStatusBadge status={job.status} /></td>
                 <td class="text-right tabular-nums">{current(job)}%</td>
                 <td class="text-right">
-                  <label class="sr-only" for="alloc-{job.id}">Allocation for {jobTitle(job)}</label>
+                  <label class="sr-only" for="alloc-{job.id}">Allocation for {jobName(job)}</label>
                   <input
                     id="alloc-{job.id}"
                     type="number"

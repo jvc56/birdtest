@@ -26,10 +26,9 @@
       {#if isAdmin}<a class="btn-primary no-underline hover:no-underline" href="/admin/rating-pools/new">New rating pool</a>{/if}
     </div>
     <p class="max-w-3xl text-sm text-muted-foreground">
-      A rating pool is a set of player configs whose ratings are comparable, plus the conditions
-      that make them so. Every rating in a pool is solved for jointly from every game pair its
-      members have played, anchored on one config at a fixed rating — so ratings are meaningful
-      within a pool and not between pools.
+      A rating pool is a set of players whose ratings are comparable. Every rating in a pool is
+      informed by every game its members have played, anchored on one player at a fixed rating.
+      This means that ratings are only meaningful within a pool and not between pools.
     </p>
   </div>
 

@@ -8,7 +8,7 @@ import { test, expect } from '@playwright/test';
 test('E-14: a visitor reads a player config and all of its settings', async ({ page }) => {
   await page.goto('/');
   await page.getByRole('link', { name: 'Players', exact: true }).click();
-  await expect(page.getByRole('heading', { name: 'Player configs' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Players', exact: true })).toBeVisible();
   await page.getByRole('link', { name: 'static-equity', exact: true }).click();
 
   await expect(page.getByRole('heading', { name: 'static-equity' })).toBeVisible();

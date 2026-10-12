@@ -1036,6 +1036,70 @@ async fn a_simming_player_config_is_bounded_by_iterations_not_time() {
     }
 }
 
+/// A movegen budget per move is the player's own: any player may state one, a
+/// static one included (it says what the player may spend, and the settings
+/// card greys it where nothing can spend it), 0 and below are refused (no
+/// budget is null), and a stated one is kept and sent to MAGPIE as stated.
+#[tokio::test]
+async fn a_player_config_takes_a_movegen_budget_per_move() {
+    let db = TestDb::new().await;
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+    let admin = db.user("root", true).await;
+    let headers = admin_headers(&state.cfg, admin);
+    let headers: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let kwg = db.input_data("kwg", "NWL23").await;
+    let klv = db.input_data("klv", "NWL23").await;
+    let winpct = db.input_data("winpct", "winpct").await;
+
+    let simmer = json!({
+        "recorder_type": "best", "kwg_id": kwg, "klv_id": klv, "winpct_id": winpct,
+        "num_plies": 2, "num_plays": 10, "num_plays_recorded": 1, "max_iterations": 100,
+        "time_limit_secs": 0,
+    });
+    let static_player = json!({
+        "recorder_type": "best", "kwg_id": kwg, "klv_id": klv, "num_plies": 0,
+        "num_plays": 10, "num_plays_recorded": 1,
+    });
+    let cases = [
+        ("simmer-none", &simmer, None, StatusCode::CREATED),
+        ("simmer-budget", &simmer, Some(json!(50_000)), StatusCode::CREATED),
+        ("static-budget", &static_player, Some(json!(1_000)), StatusCode::CREATED),
+        ("zero", &simmer, Some(json!(0)), StatusCode::BAD_REQUEST),
+        ("negative", &simmer, Some(json!(-5)), StatusCode::BAD_REQUEST),
+    ];
+    for (name, base, budget, expected) in cases {
+        let mut body = base.clone();
+        body["name"] = json!(name);
+        if let Some(budget) = &budget {
+            body["movegens_per_move"] = budget.clone();
+        }
+        let (status, response) = player_config(&app, &headers, body).await;
+        assert_eq!(status, expected, "{name}: {response}");
+        if expected == StatusCode::CREATED {
+            assert_eq!(response["movegens_per_move"], budget.clone().unwrap_or(json!(null)), "{name}: {response}");
+        } else {
+            assert_eq!(response["fields"][0]["field"], "movegens_per_move", "{name}: {response}");
+        }
+    }
+    // Read back, and named in the player spec a task sends MAGPIE.
+    let stored: Option<i64> =
+        sqlx::query_scalar("SELECT movegens_per_move FROM player_configs WHERE name = 'simmer-budget'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(stored, Some(50_000));
+    let named = sqlx::query_as::<_, birdtest::models::job::NamedPlayerConfig>(&format!(
+        "{} WHERE pc.name = 'simmer-budget'",
+        birdtest::models::job::NamedPlayerConfig::SELECT
+    ))
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let spec = serde_json::to_value(birdtest::jobs::handler::PlayerSpec::from(named)).unwrap();
+    assert_eq!(spec["movegens_per_move"], json!(50_000), "{spec}");
+}
+
 /// With capture on, MAGPIE raises a simmer's candidate count to the capture cap,
 /// so a capture job whose simmer considers fewer plays would play different
 /// games from the same job without capture.

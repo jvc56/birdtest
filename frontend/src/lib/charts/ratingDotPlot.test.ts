@@ -13,7 +13,12 @@ import {
   stderrCell,
   visibleError,
   NAME_CHARS,
-  rowLabels
+  NARROW_WIDTH,
+  padFor,
+  ratingFigure,
+  rowLabels,
+  tickLabelStep,
+  Z95
 } from './ratingDotPlot';
 
 function row(
@@ -43,18 +48,20 @@ const oneSeAbove = row('c', 1540, 40);
 const other = row('b', 1600, 50);
 
 describe('F-CHART-1 RatingDotPlot positions', () => {
-  // Intervals span [1500, 1650]; the 8% margin (12) is above the 10 floor.
+  // The 95% intervals span [1540 - 78.4, 1600 + 98] = [1461.6, 1698]; the 8%
+  // margin (18.912) is above the 10 floor.
   const layout = layoutDotPlot([anchor, other, oneSeAbove], WIDTH);
-  const pxPerPoint = INNER / 174;
+  const lo = 1461.6 - 18.912;
+  const pxPerPoint = INNER / (1698 + 18.912 - lo);
   const at = (id: string) => layout.rated.find((r) => r.row.player_config_id === id)!;
 
-  it('computes the domain from every interval plus a margin', () => {
-    expect(layout.bounds.lo).toBeCloseTo(1488, 9);
-    expect(layout.bounds.hi).toBeCloseTo(1662, 9);
+  it('computes the domain from every 95% interval plus a margin', () => {
+    expect(layout.bounds.lo).toBeCloseTo(lo, 9);
+    expect(layout.bounds.hi).toBeCloseTo(1716.912, 9);
   });
 
   it("places the anchor's dot at the anchor rating", () => {
-    expect(at('a').cx).toBeCloseTo(PAD.left + 12 * pxPerPoint, 9);
+    expect(at('a').cx).toBeCloseTo(PAD.left + (1500 - lo) * pxPerPoint, 9);
     expect(at('a').cx).toBeCloseTo(dotPlotX(1500, layout.bounds, WIDTH), 9);
     // Stderr 0: the anchor's bar is a point on its dot.
     expect(at('a').x1).toBeCloseTo(at('a').cx, 9);
@@ -68,6 +75,10 @@ describe('F-CHART-1 RatingDotPlot positions', () => {
     // And a bar is ±1 SE, symmetric about the dot.
     expect(at('b').cx - at('b').x1).toBeCloseTo(50 * pxPerPoint, 9);
     expect(at('b').x2 - at('b').cx).toBeCloseTo(50 * pxPerPoint, 9);
+    // The thin one around it is the 95% interval, 1.96 standard errors.
+    expect(at('b').cx - at('b').w1).toBeCloseTo(Z95 * 50 * pxPerPoint, 9);
+    expect(at('b').w2 - at('b').cx).toBeCloseTo(Z95 * 50 * pxPerPoint, 9);
+    expect([at('a').w1, at('a').w2]).toEqual([at('a').cx, at('a').cx]);
   });
 
   it('maps the domain ends to the plot edges', () => {
@@ -101,6 +112,30 @@ describe('F-CHART-1 RatingDotPlot positions', () => {
     expect([10, 20, 50, 100]).toContain(Math.round(step));
     ticks.forEach((t, i) => i && expect(t - ticks[i - 1]).toBeCloseTo(step, 9));
     expect(dotPlotTicks({ lo: 1000, hi: 2000 })).toEqual([1000, 1200, 1400, 1600, 1800, 2000]);
+  });
+});
+
+describe('F-CHART-1b narrow charts and the figures beside the rows', () => {
+  it('gives the names a narrower margin on a phone, and keeps the plot inside it', () => {
+    expect(padFor(WIDTH)).toEqual(PAD);
+    const phone = padFor(NARROW_WIDTH - 1);
+    expect(phone.left).toBeLessThan(PAD.left);
+    const layout = layoutDotPlot([anchor, other, oneSeAbove], 358);
+    expect(layout.pad).toEqual(phone);
+    expect(dotPlotX(layout.bounds.lo, layout.bounds, 358)).toBeCloseTo(phone.left, 9);
+    expect(dotPlotX(layout.bounds.hi, layout.bounds, 358)).toBeCloseTo(358 - phone.right, 9);
+  });
+
+  it('labels every gridline where there is room, and fewer where there is not', () => {
+    expect(tickLabelStep(6, 516)).toBe(1);
+    expect(tickLabelStep(6, 134)).toBe(3);
+    expect(tickLabelStep(0, 0)).toBe(1);
+  });
+
+  it("prints each row's rating and its true error, the anchor's fixed", () => {
+    expect(ratingFigure(other)).toEqual({ rating: '1600.0', error: '±50.0' });
+    expect(ratingFigure(anchor)).toEqual({ rating: '1500.0', error: 'fixed' });
+    expect(ratingFigure(row('u', 1500, Number.MAX_VALUE)).error).toBe('±∞');
   });
 });
 

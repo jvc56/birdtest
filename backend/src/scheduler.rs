@@ -6,6 +6,7 @@ use crate::error::{AppError, AppResult};
 use crate::jobs::handler::TaskRequest;
 use crate::jobs::leave_gen;
 use crate::jobs::registry::{self, Acquired};
+use crate::jobs::dispatch::{JobKind, JobTemplate};
 use crate::jobs::ExpectedFile;
 use crate::models::job::{Job, JobType, LeaveConfig};
 use crate::state::AppState;
@@ -56,14 +57,21 @@ pub struct TaskClaim {
 /// (`routes::worker::submit_result`).
 pub const DEADLINE_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// [`TaskClaim::job_name`].
-fn job_name_for_worker(job: &Job) -> String {
-    let name = job.name.trim();
+/// [`TaskClaim::job_name`]: the job's name, from the template's players, or
+/// its type and id when it has none.
+fn job_name_for_worker(job: &Job, template: &JobTemplate) -> String {
+    let players = match &template.kind {
+        JobKind::Games { player1, player2, .. } | JobKind::GamePairs { player1, player2, .. } => {
+            Some((player1.name.as_str(), player2.name.as_str()))
+        }
+        _ => None,
+    };
+    let name = crate::models::job::job_name(&job.title, players);
     if name.is_empty() {
         let id = job.id.simple().to_string();
         format!("{} job {}", job.job_type.as_str(), &id[..8])
     } else {
-        name.to_string()
+        name
     }
 }
 
@@ -1268,7 +1276,7 @@ async fn try_claim_from_job(
                         // dispatch lock and the job's row lock on every claim.
                         expected_data: template.expected.clone(),
                         derived_data: derived,
-                        job_name: job_name_for_worker(job),
+                        job_name: job_name_for_worker(job, &template),
                         max_task_seconds,
                     }))
                 }

@@ -26,7 +26,7 @@ test.beforeAll(async ({ browser, playwright }) => {
   const admin = await browser.newContext({ storageState: ADMIN_STATE });
   const form = await admin.newPage();
   await form.goto('/admin/jobs/new');
-  await form.getByLabel('Job Name').fill(`e17 first divergences ${suffix}`);
+  await form.getByLabel('Job Title').fill(`e17 first divergences ${suffix}`);
   await form.getByLabel('Job Type').selectOption({ label: 'Game Pairs' });
   const letterdist = form.getByLabel('Letter Distribution');
   const fixtureBag = letterdist.locator('option', { hasText: `english_fixture (${SEEDED_DATA},` });

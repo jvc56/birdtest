@@ -36,8 +36,9 @@ pub enum JobStatus {
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct Job {
     pub id: Uuid,
-    /// What the admin called it; empty for a job created without one.
-    pub name: String,
+    /// What the admin called it; empty for a job created without one. The
+    /// job's name is this and its players ([`job_name`]).
+    pub title: String,
     pub job_type: JobType,
     /// The job's share of the fleet: above 0% exactly when the job is active
     /// (`jobs_allocation_is_status`), so 0% is what `inactive` means and a
@@ -118,6 +119,38 @@ pub struct Job {
     pub activated_at: Option<DateTime<Utc>>,
 }
 
+/// A job's name, as every page shows it and a worker is told it: its title,
+/// then for a games or pairs job who plays whom -- "{title}: A vs B", or
+/// "A vs B" with no title, and "A vs A" for self-play. Any other job's name is
+/// its title, empty when it has none.
+pub fn job_name(title: &str, players: Option<(&str, &str)>) -> String {
+    let title = title.trim();
+    match players {
+        None => title.to_string(),
+        Some((a, b)) if title.is_empty() => format!("{a} vs {b}"),
+        Some((a, b)) => format!("{title}: {a} vs {b}"),
+    }
+}
+
+/// The config names of a games or pairs job's players, player 1 first; `None`
+/// for every other job.
+pub async fn player_names(
+    conn: &mut sqlx::PgConnection,
+    job_id: Uuid,
+) -> crate::error::AppResult<Option<(String, String)>> {
+    Ok(sqlx::query_as::<_, (String, String)>(
+        "SELECT p1.name, p2.name
+         FROM (SELECT player1_config_id, player2_config_id FROM job_game_config WHERE job_id = $1
+               UNION ALL
+               SELECT player1_config_id, player2_config_id FROM job_game_pair_config WHERE job_id = $1) c
+         JOIN player_configs p1 ON p1.id = c.player1_config_id
+         JOIN player_configs p2 ON p2.id = c.player2_config_id",
+    )
+    .bind(job_id)
+    .fetch_optional(&mut *conn)
+    .await?)
+}
+
 impl Job {
     /// The floor as the assignment states it. Stored as three integers so it
     /// compares numerically; rendered here only for the wire.
@@ -158,6 +191,9 @@ pub struct PlayerConfig {
     pub stopping_pct: Option<f64>,
     pub use_inference: Option<bool>,
     pub time_limit_secs: Option<i32>,
+    /// The move generations the player may spend choosing one move, or `None`
+    /// for no budget. Sent to MAGPIE as `movegens_per_move` (its -mb1/-mb2).
+    pub movegens_per_move: Option<i64>,
     pub use_wordmap: bool,
     pub use_rit: bool,
     /// Whether the player loads the word info table for its lexicon: a

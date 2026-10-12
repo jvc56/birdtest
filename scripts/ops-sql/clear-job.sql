@@ -13,7 +13,7 @@ DO $$ BEGIN RAISE EXCEPTION 'run with -v job=<the job id>'; END $$;
 
 BEGIN;
 -- Which job, so the log says what was cleared; and the refusals.
-SELECT id, name, job_type, status FROM jobs WHERE id = :'job'::uuid;
+SELECT id, title, job_type, status FROM jobs WHERE id = :'job'::uuid;
 SELECT EXISTS (SELECT 1 FROM jobs WHERE id = :'job'::uuid) AS job_exists,
        EXISTS (SELECT 1 FROM jobs WHERE id = :'job'::uuid AND status = 'active') AS job_active \gset
 \if :job_active

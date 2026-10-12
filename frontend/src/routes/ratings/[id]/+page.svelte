@@ -173,6 +173,11 @@
       {:else}
         <p class="text-xs text-muted-foreground">Never computed.</p>
       {/if}
+      <p class="max-w-3xl text-sm text-muted-foreground" data-testid="wespa-scale">
+        A gap between two ratings predicts the score the same gap does between two established
+        WESPA players. To learn more about how WESPA ratings work, see the
+        <a href="https://wespa.org/docs/WESPA-Ratings-V4-Report.pdf">WESPA ratings report</a>.
+      </p>
     </div>
 
     {#if error}
@@ -185,10 +190,10 @@
       <h2 class="text-lg font-medium">Cross table</h2>
       {#if table && pool.head_to_heads.length}
         <p class="text-sm text-muted-foreground">
-          Each cell is the row config's score against the column's — (wins + ½ draws) / games —
-          ± its standard error, and beneath it the row's average spread per game. Hover a cell for
-          what the ratings predict. Green is a winning record and red a losing one; amber text is a
-          score the ratings predict badly, on enough pairs that it is not chance.
+          Each cell is the row player's score against the column player's score. The percentage is
+          (wins + ½ draws) / games with ± indicating the standard error. Beneath it are the player's
+          average spread per game. Hover a cell for what the ratings predict. Green is a winning
+          record and red a losing record. Amber text is a score the ratings predict badly.
         </p>
         <!-- Scrolls inside the card on a phone, the row names held in place. -->
         <div class="overflow-x-auto">
@@ -206,10 +211,16 @@
               {#each table.configs as row}
                 <tr>
                   <th scope="row" class="sticky left-0 z-10 bg-card">
-                    <!-- Held to a third of a phone, so the cells have the rest. -->
-                    <span class="block max-w-[8rem] truncate sm:max-w-xs" title={row.name}>
+                    <!-- Held to a third of a phone, so the cells have the rest.
+                         A link to the config that looks as the name did,
+                         underlined only on hover. -->
+                    <a
+                      href="/player-configs/{row.player_config_id}"
+                      class="block max-w-[8rem] truncate text-foreground sm:max-w-xs"
+                      title={row.name}
+                    >
                       {row.name}
-                    </span>
+                    </a>
                   </th>
                   {#each table.configs as col}
                     {@const cell = table.cell(row.player_config_id, col.player_config_id)}
@@ -241,20 +252,12 @@
         {#if nonTransitive}
           <p class="text-xs text-warning">
             {misses.length} head-to-heads are more than {(100 * NOTABLE).toFixed(0)} points
-            from what the ratings predict, on enough pairs that it is not chance. That is the signature
-            of a non-transitive pool — configs that beat some opponents and lose to others in a way no
-            single number per config can express. Read the ratings as a summary here, not as a
-            ranking.
+            from what the ratings predict, on enough pairs that it is not a fluke.
           </p>
         {/if}
       {:else}
         <p class="text-sm text-muted-foreground">No head-to-head results in this pool yet.</p>
       {/if}
-      <p class="text-xs text-muted-foreground">
-        A gap between two ratings predicts the score the same gap does between two established
-        WESPA players; the absolute level is only where the anchor was pinned, since bot games say
-        nothing about strength against people.
-      </p>
     </div>
 
     <div class="card space-y-3">
@@ -282,7 +285,7 @@
             {#each pool.ratings as row}
               <tr>
                 <td>
-                  {row.name}
+                  <a href="/player-configs/{row.player_config_id}">{row.name}</a>
                   {#if row.is_anchor}
                     <span class="ml-1 text-xs text-warning">anchor</span>
                   {/if}
@@ -310,7 +313,7 @@
             {#each membership?.unrated ?? [] as member}
               <tr>
                 <td>
-                  {member.name}
+                  <a href="/player-configs/{member.player_config_id}">{member.name}</a>
                   {#if member.player_config_id === pool.anchor_player_config_id}
                     <span class="ml-1 text-xs text-warning">anchor</span>
                   {/if}

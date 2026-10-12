@@ -15,8 +15,8 @@ answers three questions:
 - `arg_token_t` is defined at `config.c:100–279`.
 - Each token is registered with its CLI name at `config.c:12405–12587`.
 
-**Count.** `arg_token_t` has exactly **175 tokens**, not counting
-`NUMBER_OF_ARG_TOKENS`. 45 are registered as commands (`cmd(...)`) and 130 as
+**Count.** `arg_token_t` has exactly **179 tokens**, not counting
+`NUMBER_OF_ARG_TOKENS`. 45 are registered as commands (`cmd(...)`) and 134 as
 options (`arg(...)`). 160 of them predate endgame and pre-endgame play in
 games jobs (`ENDGAME_PEG_PLAN.md`, since deleted; see PLAN.md), which added 15: the
 per-player `eplies1`/`eplies2`, `pegbag1`/`pegbag2`, `pegtopk1`/`pegtopk2`,
@@ -134,113 +134,117 @@ The 82 "Not stored" rows break down as follows:
 | 66 | `MAX_NUMBER_OF_DISPLAY_PLAYS` | `maxnumdplays` | option | Stored | `player_configs.num_plays_recorded` ([L585](backend/migrations/0001_initial.sql#L585)) on each player config. **Run-wide in MAGPIE but stored per player and never checked for agreement: see [Fix 1](#fix-1-plays-recorded-and-plies-recorded-are-run-wide-in-a-games-job).** |
 | 67 | `NUMBER_OF_SMALL_PLAYS` | `numsmallplays` | option | Not stored | A setting of the interactive `endgame` / `peg` commands. A games or game-pairs player's solves take theirs from the per-player options (`eplies1`, `pegbag1`, … below), which this one does not set. |
 | 68 | `MAX_ITERATIONS` | `iterations` | option | Stored (per-player form) | Global form of `i1`/`i2`: `player_configs.max_iterations` ([L587](backend/migrations/0001_initial.sql#L587)) on each player config. |
-| 69 | `STOP_COND_PCT` | `scondition` | option | Stored (per-player form) | Global form of `sc1`/`sc2`: `player_configs.stopping_pct` ([L588](backend/migrations/0001_initial.sql#L588)) on each player config. MAGPIE's `none` is the same as `threshold = 'none'`, which birdtest does allow. |
-| 70 | `INFERENCE_MARGIN` | `imargin` | option | Stored (per-player form) | Global form of `im1`/`im2`: `player_configs.inference_margin` ([L601](backend/migrations/0001_initial.sql#L601)) on each player config. |
-| 71 | `MOVEGEN_MARGIN` | `mmargin` | option | Stored | `player_configs.movegen_margin` ([L612](backend/migrations/0001_initial.sql#L612)) on each player config. Run-wide in MAGPIE; job creation requires both players to agree on it. |
-| 72 | `MIN_PLAY_ITERATIONS` | `minplayiterations` | option | Stored (per-player form) | Global form of `mi1`/`mi2`: `player_configs.min_play_iterations` ([L598](backend/migrations/0001_initial.sql#L598)) on each player config. |
-| 73 | `USE_GAME_PAIRS` | `gp` | option | Stored | `job_type` ([L382](backend/migrations/0001_initial.sql#L382)) `game_pairs` (MAGPIE `config.c:9200`) |
-| 74 | `USE_SMALL_PLAYS` | `sp` | option | Not stored | Endgame move-list format. `contribute` resets it to false (MAGPIE `config.c:9296`). |
-| 75 | `SIM_WITH_INFERENCE` | `sinfer` | option | Stored (per-player form) | Global form of `si1`/`si2`: `player_configs.use_inference` ([L589](backend/migrations/0001_initial.sql#L589)) on each player config. **Opening-rack jobs force it off: see [Fix 2](#fix-2-opening-rack-jobs-ignore-inference).** |
-| 76 | `USE_HEAT_MAP` | `useheatmap` | option | Not stored | Records heat-map data only. `contribute` resets it to false. |
-| 77 | `WRITE_BUFFER_SIZE` | `wb` | option | Not stored | I/O buffer for autoplay's file recorders. `contribute` returns JSON, so this changes no result. |
-| 78 | `HUMAN_READABLE` | `hr` | option | Not stored | Terminal display only; changes no result. `contribute` sets it to false. |
-| 79 | `SHOW_MISTAKES` | `mistakes` | option | Not stored | Only `analyze` reads it; display only. |
-| 80 | `RANDOM_SEED` | `seed` | option | Recorded | Per task, not a setting: `tasks.seed` ([L862](backend/migrations/0001_initial.sql#L862)), copied to `game_requests.seed` ([L1024](backend/migrations/0001_initial.sql#L1024)) and `leave_requests.seed` ([L1041](backend/migrations/0001_initial.sql#L1041)). An opening-rack task analyses rack *i* with seed + *i*. |
-| 81 | `NUMBER_OF_THREADS` | `threads` | option | Not stored | Worker-local (the contributor's settings file). Results don't depend on it: `contribute` gives each game its own thread (per-game parallelism). |
-| 82 | `PRINT_INTERVAL` | `pfrequency` | option | Not stored | Terminal display only; changes no result. `contribute` resets it to 0. |
-| 83 | `EXEC_MODE` | `mode` | option | Not stored | CLI sync/async mode. |
-| 84 | `TT_FRACTION_OF_MEM` | `ttfraction` | option | Not stored | Worker-local; doesn't change what a task computes. It also sizes the endgame transposition table a run's endgame and pre-endgame solves share: it changes how fast a solve runs, not what birdtest asks for. |
-| 85 | `TIME_LIMIT` | `tlim` | option | Stored (per-player form) | Global form of `tl1`/`tl2`: `player_configs.time_limit_secs` ([L590](backend/migrations/0001_initial.sql#L590)) on each player config. |
-| 86 | `SAMPLING_RULE` | `sr` | option | Stored (per-player form) | Global form of `sa1`/`sa2`: `player_configs.sampling_rule` ([L600](backend/migrations/0001_initial.sql#L600)) on each player config. |
-| 87 | `THRESHOLD` | `threshold` | option | Stored (per-player form) | Global form of `th1`/`th2`: `player_configs.threshold` ([L599](backend/migrations/0001_initial.sql#L599)) on each player config. |
-| 88 | `CUTOFF` | `cutoff` | option | Stored | `jobs.sim_cutoff` ([L426](backend/migrations/0001_initial.sql#L426)) |
-| 89 | `UTILITY_W_WINPCT` | `uwin` | option | Stored (per-player form) | Global form of `uwin1`/`uwin2`: `player_configs.utility_w_winpct` ([L602](backend/migrations/0001_initial.sql#L602)) on each player config. |
-| 90 | `UTILITY_W_SPREAD` | `uspread` | option | Stored (per-player form) | Global form of `uspread1`/`uspread2`: `player_configs.utility_w_spread` ([L603](backend/migrations/0001_initial.sql#L603)) on each player config. |
-| 91 | `UTILITY_SPREAD_SCALE` | `uspreadscale` | option | Stored (per-player form) | Global form of `uspreadscale1`/`uspreadscale2`: `player_configs.utility_spread_scale` ([L604](backend/migrations/0001_initial.sql#L604)) on each player config. |
-| 92 | `LOAD` | `load` | command | Not stored | Interactive CLI command; no task runs it. |
-| 93 | `NEW_GAME` | `newgame` | command | Not stored | Interactive CLI command; no task runs it. |
-| 94 | `EXPORT` | `export` | command | Not stored | Interactive CLI command; no task runs it. |
-| 95 | `COMMIT` | `commit` | command | Not stored | Interactive CLI command; no task runs it. |
-| 96 | `TOP_COMMIT` | `tcommit` | command | Not stored | Interactive CLI command; no task runs it. |
-| 97 | `CHALLENGE` | `challenge` | command | Not stored | Interactive CLI command; no task runs it. |
-| 98 | `UNCHALLENGE` | `unchallenge` | command | Not stored | Interactive CLI command; no task runs it. |
-| 99 | `OVERTIME` | `overtimepenalty` | command | Not stored | Interactive CLI command; no task runs it. (Applies a penalty to a loaded game's history.) |
-| 100 | `SWITCH_NAMES` | `switchnames` | command | Not stored | Interactive CLI command; no task runs it. |
-| 101 | `SHOW_GAME` | `shgame` | command | Not stored | Interactive CLI command; no task runs it. |
-| 102 | `SHOW_MOVES` | `shmoves` | command | Not stored | Interactive CLI command; no task runs it. |
-| 103 | `SHOW_INFERENCE` | `shinference` | command | Not stored | Interactive CLI command; no task runs it. |
-| 104 | `SHOW_ENDGAME` | `shendgame` | command | Not stored | Interactive CLI command; no task runs it. |
-| 105 | `SHOW_PEG` | `shpeg` | command | Not stored | Interactive CLI command; no task runs it. |
-| 106 | `SHOW_HEAT_MAP` | `heatmap` | command | Not stored | Interactive CLI command; no task runs it. |
-| 107 | `NEXT` | `next` | command | Not stored | Interactive CLI command; no task runs it. |
-| 108 | `PREVIOUS` | `previous` | command | Not stored | Interactive CLI command; no task runs it. |
-| 109 | `GOTO` | `goto` | command | Not stored | Interactive CLI command; no task runs it. |
-| 110 | `NOTE` | `note` | command | Not stored | Interactive CLI command; no task runs it. |
-| 111 | `CNOTE` | `cnote` | command | Not stored | Interactive CLI command; no task runs it. |
-| 112 | `PRINT_BOARDS` | `printboards` | option | Not stored | Terminal display only; changes no result. |
-| 113 | `BOARD_COLOR` | `boardcolor` | option | Not stored | Terminal display only; changes no result. |
-| 114 | `BOARD_TILE_GLYPHS` | `boardtiles` | option | Not stored | Terminal display only; changes no result. |
-| 115 | `BOARD_BORDER` | `boardborder` | option | Not stored | Terminal display only; changes no result. |
-| 116 | `BOARD_COLUMN_LABEL` | `boardcolumns` | option | Not stored | Terminal display only; changes no result. |
-| 117 | `ON_TURN_MARKER` | `onturnmarker` | option | Not stored | Terminal display only; changes no result. |
-| 118 | `ON_TURN_COLOR` | `onturncolor` | option | Not stored | Terminal display only; changes no result. |
-| 119 | `ON_TURN_SCORE_STYLE` | `onturnscore` | option | Not stored | Terminal display only; changes no result. |
-| 120 | `PRETTY` | `pretty` | option | Not stored | Terminal display only; changes no result. |
-| 121 | `PRINT_ON_FINISH` | `printonfinish` | option | Not stored | Terminal display only; changes no result. `contribute` sets it to false. |
-| 122 | `SHOW_PROMPT` | `shprompt` | option | Not stored | Terminal display only; changes no result. |
-| 123 | `SAVE_SETTINGS` | `savesettings` | option | Not stored | CLI session behaviour; changes no result. |
-| 124 | `AUTOSAVE_GCG` | `autosavegcg` | option | Not stored | CLI session behaviour; changes no result. |
-| 125 | `FG_REQUIRED` | `fgrequired` | option | Not stored | Whether `newgame` needs a filename; CLI only. |
-| 126 | `SHOW_GAME_WITH_MOVES` | `shwithmoves` | option | Not stored | Terminal display only; changes no result. |
-| 127 | `P1_SIM_PLIES` | `pl1` | option | Stored | `player_configs.num_plies` ([L578](backend/migrations/0001_initial.sql#L578)) on each player config |
-| 128 | `P2_SIM_PLIES` | `pl2` | option | Stored | `player_configs.num_plies` ([L578](backend/migrations/0001_initial.sql#L578)) on each player config |
-| 129 | `P1_NUM_PLAYS` | `np1` | option | Stored | `player_configs.num_plays` ([L582](backend/migrations/0001_initial.sql#L582)) on each player config |
-| 130 | `P2_NUM_PLAYS` | `np2` | option | Stored | `player_configs.num_plays` ([L582](backend/migrations/0001_initial.sql#L582)) on each player config |
-| 131 | `P1_STOP_COND_PCT` | `sc1` | option | Stored | `player_configs.stopping_pct` ([L588](backend/migrations/0001_initial.sql#L588)) on each player config |
-| 132 | `P2_STOP_COND_PCT` | `sc2` | option | Stored | `player_configs.stopping_pct` ([L588](backend/migrations/0001_initial.sql#L588)) on each player config |
-| 133 | `P1_MAX_ITERATIONS` | `i1` | option | Stored | `player_configs.max_iterations` ([L587](backend/migrations/0001_initial.sql#L587)) on each player config |
-| 134 | `P2_MAX_ITERATIONS` | `i2` | option | Stored | `player_configs.max_iterations` ([L587](backend/migrations/0001_initial.sql#L587)) on each player config |
-| 135 | `P1_MIN_PLAY_ITERATIONS` | `mi1` | option | Stored | `player_configs.min_play_iterations` ([L598](backend/migrations/0001_initial.sql#L598)) on each player config |
-| 136 | `P2_MIN_PLAY_ITERATIONS` | `mi2` | option | Stored | `player_configs.min_play_iterations` ([L598](backend/migrations/0001_initial.sql#L598)) on each player config |
-| 137 | `P1_SIM_WITH_INFERENCE` | `si1` | option | Stored | `player_configs.use_inference` ([L589](backend/migrations/0001_initial.sql#L589)) on each player config |
-| 138 | `P2_SIM_WITH_INFERENCE` | `si2` | option | Stored | `player_configs.use_inference` ([L589](backend/migrations/0001_initial.sql#L589)) on each player config |
-| 139 | `P1_TIME_LIMIT` | `tl1` | option | Stored | `player_configs.time_limit_secs` ([L590](backend/migrations/0001_initial.sql#L590)) on each player config (must be 0 for a simmer; see [Notes](#lower-priority-notes)) |
-| 140 | `P2_TIME_LIMIT` | `tl2` | option | Stored | `player_configs.time_limit_secs` ([L590](backend/migrations/0001_initial.sql#L590)) on each player config (must be 0 for a simmer; see [Notes](#lower-priority-notes)) |
-| 141 | `P1_PLAY_CHOOSER_TIME` | `pc1` | option | Not stored | Turns on PlayChooser (timed play). `contribute` resets it to -1 (off) before every task (MAGPIE `config.c:8444`): timed games are not reproducible from the seed, so game pairs would mean nothing. Deliberately omitted. |
-| 142 | `P2_PLAY_CHOOSER_TIME` | `pc2` | option | Not stored | Turns on PlayChooser (timed play). `contribute` resets it to -1 (off) before every task (MAGPIE `config.c:8444`): timed games are not reproducible from the seed, so game pairs would mean nothing. Deliberately omitted. |
-| 143 | `OVERTIME_PENALTY_POINTS` | `otpenalty` | option | Not stored | Only read by a PlayChooser clock, which `contribute` always turns off (see `pc1`/`pc2`). |
-| 144 | `OVERTIME_PERIOD` | `otperiod` | option | Not stored | Only read by a PlayChooser clock, which `contribute` always turns off (see `pc1`/`pc2`). |
-| 145 | `P1_THRESHOLD` | `th1` | option | Stored | `player_configs.threshold` ([L599](backend/migrations/0001_initial.sql#L599)) on each player config |
-| 146 | `P2_THRESHOLD` | `th2` | option | Stored | `player_configs.threshold` ([L599](backend/migrations/0001_initial.sql#L599)) on each player config |
-| 147 | `P1_SAMPLING_RULE` | `sa1` | option | Stored | `player_configs.sampling_rule` ([L600](backend/migrations/0001_initial.sql#L600)) on each player config |
-| 148 | `P2_SAMPLING_RULE` | `sa2` | option | Stored | `player_configs.sampling_rule` ([L600](backend/migrations/0001_initial.sql#L600)) on each player config |
-| 149 | `P1_UTILITY_W_WINPCT` | `uwin1` | option | Stored | `player_configs.utility_w_winpct` ([L602](backend/migrations/0001_initial.sql#L602)) on each player config |
-| 150 | `P2_UTILITY_W_WINPCT` | `uwin2` | option | Stored | `player_configs.utility_w_winpct` ([L602](backend/migrations/0001_initial.sql#L602)) on each player config |
-| 151 | `P1_UTILITY_W_SPREAD` | `uspread1` | option | Stored | `player_configs.utility_w_spread` ([L603](backend/migrations/0001_initial.sql#L603)) on each player config |
-| 152 | `P2_UTILITY_W_SPREAD` | `uspread2` | option | Stored | `player_configs.utility_w_spread` ([L603](backend/migrations/0001_initial.sql#L603)) on each player config |
-| 153 | `P1_UTILITY_SPREAD_SCALE` | `uspreadscale1` | option | Stored | `player_configs.utility_spread_scale` ([L604](backend/migrations/0001_initial.sql#L604)) on each player config |
-| 154 | `P2_UTILITY_SPREAD_SCALE` | `uspreadscale2` | option | Stored | `player_configs.utility_spread_scale` ([L604](backend/migrations/0001_initial.sql#L604)) on each player config |
-| 155 | `P1_INFERENCE_MARGIN` | `im1` | option | Stored | `player_configs.inference_margin` ([L601](backend/migrations/0001_initial.sql#L601)) on each player config |
-| 156 | `P2_INFERENCE_MARGIN` | `im2` | option | Stored | `player_configs.inference_margin` ([L601](backend/migrations/0001_initial.sql#L601)) on each player config |
-| 157 | `P1_ENDGAME_PLIES` | `eplies1` | option | Stored | `player_configs.endgame_plies` ([L624](backend/migrations/0001_initial.sql#L624)) on each player config (0 solves nothing, the pre-endgame included) |
-| 158 | `P2_ENDGAME_PLIES` | `eplies2` | option | Stored | `player_configs.endgame_plies` ([L624](backend/migrations/0001_initial.sql#L624)) on each player config (0 solves nothing, the pre-endgame included) |
-| 159 | `P1_PEG_MAX_BAG` | `pegbag1` | option | Stored | `player_configs.peg_max_bag` ([L625](backend/migrations/0001_initial.sql#L625)) on each player config |
-| 160 | `P2_PEG_MAX_BAG` | `pegbag2` | option | Stored | `player_configs.peg_max_bag` ([L625](backend/migrations/0001_initial.sql#L625)) on each player config |
-| 161 | `P1_PEG_TOP_K` | `pegtopk1` | option | Stored | `player_configs.peg_stage_top_k` ([L627](backend/migrations/0001_initial.sql#L627)) on each player config |
-| 162 | `P2_PEG_TOP_K` | `pegtopk2` | option | Stored | `player_configs.peg_stage_top_k` ([L627](backend/migrations/0001_initial.sql#L627)) on each player config |
-| 163 | `P1_PEG_STRIDE` | `pegstride1` | option | Stored | `player_configs.peg_scenario_stride` ([L628](backend/migrations/0001_initial.sql#L628)) on each player config |
-| 164 | `P2_PEG_STRIDE` | `pegstride2` | option | Stored | `player_configs.peg_scenario_stride` ([L628](backend/migrations/0001_initial.sql#L628)) on each player config |
-| 165 | `P1_PEG_PESSIMISTIC` | `pegpess1` | option | Stored | `player_configs.peg_opp_model` ([L629](backend/migrations/0001_initial.sql#L629)) on each player config (`'pessimistic'` for true) |
-| 166 | `P2_PEG_PESSIMISTIC` | `pegpess2` | option | Stored | `player_configs.peg_opp_model` ([L629](backend/migrations/0001_initial.sql#L629)) on each player config (`'pessimistic'` for true) |
-| 167 | `P1_PEG_NESTED` | `pegnested1` | option | Stored | `player_configs.peg_nested` ([L630](backend/migrations/0001_initial.sql#L630)) on each player config |
-| 168 | `P2_PEG_NESTED` | `pegnested2` | option | Stored | `player_configs.peg_nested` ([L630](backend/migrations/0001_initial.sql#L630)) on each player config |
-| 169 | `PEG_NESTED_CAND_CAPS` | `pegncaps` | option | Stored | `player_configs.peg_nested_cand_caps` ([L632](backend/migrations/0001_initial.sql#L632)) on each player config. One option for both players on the CLI; birdtest states it per player. |
-| 170 | `PEG_NESTED_DEPTH` | `pegndepth` | option | Stored | `player_configs.peg_nested_max_depth` ([L633](backend/migrations/0001_initial.sql#L633)) on each player config. One option for both players on the CLI; birdtest states it per player. |
-| 171 | `PEG_NESTED_STRIDES` | `pegnstrides` | option | Stored | `player_configs.peg_nested_strides` ([L634](backend/migrations/0001_initial.sql#L634)) on each player config. One option for both players on the CLI; birdtest states it per player. |
-| 172 | `MULTI_THREADING_MODE` | `mtmode` | option | Stored | `job_game_config.threading_mode` ([L777](backend/migrations/0001_initial.sql#L777)) and `job_game_pair_config.threading_mode` ([L813](backend/migrations/0001_initial.sql#L813)), one per job, `igp` (the default) or `pgp`, stated on every games and pairs request as `threading_mode`. It changes results only when a player simulates: `igp` gives one game's simulation every thread, which makes an iteration-bounded simulation reproducible. Opening-rack and leave requests state none. `contribute` resets it to `pgp` before every task (MAGPIE `config.c:9295`, `config_contribute_reset_shared_settings`), then a games or pairs task takes it from the request, `igp` when absent (`config.c:9355`, `config_contribute_apply_threading_mode`). |
-| 173 | `ANALYZE` | `analyze` | command | Not stored | Interactive CLI command; no task runs it. |
-| 174 | `VERSION` | `version` | command | Recorded | Not a setting. Each claim records the worker's version in `task_claims.magpie_version` ([L932](backend/migrations/0001_initial.sql#L932)); each job sets a floor in `jobs.min_magpie_*` ([L441](backend/migrations/0001_initial.sql#L441)). |
-| 175 | `BUILDERS` | `builders` | command | Recorded | Not a setting. The server asks its own MAGPIE and records the answer in `derived_data.builder` ([L314](backend/migrations/0001_initial.sql#L314)). |
+| 69 | `MOVEGEN_LIMIT` | `movegenlimit` | option | Not stored | A cap on a whole command's move generations, across its threads: a debugging and benchmarking budget for the CLI. birdtest never sends it; a task's budget is per player and per move (`movegens_per_move`, below). |
+| 70 | `STOP_COND_PCT` | `scondition` | option | Stored (per-player form) | Global form of `sc1`/`sc2`: `player_configs.stopping_pct` ([L588](backend/migrations/0001_initial.sql#L588)) on each player config. MAGPIE's `none` is the same as `threshold = 'none'`, which birdtest does allow. |
+| 71 | `INFERENCE_MARGIN` | `imargin` | option | Stored (per-player form) | Global form of `im1`/`im2`: `player_configs.inference_margin` ([L601](backend/migrations/0001_initial.sql#L601)) on each player config. |
+| 72 | `MOVEGEN_MARGIN` | `mmargin` | option | Stored | `player_configs.movegen_margin` ([L612](backend/migrations/0001_initial.sql#L612)) on each player config. Run-wide in MAGPIE; job creation requires both players to agree on it. |
+| 73 | `MIN_PLAY_ITERATIONS` | `minplayiterations` | option | Stored (per-player form) | Global form of `mi1`/`mi2`: `player_configs.min_play_iterations` ([L598](backend/migrations/0001_initial.sql#L598)) on each player config. |
+| 74 | `USE_GAME_PAIRS` | `gp` | option | Stored | `job_type` ([L382](backend/migrations/0001_initial.sql#L382)) `game_pairs` (MAGPIE `config.c:9200`) |
+| 75 | `USE_SMALL_PLAYS` | `sp` | option | Not stored | Endgame move-list format. `contribute` resets it to false (MAGPIE `config.c:9296`). |
+| 76 | `SIM_WITH_INFERENCE` | `sinfer` | option | Stored (per-player form) | Global form of `si1`/`si2`: `player_configs.use_inference` ([L589](backend/migrations/0001_initial.sql#L589)) on each player config. **Opening-rack jobs force it off: see [Fix 2](#fix-2-opening-rack-jobs-ignore-inference).** |
+| 77 | `USE_HEAT_MAP` | `useheatmap` | option | Not stored | Records heat-map data only. `contribute` resets it to false. |
+| 78 | `WRITE_BUFFER_SIZE` | `wb` | option | Not stored | I/O buffer for autoplay's file recorders. `contribute` returns JSON, so this changes no result. |
+| 79 | `HUMAN_READABLE` | `hr` | option | Not stored | Terminal display only; changes no result. `contribute` sets it to false. |
+| 80 | `SHOW_MISTAKES` | `mistakes` | option | Not stored | Only `analyze` reads it; display only. |
+| 81 | `RANDOM_SEED` | `seed` | option | Recorded | Per task, not a setting: `tasks.seed` ([L862](backend/migrations/0001_initial.sql#L862)), copied to `game_requests.seed` ([L1024](backend/migrations/0001_initial.sql#L1024)) and `leave_requests.seed` ([L1041](backend/migrations/0001_initial.sql#L1041)). An opening-rack task analyses rack *i* with seed + *i*. |
+| 82 | `NUMBER_OF_THREADS` | `threads` | option | Not stored | Worker-local (the contributor's settings file). Results don't depend on it: `contribute` gives each game its own thread (per-game parallelism). |
+| 83 | `PRINT_INTERVAL` | `pfrequency` | option | Not stored | Terminal display only; changes no result. `contribute` resets it to 0. |
+| 84 | `EXEC_MODE` | `mode` | option | Not stored | CLI sync/async mode. |
+| 85 | `TT_FRACTION_OF_MEM` | `ttfraction` | option | Not stored | Worker-local; doesn't change what a task computes. It also sizes the endgame transposition table a run's endgame and pre-endgame solves share: it changes how fast a solve runs, not what birdtest asks for. |
+| 86 | `TIME_LIMIT` | `tlim` | option | Stored (per-player form) | Global form of `tl1`/`tl2`: `player_configs.time_limit_secs` ([L590](backend/migrations/0001_initial.sql#L590)) on each player config. |
+| 87 | `SAMPLING_RULE` | `sr` | option | Stored (per-player form) | Global form of `sa1`/`sa2`: `player_configs.sampling_rule` ([L600](backend/migrations/0001_initial.sql#L600)) on each player config. |
+| 88 | `THRESHOLD` | `threshold` | option | Stored (per-player form) | Global form of `th1`/`th2`: `player_configs.threshold` ([L599](backend/migrations/0001_initial.sql#L599)) on each player config. |
+| 89 | `CUTOFF` | `cutoff` | option | Stored | `jobs.sim_cutoff` ([L426](backend/migrations/0001_initial.sql#L426)) |
+| 90 | `UTILITY_W_WINPCT` | `uwin` | option | Stored (per-player form) | Global form of `uwin1`/`uwin2`: `player_configs.utility_w_winpct` ([L602](backend/migrations/0001_initial.sql#L602)) on each player config. |
+| 91 | `UTILITY_W_SPREAD` | `uspread` | option | Stored (per-player form) | Global form of `uspread1`/`uspread2`: `player_configs.utility_w_spread` ([L603](backend/migrations/0001_initial.sql#L603)) on each player config. |
+| 92 | `UTILITY_SPREAD_SCALE` | `uspreadscale` | option | Stored (per-player form) | Global form of `uspreadscale1`/`uspreadscale2`: `player_configs.utility_spread_scale` ([L604](backend/migrations/0001_initial.sql#L604)) on each player config. |
+| 93 | `LOAD` | `load` | command | Not stored | Interactive CLI command; no task runs it. |
+| 94 | `NEW_GAME` | `newgame` | command | Not stored | Interactive CLI command; no task runs it. |
+| 95 | `EXPORT` | `export` | command | Not stored | Interactive CLI command; no task runs it. |
+| 96 | `COMMIT` | `commit` | command | Not stored | Interactive CLI command; no task runs it. |
+| 97 | `TOP_COMMIT` | `tcommit` | command | Not stored | Interactive CLI command; no task runs it. |
+| 98 | `CHALLENGE` | `challenge` | command | Not stored | Interactive CLI command; no task runs it. |
+| 99 | `UNCHALLENGE` | `unchallenge` | command | Not stored | Interactive CLI command; no task runs it. |
+| 100 | `OVERTIME` | `overtimepenalty` | command | Not stored | Interactive CLI command; no task runs it. (Applies a penalty to a loaded game's history.) |
+| 101 | `SWITCH_NAMES` | `switchnames` | command | Not stored | Interactive CLI command; no task runs it. |
+| 102 | `SHOW_GAME` | `shgame` | command | Not stored | Interactive CLI command; no task runs it. |
+| 103 | `SHOW_MOVES` | `shmoves` | command | Not stored | Interactive CLI command; no task runs it. |
+| 104 | `SHOW_INFERENCE` | `shinference` | command | Not stored | Interactive CLI command; no task runs it. |
+| 105 | `SHOW_ENDGAME` | `shendgame` | command | Not stored | Interactive CLI command; no task runs it. |
+| 106 | `SHOW_PEG` | `shpeg` | command | Not stored | Interactive CLI command; no task runs it. |
+| 107 | `SHOW_HEAT_MAP` | `heatmap` | command | Not stored | Interactive CLI command; no task runs it. |
+| 108 | `NEXT` | `next` | command | Not stored | Interactive CLI command; no task runs it. |
+| 109 | `PREVIOUS` | `previous` | command | Not stored | Interactive CLI command; no task runs it. |
+| 110 | `GOTO` | `goto` | command | Not stored | Interactive CLI command; no task runs it. |
+| 111 | `NOTE` | `note` | command | Not stored | Interactive CLI command; no task runs it. |
+| 112 | `CNOTE` | `cnote` | command | Not stored | Interactive CLI command; no task runs it. |
+| 113 | `PRINT_BOARDS` | `printboards` | option | Not stored | Terminal display only; changes no result. |
+| 114 | `BOARD_COLOR` | `boardcolor` | option | Not stored | Terminal display only; changes no result. |
+| 115 | `BOARD_TILE_GLYPHS` | `boardtiles` | option | Not stored | Terminal display only; changes no result. |
+| 116 | `BOARD_BORDER` | `boardborder` | option | Not stored | Terminal display only; changes no result. |
+| 117 | `BOARD_COLUMN_LABEL` | `boardcolumns` | option | Not stored | Terminal display only; changes no result. |
+| 118 | `ON_TURN_MARKER` | `onturnmarker` | option | Not stored | Terminal display only; changes no result. |
+| 119 | `ON_TURN_COLOR` | `onturncolor` | option | Not stored | Terminal display only; changes no result. |
+| 120 | `ON_TURN_SCORE_STYLE` | `onturnscore` | option | Not stored | Terminal display only; changes no result. |
+| 121 | `PRETTY` | `pretty` | option | Not stored | Terminal display only; changes no result. |
+| 122 | `PRINT_ON_FINISH` | `printonfinish` | option | Not stored | Terminal display only; changes no result. `contribute` sets it to false. |
+| 123 | `SHOW_PROMPT` | `shprompt` | option | Not stored | Terminal display only; changes no result. |
+| 124 | `SAVE_SETTINGS` | `savesettings` | option | Not stored | CLI session behaviour; changes no result. |
+| 125 | `AUTOSAVE_GCG` | `autosavegcg` | option | Not stored | CLI session behaviour; changes no result. |
+| 126 | `FG_REQUIRED` | `fgrequired` | option | Not stored | Whether `newgame` needs a filename; CLI only. |
+| 127 | `SHOW_GAME_WITH_MOVES` | `shwithmoves` | option | Not stored | Terminal display only; changes no result. |
+| 128 | `P1_SIM_PLIES` | `pl1` | option | Stored | `player_configs.num_plies` ([L578](backend/migrations/0001_initial.sql#L578)) on each player config |
+| 129 | `P2_SIM_PLIES` | `pl2` | option | Stored | `player_configs.num_plies` ([L578](backend/migrations/0001_initial.sql#L578)) on each player config |
+| 130 | `P1_NUM_PLAYS` | `np1` | option | Stored | `player_configs.num_plays` ([L582](backend/migrations/0001_initial.sql#L582)) on each player config |
+| 131 | `P2_NUM_PLAYS` | `np2` | option | Stored | `player_configs.num_plays` ([L582](backend/migrations/0001_initial.sql#L582)) on each player config |
+| 132 | `P1_STOP_COND_PCT` | `sc1` | option | Stored | `player_configs.stopping_pct` ([L588](backend/migrations/0001_initial.sql#L588)) on each player config |
+| 133 | `P2_STOP_COND_PCT` | `sc2` | option | Stored | `player_configs.stopping_pct` ([L588](backend/migrations/0001_initial.sql#L588)) on each player config |
+| 134 | `P1_MAX_ITERATIONS` | `i1` | option | Stored | `player_configs.max_iterations` ([L587](backend/migrations/0001_initial.sql#L587)) on each player config |
+| 135 | `P2_MAX_ITERATIONS` | `i2` | option | Stored | `player_configs.max_iterations` ([L587](backend/migrations/0001_initial.sql#L587)) on each player config |
+| 136 | `P1_MIN_PLAY_ITERATIONS` | `mi1` | option | Stored | `player_configs.min_play_iterations` ([L598](backend/migrations/0001_initial.sql#L598)) on each player config |
+| 137 | `P2_MIN_PLAY_ITERATIONS` | `mi2` | option | Stored | `player_configs.min_play_iterations` ([L598](backend/migrations/0001_initial.sql#L598)) on each player config |
+| 138 | `P1_SIM_WITH_INFERENCE` | `si1` | option | Stored | `player_configs.use_inference` ([L589](backend/migrations/0001_initial.sql#L589)) on each player config |
+| 139 | `P2_SIM_WITH_INFERENCE` | `si2` | option | Stored | `player_configs.use_inference` ([L589](backend/migrations/0001_initial.sql#L589)) on each player config |
+| 140 | `P1_TIME_LIMIT` | `tl1` | option | Stored | `player_configs.time_limit_secs` ([L590](backend/migrations/0001_initial.sql#L590)) on each player config (must be 0 for a simmer; see [Notes](#lower-priority-notes)) |
+| 141 | `P2_TIME_LIMIT` | `tl2` | option | Stored | `player_configs.time_limit_secs` ([L590](backend/migrations/0001_initial.sql#L590)) on each player config (must be 0 for a simmer; see [Notes](#lower-priority-notes)) |
+| 142 | `MOVE_BUDGET` | `movebudget` | option | Stored (per-player form) | Global form of `mb1`/`mb2`: `player_configs.movegens_per_move` on each player config |
+| 143 | `P1_MOVE_BUDGET` | `mb1` | option | Stored | `player_configs.movegens_per_move` on each player config: the move generations the player may spend choosing one move (its inference, simulation and solving together), null for none |
+| 144 | `P2_MOVE_BUDGET` | `mb2` | option | Stored | `player_configs.movegens_per_move` on each player config, as `mb1` |
+| 145 | `P1_PLAY_CHOOSER_TIME` | `pc1` | option | Not stored | Turns on PlayChooser (timed play). `contribute` resets it to -1 (off) before every task (MAGPIE `config.c:8444`): timed games are not reproducible from the seed, so game pairs would mean nothing. Deliberately omitted. |
+| 146 | `P2_PLAY_CHOOSER_TIME` | `pc2` | option | Not stored | Turns on PlayChooser (timed play). `contribute` resets it to -1 (off) before every task (MAGPIE `config.c:8444`): timed games are not reproducible from the seed, so game pairs would mean nothing. Deliberately omitted. |
+| 147 | `OVERTIME_PENALTY_POINTS` | `otpenalty` | option | Not stored | Only read by a PlayChooser clock, which `contribute` always turns off (see `pc1`/`pc2`). |
+| 148 | `OVERTIME_PERIOD` | `otperiod` | option | Not stored | Only read by a PlayChooser clock, which `contribute` always turns off (see `pc1`/`pc2`). |
+| 149 | `P1_THRESHOLD` | `th1` | option | Stored | `player_configs.threshold` ([L599](backend/migrations/0001_initial.sql#L599)) on each player config |
+| 150 | `P2_THRESHOLD` | `th2` | option | Stored | `player_configs.threshold` ([L599](backend/migrations/0001_initial.sql#L599)) on each player config |
+| 151 | `P1_SAMPLING_RULE` | `sa1` | option | Stored | `player_configs.sampling_rule` ([L600](backend/migrations/0001_initial.sql#L600)) on each player config |
+| 152 | `P2_SAMPLING_RULE` | `sa2` | option | Stored | `player_configs.sampling_rule` ([L600](backend/migrations/0001_initial.sql#L600)) on each player config |
+| 153 | `P1_UTILITY_W_WINPCT` | `uwin1` | option | Stored | `player_configs.utility_w_winpct` ([L602](backend/migrations/0001_initial.sql#L602)) on each player config |
+| 154 | `P2_UTILITY_W_WINPCT` | `uwin2` | option | Stored | `player_configs.utility_w_winpct` ([L602](backend/migrations/0001_initial.sql#L602)) on each player config |
+| 155 | `P1_UTILITY_W_SPREAD` | `uspread1` | option | Stored | `player_configs.utility_w_spread` ([L603](backend/migrations/0001_initial.sql#L603)) on each player config |
+| 156 | `P2_UTILITY_W_SPREAD` | `uspread2` | option | Stored | `player_configs.utility_w_spread` ([L603](backend/migrations/0001_initial.sql#L603)) on each player config |
+| 157 | `P1_UTILITY_SPREAD_SCALE` | `uspreadscale1` | option | Stored | `player_configs.utility_spread_scale` ([L604](backend/migrations/0001_initial.sql#L604)) on each player config |
+| 158 | `P2_UTILITY_SPREAD_SCALE` | `uspreadscale2` | option | Stored | `player_configs.utility_spread_scale` ([L604](backend/migrations/0001_initial.sql#L604)) on each player config |
+| 159 | `P1_INFERENCE_MARGIN` | `im1` | option | Stored | `player_configs.inference_margin` ([L601](backend/migrations/0001_initial.sql#L601)) on each player config |
+| 160 | `P2_INFERENCE_MARGIN` | `im2` | option | Stored | `player_configs.inference_margin` ([L601](backend/migrations/0001_initial.sql#L601)) on each player config |
+| 161 | `P1_ENDGAME_PLIES` | `eplies1` | option | Stored | `player_configs.endgame_plies` ([L624](backend/migrations/0001_initial.sql#L624)) on each player config (0 solves nothing, the pre-endgame included) |
+| 162 | `P2_ENDGAME_PLIES` | `eplies2` | option | Stored | `player_configs.endgame_plies` ([L624](backend/migrations/0001_initial.sql#L624)) on each player config (0 solves nothing, the pre-endgame included) |
+| 163 | `P1_PEG_MAX_BAG` | `pegbag1` | option | Stored | `player_configs.peg_max_bag` ([L625](backend/migrations/0001_initial.sql#L625)) on each player config |
+| 164 | `P2_PEG_MAX_BAG` | `pegbag2` | option | Stored | `player_configs.peg_max_bag` ([L625](backend/migrations/0001_initial.sql#L625)) on each player config |
+| 165 | `P1_PEG_TOP_K` | `pegtopk1` | option | Stored | `player_configs.peg_stage_top_k` ([L627](backend/migrations/0001_initial.sql#L627)) on each player config |
+| 166 | `P2_PEG_TOP_K` | `pegtopk2` | option | Stored | `player_configs.peg_stage_top_k` ([L627](backend/migrations/0001_initial.sql#L627)) on each player config |
+| 167 | `P1_PEG_STRIDE` | `pegstride1` | option | Stored | `player_configs.peg_scenario_stride` ([L628](backend/migrations/0001_initial.sql#L628)) on each player config |
+| 168 | `P2_PEG_STRIDE` | `pegstride2` | option | Stored | `player_configs.peg_scenario_stride` ([L628](backend/migrations/0001_initial.sql#L628)) on each player config |
+| 169 | `P1_PEG_PESSIMISTIC` | `pegpess1` | option | Stored | `player_configs.peg_opp_model` ([L629](backend/migrations/0001_initial.sql#L629)) on each player config (`'pessimistic'` for true) |
+| 170 | `P2_PEG_PESSIMISTIC` | `pegpess2` | option | Stored | `player_configs.peg_opp_model` ([L629](backend/migrations/0001_initial.sql#L629)) on each player config (`'pessimistic'` for true) |
+| 171 | `P1_PEG_NESTED` | `pegnested1` | option | Stored | `player_configs.peg_nested` ([L630](backend/migrations/0001_initial.sql#L630)) on each player config |
+| 172 | `P2_PEG_NESTED` | `pegnested2` | option | Stored | `player_configs.peg_nested` ([L630](backend/migrations/0001_initial.sql#L630)) on each player config |
+| 173 | `PEG_NESTED_CAND_CAPS` | `pegncaps` | option | Stored | `player_configs.peg_nested_cand_caps` ([L632](backend/migrations/0001_initial.sql#L632)) on each player config. One option for both players on the CLI; birdtest states it per player. |
+| 174 | `PEG_NESTED_DEPTH` | `pegndepth` | option | Stored | `player_configs.peg_nested_max_depth` ([L633](backend/migrations/0001_initial.sql#L633)) on each player config. One option for both players on the CLI; birdtest states it per player. |
+| 175 | `PEG_NESTED_STRIDES` | `pegnstrides` | option | Stored | `player_configs.peg_nested_strides` ([L634](backend/migrations/0001_initial.sql#L634)) on each player config. One option for both players on the CLI; birdtest states it per player. |
+| 176 | `MULTI_THREADING_MODE` | `mtmode` | option | Stored | `job_game_config.threading_mode` ([L777](backend/migrations/0001_initial.sql#L777)) and `job_game_pair_config.threading_mode` ([L813](backend/migrations/0001_initial.sql#L813)), one per job, `igp` (the default) or `pgp`, stated on every games and pairs request as `threading_mode`. It changes results only when a player simulates: `igp` gives one game's simulation every thread, which makes an iteration-bounded simulation reproducible. Opening-rack and leave requests state none. `contribute` resets it to `pgp` before every task (MAGPIE `config.c:9295`, `config_contribute_reset_shared_settings`), then a games or pairs task takes it from the request, `igp` when absent (`config.c:9355`, `config_contribute_apply_threading_mode`). |
+| 177 | `ANALYZE` | `analyze` | command | Not stored | Interactive CLI command; no task runs it. |
+| 178 | `VERSION` | `version` | command | Recorded | Not a setting. Each claim records the worker's version in `task_claims.magpie_version` ([L932](backend/migrations/0001_initial.sql#L932)); each job sets a floor in `jobs.min_magpie_*` ([L441](backend/migrations/0001_initial.sql#L441)). |
+| 179 | `BUILDERS` | `builders` | command | Recorded | Not a setting. The server asks its own MAGPIE and records the answer in `derived_data.builder` ([L314](backend/migrations/0001_initial.sql#L314)). |
 
 ## Settings birdtest accounts for incorrectly
 
@@ -316,7 +320,7 @@ With capture off, a games job never reads either value.
 5. **Find existing jobs that are affected:**
 
    ```sql
-   SELECT j.id, j.name, 'games' AS kind
+   SELECT j.id, j.title, 'games' AS kind
    FROM jobs j
    JOIN job_game_config c ON c.job_id = j.id
    JOIN player_configs p1 ON p1.id = c.player1_config_id
@@ -325,7 +329,7 @@ With capture off, a games job never reads either value.
      AND (p1.num_plays_recorded <> p2.num_plays_recorded
           OR p1.num_plies_recorded <> p2.num_plies_recorded)
    UNION ALL
-   SELECT j.id, j.name, 'game_pairs'
+   SELECT j.id, j.title, 'game_pairs'
    FROM jobs j
    JOIN job_game_pair_config c ON c.job_id = j.id
    JOIN player_configs p1 ON p1.id = c.player1_config_id
@@ -501,33 +505,34 @@ Every label is in Title Case, and the player-config form uses the same names, wi
 | 4 | Move Recorder | `recorder_type` | `r1`/`r2` | every job but an opening-rack static analysis |
 | 5 | Moves Generated | `num_plays` | `np1`/`np2` (`numplays`) | leave jobs; games and pairs jobs that record no positions and have no simmer (a static player's list only holds the best move it plays) |
 | 6 | Plies (0 = static) | `num_plies` | `pl1`/`pl2` (`plies`) | n/a |
-| 7 | Uses Inference ("—" for a static player) | `use_inference` | `si1`/`si2` (`sinfer`) | static players, opening-rack jobs (Fix 2) |
+| 7 | Uses Inference ("no" for a static player) | `use_inference` | `si1`/`si2` (`sinfer`) | static players, opening-rack jobs (Fix 2) |
 | 8 | Uses Preendgame ("yes (bag ≤ 2)" or "no"; no without the endgame) | `peg_max_bag` | `pegbag1`/`pegbag2` | opening-rack jobs; leave jobs |
 | 9 | Uses Endgame ("yes (6 plies)" or "no") | `endgame_plies` | `eplies1`/`eplies2` | opening-rack jobs; leave jobs (they refuse a player that solves) |
 | 10 | Win % Model | `winpct_id` | `winpct` | static players |
 | 11 | Maximum Total Iterations | `max_iterations` | `i1`/`i2` (`iterations`) | static players |
-| 12 | Stopping % | `stopping_pct` | `sc1`/`sc2` (`scondition`) | static players |
-| 13 | Moves Recorded | `num_plays_recorded` | `maxnumdplays` | leave jobs; games/pairs jobs without capture (Fix 1) |
-| 14 | Plies Recorded ("—" for a static player) | `num_plies_recorded` | `shplies` | leave jobs; games/pairs jobs without capture (Fix 1) |
-| 15 | Minimum Iterations per Play | `min_play_iterations` | `mi1`/`mi2` (`minplayiterations`) | static players |
-| 16 | Stopping Threshold Rule | `threshold` | `th1`/`th2` (`threshold`) | static players |
-| 17 | Sampling Rule | `sampling_rule` | `sa1`/`sa2` (`sr`) | static players |
-| 18 | Inference Margin | `inference_margin` | `im1`/`im2` (`imargin`) | static players, opening-rack jobs (Fix 2) |
-| 19 | Win % Utility Weight | `utility_w_winpct` | `uwin1`/`uwin2` (`uwin`) | static players |
-| 20 | Spread Utility Weight | `utility_w_spread` | `uspread1`/`uspread2` (`uspread`) | static players |
-| 21 | Spread Utility Scale | `utility_spread_scale` | `uspreadscale1`/`uspreadscale2` (`uspreadscale`) | static players |
-| 22 | Time Limit (Seconds) | `time_limit_secs` | `tl1`/`tl2` (`tlim`) | static players (always 0 for a simmer) |
-| 23 | Movegen Margin ("—" unless the recorder is `equity`) | `movegen_margin` | `mmargin` | every job but an opening-rack static analysis |
-| 24 | PEG Schedule | `peg_stage_top_k` | `pegtopk1`/`pegtopk2` | players without the pre-endgame; opening-rack and leave jobs |
-| 25 | PEG Stride | `peg_scenario_stride` | `pegstride1`/`pegstride2` | the same |
-| 26 | PEG Opponent | `peg_opp_model` | `pegpess1`/`pegpess2` | the same |
-| 27 | Nested Lookahead | `peg_nested` | `pegnested1`/`pegnested2` | the same |
-| 28 | Nested Caps | `peg_nested_cand_caps` | `pegncaps` | the same, and players without nested lookahead |
-| 29 | Nested Depth | `peg_nested_max_depth` | `pegndepth` | the same |
-| 30 | Nested Strides | `peg_nested_strides` | `pegnstrides` | the same |
-| 31 | Wordmap | `use_wordmap` | `w1`/`w2` (`wmp`) | n/a |
-| 32 | Rack Info Table | `use_rit` | `rit1`/`rit2` (`rit`) | n/a (leave jobs refuse it) |
-| 33 | Word Info Table | `use_wit` | `wit1`/`wit2` (`wit`) | n/a |
+| 12 | Movegens per Move ("—" for no budget) | `movegens_per_move` | `mb1`/`mb2` (`movebudget`) | jobs where no player simulates or solves: a static player generates once a move |
+| 13 | Stopping % | `stopping_pct` | `sc1`/`sc2` (`scondition`) | static players |
+| 14 | Moves Recorded | `num_plays_recorded` | `maxnumdplays` | leave jobs; games/pairs jobs without capture (Fix 1) |
+| 15 | Plies Recorded ("—" for a static player) | `num_plies_recorded` | `shplies` | leave jobs; games/pairs jobs without capture (Fix 1) |
+| 16 | Minimum Iterations per Play | `min_play_iterations` | `mi1`/`mi2` (`minplayiterations`) | static players |
+| 17 | Stopping Threshold Rule | `threshold` | `th1`/`th2` (`threshold`) | static players |
+| 18 | Sampling Rule | `sampling_rule` | `sa1`/`sa2` (`sr`) | static players |
+| 19 | Inference Margin | `inference_margin` | `im1`/`im2` (`imargin`) | static players, opening-rack jobs (Fix 2) |
+| 20 | Win % Utility Weight | `utility_w_winpct` | `uwin1`/`uwin2` (`uwin`) | static players |
+| 21 | Spread Utility Weight | `utility_w_spread` | `uspread1`/`uspread2` (`uspread`) | static players |
+| 22 | Spread Utility Scale | `utility_spread_scale` | `uspreadscale1`/`uspreadscale2` (`uspreadscale`) | static players |
+| 23 | Time Limit (Seconds) | `time_limit_secs` | `tl1`/`tl2` (`tlim`) | static players (always 0 for a simmer) |
+| 24 | Movegen Margin ("—" unless the recorder is `equity`) | `movegen_margin` | `mmargin` | every job but an opening-rack static analysis |
+| 25 | PEG Schedule | `peg_stage_top_k` | `pegtopk1`/`pegtopk2` | players without the pre-endgame; opening-rack and leave jobs |
+| 26 | PEG Stride | `peg_scenario_stride` | `pegstride1`/`pegstride2` | the same |
+| 27 | PEG Opponent | `peg_opp_model` | `pegpess1`/`pegpess2` | the same |
+| 28 | Nested Lookahead | `peg_nested` | `pegnested1`/`pegnested2` | the same |
+| 29 | Nested Caps | `peg_nested_cand_caps` | `pegncaps` | the same, and players without nested lookahead |
+| 30 | Nested Depth | `peg_nested_max_depth` | `pegndepth` | the same |
+| 31 | Nested Strides | `peg_nested_strides` | `pegnstrides` | the same |
+| 32 | Wordmap | `use_wordmap` | `w1`/`w2` (`wmp`) | n/a |
+| 33 | Rack Info Table | `use_rit` | `rit1`/`rit2` (`rit`) | n/a (leave jobs refuse it) |
+| 34 | Word Info Table | `use_wit` | `wit1`/`wit2` (`wit`) | n/a |
 
 How the "Never read by" column affects the display:
 

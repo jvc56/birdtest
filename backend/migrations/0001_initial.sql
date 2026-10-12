@@ -388,9 +388,11 @@ CREATE TYPE job_status AS ENUM (
 
 CREATE TABLE jobs (
     id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    -- What the admin called it, shown first wherever jobs are listed. '' for
-    -- a job created without one (through the API; the form asks for it).
-    name       TEXT NOT NULL DEFAULT '' CHECK (char_length(name) <= 100),
+    -- What the admin called it. '' for a job created without one (through
+    -- the API; the form asks for it). Not the job's name: a games or pairs
+    -- job is named for its title and its players, "{title}: A vs B", read
+    -- from its config (models::job::job_name).
+    title      TEXT NOT NULL DEFAULT '' CHECK (char_length(title) <= 100),
     job_type   job_type NOT NULL,
     -- Every active job's share of the fleet: the scheduler hands each claim
     -- to the active job furthest behind
@@ -676,6 +678,12 @@ CREATE TABLE player_configs (
     -- games or game-pairs job that captures positions: MAGPIE reads player
     -- 1's for both seats, so job creation requires the two to agree.
     movegen_margin         DOUBLE PRECISION NOT NULL, -- move-gen equity margin for 'equity' recording (-mmargin)
+    -- The move generations the player may spend choosing one move -- its
+    -- inference, simulation and solving together -- or NULL for no budget
+    -- (-mb1 / -mb2). Unlike a time limit it is the same work on any machine.
+    -- Any player may state one; only a simmer or a solver spends more than
+    -- one generation a move, so only for one can it bind.
+    movegens_per_move      BIGINT CHECK (movegens_per_move > 0),
     -- Endgame and pre-endgame (PEG) solving, read only by games and game-pairs
     -- jobs: an opening rack never reaches a small bag, and a leave job's games
     -- end before one (job creation refuses a leave player that solves).

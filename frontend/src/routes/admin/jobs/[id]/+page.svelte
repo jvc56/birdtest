@@ -11,16 +11,15 @@
     type JobStats
   } from '$lib/api';
   import { subscribeToJob } from '$lib/sse';
-  import { computeTime, exactCount, exportSummary, jobTitle, jobTypeLabel } from '$lib/format';
+  import { computeTime, exactCount, exportSummary } from '$lib/format';
   import type { JobConfig } from '$lib/jobSettings';
+  import JobHeader from '$lib/components/JobHeader.svelte';
   import JobStatusCard from '$lib/components/JobStatusCard.svelte';
-  import JobStatsRow from '$lib/components/JobStatsRow.svelte';
-  import TaskCounts from '$lib/components/TaskCounts.svelte';
+  import JobProgressCard from '$lib/components/JobProgressCard.svelte';
   import DerivedDataStatus from '$lib/components/DerivedDataStatus.svelte';
   import JobSettings from '$lib/components/JobSettings.svelte';
   import ConsensusEditor from '$lib/components/ConsensusEditor.svelte';
   import MatchScore from '$lib/components/MatchScore.svelte';
-  import ProgressBar from '$lib/components/ProgressBar.svelte';
   import MatchTestCard from '$lib/components/MatchTestCard.svelte';
   import WorkerTable from '$lib/components/WorkerTable.svelte';
 
@@ -388,15 +387,11 @@
   {#if !gone}<p class="text-muted-foreground">Loading…</p>{/if}
 {:else}
   <div class="space-y-6">
-    <header class="flex flex-wrap items-center gap-3">
-      <h1 class="text-2xl font-semibold">{jobTitle(stats.job)}</h1>
-      {#if stats.job.name}
-        <span class="text-sm text-muted-foreground">{jobTypeLabel(stats.job.job_type)}</span>
-      {/if}
+    <JobHeader job={stats.job} {config}>
       <a href="/jobs/{jobId}" class="text-sm">public view</a>
-    </header>
+    </JobHeader>
     <JobStatusCard {stats} />
-    <JobStatsRow {stats} />
+    <JobProgressCard {stats} />
     <DerivedDataStatus {jobId} />
 
     <div class="card space-y-4">
@@ -591,31 +586,6 @@
       {/if}
     </div>
 
-    <div class="card space-y-3">
-      <h2 class="text-lg font-medium">Progress</h2>
-      {#if stats.games}
-        <ProgressBar
-          value={stats.games.units_completed}
-          max={stats.games.max_units}
-          label="{stats.games.unit}s completed"
-        />
-      {:else if stats.opening_racks}
-        <ProgressBar
-          value={stats.opening_racks.racks_settled}
-          max={stats.opening_racks.racks_total}
-          label="racks settled"
-        />
-      {:else if stats.leave_generation}
-        <ProgressBar
-          value={stats.leave_generation.generations_closed}
-          max={stats.leave_generation.generation_count}
-          label="generations closed"
-        />
-      {:else}
-        <ProgressBar value={stats.tasks_completed} max={stats.tasks_total} label="tasks completed" />
-      {/if}
-      <TaskCounts {stats} />
-    </div>
 
     {#if config?.opening_racks}
       <ConsensusEditor

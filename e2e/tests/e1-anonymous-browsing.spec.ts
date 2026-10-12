@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { seededJob, waitForResults } from '../lib/api';
+import { jobHeading, seededJob, waitForResults } from '../lib/api';
 
 /**
  * E-1: an anonymous visitor browses the landing page, the job list, a job's
@@ -17,6 +17,16 @@ test('E-1: an anonymous visitor browses the landing page, jobs, a job and the le
 
   await page.goto('/');
   await expect(page.getByRole('heading', { name: 'Crowdsourced Crossword Game Research' })).toBeVisible();
+  // What birdtest is, and the four kinds of job it hosts, each described.
+  await expect(page.getByTestId('intro').locator('li')).toHaveText([
+    /^\s*Games: two players/, /^\s*Game Pairs: like Games/,
+    /^\s*Opening Rack Analysis: every single opening rack/, /^\s*Leave Generation: many games/
+  ]);
+  // Step 3 is optional wherever the site is, and its example names every setting.
+  await expect(page.getByRole('heading', { name: '(Optional) Create a contribute.txt file' })).toBeVisible();
+  await expect(page.getByTestId('contribute-example')).toHaveText(
+    /^server\s+http:\/\/localhost:5280\s+apikey\s+.+?\s+threads\s+4\s+maxtasks\s+0\s+idlewait\s+5$/
+  );
   // Signed out: the header offers an account, and no admin link.
   await expect(page.getByRole('link', { name: 'Sign in' })).toBeVisible();
   await expect(page.getByRole('link', { name: 'Admin', exact: true })).toHaveCount(0);
@@ -30,11 +40,17 @@ test('E-1: an anonymous visitor browses the landing page, jobs, a job and the le
   // fourteenth audit).
   await expect(row).toContainText(/\d[\d,]* \/ [\d,]+ pairs/);
 
-  // Listed, and titled on its page, by its name: a pairs job between two
-  // configs is named for them ("static-equity vs static-score").
+  // Listed by its name: a pairs job is named for its players
+  // ("static-equity vs static-score"). Its page is headed by its title, or
+  // its type without one, with each player under it.
   await row.getByRole('link', { name: job.name, exact: true }).click();
   await expect(page).toHaveURL(new RegExp(`/jobs/${job.id}$`));
-  await expect(page.getByRole('heading', { level: 1, name: job.name, exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { level: 1, name: jobHeading(job), exact: true })).toBeVisible();
+  const players = page.getByTestId('job-players').getByRole('listitem');
+  await expect(players).toHaveCount(2);
+  for (const [i, player] of job.name.slice(job.title ? job.title.length + 2 : 0).split(' vs ').entries()) {
+    await expect(players.nth(i).getByRole('link', { name: player, exact: true })).toBeVisible();
+  }
   await expect(page.getByRole('heading', { name: 'Significance Test' })).toBeVisible();
   // The status on a row of its own, saying what it means for this job unless
   // it is active (the badge says that plainly), then the headline figures.
@@ -45,8 +61,8 @@ test('E-1: an anonymous visitor browses the landing page, jobs, a job and the le
   } else {
     await expect(page.getByTestId('job-status-context')).toContainText(/Paused|Finished/);
   }
-  await expect(page.locator('.grid > .card > p:first-child')).toHaveText([
-    'Allocation', 'Tasks completed', 'Throughput', 'Estimated time left'
+  await expect(page.getByTestId('progress-figures').locator('dt')).toHaveText([
+    'Done', 'Throughput', 'Time left', 'Allocation'
   ]);
   // Anonymous workers are shown by pseudonym, never by the UUID that is
   // their credential.

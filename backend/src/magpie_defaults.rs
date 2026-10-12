@@ -12,7 +12,7 @@
 //! changes configs and jobs created afterwards only: an existing config keeps
 //! playing as it did, and its ratings keep comparing like with like.
 //!
-//! Each value is MAGPIE's on `birdtest-contribute`: the `CONFIG_DEFAULT_*`
+//! Each value is MAGPIE's on `main`: the `CONFIG_DEFAULT_*`
 //! constants and `config_contribute_reset_player_settings` in
 //! `src/impl/config.c`, and `DEFAULT_BINGO_BONUS` in `src/def/config_defs.h`.
 //! Keep them in step with that build.

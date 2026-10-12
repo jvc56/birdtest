@@ -2,7 +2,7 @@ use crate::clientip::ClientIp;
 use crate::error::{AppError, AppResult};
 use crate::jobs::racks::LetterDistribution;
 use crate::jobstats;
-use crate::models::job::{Job, JobType};
+use crate::models::job::{job_name, Job, JobType};
 use crate::state::AppState;
 use crate::extract::{ApiPath as Path, ApiQuery as Query};
 use axum::extract::State;
@@ -61,6 +61,9 @@ struct JobListQuery {
 #[derive(Serialize)]
 struct JobListItem {
     id: Uuid,
+    /// What the admin called it, and its name: the title and, for a games
+    /// or pairs job, its players ([`job_name`]).
+    title: String,
     name: String,
     job_type: JobType,
     status: String,
@@ -91,7 +94,7 @@ async fn list_jobs(
     let (limit, offset) = super::paginate(query.page, query.per_page);
 
     let rows = sqlx::query(
-        "SELECT j.id, j.name, j.job_type, j.status::text AS status, j.allocation,
+        "SELECT j.id, j.title, p1.name AS player1_name, p2.name AS player2_name, j.job_type, j.status::text AS status, j.allocation,
                 j.created_at,
                 -- Running totals, like games_completed below. Counted, these
                 -- were two scans of a job's whole task history for every job on
@@ -134,6 +137,8 @@ async fn list_jobs(
          LEFT JOIN job_game_pair_config pc ON pc.job_id = j.id
          LEFT JOIN job_opening_rack_config rc ON rc.job_id = j.id
          LEFT JOIN job_leave_config lc ON lc.job_id = j.id
+         LEFT JOIN player_configs p1 ON p1.id = COALESCE(gc.player1_config_id, pc.player1_config_id)
+         LEFT JOIN player_configs p2 ON p2.id = COALESCE(gc.player2_config_id, pc.player2_config_id)
          WHERE $3::job_status IS NULL OR j.status = $3
          ORDER BY j.created_at DESC, j.id DESC
          LIMIT $1 OFFSET $2",
@@ -170,9 +175,13 @@ async fn list_jobs(
                     row.get::<Option<i32>, _>("generation_count").map(i64::from),
                 ),
             };
+            let title: String = row.get("title");
+            let player1: Option<String> = row.get("player1_name");
+            let player2: Option<String> = row.get("player2_name");
             JobListItem {
                 id: row.get("id"),
-                name: row.get("name"),
+                name: job_name(&title, player1.as_deref().zip(player2.as_deref())),
+                title,
                 job_type,
                 status: row.get("status"),
                 allocation: row.get("allocation"),
@@ -234,6 +243,8 @@ struct JobConfigView {
 #[derive(Serialize)]
 struct JobSettings {
     id: Uuid,
+    /// As [`JobListItem`]'s.
+    title: String,
     name: String,
     job_type: JobType,
     variant: String,
@@ -295,6 +306,7 @@ struct PlayerSettings {
     stopping_pct: Option<f64>,
     use_inference: Option<bool>,
     time_limit_secs: Option<i32>,
+    movegens_per_move: Option<i64>,
     use_wordmap: bool,
     use_rit: bool,
     use_wit: bool,
@@ -341,6 +353,7 @@ impl PlayerSettings {
             stopping_pct: c.stopping_pct,
             use_inference: c.use_inference,
             time_limit_secs: c.time_limit_secs,
+            movegens_per_move: c.movegens_per_move,
             use_wordmap: c.use_wordmap,
             use_rit: c.use_rit,
             use_wit: c.use_wit,
@@ -495,10 +508,15 @@ async fn job_config(
         }
     }
 
+    // A games or pairs job's two players, by which it is named.
+    let pair = matches!(job.job_type, JobType::Games | JobType::GamePairs)
+        .then(|| (players[0].name.as_str(), players[1].name.as_str()));
+    let name = job_name(&job.title, pair);
     Ok(Json(JobConfigView {
         job: JobSettings {
             id: job.id,
-            name: job.name.clone(),
+            title: job.title.clone(),
+            name,
             job_type: job.job_type,
             variant: job.variant.clone(),
             letter_distribution: file(job.letterdist_id).await?,

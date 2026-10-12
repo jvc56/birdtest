@@ -6,8 +6,9 @@ const seats = (list: { player1: string; player2: string }[]) =>
   list.map((m) => `${m.player1}-${m.player2}`);
 
 describe('F-RR-1 matchups', () => {
-  it('makes one self-play job of one config, under the name as given', () => {
-    expect(matchups(['a'], '  solo  ', name)).toEqual([{ player1: 'a', player2: 'a', name: 'solo' }]);
+  it('makes one self-play job of one config, named for it twice', () => {
+    expect(matchups(['a'], '  solo  ', name)).toEqual([{ player1: 'a', player2: 'a', name: 'solo: A vs A' }]);
+    expect(matchups(['a'], '', name)).toEqual([{ player1: 'a', player2: 'a', name: 'A vs A' }]);
   });
 
   it('makes every pairing once, seated in the order the configs are listed', () => {

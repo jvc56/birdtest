@@ -1767,6 +1767,10 @@ async fn an_assignment_names_every_file_the_task_loads_and_no_others() {
         let value = request["player1"].get(field);
         assert!(value.is_some_and(|v| v.is_null()), "player1 {field} sent as null: {request}");
     }
+    // So is a player without a movegen budget: stated, as null, since MAGPIE
+    // refuses a player that leaves it out.
+    let budget = request["player1"].get("movegens_per_move");
+    assert!(budget.is_some_and(|v| v.is_null()), "player1 movegens_per_move sent as null: {request}");
 }
 
 /// Contribution counters are running totals now, not counts over `task_claims`,

@@ -17,7 +17,7 @@ on:
     inputs:
       magpie_ref:
         description: MAGPIE branch or commit to test
-        default: birdtest-contribute
+        default: main
 
 jobs:
   # Twice: the MAGPIE commit docker/Dockerfile pins -- what production runs,
@@ -45,7 +45,7 @@ jobs:
         # ref is free text.
         env:
           LEG: ${{ matrix.magpie }}
-          HEAD_REF: ${{ inputs.magpie_ref || 'birdtest-contribute' }}
+          HEAD_REF: ${{ inputs.magpie_ref || 'main' }}
         run: |
           if [ "$LEG" = pin ]; then
             ref="$(sed -n 's/^ARG MAGPIE_COMMIT=//p' docker/Dockerfile | head -n 1)"
