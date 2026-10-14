@@ -59,7 +59,7 @@ services:
       GITHUB_TOKEN: ""
       # Must match fixtures/build.sh's REPO. Not a real repository, on purpose.
       MAGPIE_DATA_REPO: birdtest/fixtures
-      MIN_MAGPIE_VERSION: 0.1.2
+      MIN_MAGPIE_VERSION: 0.1.3
       # A journey watches a job's page move as the fake worker submits; at
       # the production default a push is up to ten seconds behind.
       JOB_STATS_CACHE_SECONDS: 1

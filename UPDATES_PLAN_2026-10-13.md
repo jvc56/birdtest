@@ -398,6 +398,13 @@ and every contributor stays eligible for every job.
    - Builds check free space first, so a full disk skips the table instead of
      crashing. The RIT writer returns an error instead of `fwrite_or_die`,
      which closes KL-51.
+   - **Memory too (owner, 2026-10-13).** The chooser also fits the tables to
+     memory: `MemAvailable` less a `contribute.txt` reserve, `memreserve` (GB,
+     default 1). Each table needs its build's peak memory if it must be built
+     (about 710 MB for a WMP, 310 MB for a WIT, 2.4 GB for an RIT), and its
+     size while the task plays. A table this process already holds costs
+     nothing more. A table that fits on disk but not in memory is skipped the
+     same way, and reported in `derived_skipped` like any other.
    - A log line names what was skipped and why: "skipping the rack info
      table for CSW24.CSW24: 1.9 GB needed, 0.8 GB free".
    - Tests: the chooser on its own (every combination of space and requests,
@@ -456,7 +463,4 @@ and every contributor stays eligible for every job.
 
 ## Not in this plan
 
-- Memory as a constraint on tables: an RIT holds 1.9 GB of RAM while it
-  plays. Item 7 is about storage only. A RAM-aware chooser would extend the
-  same function.
 - Renaming `/player-configs` and the API's `player_config` names (D7).

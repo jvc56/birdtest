@@ -431,7 +431,7 @@ variable "acm_certificate_arn" {
 
 variable "min_magpie_version" {
   description = <<-EOT
-    The oldest MAGPIE that may contribute (MIN_MAGPIE_VERSION). 0.1.2 is the
+    The oldest MAGPIE that may contribute (MIN_MAGPIE_VERSION). 0.1.3 is the
     version of the MAGPIE `main` commit the backend image pins, and a build reporting
     a lower version is offered nothing. Raise it whenever a MAGPIE release
     changes results: it is the only way to keep a build known to compute
@@ -441,7 +441,7 @@ variable "min_magpie_version" {
     workers may not run.
   EOT
   type        = string
-  default     = "0.1.2"
+  default     = "0.1.3"
 
   # What the backend's `Version::parse_strict` takes, which it holds this to at
   # startup (config.rs): two or three dot-separated runs of digits, after

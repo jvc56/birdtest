@@ -570,6 +570,77 @@ async fn data_gaps_report_what_workers_declined_for() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
+/// A-ADMIN-8b: a result says which derived files its worker ran without for
+/// want of space (`derived_skipped`: the tables are a best attempt); the claim
+/// keeps them sorted and once each, null for none or a build that does not
+/// say, and the job's skipped-tables view counts them by role with the
+/// workers that skipped each. Anything but a list of wmp, wit and rit is a
+/// `400` naming the field, and the claim stays open.
+#[tokio::test]
+async fn skipped_tables_are_kept_and_counted() {
+    let db = TestDb::new().await;
+    let admin = Admin::new(&db).await;
+    let job = db.games_job(2).await;
+    let submit = |uuid: String, assignment: Value, skipped: Option<Value>| {
+        let app = admin.app.clone();
+        async move {
+            let mut body = json!({ "claim_token": assignment["claim_token"], "movegens": 10, "result": games_result(2, 1) });
+            if let Some(skipped) = skipped {
+                body["derived_skipped"] = skipped;
+            }
+            send(&app, post_json("/api/worker/result", &[("x-worker-uuid", uuid.as_str())], body)).await
+        }
+    };
+    let mut claims = Vec::new();
+    for skipped in [Some(json!(["rit", "wmp", "rit"])), Some(json!(["rit"])), Some(json!([])), None] {
+        let (status, assignment) = claim(&admin.app, &[], "1.0.0", &[]).await;
+        assert_eq!(status, StatusCode::OK, "{assignment}");
+        let uuid = assignment["worker_uuid"].as_str().unwrap().to_string();
+        claims.push(assignment["claim_token"].as_str().unwrap().to_string());
+        let (status, body) = submit(uuid, assignment, skipped).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let stored: Vec<Option<Vec<String>>> = sqlx::query_scalar(
+        "SELECT derived_skipped FROM task_claims WHERE claim_token::text = ANY($1) ORDER BY array_position($1, claim_token::text)",
+    )
+    .bind(&claims)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(stored, vec![Some(vec!["rit".into(), "wmp".into()]), Some(vec!["rit".into()]), None, None]);
+
+    // Not a list of the three roles: refused, and the claim is still open.
+    for wrong in [json!(["kwg"]), json!("rit"), json!([1])] {
+        let (_, assignment) = claim(&admin.app, &[], "1.0.0", &[]).await;
+        let uuid = assignment["worker_uuid"].as_str().unwrap().to_string();
+        let token = assignment["claim_token"].clone();
+        let (status, body) = submit(uuid, assignment, Some(wrong)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.to_string().contains("derived_skipped"), "{body}");
+        let state: String = sqlx::query_scalar("SELECT state::text FROM task_claims WHERE claim_token::text = $1")
+            .bind(token.as_str().unwrap())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(state, "claimed");
+    }
+
+    let (status, skipped) = admin.get(&format!("/api/admin/jobs/{job}/skipped-tables")).await;
+    assert_eq!(status, StatusCode::OK, "{skipped}");
+    let summary: Vec<(String, i64, i64)> = skipped
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| {
+            assert!(s["last_completed_at"].is_string(), "{s}");
+            (s["role"].as_str().unwrap().into(), s["tasks"].as_i64().unwrap(), s["workers"].as_i64().unwrap())
+        })
+        .collect();
+    assert_eq!(summary, vec![("wmp".into(), 1, 1), ("rit".into(), 2, 2)]);
+    let (status, skipped) = admin.get(&format!("/api/admin/jobs/{}/skipped-tables", Uuid::new_v4())).await;
+    assert_eq!((status, skipped), (StatusCode::OK, json!([])));
+}
+
 /// A job's derived-data view lists each wordmap and rack info table the job
 /// waits on and how its build stands, so the job page can say why an active
 /// job hands out nothing; once each is built it says so.

@@ -219,6 +219,7 @@ const ROUTES: &[(&str, &str, Access, &str)] = &[
     ("GET", "/api/admin/input-data/imports/:id", Admin, ""),
     ("POST", "/api/admin/input-data/imports/:id/confirm", Admin, ""),
     ("GET", "/api/admin/jobs/:id/data-gaps", Admin, ""),
+    ("GET", "/api/admin/jobs/:id/skipped-tables", Admin, ""),
     ("GET", "/api/admin/jobs/:id/derived-data", Admin, ""),
     ("GET", "/api/admin/jobs/:id/results/stream", Admin, ""),
     ("POST", "/api/admin/jobs/:id/export", Admin, ""),

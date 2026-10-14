@@ -3050,7 +3050,7 @@ below.
 - `A-WORKER-2` A claim with a malformed `magpie_version` is rejected rather than
   assumed. Unparseable text reads as `0.0.0`, below the floor, so the worker is
   handed nothing and told to update (a floor of `0.0.0` would admit it; the
-  shipped floor is `0.1.2`); a version that is not a string is a `400` naming
+  shipped floor is `0.1.3`); a version that is not a string is a `400` naming
   the field. *(Covered:
   `worker_routes::a_malformed_magpie_version_is_refused_rather_than_assumed`.)*
 - `A-WORKER-3` An `unsupported_jobs` list over 200 is **truncated, not
@@ -3315,6 +3315,13 @@ below.
   `input_data::a_file_only_derived_data_refers_to_can_be_deleted_and_takes_that_data_with_it`.)*
 - `A-ADMIN-8` `job/:id/data-gaps` reports what workers declined for. *(Covered:
   `admin_routes::data_gaps_report_what_workers_declined_for`.)*
+- `A-ADMIN-8b` A result's `derived_skipped` (the derived files its worker ran
+  without for want of space; the tables are a best attempt) is kept on the
+  claim sorted and once each, null for `[]` or a build that leaves it out
+  (migration `0002`), and `job/:id/skipped-tables` counts each role's tasks
+  and workers; anything but a list of `wmp`, `wit` and `rit` is a `400`
+  naming the field, with the claim left open. *(Covered:
+  `admin_routes::skipped_tables_are_kept_and_counted`.)*
 - `A-ADMIN-9` `fleet` reports connected workers and their versions: a claim
   counts while open (claimed in the week) or once completed in the week,
   whenever it was claimed; one completed before the week or lapsed does not
@@ -4265,7 +4272,7 @@ works — the directory it lays out, the names it invokes, the bytes it gets
 back.
 
 **Correctness is established by version and capability probe.**
-MAGPIE's `main` reports `0.1.2`, the shipped `MIN_MAGPIE_VERSION` default; a checkout reporting anything lower is refused. The
+MAGPIE's `main` reports `0.1.3`, the shipped `MIN_MAGPIE_VERSION` default; a checkout reporting anything lower is refused. The
 probe additionally asks the binary what it can do: that `contribute` is a
 registered command, and that it accepts the current required claim body.
 

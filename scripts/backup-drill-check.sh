@@ -7,7 +7,7 @@
 #
 #   docker compose up -d --wait postgres minio minio-init
 #   (the schema applied to the database: the backend applies it on start, or
-#    psql < backend/migrations/0001_initial.sql)
+#    cat backend/migrations/*.sql | psql)
 #   ./scripts/backup-drill-check.sh
 #
 # 1. A backup taken while another session keeps writing (audit_log rows, as
@@ -117,20 +117,26 @@ for _ in $(seq 60); do
   sleep 1
 done
 [[ "$(sql "SELECT to_regclass('public.backups') IS NOT NULL")" == t ]] \
-  || fail "no schema in the database -- apply backend/migrations/0001_initial.sql first"
+  || fail "no schema in the database -- apply backend/migrations/*.sql, in order, first"
 
 # backup.sh records which migrations the dump can be read by, from the table
 # sqlx keeps. A schema applied with psql rather than by the backend has none,
-# so the check records the one migration the way sqlx would, and removes the
-# table again afterwards.
+# so the check records every migration the way sqlx would (its version, its
+# name with spaces, the SHA-384 of its file), and removes the table again
+# afterwards.
 if [[ "$(sql "SELECT to_regclass('public._sqlx_migrations') IS NULL")" == t ]]; then
-  checksum="$(sha384sum "${REPO}/backend/migrations/0001_initial.sql" | cut -d' ' -f1)"
   sql "CREATE TABLE _sqlx_migrations (
          version BIGINT PRIMARY KEY, description TEXT NOT NULL,
          installed_on TIMESTAMPTZ NOT NULL DEFAULT now(), success BOOLEAN NOT NULL,
-         checksum BYTEA NOT NULL, execution_time BIGINT NOT NULL);
-       INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time)
-       VALUES (1, 'initial', true, '\\x${checksum}', 0)" >/dev/null
+         checksum BYTEA NOT NULL, execution_time BIGINT NOT NULL)" >/dev/null
+  for migration in "${REPO}"/backend/migrations/*.sql; do
+    base="$(basename "$migration" .sql)"
+    version="$((10#${base%%_*}))"
+    description="${base#*_}"
+    checksum="$(sha384sum "$migration" | cut -d' ' -f1)"
+    sql "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time)
+         VALUES (${version}, '${description//_/ }', true, '\\x${checksum}', 0)" >/dev/null
+  done
   created_migrations=1
 fi
 

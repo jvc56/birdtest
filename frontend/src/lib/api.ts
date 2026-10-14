@@ -616,6 +616,15 @@ export interface DataGap {
   last_reported_at: string;
 }
 
+/** A derived file a job's workers ran without for want of space, by role. */
+export interface SkippedTable {
+  role: 'wmp' | 'wit' | 'rit';
+  /** Completed tasks whose worker ran without it. */
+  tasks: number;
+  workers: number;
+  last_completed_at: string | null;
+}
+
 export interface FleetVersion {
   magpie_version: string | null;
   workers: number;
@@ -885,6 +894,7 @@ export const api = {
   confirmImport: (id: string) =>
     post<{ inserted: number }>(`/api/admin/input-data/imports/${id}/confirm`),
   jobDataGaps: (id: string) => get<DataGap[]>(`/api/admin/jobs/${id}/data-gaps`),
+  jobSkippedTables: (id: string) => get<SkippedTable[]>(`/api/admin/jobs/${id}/skipped-tables`),
   jobDerivedData: (id: string) =>
     get<JobDerivedFile[]>(`/api/admin/jobs/${id}/derived-data`),
   fleet: () => get<FleetVersion[]>('/api/admin/fleet'),

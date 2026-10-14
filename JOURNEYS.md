@@ -944,6 +944,15 @@ while those run).
   decline that job, and the job's **Manage** page to list `kwg CSW21_ab` under
   data gaps with its workers and declines. Other jobs show "No worker has
   declined this job."
+- [ ] **Do** run a worker whose data directory has too little free space for
+  a rack info table: a small filesystem (`truncate -s 3G img && mkfs.ext4 img`,
+  loop-mounted) holding a copy of `~/MAGPIE/data`, with `diskreserve 1` in its
+  `contribute.txt`, while a job whose player asks for a rack info table on a
+  full English lexicon is active. **Expect** the worker to say it is skipping
+  the rack info table ("…needed, … free") and finish its tasks anyway, and the
+  job's **Manage** page to list "Rack info table" under **Tables skipped**
+  with that worker and its tasks. A job whose workers had room for everything
+  says "Every task ran with every table its players use."
 
 ### A-12 A leave-generation job, start to finish
 

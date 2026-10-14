@@ -1789,7 +1789,7 @@ start. The process has no SSM code path of its own.
 | `S3_BUCKET` | `birdtest-artifacts` | |
 | `S3_ENDPOINT` | unset | Set to MinIO's address locally; the AWS SDK works against it unmodified. |
 | `S3_PUBLIC_ENDPOINT` | unset | The object store as a browser reaches it, when that differs from `S3_ENDPOINT`: export download links are signed for it. The compose stack sets `http://localhost:${MINIO_PORT}`, since its backend reaches MinIO as `minio:9000`; production leaves it unset. |
-| `MIN_MAGPIE_VERSION` | `0.1.2` | The enforced global floor, and the default floor for a new job. Also a floor the server's own pinned MAGPIE must clear: startup fails if `MAGPIE_BIN` reports less, since the server would be publishing hashes built by a MAGPIE its workers may not run. The default (`config::DEFAULT_MIN_MAGPIE_VERSION`) is copied into Terraform's `min_magpie_version`, both compose files, `scripts/e2e_magpie_native.sh`, `backend/.env.example`, the root `.env.example`, the `jobs` column defaults and `scripts/dev.py`; `U-CFG-5` fails when a raise misses one. |
+| `MIN_MAGPIE_VERSION` | `0.1.3` | The enforced global floor, and the default floor for a new job. Also a floor the server's own pinned MAGPIE must clear: startup fails if `MAGPIE_BIN` reports less, since the server would be publishing hashes built by a MAGPIE its workers may not run. The default (`config::DEFAULT_MIN_MAGPIE_VERSION`) is copied into Terraform's `min_magpie_version`, both compose files, `scripts/e2e_magpie_native.sh`, `backend/.env.example`, the root `.env.example`, the `jobs` column defaults and `scripts/dev.py`; `U-CFG-5` fails when a raise misses one. |
 | `MAGPIE_BIN` | `/usr/local/bin/magpie` | The pinned MAGPIE the server runs for every derived file and every leave-generation KLV. The backend image builds one in; locally, a checkout's `bin/magpie`. Startup fails without a working one. |
 | `MAGPIE_THREADS` | `1` | Threads given to a conversion. The web task keeps 1; the derived-file builder task sets its vCPU count. |
 | `MAGPIE_SCRATCH_DIR` | the system temp directory | Where a conversion's throwaway data directory goes. The builder task points it at its ephemeral volume, since a rack info table is 1.9 GB. |
@@ -2437,10 +2437,10 @@ WHERE (j.min_magpie_major, j.min_magpie_minor, j.min_magpie_patch)
 distribution and a layout — and a client too old to understand `expected_data`
 will contribute unverified rather than decline. "No floor" is not a state worth
 being able to express once every job depends on the client honouring a protocol,
-so the columns are `NOT NULL` and default to **`0.1.2`**, the same value as the
+so the columns are `NOT NULL` and default to **`0.1.3`**, the same value as the
 server's `MIN_MAGPIE_VERSION`, which `create_job` writes explicitly.
 
-`0.1.2` is the version of the MAGPIE `main` commit the backend image pins. The version
+`0.1.3` is the version of the MAGPIE `main` commit the backend image pins. The version
 was incremented through `0.5.1` as birdtest and MAGPIE changed together during
 development and reset to `0.1.0` when the protocol settled; none of those numbers
 shipped. **The version moves with every change that can alter what a task
@@ -2453,7 +2453,12 @@ played a leave task after its first with the previous task's KLV — so the bran
 went to `0.1.1` and the floor with it. `0.1.2` (October 2026) followed a fix to
 the move generator's rack info table cache, which across two lexicons in one
 contributor process crashed or used the other lexicon's leaves, together with
-captured positions naming their mover. The
+captured positions naming their mover. `0.1.3` (October 2026) made the
+wordmap, word info table and rack info table a best attempt -- a contributor
+short of space runs a task without the tables that do not fit and says so in
+its result (`derived_skipped`) -- and read each table's size from the claim;
+since the first deploy, a floor change moves the `jobs` column defaults in a
+numbered migration (`0002_best_attempt_tables.sql`) rather than in `0001`. The
 one place the floor lives is the server's configuration: the column default,
 the Terraform variable, the compose file and the env examples all carry the
 same value so no path writes a lower one.

@@ -39,6 +39,7 @@ pub fn router() -> Router<AppState> {
         .route("/input-data/imports/:id", get(get_import))
         .route("/input-data/imports/:id/confirm", post(confirm_import))
         .route("/jobs/:id/data-gaps", get(job_data_gaps))
+        .route("/jobs/:id/skipped-tables", get(job_skipped_tables))
         .route("/jobs/:id/derived-data", get(job_derived_data))
         // Bulk reads of a job's results are admin operations: the public gets
         // the paginated `/api/jobs/:id/results`. The stream scans from a cursor
@@ -503,6 +504,45 @@ async fn job_data_gaps(
              WHERE g.job_id = $1
              GROUP BY g.role, g.name, g.expected
              ORDER BY workers DESC, g.role, g.name",
+        )
+        .bind(id)
+        .fetch_all(&state.pool)
+        .await?,
+    ))
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+struct SkippedTable {
+    /// `wmp`, `wit` or `rit`.
+    role: String,
+    /// Completed tasks whose worker ran without it.
+    tasks: i64,
+    /// Distinct workers that did.
+    workers: i64,
+    last_completed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// The derived files the job's workers ran without for want of space, by
+/// role. The tables are a best attempt: a task runs without one that does not
+/// fit, slower and with the same moves, so this explains a job whose tasks run
+/// slow or time out rather than anything wrong with its results. Reads only
+/// the claims that skipped one (`task_claims_derived_skipped_idx`).
+async fn job_skipped_tables(
+    State(state): State<AppState>,
+    _admin: AdminUser,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<Vec<SkippedTable>>> {
+    Ok(Json(
+        sqlx::query_as::<_, SkippedTable>(
+            "SELECT s.role,
+                    COUNT(*) AS tasks,
+                    COUNT(DISTINCT COALESCE(c.claimed_by_user_id, c.claimed_by_anon_uuid)) AS workers,
+                    MAX(c.completed_at) AS last_completed_at
+             FROM task_claims c
+             CROSS JOIN LATERAL unnest(c.derived_skipped) AS s(role)
+             WHERE c.job_id = $1 AND c.derived_skipped IS NOT NULL AND c.state = 'completed'
+             GROUP BY s.role
+             ORDER BY array_position(ARRAY['wmp', 'wit', 'rit'], s.role)",
         )
         .bind(id)
         .fetch_all(&state.pool)

@@ -844,6 +844,37 @@ struct ResultBody {
     /// refusal names the field rather than quoting serde.
     #[serde(default)]
     movegens: Option<serde_json::Value>,
+    /// The derived files the task's players use that this worker ran without,
+    /// for want of space: `"wmp"`, `"wit"`, `"rit"`. The tables are a best
+    /// attempt and the moves are the same without them, so nothing depends on
+    /// it; it is kept on the claim so an admin can see why a job's tasks run
+    /// slow. Absent from a build before 0.1.3, which is read as none skipped.
+    #[serde(default)]
+    derived_skipped: Option<serde_json::Value>,
+}
+
+/// A submission's `derived_skipped`: the roles it ran without, sorted and
+/// once each, or `None` for none (absent, `null` or `[]`).
+fn derived_skipped_of(value: Option<&serde_json::Value>) -> AppResult<Option<Vec<String>>> {
+    let refuse = || {
+        Err(AppError::bad_request("derived_skipped must be a list of \"wmp\", \"wit\" and \"rit\"")
+            .with_field("derived_skipped", "must be a list of wmp, wit and rit"))
+    };
+    let items = match value {
+        None | Some(serde_json::Value::Null) => return Ok(None),
+        Some(serde_json::Value::Array(items)) => items,
+        Some(_) => return refuse(),
+    };
+    let mut roles = Vec::with_capacity(items.len());
+    for item in items {
+        match item.as_str() {
+            Some(role @ ("wmp" | "wit" | "rit")) => roles.push(role.to_string()),
+            _ => return refuse(),
+        }
+    }
+    roles.sort();
+    roles.dedup();
+    Ok((!roles.is_empty()).then_some(roles))
 }
 
 /// A submission's `movegens`: a whole number from 0 to `i64::MAX`.
@@ -929,6 +960,7 @@ async fn submit_result(
     // Checked once the claim is known to be live, as a stale one is answered
     // `accepted: false` whatever it carries.
     let movegens = movegens_of(body.movegens.as_ref())?;
+    let derived_skipped = derived_skipped_of(body.derived_skipped.as_ref())?;
     // Held until the handler returns, after the commit.
     let turn = crate::jobs::registry::large_result_turn(body.result.get().len()).await?;
     // The job's immutable half: its batch size, its players' reporting caps,
@@ -1043,12 +1075,13 @@ async fn submit_result(
     // which follows the claim's).
     let compute_ms: i64 = sqlx::query_scalar(&format!(
         "UPDATE task_claims c
-         SET state = 'completed', completed_at = now(), movegens = $2
+         SET state = 'completed', completed_at = now(), movegens = $2, derived_skipped = $3
          WHERE c.id = $1
          RETURNING {CLAIM_COMPUTE_MS}"
     ))
     .bind(claim_id)
     .bind(movegens)
+    .bind(&derived_skipped)
     .fetch_one(&mut *tx)
     .await?;
     // Checked against the time held, which only the update above measures; a
@@ -1655,6 +1688,7 @@ mod contract_fixtures {
                 sha256: "214a46d7".into(),
                 builder: "wmp-1".into(),
                 build_target: "nehalem".into(),
+                bytes: 104_000_000,
             }]),
         }
     }

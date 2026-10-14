@@ -101,7 +101,7 @@ for db in "$RESTORED" "$DAMAGED"; do
 done
 ${EXEC} sh -c 'rm -f /tmp/after-* /tmp/after.done'
 psql_ -d postgres -c "CREATE DATABASE $RESTORED" >/dev/null
-psql_ -d "$RESTORED" < "$HERE/../backend/migrations/0001_initial.sql" >/dev/null
+cat "$HERE"/../backend/migrations/*.sql | psql_ -d "$RESTORED" >/dev/null
 
 # The restore point's state, with one audit row: a reset from just before it,
 # which the export's hour takes in and must not apply again.

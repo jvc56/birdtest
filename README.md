@@ -147,9 +147,10 @@ Everything worth varying is a flag; `./scripts/dev.py --help` is the full list.
 ./scripts/dev.py --fresh                      # as a new deployment: no accounts, data or jobs
 ```
 
-After a schema change the backend refuses a database made by the migration's
-older edit ("migration 1 was previously applied but has been modified": the one
-migration changes in place until release), and `dev.py` says so. `--reset-db`
+A new migration applies itself when the backend starts. A database made by an
+older edit of an applied one (from before 2026-10-13, when `0001` changed in
+place) is refused ("migration 1 was previously applied but has been
+modified"), and `dev.py` says so. `--reset-db`
 drops the schema so the backend rebuilds it; the database's data goes, the
 MinIO bucket stays, and `scripts/dev-dump.sh` snapshots both first if you want
 them. Add `--rebuild` when the images predate the change.
@@ -274,7 +275,7 @@ magpie BUILD=portable_release`) and set `MAGPIE_ROOT` if the checkout is not at
 server's builder and the fleet's identical.
 
 **The version floor stops an old MAGPIE from contributing.**
-`MIN_MAGPIE_VERSION` defaults to `0.1.2`, the version MAGPIE's `main`
+`MIN_MAGPIE_VERSION` defaults to `0.1.3`, the version MAGPIE's `main`
 reports. A checkout that reports something
 lower has every task declined with "update MAGPIE" until you update it or lower
 the floor — on the server *and* on the job, which records its own floor at
@@ -371,11 +372,16 @@ collides with a host one.
 
 ### After a schema change
 
-There is a single migration until release — schema changes edit
-`backend/migrations/0001_initial.sql` in place rather than adding a numbered
-one. sqlx checksums applied migrations, so an edited `0001` will not apply over
-a database that already has the old version, and the backend will refuse to
-start. Reset it:
+Since birdtest was deployed (2026-10-13), a schema change is a new numbered
+migration -- `backend/migrations/0002_best_attempt_tables.sql`, then `0003_…`
+-- and never an edit to one already applied. Each is additive, so the image
+before it still runs on the schema it leaves (`db.rs` ignores migrations it
+does not know, which is what lets a rollback start). The backend applies new
+ones at startup; nothing needs resetting.
+
+sqlx checksums applied migrations, so a database made by an older edit of an
+applied migration (a local database from before 2026-10-13, when `0001` was
+edited in place) makes the backend refuse to start. Reset it:
 
 ```bash
 docker compose exec postgres \
@@ -617,7 +623,7 @@ every one of the 431 leave values.
   it fetches only the files a build uses.
 - birdtest is AGPL-3.0 and MAGPIE GPL-3.0; shipping the GPL binary in an AGPL
   service image is compatible.
-- `MAGPIE_VERSION` (0.1.2 at the time of writing) moves with every change that
+- `MAGPIE_VERSION` (0.1.3 at the time of writing) moves with every change that
   can alter what a task computes or submits, and birdtest's version floor moves
   with it.
 
@@ -898,7 +904,7 @@ worker set to `http://` fails at once rather than sending its credential in
 the clear on every request. `public_url`, `ses_domain` and `mail_from_address` have
 none: they are what every confirmation and reset mail links to and is sent
 from, and a placeholder left in is refused. `min_magpie_version` defaults to
-`0.1.2`, the version of the MAGPIE `main` commit the backend image pins; raise it
+`0.1.3`, the version of the MAGPIE `main` commit the backend image pins; raise it
 whenever a MAGPIE release changes results, since it is the only way to keep a
 build that computes something wrong off the fleet. `derived_builder_image`
 has no default — it is the backend image built with `--target derived-builder`,
@@ -1095,7 +1101,7 @@ Session Manager plugin for ECS Exec), `terraform`, `jq`, `git`, `gh`,
 
 | Script | Does |
 | --- | --- |
-| `deploy.sh [--all] [--reset-db] [--set KEY=VALUE]` | Deploys the checked-out commit of main, only what it changed: a clean tree, CI green for it (`gh`); then, from the image each service runs (its tag is a commit), `git diff` to HEAD by path -- `frontend/` deploys the frontend; `backend/`, `docker/` (the MAGPIE pin), `Cargo.*` and `.dockerignore` the backend and the derived-data builder with it; `infra/` (and the scripts its task definitions read) a plan; anything else nothing, and it says so. `--all` deploys both. For the backend, the MAGPIE pin on `main` (`MAGPIE_DIR`, default `~/MAGPIE`). Builds and pushes the images ECR lacks (`linux/amd64`, `CARGO_BUILD_JOBS=2`, `MAKE_JOBS=3`), retags those services in `prod.tfvars`, plans, applies, uploads, waits for both services and target groups. A frontend release never stops the backend. Refuses a backend whose migrations the live backend applied changed (until launch `0001_initial.sql`, edited in place) unless `--reset-db`, and a service ECS's circuit breaker rolled back until `rollback.sh` has run. |
+| `deploy.sh [--all] [--reset-db] [--set KEY=VALUE]` | Deploys the checked-out commit of main, only what it changed: a clean tree, CI green for it (`gh`); then, from the image each service runs (its tag is a commit), `git diff` to HEAD by path -- `frontend/` deploys the frontend; `backend/`, `docker/` (the MAGPIE pin), `Cargo.*` and `.dockerignore` the backend and the derived-data builder with it; `infra/` (and the scripts its task definitions read) a plan; anything else nothing, and it says so. `--all` deploys both. For the backend, the MAGPIE pin on `main` (`MAGPIE_DIR`, default `~/MAGPIE`). Builds and pushes the images ECR lacks (`linux/amd64`, `CARGO_BUILD_JOBS=2`, `MAKE_JOBS=3`), retags those services in `prod.tfvars`, plans, applies, uploads, waits for both services and target groups. A frontend release never stops the backend. Refuses a backend whose migrations the live backend applied changed (an edit to an applied migration; since 2026-10-13 a schema change is a new numbered one, which this never refuses) unless `--reset-db`, and a service ECS's circuit breaker rolled back until `rollback.sh` has run. |
 | `reset-prod-db.sh [--no-start]` | RUNBOOK "Resetting the production database": empties it (the hostname typed, in a prompt that names both backup buckets and their dump count): the backend's service stopped, the schema dropped and made again, every version under `pg/` in the backups bucket and its DR replica deleted, the backend started so it applies `0001`. RDS's automated backups are left to expire (30 days). Then: register, `confirm-user.sh --admin`, import the input data. `deploy.sh --reset-db` does the same once its plan is approved and before the new task starts. |
 | `rollback.sh [--to TAG] [--reset-db]` | RUNBOOK "Rolling back a deploy": the previous release from the log (its backend and frontend images, which may be at different tags), or what a circuit breaker went back to. |
 | `set-setting.sh KEY=VALUE...` | Changes `prod.tfvars` values (e.g. `mail_max_per_second=14`) and applies them. The task time limit is not Terraform's, nor the site's: each job has its own, set when it is created and changed on its admin page, and a change takes effect at the job's next claim. |
