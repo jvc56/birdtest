@@ -601,6 +601,22 @@ async fn an_opening_rack_jobs_consensus_can_change_and_the_job_follows() {
             .unwrap()
             .unwrap_or(0)
     };
+    // The job page's task split and where the consensus stands: first-pass
+    // tasks done, re-analysis tasks done, and the fewest analyses an open rack
+    // has (null until every rack is analysed, without a consensus to seek, and
+    // once every rack is settled).
+    let stage = || async {
+        let (status, detail) = send(&app, get_request(&format!("/api/jobs/{job}"), &[])).await;
+        assert_eq!(status, StatusCode::OK, "{detail}");
+        let racks = &detail["opening_racks"];
+        assert_eq!(racks["first_pass_tasks_total"], json!(2), "{detail}");
+        assert_eq!(
+            racks["first_pass_tasks_done"].as_i64().unwrap() + racks["reissue_tasks_done"].as_i64().unwrap(),
+            detail["tasks_completed"].as_i64().unwrap(),
+            "the kinds add up: {detail}"
+        );
+        (racks["first_pass_tasks_done"].clone(), racks["reissue_tasks_done"].clone(), racks["fewest_open_analyses"].clone())
+    };
 
     // One analysis per rack: the first pass settles every rack, and the job
     // completes -- with a progress row per rack all the same.
@@ -615,6 +631,7 @@ async fn an_opening_rack_jobs_consensus_can_change_and_the_job_follows() {
         .await
         .unwrap();
     assert_eq!(rows, 4, "a job wanting one analysis per rack keeps its rows");
+    assert_eq!(stage().await, (json!(2), json!(0), json!(null)), "one analysis a rack seeks no consensus");
     // Its final export, which reopening it makes a snapshot.
     sqlx::query("INSERT INTO job_exports (job_id, state, is_final) VALUES ($1, 'ready', TRUE)")
         .bind(job)
@@ -637,6 +654,7 @@ async fn an_opening_rack_jobs_consensus_can_change_and_the_job_follows() {
         (json!(2), json!(3))
     );
     assert_eq!(counters().await, (4, 0, 0, "inactive".into()));
+    assert_eq!(stage().await, (json!(2), json!(0), json!(1)), "every open rack has one analysis");
     // The job list counts racks settled, as the job's page does: every rack
     // is analysed, and none is done.
     let listed = || async {
@@ -674,6 +692,7 @@ async fn an_opening_rack_jobs_consensus_can_change_and_the_job_follows() {
     assert_eq!(racks_of(&again_a).len() + racks_of(&again_b).len(), 4);
     submit(again_a, uuid_a.clone(), "8G WUZ").await;
     assert_eq!(counters().await, (4, 2, 0, "active".into()), "two racks agree twice");
+    assert_eq!(stage().await, (json!(2), json!(1), json!(1)), "the other two still have one");
     assert_eq!(listed().await, (json!(2), json!(4)));
 
     // One analysis is enough again while B's reissue is in flight: every
@@ -689,6 +708,7 @@ async fn an_opening_rack_jobs_consensus_can_change_and_the_job_follows() {
     // settles them without a consensus.
     submit(again_b, uuid_b.clone(), "8G ZOA").await;
     assert_eq!(counters().await, (4, 4, 2, "completed".into()));
+    assert_eq!(stage().await, (json!(2), json!(2), json!(null)));
     // Each line of the corpus carries its rack's standing: every rack has two
     // analyses, which the job's maximum of one no longer hides.
     let response = tower::ServiceExt::oneshot(

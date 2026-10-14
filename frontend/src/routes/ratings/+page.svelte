@@ -41,7 +41,7 @@
       <h2 class="text-lg font-medium">No rating pools yet</h2>
       <p class="text-sm text-muted-foreground">
         An admin creates a pool by naming its variant, letter distribution and board layout, then
-        picking the anchor config that fixes the scale{#if isAdmin}:
+        picking the anchor player that fixes the scale{#if isAdmin}:
           <a href="/admin/rating-pools/new">create one</a>{/if}.
       </p>
     </div>
@@ -52,7 +52,7 @@
         <tr>
           <th>Pool</th>
           <th>Conditions</th>
-          <th class="text-right">Configs</th>
+          <th class="text-right">Players</th>
           <th class="text-right">Last computed</th>
         </tr>
       </thead>

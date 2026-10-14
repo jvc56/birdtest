@@ -439,12 +439,14 @@ export interface JobStats {
   tasks_claimed: number;
   /** The move generations the job's accepted claims reported: the work done for it. */
   movegens: number;
+  /** The compute time the job's accepted claims were credited with, claim to submission. */
+  compute_seconds: number;
   /**
    * Units finished an hour, over the last hour (or since activation): the
    * rate `eta_seconds` extrapolates. Null when the job is not active or
    * nothing finished recently.
    */
-  throughput: { per_hour: number; unit: 'game' | 'pair' | 'rack' } | null;
+  throughput: { per_hour: number; unit: 'game' | 'pair' | 'analysis' } | null;
   games?: GameStats;
   opening_racks?: {
     racks_analyzed: number;
@@ -457,6 +459,23 @@ export interface JobStats {
     racks_without_consensus: number;
     /** Size of the rack space — the denominator for progress. */
     racks_total: number;
+    /**
+     * Completed tasks by kind: first-pass tasks analyse a slice of the rack
+     * space, re-analysis tasks list unsettled racks again for a consensus.
+     * They add up to `tasks_completed`. The first pass's total is known from
+     * the start.
+     */
+    first_pass_tasks_done: number;
+    first_pass_tasks_total: number;
+    reissue_tasks_done: number;
+    /**
+     * The fewest analyses an open rack has, once every rack is analysed and
+     * the job seeks a consensus; null before then and once all are settled.
+     */
+    fewest_open_analyses: number | null;
+    /** The job's consensus bounds: a most above 1 seeks a consensus. */
+    min_results_per_rack: number;
+    max_results_per_rack: number;
   };
   leave_generation?: {
     current_generation: number;
@@ -484,6 +503,8 @@ export interface JobStats {
     tasks_completed: number;
     /** Those claims held from claim to submission. */
     compute_seconds: number;
+    /** The move generations those claims reported. */
+    movegens: number;
   }[];
   /** Contributors beyond the ones listed; the list is capped. */
   other_workers: number;
@@ -593,6 +614,15 @@ export interface DataGap {
   workers: number;
   declines: number;
   last_reported_at: string;
+}
+
+/** A derived file a job's workers ran without for want of space, by role. */
+export interface SkippedTable {
+  role: 'wmp' | 'wit' | 'rit';
+  /** Completed tasks whose worker ran without it. */
+  tasks: number;
+  workers: number;
+  last_completed_at: string | null;
 }
 
 export interface FleetVersion {
@@ -864,6 +894,7 @@ export const api = {
   confirmImport: (id: string) =>
     post<{ inserted: number }>(`/api/admin/input-data/imports/${id}/confirm`),
   jobDataGaps: (id: string) => get<DataGap[]>(`/api/admin/jobs/${id}/data-gaps`),
+  jobSkippedTables: (id: string) => get<SkippedTable[]>(`/api/admin/jobs/${id}/skipped-tables`),
   jobDerivedData: (id: string) =>
     get<JobDerivedFile[]>(`/api/admin/jobs/${id}/derived-data`),
   fleet: () => get<FleetVersion[]>('/api/admin/fleet'),

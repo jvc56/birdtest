@@ -37,7 +37,7 @@ test.beforeAll(async ({ browser, playwright }) => {
   // Two players ticked: one job between them.
   await form.getByLabel(a, { exact: true }).check();
   await form.getByLabel(b, { exact: true }).check();
-  await expect(form.getByTestId('matchups')).toContainText('2 configs → 1 job');
+  await expect(form.getByTestId('matchups')).toContainText('2 players → 1 job');
   await form.getByLabel('Games Per Task').fill('2');
   // No match test, the form's default: the job plays its four games and stops.
   await expect(form.getByLabel('Significance Test')).not.toBeChecked();
@@ -97,13 +97,15 @@ test('E-12: anyone draws saved positions at random and searches them by rack', a
   expect(await moves.locator('tbody tr').count()).toBeGreaterThan(0);
   // Both players simulate: each move's win percentage and its first two
   // plies' statistics, the reply's first.
-  await expect(moves.locator('thead th')).toContainText(['Win %', 'P1-S', 'P1-BP', 'P2-S', 'P2-BP']);
-  // The move played from here: named, marked in the list, and -- unless it
+  await expect(moves.locator('thead th')).toContainText(['Move', 'Leave', 'Win %', 'P1-S', 'P1-BP', 'P2-S', 'P2-BP']);
+  // The move played from here: named, tinted in the list (no tag, only words
+  // for a screen reader), and -- unless it
   // was a pass or an exchange -- drawn where it goes, apart from the tiles
   // already down. No CGP text under the board.
   const played = (await shown.getByTestId('played-move').innerText()).trim();
   expect(played.length).toBeGreaterThan(0);
   await expect(shown.locator('tr[data-played]')).toHaveCount(1);
+  await expect(shown.locator('tr[data-played] .sr-only')).toHaveText('(played)');
   if (!/^(pass|\(exch )/.test(played)) {
     expect(await board.locator('.played').count()).toBeGreaterThan(0);
   }

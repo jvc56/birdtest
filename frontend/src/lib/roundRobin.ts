@@ -45,15 +45,15 @@ export function matchups<T>(
   return out;
 }
 
-/** "4 configs → 6 jobs", "1 config → 1 self-play job", or why it cannot be sent. */
+/** "4 players → 6 jobs", "1 player → 1 self-play job", or why it cannot be sent. */
 export function matchupSummary(configs: number): string {
-  if (configs === 0) return 'Tick at least one player config.';
+  if (configs === 0) return 'Tick at least one player.';
   if (configs > MAX_ROUND_ROBIN_CONFIGS) {
-    return `At most ${MAX_ROUND_ROBIN_CONFIGS} player configs: ${configs} are ticked.`;
+    return `At most ${MAX_ROUND_ROBIN_CONFIGS} players: ${configs} are ticked.`;
   }
-  if (configs === 1) return '1 config → 1 self-play job';
+  if (configs === 1) return '1 player → 1 self-play job';
   const jobs = (configs * (configs - 1)) / 2;
-  return `${configs} configs → ${jobs} job${jobs === 1 ? '' : 's'}`;
+  return `${configs} players → ${jobs} job${jobs === 1 ? '' : 's'}`;
 }
 
 /** Whether `configs` ticked can be sent: one to twelve. */

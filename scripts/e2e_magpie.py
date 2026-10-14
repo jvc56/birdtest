@@ -392,6 +392,8 @@ class Worker:
                  threads: Optional[int] = None):
         self.ctx = ctx
         self.threads = threads or ctx.args.threads
+        # More `contribute.txt` lines, e.g. a `diskreserve` (M-19).
+        self.settings: List[str] = []
         self.dir = ctx.args.workdir.resolve() / name
         shutil.rmtree(self.dir, ignore_errors=True)
         self.dir.mkdir(parents=True)
@@ -423,7 +425,7 @@ class Worker:
         if path.exists():
             kept = [line for line in path.read_text().splitlines() if line.startswith("uuid ")]
         lines = [f"server {server or self.ctx.args.api}", f"threads {self.threads}",
-                 f"maxtasks {tasks}", "idlewait 2", *kept]
+                 f"maxtasks {tasks}", "idlewait 2", *self.settings, *kept]
         path.write_text("\n".join(lines) + "\n")
 
     def uuid(self) -> Optional[str]:
@@ -1154,7 +1156,7 @@ def case_rack_info_table(ctx: Context) -> None:
         # Not dispatched while the table is unbuilt: an anonymous claim finds
         # no work at all, since this is the only active job.
         claim = requests.post(f"{ctx.args.api}/api/worker/task",
-                              json={"magpie_version": "0.1.2", "board_dim": 15,
+                              json={"magpie_version": "0.1.3", "board_dim": 15,
                                     "rack_size": 7, "unsupported_jobs": []},
                               timeout=30)
         expect(claim.status_code == 204,
@@ -1208,7 +1210,7 @@ def case_word_info_table(ctx: Context) -> None:
                          f"'{data['kwg']}'")
         expect(roles == "wit CSW21_ab pending", f"derived rows before any build: {roles!r}")
         claim = requests.post(f"{ctx.args.api}/api/worker/task",
-                              json={"magpie_version": "0.1.2", "board_dim": 15,
+                              json={"magpie_version": "0.1.3", "board_dim": 15,
                                     "rack_size": 7, "unsupported_jobs": []},
                               timeout=30)
         expect(claim.status_code == 204,
@@ -1338,8 +1340,64 @@ def case_consensus(ctx: Context) -> None:
             "SELECT COUNT(*) FROM tasks t JOIN opening_rack_requests r ON r.task_id = t.id "
             f"WHERE t.job_id = '{job_id}' AND t.seed >= 8 AND r.racks IS NOT NULL"))
         expect(reissues >= 2, f"{reissues} reissue tasks")
+        # The job page's task split and consensus stage: two first-pass tasks
+        # of four racks, the re-analysis tasks after them, adding up to the
+        # job's completed tasks; no open rack left to stand anywhere.
+        expect(racks["first_pass_tasks_total"] == 2 and racks["first_pass_tasks_done"] == 2,
+               f"first pass: {racks}")
+        expect(racks["first_pass_tasks_done"] + racks["reissue_tasks_done"]
+               == stats["tasks_completed"] and racks["reissue_tasks_done"] >= 2,
+               f"task split: {racks}, {stats['tasks_completed']} completed")
+        expect(racks["fewest_open_analyses"] is None and racks["max_results_per_rack"] == 3,
+               f"consensus stage: {racks}")
+        expect(stats["throughput"] is None or stats["throughput"]["unit"] == "analysis",
+               f"throughput unit: {stats['throughput']}")
         log(f"M-15: 8 racks settled after {reissues} reissues, "
             f"{racks['racks_without_consensus']} without a consensus")
+    finally:
+        remove_small_data(ctx)
+        if worker:
+            worker.remove()
+
+
+def case_best_attempt_tables(ctx: Context) -> None:
+    """M-19: tables a worker has no room for are skipped, not required."""
+    deactivate_everything(ctx)
+    remove_small_data(ctx)
+    worker = None
+    try:
+        data = small_data(ctx)
+        players = {
+            "player1_config_id": create_player(ctx, data, "e2e-ab-best-equity",
+                                               {"use_rit": True, "use_wordmap": True}),
+            "player2_config_id": create_player(ctx, data, "e2e-ab-best-score",
+                                               {"sort_strategy": "score", "use_rit": True,
+                                                "use_wordmap": True}),
+        }
+        job_id = create_and_activate(ctx, data, games_body(players, 2))
+        build_derived(ctx)
+
+        # A reserve no disk can leave free: every table the players ask for
+        # is skipped, and the tasks run without them.
+        worker = Worker(ctx, "m19", small=True)
+        worker.settings = ["diskreserve 1000000"]
+        output = worker.run(tasks=2)
+        expect("skipping the wordmap" in output and "skipping the rack info table" in output,
+               f"the worker did not say what it skipped:\n{output[-3000:]}")
+        built = [p.name for p in worker.data.rglob("*") if p.suffix in (".wmp", ".rit")]
+        expect(built == [], f"the worker built tables it had no room for: {built}")
+        expect(completed_claims(ctx, job_id) == 2, "the job completed no tasks without its tables")
+        stats = ctx.get(f"/api/jobs/{job_id}", "job stats")
+        expect(stats["games"]["units_completed"] == 4, f"games: {stats['games']}")
+        skipped = ctx.psql(
+            "SELECT string_agg(array_to_string(c.derived_skipped, ','), ' ') FROM task_claims c "
+            f"WHERE c.job_id = '{job_id}' AND c.state = 'completed'")
+        expect(skipped == "rit,wmp rit,wmp", f"the claims' derived_skipped: {skipped!r}")
+        counted = ctx.get(f"/api/admin/jobs/{job_id}/skipped-tables", "skipped tables")
+        roles = {row["role"]: row["tasks"] for row in counted}
+        expect(roles == {"wmp": 2, "rit": 2}, f"the skipped-tables view: {counted}")
+        log("M-19: with no room for them, the worker skipped the wordmap and rack info table, "
+            "played 4 games without them, and the job page counts the skips")
     finally:
         remove_small_data(ctx)
         if worker:
@@ -1442,6 +1500,7 @@ CASES = {
     "M-16": case_inference,
     "M-17": case_solvers_many_threads,
     "M-18": case_movegen_budget,
+    "M-19": case_best_attempt_tables,
     "capture": case_capture,
 }
 DEFAULT_CASES = [name for name in CASES if name.startswith("M-")]

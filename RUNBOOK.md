@@ -1912,8 +1912,9 @@ service runs and offers what ECS went back to (otherwise the previous release
 in the log, with the backend and frontend images it ran), asks step 1's
 question when the backend changes and whether to put `min_magpie_version`
 back, refuses a target backend whose migrations differ from the live one's
-unless `--reset-db` (until launch `0001_initial.sql` is edited in place, so a
-rollback across a change to it needs a database reset), then plans, applies,
+unless `--reset-db` (a rollback across an edit to an applied migration needs a
+database reset; since 2026-10-13 schema changes are new, additive migrations,
+which the previous image runs on unchanged), then plans, applies,
 uploads `prod.tfvars` and waits for both services and target groups. `--to
 <tag>` names the release outright.
 
@@ -2001,9 +2002,12 @@ loses every write since.
 
 ## Resetting the production database (until launch)
 
-Until launch a schema change edits `0001_initial.sql` in place, and a
-database migrated by the old file refuses the new backend. A release that
-changes it ships with a reset: `scripts/deploy.sh --reset-db` (once its plan
+Since 2026-10-13 a schema change is a new numbered migration
+(`0002_best_attempt_tables.sql` onwards), additive, and needs no reset: the
+new backend applies it and the old one still runs on it. What follows is for
+an edit to a migration already applied -- before that date `0001_initial.sql`
+was edited in place -- after which a database migrated by the old file
+refuses the new backend. Such a release ships with a reset: `scripts/deploy.sh --reset-db` (once its plan
 is approved, before the new backend starts), `scripts/rollback.sh --reset-db`
 for a rollback across such a change, or `scripts/reset-prod-db.sh` for a reset
 on its own. Each one first counts the nightly dumps and prints, for the

@@ -2,17 +2,19 @@ use anyhow::{Context, Result};
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use std::time::Duration;
 
-/// `MIN_MAGPIE_VERSION` when unset: the version of the MAGPIE `main` commit
-/// the backend image pins. MAGPIE's version moves whenever a change can alter
-/// what a task computes, and this floor moves with it: it is the only way to
-/// keep a build known to compute something wrong off the fleet. 0.1.0 is below
+/// `MIN_MAGPIE_VERSION` when unset: the oldest MAGPIE whose results are right.
+/// It rises when a release fixes a build that computes something wrong -- the
+/// only way to keep such a build off the fleet -- and not for a release that
+/// only adds behaviour: 0.1.3 made the derived tables a best attempt and the
+/// floor stayed at 0.1.2, so contributors upgrade at their own pace. 0.1.0 is below
 /// it because builds reporting it include ones where a capturing static player
 /// played its worst move, and every one of them played a leave task after its
 /// first with the previous task's KLV.
 ///
 /// Copied by hand into Terraform's default (the one production runs on), both
 /// compose files, the native e2e script, the jobs table's column defaults and
-/// `scripts/dev.py`; `U-CFG-5` fails when a raise misses one.
+/// `scripts/dev.py`; `U-CFG-5` fails when a raise misses one. MAGPIE's own
+/// version (what its `main` reports) may be newer.
 pub const DEFAULT_MIN_MAGPIE_VERSION: &str = "0.1.2";
 
 /// Runtime configuration.
@@ -562,22 +564,43 @@ mod tests {
                 1,
             ),
             ("backend/.env.example", source!("backend/.env.example"), "MIN_MAGPIE_VERSION=", 1),
-            ("backend/.env.example", source!("backend/.env.example"), REPORTS, 1),
             (".env.example", source!(".env.example"), "MIN_MAGPIE_VERSION=", 1),
-            (".env.example", source!(".env.example"), REPORTS, 1),
-            ("docker-compose.yml", source!("docker-compose.yml"), REPORTS, 1),
         ] {
             assert_eq!(versions_after(text, prefix), vec![floor; copies], "{path}");
         }
+        // What they say MAGPIE's main reports: one version in all three, and
+        // one that meets the floor (it may be newer: a release that only adds
+        // behaviour leaves the floor where it is).
+        let reported: Vec<&str> = [
+            source!("backend/.env.example"),
+            source!(".env.example"),
+            source!("docker-compose.yml"),
+        ]
+        .iter()
+        .flat_map(|text| versions_after(text, REPORTS))
+        .collect();
+        assert_eq!(reported.len(), 3, "{reported:?}");
+        assert!(reported.iter().all(|v| *v == reported[0]), "they disagree: {reported:?}");
+        let parts = |v: &str| v.split('.').map(|p| p.parse::<u32>().unwrap()).collect::<Vec<_>>();
+        assert!(parts(reported[0]) >= parts(floor), "main reports {} below the floor {floor}", reported[0]);
 
-        let migration = source!("backend/migrations/0001_initial.sql");
+        // The jobs table's defaults as the latest migration to set them left
+        // them: 0001 declared them, and since the first deploy a floor change
+        // moves them in a numbered migration of its own (0002 onwards).
+        let created = source!("backend/migrations/0001_initial.sql");
+        let altered = [source!("backend/migrations/0002_best_attempt_tables.sql")];
         let part = |column: &str| {
-            let found = versions_after(migration, &format!("{column} INT NOT NULL DEFAULT "));
+            let set = altered
+                .iter()
+                .rev()
+                .map(|m| versions_after(m, &format!("ALTER COLUMN {column} SET DEFAULT ")))
+                .find(|found| !found.is_empty());
+            let found = set.unwrap_or_else(|| versions_after(created, &format!("{column} INT NOT NULL DEFAULT ")));
             assert_eq!(found.len(), 1, "{column}: {found:?}");
             found[0]
         };
         let columns = ["min_magpie_major", "min_magpie_minor", "min_magpie_patch"].map(part);
-        assert_eq!(columns.join("."), floor, "the jobs table's column defaults");
+        assert_eq!(columns.join("."), floor, "the jobs table's column defaults, as the latest migration left them");
 
         assert!(
             source!("scripts/dev.py").contains(&format!("({floor} by default)")),

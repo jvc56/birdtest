@@ -7,11 +7,12 @@
     ApiError,
     type ArtifactRebuild,
     type DataGap,
+    type SkippedTable,
     type JobExport,
     type JobStats
   } from '$lib/api';
   import { subscribeToJob } from '$lib/sse';
-  import { computeTime, exactCount, exportSummary } from '$lib/format';
+  import { computeTime, exportSummary } from '$lib/format';
   import type { JobConfig } from '$lib/jobSettings';
   import JobHeader from '$lib/components/JobHeader.svelte';
   import JobStatusCard from '$lib/components/JobStatusCard.svelte';
@@ -44,6 +45,12 @@
   let config: JobConfig | null = null;
   // null until read: shown as "could not load", never as "none".
   let gaps: DataGap[] | null = null;
+  let skipped: SkippedTable[] | null = null;
+  const TABLE_NAMES: Record<SkippedTable['role'], string> = {
+    wmp: 'Wordmap',
+    wit: 'Word info table',
+    rit: 'Rack info table'
+  };
   let reloadGen = 0;
   let streamPayloads = 0;
   // Why the page's reads last failed, if they did; kept apart from `error`
@@ -125,10 +132,11 @@
         .then((value) => (config = value))
         .catch(() => {});
     }
-    const [job, gapsRead, exportRead] = await Promise.allSettled([
+    const [job, gapsRead, exportRead, skippedRead] = await Promise.allSettled([
       api.job(jobId),
       api.jobDataGaps(jobId),
-      fetchExport()
+      fetchExport(),
+      api.jobSkippedTables(jobId)
     ]);
     if (gen !== reloadGen || destroyed) return;
     reloading = false;
@@ -138,6 +146,8 @@
     } else if (!goneIf(job.reason)) failures.push((job.reason as Error).message);
     if (gapsRead.status === 'fulfilled') gaps = gapsRead.value;
     else if (!gone) failures.push((gapsRead.reason as Error).message);
+    if (skippedRead.status === 'fulfilled') skipped = skippedRead.value;
+    else if (!gone) failures.push((skippedRead.reason as Error).message);
     if (exportRead.status === 'fulfilled') {
       if (exportGen === exportGenAtStart) applyExport(exportRead.value);
     } else if (!gone && exportGen === exportGenAtStart) exportError = `Could not check the export: ${(exportRead.reason as Error).message}`;
@@ -644,13 +654,41 @@
       {/if}
     </div>
 
+    <div class="card" data-testid="skipped-tables">
+      <h2 class="mb-1 text-lg font-medium">Tables skipped</h2>
+      <p class="mb-3 text-sm text-muted-foreground">
+        Wordmaps, word info tables and rack info tables are a best attempt: a contributor short of
+        disk or memory runs a task without the ones that do not fit. That is slower, and its games
+        are as valid (a static player plays the same moves). Tasks here run slow, and may reach the
+        job's time limit, for that reason alone.
+      </p>
+      {#if skipped === null}
+        <p class="text-sm text-muted-foreground">
+          {loadError ? 'Could not load the skipped tables.' : 'Loading…'}
+        </p>
+      {:else if skipped.length}
+        <table class="table">
+          <thead>
+            <tr><th>Table</th><th class="text-right">Workers</th><th class="text-right">Tasks</th></tr>
+          </thead>
+          <tbody>
+            {#each skipped as table}
+              <tr>
+                <td>{TABLE_NAMES[table.role]}</td>
+                <td class="text-right tabular-nums">{table.workers.toLocaleString()}</td>
+                <td class="text-right tabular-nums">{table.tasks.toLocaleString()}</td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      {:else}
+        <p class="text-sm text-muted-foreground">Every task ran with every table its players use.</p>
+      {/if}
+    </div>
+
     <div class="card">
       <h2 class="mb-3 text-lg font-medium">Contributors</h2>
-      <WorkerTable workers={stats.workers} />
-      <p class="mt-2 text-sm text-muted-foreground" data-testid="job-movegens">
-        <span class="break-all tabular-nums text-foreground">{exactCount(stats.movegens)}</span> movegens
-        for this job
-      </p>
+      <WorkerTable workers={stats.workers} totals={stats} />
     </div>
 
     <!-- The settings last, as on the public page. -->

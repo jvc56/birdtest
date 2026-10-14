@@ -1,7 +1,7 @@
 <script lang="ts">
   /**
-   * A games or pairs job's significance test: three tiles -- the verdict, player
-   * 1's score with its interval, and the pairs or games played against the
+   * A games or pairs job's significance test: three tiles -- the verdict, the
+   * leading player's score with its interval, and the pairs or games played against the
    * job's cap -- then the interval on a scale with an even score in the
    * middle, for a pairs job the pair outcomes it runs on, and what the
    * interval means with this job's own confidence. Nothing for a job that runs
@@ -10,7 +10,7 @@
    */
   import type { JobStats } from '$lib/api';
   import { testState } from '$lib/format';
-  import { testPct, testScale, testVerdict } from '$lib/matchTest';
+  import { leaderScore, testPct, testScale, testVerdict } from '$lib/matchTest';
   import { pairOutcomes } from '$lib/charts/pentanomial';
   import StatusPill from './StatusPill.svelte';
 
@@ -23,6 +23,9 @@
   $: names = [players[0] ?? 'Player 1', players[1] ?? 'Player 2'] as [string, string];
   $: verdict = games && test ? testVerdict(testState(stats.job.status, games), { ...games, test }) : null;
   $: scale = test ? testScale(test) : null;
+  // The leader's score, player 1's while neither leads; the chart below keeps
+  // player 1 on the right whoever leads, so it does not flip with the lead.
+  $: lead = test ? leaderScore(test) : null;
   $: outcomes = games?.pentanomial ? pairOutcomes(games.pentanomial, games.units_completed, names) : [];
   $: unit = games?.unit ?? 'pair';
   // A tick at either end is pinned by its own edge, so neither leaves the chart.
@@ -39,7 +42,7 @@
     player === null ? tones.even : tones[both ? 'sweep' : 'split'][player];
 </script>
 
-{#if games && test && verdict && scale}
+{#if games && test && verdict && scale && lead}
   <div class="card space-y-4" data-testid="significance-test">
     <div class="flex flex-wrap items-center justify-between gap-3">
       <h2 class="text-lg font-medium">Significance Test</h2>
@@ -62,11 +65,11 @@
       </div>
       <div class="min-w-0 space-y-1 rounded-lg border border-border px-3.5 py-3" data-testid="test-score">
         <div class="text-[11px] uppercase tracking-wider text-muted-foreground">
-          <span class={text[0]}>{names[0]}</span>'s score
+          <span class={text[lead.player]}>{names[lead.player]}</span>'s score
         </div>
-        <div class="text-2xl font-semibold tabular-nums">{testPct(test.mean)}</div>
+        <div class="text-2xl font-semibold tabular-nums {text[lead.player]}">{testPct(lead.mean)}</div>
         <div class="text-xs tabular-nums text-muted-foreground">
-          {test.confidence_pct}% interval {testPct(test.lower)} to {testPct(test.upper)}
+          {test.confidence_pct}% interval {testPct(lead.lower)} to {testPct(lead.upper)}
         </div>
         {#if games.decided && games.units_completed > games.decided.units}
           <!-- The decision stands; what was in flight then landed after it. -->

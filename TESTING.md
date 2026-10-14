@@ -74,7 +74,7 @@ at tier 5 names a symptom.
 | 3 API | 250 | `backend/tests/`: `worker_api.rs` (52), `admin_api.rs` (59), `auth_routes.rs` (28), `worker_routes.rs` (24), `boundaries.rs` (18), `public_api.rs` (24), `admin_routes.rs` (13), `authz.rs` (7), `account.rs` (10), `auth_api.rs` (5), `finish.rs` (9), `fake_worker.rs` (1) |
 | 4 Contract | 15 | `routes::worker::contract_fixtures`, over 18 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
 | 5 End-to-end | 23 | Playwright journeys `E-1`..`E-18` (`E-11` in three tests, `E-10`, `E-12` and `E-18` in two each) in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
-| 6 MAGPIE smoke | 17 cases + 16 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-18` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 16 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (6), `magpie_leave.rs` (7), `magpie_routes.rs` (3) |
+| 6 MAGPIE smoke | 18 cases + 16 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-19` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 16 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (6), `magpie_leave.rs` (7), `magpie_routes.rs` (3) |
 
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
@@ -434,11 +434,13 @@ process environment, so no test mutates `std::env` under another.
   its description), which `ecs.tf` and `derived.tf` pass through; both compose
   files; `scripts/e2e_magpie_native.sh`; `backend/.env.example`, which a
   backend run on the host starts from; the root `.env.example`, which a
-  compose user copies to `.env` (its commented value and the version it says
-  MAGPIE's `main` reports; thirty-third audit, pass 3); the same
-  "MAGPIE's `main` reports" sentence in `backend/.env.example` and
-  `docker-compose.yml` (thirty-third audit, pass 4); the `jobs`
-  table's three column defaults; and `scripts/dev.py`'s note. A raise that missed Terraform passed
+  compose user copies to `.env` (its commented value; thirty-third audit,
+  pass 3); the `jobs` table's three column defaults, as the latest migration
+  to set them left them; and `scripts/dev.py`'s note. The "MAGPIE's `main`
+  reports" sentence in both `.env.example`s and `docker-compose.yml`
+  (thirty-third audit, pass 4) names one version in all three, at or above
+  the floor: since 0.1.3, a release that only adds behaviour leaves the floor
+  where it is. A raise that missed Terraform passed
   CI and left production admitting the builds it was meant to keep out
   (thirty-third audit, pass 1). *(Covered:
   `config::tests::every_copy_of_the_version_floor_agrees`.)*
@@ -979,8 +981,9 @@ Each entry's tests are the `describe` block named for its id.
   `format.test.ts`.)*
 - `F-FMT-21` `throughputParts` reads a job's pace an hour in its unit, the
   figure and the unit apart ("1,240" and "games/hour", "8" and
-  "pairs/hour"): whole units from ten up, a decimal below, "game/hour"
-  singular, and nothing with no recent work. *(Covered:
+  "pairs/hour", an opening-rack job's "analyses/hour"): whole units from ten
+  up, a decimal below, "game/hour" and "analysis/hour" singular, and nothing
+  with no recent work. *(Covered:
   `format.test.ts`.)*
 
 ### `F-PROG-*` — `lib/jobProgress.ts`
@@ -997,6 +1000,17 @@ Each entry's tests are the `describe` block named for its id.
   with why (not measured yet, paused while inactive, finished); its Time
   left the time at the current pace and the clock time it reaches, only
   while the job is active, and when a completed job finished. *(Covered:
+  `jobProgress.test.ts`.)*
+- `F-PROG-3` An opening-rack job's Progress card (`rackProgress`,
+  `taskCounts`): seeking a consensus, its headline is "x% settled · y%
+  analysed" and its table gives racks analysed and racks settled each a Done
+  and a Time left -- analysed at the current pace from the racks not yet
+  analysed, "every rack analysed" once they all are; settled the server's
+  estimate, "finished …" once completed; the idle wording while inactive.
+  Analysing each rack once, one row, "Analysed and settled". Its tasks line
+  splits done tasks into "of N first pass" and "re-analysis" (the latter
+  only with a consensus), then in progress and "to be handed out again";
+  any other job keeps in flight, then done. *(Covered:
   `jobProgress.test.ts`.)*
 
 ### `F-STATUS-*` — `lib/status.ts`
@@ -1023,7 +1037,7 @@ Each entry's tests are the `describe` block named for its id.
   A vs A", every pairing once for more -- seated in the order given (3 → 3,
   4 → 6) -- and names each "{title}: A vs B", or "A vs B" with no title, as
   the server does (`I-JOB-15`). *(Covered: `roundRobin.test.ts`.)*
-- `F-RR-2` `matchupSummary` reads "4 configs → 6 jobs", "1 config → 1
+- `F-RR-2` `matchupSummary` reads "4 players → 6 jobs", "1 player → 1
   self-play job", and why none or more than twelve cannot be sent;
   `matchupsAllowed` is one to twelve. *(Covered: `roundRobin.test.ts`.)*
 
@@ -1060,6 +1074,12 @@ Each entry's tests are the `describe` block named for its id.
   as numbers, and the share only past one analysis per rack, so a share left
   in the disabled box at a most of 1 is never sent for the server to refuse.
   *(Covered: `consensus.test.ts`.)*
+- `F-CONS-5` `consensusStage` says where a job seeking a consensus stands:
+  "First pass." with the share of racks analysed (and, when the fewest is
+  above one, that none can settle before that analysis), "Re-analysis."
+  from the fewest analyses an open rack has, "Finished." with racks agreed
+  and without a consensus; nothing for a job analysing each rack once.
+  *(Covered: `consensus.test.ts`.)*
 
 ### `F-TEST-*` — `lib/matchTest.ts`
 
@@ -1080,6 +1100,10 @@ Each entry's tests are the `describe` block named for its id.
   form checks it on submit and under the input, which has no `min` or `max`
   (`min="50.1" max="99.99"` blocked values the server takes; thirty-third
   audit, pass 3). *(Covered: `matchTest.test.ts`.)*
+- `F-TEST-4` `leaderScore` gives the score tile the leading player's score
+  per game: player 1's as it is, player 2's turned over (`1 − mean`, the
+  interval `1 − upper` to `1 − lower`), and player 1's while neither leads,
+  at no games or exactly 50%. *(Covered: `matchTest.test.ts`.)*
 
 ### `F-MOVES-*` — `lib/moveList.ts`
 
@@ -1123,6 +1147,12 @@ refuse what it could not have written, rather than draw a wrong board.
   -- a blank as its letter, flagged -- skipping the squares it plays through,
   and nothing for a pass, an exchange or text it cannot read: what the board
   draws for the move played from a position. *(Covered: `cgp.test.ts`.)*
+- `F-CGP-6` `leaveOf` gives the Leave column of a move list: the rack less
+  the tiles a play puts down (a lower-case blank takes a `?`, squares played
+  through take nothing), less an exchange's tiles, the whole rack for a pass,
+  `''` for a bingo, multi-character letters kept bracketed, and `null` for a
+  move it cannot read or the rack cannot make. `rackSpelling` spells a typed
+  rack as `RackIndex::spelling` does. *(Covered: `cgp.test.ts`.)*
 
 ### `F-API-*` — `lib/api.ts`
 
@@ -1846,6 +1876,12 @@ job creation touches needs one caller here.
   every line of its corpus then carries its rack's standing, each rack having
   two analyses, though the maximum is one again (it was gated on the maximum
   alone, and hid the disagreements `racks_without_consensus` counts).
+  Throughout, the job page's `opening_racks` splits the completed tasks into
+  first-pass (seed below the rack total; two of two) and re-analysis tasks,
+  the two adding up to `tasks_completed`, and gives `fewest_open_analyses`:
+  null with one analysis a rack, 1 once reopened with every rack analysed
+  once, still 1 while two racks wait for a second, null once every rack is
+  settled.
   Asking for what every rack already has leaves a completed job completed,
   and still demotes its final export and fails one building from before the
   edit ("the job's consensus settings changed while this export was
@@ -3281,6 +3317,13 @@ below.
   `input_data::a_file_only_derived_data_refers_to_can_be_deleted_and_takes_that_data_with_it`.)*
 - `A-ADMIN-8` `job/:id/data-gaps` reports what workers declined for. *(Covered:
   `admin_routes::data_gaps_report_what_workers_declined_for`.)*
+- `A-ADMIN-8b` A result's `derived_skipped` (the derived files its worker ran
+  without for want of disk or memory; the tables are a best attempt) is kept on the
+  claim sorted and once each, null for `[]` or a build that leaves it out
+  (migration `0002`), and `job/:id/skipped-tables` counts each role's tasks
+  and workers; anything but a list of `wmp`, `wit` and `rit` is a `400`
+  naming the field, with the claim left open. *(Covered:
+  `admin_routes::skipped_tables_are_kept_and_counted`.)*
 - `A-ADMIN-9` `fleet` reports connected workers and their versions: a claim
   counts while open (claimed in the week) or once completed in the week,
   whenever it was claimed; one completed before the week or lapsed does not
@@ -3505,7 +3548,8 @@ below.
 
 ### `A-PUBLIC-*` — `routes/public.rs`
 
-- `A-PUBLIC-1` Job list paginates, and `per_page` is clamped to the maximum;
+- `A-PUBLIC-1` Job list paginates (jobs of one status newest first; see
+  `A-PUBLIC-1g`), and `per_page` is clamped to the maximum;
   jobs that tie on the sort key are each listed exactly once. *(Covered:
   `public_api::the_job_list_paginates_and_clamps_its_page_size`,
   `public_api::tied_jobs_and_users_are_each_listed_exactly_once`; ties had no
@@ -3534,6 +3578,10 @@ below.
   racks analysed, so a job seeking a consensus read finished while it
   re-analysed. *(Covered:
   `worker_api::an_opening_rack_jobs_consensus_can_change_and_the_job_follows`.)*
+- `A-PUBLIC-1g` The job list puts active jobs first, then inactive, then
+  completed, newest first within each, so a running job is never pages
+  down behind finished ones. *(Covered:
+  `public_api::the_job_list_lists_active_jobs_first`.)*
 - `A-PUBLIC-1b` `?status=` filters the job list and its total. *(Covered:
   `public_api::the_job_list_filters_by_status`.)* (Eighteenth audit.) Deleting
   a job ends its open streams (`sse::tests::closing_a_job_ends_its_streams`).
@@ -3672,7 +3720,10 @@ below.
   time and tasks counted from completed claims only; the jobs' compute time
   by type is the contributors' together; and all of them add up to the
   contributor list's columns, before and after a purge or a delete takes a
-  job's out of all three. Only a contributor the list shows is answered -- an
+  job's out of all three. A job page's Contributors card lists each
+  contributor's movegens on the job, and its totals row (the job's own
+  movegens, `compute_seconds` and `tasks_completed`) is the listed rows' sums
+  when every contributor is listed. Only a contributor the list shows is answered -- an
   anonymous one by pseudonym, never by its UUID -- and anyone else is a `404`.
   The breakdown is an index-only walk of the contributor's own index, which
   carries each claim's movegens and claim time. *(Covered:
@@ -3990,9 +4041,9 @@ admin in once and the admin journeys reuse its storage state.
   `e2-register-and-api-key.spec.ts`, reading its code from the outbox.)*
 - `E-3` An admin imports input data, reviews the staged diff, and confirms it.
   *(Covered: `e3-input-data-import.spec.ts`, against the fixture tarballs.)*
-- `E-4` An admin creates two player configs and a game-pairs job between them
+- `E-4` An admin creates two players and a game-pairs job between them
   with **Significance Test** ticked -- its players a checklist whose preview
-  says "3 configs → 3 jobs" with a third ticked and "2 configs → 1 job", the
+  says "3 players → 3 jobs" with a third ticked and "2 players → 1 job", the
   job named for its pairing -- lands on `/admin/allocation` with the new job
   marked and first, activates it there by giving it an allocation (and
   deactivates it there at the end), and watches the dashboard
@@ -4090,7 +4141,7 @@ admin in once and the admin journeys reuse its storage state.
   `e13-opening-rack-samples.spec.ts`.)* (Thirty-third audit, pass 1: `E-12`
   and `E-13` ran static players and asserted simulation columns, which only
   the fake worker's simulating every position whatever its config let pass.)
-- `E-14` A signed-out visitor reaches the player configs from the nav, opens
+- `E-14` A signed-out visitor reaches the players from the nav, opens
   one, reads how it searches beside its name and its key settings in a table
   (Lexicon first), grows the table to every setting with **All settings**,
   Lexicon still first, and shrinks it back. *(Covered:
@@ -4223,7 +4274,7 @@ works — the directory it lays out, the names it invokes, the bytes it gets
 back.
 
 **Correctness is established by version and capability probe.**
-MAGPIE's `main` reports `0.1.2`, the shipped `MIN_MAGPIE_VERSION` default; a checkout reporting anything lower is refused. The
+MAGPIE's `main` reports `0.1.3`; the shipped `MIN_MAGPIE_VERSION` default is `0.1.2`, and a checkout reporting anything lower is refused. The
 probe additionally asks the binary what it can do: that `contribute` is a
 registered command, and that it accepts the current required claim body.
 
@@ -4311,7 +4362,10 @@ surfacing the mismatch as a red build rather than as a dead job in production.
   analyses a rack, 100%), with a real 1-ply simmer on the two-letter data,
   covers its eight racks, reissues them as lists from seeds past the end of
   the space, and completes with every rack settled after at least two
-  analyses. *(Covered: `case_consensus`, one task a run until the job
+  analyses; its page's stats split the completed tasks into two first-pass
+  tasks and the re-analysis ones (adding up to `tasks_completed`), count
+  throughput in analyses, and leave no open rack (`fewest_open_analyses`
+  null). *(Covered: `case_consensus`, one task a run until the job
   completes.)*
 - `M-16` A games job between two real 2-ply simmers that infer, capturing
   positions: every position past a game's first turn keeps its inference
@@ -4330,6 +4384,12 @@ surfacing the mismatch as a red build rather than as a dead job in production.
   the budgeted job reports less than half the movegens a game. Every run
   that started a task also prints how long it took ("finished task #N: … in
   …"). *(Covered: `case_movegen_budget`, one task each.)*
+- `M-19` The tables are a best attempt: a worker whose `diskreserve` no disk
+  can leave free, on a games job whose players ask for a wordmap and a rack
+  info table, says it is skipping both, builds neither, plays its two tasks
+  without them, and reports `derived_skipped` `["rit","wmp"]` on both claims,
+  which the admin's skipped-tables view counts. *(Covered:
+  `case_best_attempt_tables`.)*
 - `M-13` A job with `use_wit` dispatches only once its word info table is
   built; a worker whose table does not match the recorded hash declines with
   `derived_mismatch` and both digests reach `worker_data_gaps`; with the right

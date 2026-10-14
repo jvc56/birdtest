@@ -94,7 +94,7 @@ for db in "$PROD" "$SCRATCH" "$LATE"; do
   psql_ -d postgres -c "DROP DATABASE IF EXISTS $db WITH (FORCE)" >/dev/null
 done
 psql_ -d postgres -c "CREATE DATABASE $PROD" >/dev/null
-psql_ -d "$PROD" < "$HERE/../backend/migrations/0001_initial.sql" >/dev/null
+cat "$HERE"/../backend/migrations/*.sql | psql_ -d "$PROD" >/dev/null
 
 # Four jobs: a games job with 500 tasks (five batches of a hundred), a leave
 # job in its tail, a third that is never purged, and a fourth, with a player

@@ -638,7 +638,7 @@ if [[ -n "${PG_EXEC:-}" ]]; then
   pgx() { PATH="$REAL_PATH" HOME="$REAL_HOME" ${PG_EXEC} "$@"; }
   pg() { pgx psql -U "$PGU" -X -q -v ON_ERROR_STOP=1 "$@"; }
   pg -d postgres -c "DROP DATABASE IF EXISTS ops_check" -c "CREATE DATABASE ops_check" >/dev/null
-  pg -d ops_check < "$ROOT/backend/migrations/0001_initial.sql" > /dev/null
+  cat "$ROOT"/backend/migrations/*.sql | pg -d ops_check > /dev/null
   name="x'); DROP TABLE users; --"
   pg -d ops_check -c "INSERT INTO users (username, email, password_hash) VALUES ('X''); DROP TABLE users; --', 'a@example.org', 'h')" >/dev/null
   pg -d ops_check -c "INSERT INTO email_confirmations (user_id, code_hash, expires_at) SELECT id, 'c', now() + interval '1 day' FROM users" >/dev/null
@@ -713,9 +713,9 @@ if [[ -n "${PG_EXEC:-}" ]]; then
     || fail "the reset SQL failed"
   [[ "$(pgx psql -U "$PGU" -X -tA -d ops_check -c "SELECT count(*) FROM pg_tables WHERE schemaname = 'public'")" == 0 ]] \
     || fail "the reset left tables"
-  pg -d ops_check < "$ROOT/backend/migrations/0001_initial.sql" > /dev/null || fail "0001 does not apply after the reset"
+  cat "$ROOT"/backend/migrations/*.sql | pg -d ops_check > /dev/null || fail "the migrations do not apply after the reset"
   pg -d postgres -c "DROP DATABASE ops_check" >/dev/null
-  pass "the ops-sql files run through run.sh, the one-off and --task paths in the postgres image, and the reset empties a schema 0001 applies to again"
+  pass "the ops-sql files run through run.sh, the one-off and --task paths in the postgres image, and the reset empties a schema the migrations apply to again"
 fi
 
 echo "ops scripts check passed"

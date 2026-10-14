@@ -4,10 +4,10 @@
    * type's, every one of them, in one ordered list, then its players' -- one
    * column for a single player (an opening-rack or leave job's), two side by
    * side for a games or pairs job, those the job never reads muted. Two
-   * players' card shows every setting, those they differ in marked and
-   * counted beside the heading, with a "Different settings only" toggle; one
-   * player's shows its key rows, with an "All settings" toggle. Public, like
-   * the rest of the page.
+   * players' card shows only the settings they differ in, counted beside the
+   * heading, with an "All settings" toggle that lists every one with the
+   * differences marked; one player's shows its key rows, with an "All
+   * settings" toggle. Public, like the rest of the page.
    */
   import {
     differingSettings,
@@ -21,13 +21,13 @@
 
   export let config: JobConfig;
 
-  /** Two players: only the settings they differ in. One: every setting. */
+  /** Every setting: for two players, not only those they differ in; for one, not only its key rows. */
   let toggled = false;
 
   // One player differs from nothing: it reads its key rows instead.
   $: paired = config.players.length > 1;
   let mode: SettingsMode;
-  $: mode = paired ? (toggled ? 'differences' : 'all') : toggled ? 'all' : 'key';
+  $: mode = toggled ? 'all' : paired ? 'differences' : 'key';
   $: unused = unusedPlayerSettings(config);
   $: differing = paired ? differingSettings(config.players, unused).length : 0;
   $: listed = paired ? playerRows(config.players, unused).length : 0;
@@ -68,10 +68,10 @@
         {/if}
       </div>
       <button type="button" class="btn-secondary" aria-pressed={toggled} on:click={() => (toggled = !toggled)}>
-        {#if paired}
-          {toggled ? 'All settings' : 'Different settings only'}
+        {#if toggled}
+          {paired ? 'Different settings only' : 'Key settings only'}
         {:else}
-          {toggled ? 'Key settings only' : 'All settings'}
+          All settings
         {/if}
       </button>
     </div>

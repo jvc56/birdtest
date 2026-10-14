@@ -39,6 +39,7 @@ pub fn router() -> Router<AppState> {
         .route("/input-data/imports/:id", get(get_import))
         .route("/input-data/imports/:id/confirm", post(confirm_import))
         .route("/jobs/:id/data-gaps", get(job_data_gaps))
+        .route("/jobs/:id/skipped-tables", get(job_skipped_tables))
         .route("/jobs/:id/derived-data", get(job_derived_data))
         // Bulk reads of a job's results are admin operations: the public gets
         // the paginated `/api/jobs/:id/results`. The stream scans from a cursor
@@ -211,7 +212,7 @@ async fn delete_input_data(
     .await?;
     if uses > 0 {
         return Err(AppError::conflict(format!(
-            "this file is pinned by {uses} job{s}, player config{s} or rating pool{s}",
+            "this file is pinned by {uses} job{s}, player{s} or rating pool{s}",
             s = if uses == 1 { "" } else { "s" },
         )));
     }
@@ -510,6 +511,46 @@ async fn job_data_gaps(
     ))
 }
 
+#[derive(Serialize, sqlx::FromRow)]
+struct SkippedTable {
+    /// `wmp`, `wit` or `rit`.
+    role: String,
+    /// Completed tasks whose worker ran without it.
+    tasks: i64,
+    /// Distinct workers that did.
+    workers: i64,
+    last_completed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// The derived files the job's workers ran without for want of disk or
+/// memory, by role. The tables are a best attempt: a task runs without one
+/// that does not fit, slower, its games equally valid (a static player's the
+/// same moves), so this explains a job whose tasks run slow or time out rather
+/// than anything wrong with its results. Reads only
+/// the claims that skipped one (`task_claims_derived_skipped_idx`).
+async fn job_skipped_tables(
+    State(state): State<AppState>,
+    _admin: AdminUser,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<Vec<SkippedTable>>> {
+    Ok(Json(
+        sqlx::query_as::<_, SkippedTable>(
+            "SELECT s.role,
+                    COUNT(*) AS tasks,
+                    COUNT(DISTINCT COALESCE(c.claimed_by_user_id, c.claimed_by_anon_uuid)) AS workers,
+                    MAX(c.completed_at) AS last_completed_at
+             FROM task_claims c
+             CROSS JOIN LATERAL unnest(c.derived_skipped) AS s(role)
+             WHERE c.job_id = $1 AND c.derived_skipped IS NOT NULL AND c.state = 'completed'
+             GROUP BY s.role
+             ORDER BY array_position(ARRAY['wmp', 'wit', 'rit'], s.role)",
+        )
+        .bind(id)
+        .fetch_all(&state.pool)
+        .await?,
+    ))
+}
+
 /// The wordmaps and rack info tables a job needs and how their builds stand.
 /// A job is not dispatched until every one is built, so this is what an
 /// active job that nothing claims from is waiting for.
@@ -597,7 +638,7 @@ async fn get_player_config(
             .bind(id)
             .fetch_optional(&state.pool)
             .await?
-            .ok_or_else(|| AppError::not_found("no such player config"))?,
+            .ok_or_else(|| AppError::not_found("no such player"))?,
     ))
 }
 
@@ -706,7 +747,7 @@ const MAGPIE_MAX_PEG_STAGES: usize = 16;
 /// ([`crate::magpie_defaults`]), written into the row like every other.
 fn resolve_solver_settings(body: &CreatePlayerConfigBody) -> AppResult<SolverSettings> {
     use crate::magpie_defaults as defaults;
-    let mut err = AppError::bad_request("player config is invalid");
+    let mut err = AppError::bad_request("player settings are invalid");
     let plies = body.endgame_plies.unwrap_or(0);
     let max_bag = body.peg_max_bag.unwrap_or(0);
     if !(0..=MAGPIE_MAX_ENDGAME_PLIES).contains(&plies) {
@@ -898,7 +939,7 @@ async fn create_player_config(
         || body.utility_w_spread.is_some()
         || body.utility_spread_scale.is_some();
     if states_simulation && !simming {
-        return Err(AppError::bad_request("player config is invalid")
+        return Err(AppError::bad_request("player settings are invalid")
             .with_field("num_plies", "a simming player must simulate at least 1 ply"));
     }
     // A simulation stops at whichever comes first, its iteration budget or its
@@ -908,7 +949,7 @@ async fn create_player_config(
     // its 60-second default, so a simmer states 0 and an iteration budget --
     // without one, nothing but the stopping condition would end a simulation.
     if simming {
-        let mut err = AppError::bad_request("player config is invalid");
+        let mut err = AppError::bad_request("player settings are invalid");
         if body.max_iterations.is_none() {
             err = err.with_field("max_iterations", "a simming player must set an iteration budget");
         }
@@ -937,12 +978,12 @@ async fn create_player_config(
     match (simming, &winpct) {
         (true, None) => {
             return Err(AppError::bad_request(
-                "a simming player config must name a win% model (winpct_id)",
+                "a simming player must name a win% model (winpct_id)",
             ))
         }
         (false, Some(_)) => {
             return Err(AppError::bad_request(
-                "a static player config must not name a win% model: MAGPIE never loads one for it",
+                "a static player must not name a win% model: MAGPIE never loads one for it",
             ))
         }
         _ => {}
@@ -1104,7 +1145,7 @@ pub(crate) fn layout_problem(content: &[u8]) -> Option<String> {
 }
 
 fn validate_player_config_body(body: &CreatePlayerConfigBody) -> AppResult<()> {
-    let mut err = AppError::bad_request("player config is invalid");
+    let mut err = AppError::bad_request("player settings are invalid");
     if body.name.trim().is_empty() {
         err = err.with_field("name", "must not be empty");
     } else if let Some(problem) = name_problem(body.name.trim()) {
@@ -1241,7 +1282,7 @@ async fn delete_player_config(
 
     if referenced {
         return Err(AppError::conflict(
-            "a job, a rating pool, a rating history or a clone references this player config",
+            "a job, a rating pool, a rating history or a clone references this player",
         ));
     }
 
@@ -1251,7 +1292,7 @@ async fn delete_player_config(
         .execute(&mut *tx)
         .await?;
     if deleted.rows_affected() == 0 {
-        return Err(AppError::not_found("no such player config"));
+        return Err(AppError::not_found("no such player"));
     }
     audit::log(
         &mut tx,
@@ -1511,7 +1552,7 @@ struct PlannedJob {
 
 impl PlannedJob {
     /// `err` about this job, named for its pairing when it has one -- in a
-    /// round robin, "player configs disagree on the win% model" alone does
+    /// round robin, "the players disagree on the win% model" alone does
     /// not say which two.
     fn qualify(&self, mut err: AppError) -> AppError {
         if let Some(pairing) = &self.pairing {
@@ -1545,8 +1586,8 @@ async fn plan_jobs(conn: &mut sqlx::PgConnection, body: &CreateJobBody) -> AppRe
             .into_iter()
             .collect();
     if let Some(missing) = ids.iter().find(|id| !names.contains_key(id)) {
-        return Err(AppError::bad_request("player config not found")
-            .with_field("player_config_ids", format!("no such player config: {missing}")));
+        return Err(AppError::bad_request("player not found")
+            .with_field("player_config_ids", format!("no such player: {missing}")));
     }
     Ok(pairs
         .into_iter()
@@ -1829,12 +1870,12 @@ const MAX_ROUND_ROBIN_CONFIGS: usize = 12;
 /// by naming it alone.
 fn round_robin_problems(mut err: AppError, ids: &[Uuid]) -> AppError {
     if ids.is_empty() {
-        err = err.with_field("player_config_ids", "must name at least one player config");
+        err = err.with_field("player_config_ids", "must name at least one player");
     } else if ids.len() > MAX_ROUND_ROBIN_CONFIGS {
         err = err.with_field(
             "player_config_ids",
             format!(
-                "must name at most {MAX_ROUND_ROBIN_CONFIGS} player configs ({} jobs)",
+                "must name at most {MAX_ROUND_ROBIN_CONFIGS} players ({} jobs)",
                 MAX_ROUND_ROBIN_CONFIGS * (MAX_ROUND_ROBIN_CONFIGS - 1) / 2
             ),
         );
@@ -1843,7 +1884,7 @@ fn round_robin_problems(mut err: AppError, ids: &[Uuid]) -> AppError {
     if let Some(twice) = ids.iter().find(|id| !seen.insert(**id)) {
         err = err.with_field(
             "player_config_ids",
-            format!("names {twice} twice; name a config alone for a self-play job"),
+            format!("names {twice} twice; name a player alone for a self-play job"),
         );
     }
     err
@@ -2114,7 +2155,7 @@ async fn validate_opening_rack_player(
     .bind(player_config_id)
     .fetch_optional(&mut *conn)
     .await?
-    .ok_or_else(|| AppError::bad_request("player config not found"))?;
+    .ok_or_else(|| AppError::bad_request("player not found"))?;
 
     if recorder == "best" && recorded > 1 && plies == 0 {
         return Err(AppError::bad_request(
@@ -2123,8 +2164,8 @@ async fn validate_opening_rack_player(
         .with_field(
             "player_config_id",
             format!(
-                "this static config records the single best move, so every rack would come \
-                 back with one move rather than the {recorded} it asks for. Use a config with \
+                "this static player records the single best move, so every rack would come \
+                 back with one move rather than the {recorded} it asks for. Use a player with \
                  recorder_type 'all' ('equity' keeps only the moves within its equity \
                  margin), a simulating one, or set num_plays_recorded to 1."
             ),
@@ -2137,9 +2178,9 @@ async fn validate_opening_rack_player(
         .with_field(
             "player_config_id",
             format!(
-                "this config generates {plays} plays per rack, so every rack would come back \
+                "this player generates {plays} plays per rack, so every rack would come back \
                  with at most {plays} moves rather than the {recorded} it asks for. Use a \
-                 config with num_plays of at least {recorded}, or a lower num_plays_recorded."
+                 player with num_plays of at least {recorded}, or a lower num_plays_recorded."
             ),
         ));
     }
@@ -2192,7 +2233,7 @@ async fn validate_shared_player_options(
     .bind(player2_config_id)
     .fetch_optional(&mut *conn)
     .await?
-    .ok_or_else(|| AppError::bad_request("player config not found"))?;
+    .ok_or_else(|| AppError::bad_request("player not found"))?;
 
     use sqlx::Row;
     // Only two *simming* players can disagree. A static player has no win%
@@ -2204,7 +2245,7 @@ async fn validate_shared_player_options(
     let p2_winpct_id: Option<Uuid> = row.get("p2_winpct_id");
     if matches!((p1_winpct_id, p2_winpct_id), (Some(p1), Some(p2)) if p1 != p2) {
         return Err(AppError::bad_request(
-            "player configs disagree on the win% model, which MAGPIE cannot vary per player",
+            "the players disagree on the win% model, which MAGPIE cannot vary per player",
         ));
     }
     Ok(())
@@ -2234,7 +2275,7 @@ async fn validate_capture_play_cap(
                 format!(
                     "{name} simulates {plays} candidate plays, fewer than the {cap} it captures \
                      per position; with capture on MAGPIE would raise it and play different \
-                     games. Use a config with num_plays of at least {cap}, or a lower \
+                     games. Use a player with num_plays of at least {cap}, or a lower \
                      num_plays_recorded."
                 ),
             ));
@@ -2284,7 +2325,7 @@ async fn player_file_names(
     .bind(player_config_id)
     .fetch_optional(conn)
     .await?
-    .ok_or_else(|| AppError::bad_request("no such player config"))?;
+    .ok_or_else(|| AppError::bad_request("no such player"))?;
     Ok(row)
 }
 
@@ -2319,7 +2360,7 @@ async fn validate_leave_player(
         .bind(player_config_id)
         .fetch_optional(&mut *conn)
         .await?
-        .ok_or_else(|| AppError::bad_request("no such player config"))?;
+        .ok_or_else(|| AppError::bad_request("no such player"))?;
 
     let mut problems = Vec::new();
     if plies > 0 {
@@ -2340,9 +2381,9 @@ async fn validate_leave_player(
         ));
     }
     if !problems.is_empty() {
-        return Err(AppError::bad_request("this player config cannot generate leaves").with_field(
+        return Err(AppError::bad_request("this player cannot generate leaves").with_field(
             "player_config_id",
-            format!("leave generation plays statically on equity; this config {}", problems.join(", ")),
+            format!("leave generation plays statically on equity; this player {}", problems.join(", ")),
         ));
     }
     if kwg_role != "kwg" {

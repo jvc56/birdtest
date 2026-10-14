@@ -147,9 +147,10 @@ Everything worth varying is a flag; `./scripts/dev.py --help` is the full list.
 ./scripts/dev.py --fresh                      # as a new deployment: no accounts, data or jobs
 ```
 
-After a schema change the backend refuses a database made by the migration's
-older edit ("migration 1 was previously applied but has been modified": the one
-migration changes in place until release), and `dev.py` says so. `--reset-db`
+A new migration applies itself when the backend starts. A database made by an
+older edit of an applied one (from before 2026-10-13, when `0001` changed in
+place) is refused ("migration 1 was previously applied but has been
+modified"), and `dev.py` says so. `--reset-db`
 drops the schema so the backend rebuilds it; the database's data goes, the
 MinIO bucket stays, and `scripts/dev-dump.sh` snapshots both first if you want
 them. Add `--rebuild` when the images predate the change.
@@ -274,8 +275,8 @@ magpie BUILD=portable_release`) and set `MAGPIE_ROOT` if the checkout is not at
 server's builder and the fleet's identical.
 
 **The version floor stops an old MAGPIE from contributing.**
-`MIN_MAGPIE_VERSION` defaults to `0.1.2`, the version MAGPIE's `main`
-reports. A checkout that reports something
+`MIN_MAGPIE_VERSION` defaults to `0.1.2`, the oldest release whose results are
+right; MAGPIE's `main` reports `0.1.3`, which only adds behaviour. A checkout that reports something
 lower has every task declined with "update MAGPIE" until you update it or lower
 the floor — on the server *and* on the job, which records its own floor at
 creation:
@@ -326,9 +327,11 @@ MAGPIE's `data/`, or a link to it: MAGPIE loads its default board from
 `./data` before it reads anything else.) Settings never
 go on the command line, so an API
 key stays out of shell history and `ps` output. A job's players decide whether
-a wordmap (`.wmp`) and a rack info table (`.rit`) are used — both are on by
-default, since they make game play much faster — and a word info table
-(`.wit`), which is off by default, as it is in MAGPIE. MAGPIE builds each from
+a wordmap (`.wmp`), a word info table (`.wit`) and a rack info table (`.rit`)
+are used -- all three are on by default, since they make game play much faster
+-- and each is a best attempt: a contributor short of disk or memory plays
+without the ones that do not fit (see [What it costs a
+contributor](#what-it-costs-a-contributor)). MAGPIE builds each from
 files it already has the first time a job asks (a wordmap or a word info table
 in a couple of seconds, a rack info table in one to three minutes and about
 2.4 GB of memory, 1.9 GB on disk and in memory after), checks it against the
@@ -371,11 +374,16 @@ collides with a host one.
 
 ### After a schema change
 
-There is a single migration until release — schema changes edit
-`backend/migrations/0001_initial.sql` in place rather than adding a numbered
-one. sqlx checksums applied migrations, so an edited `0001` will not apply over
-a database that already has the old version, and the backend will refuse to
-start. Reset it:
+Since birdtest was deployed (2026-10-13), a schema change is a new numbered
+migration -- `backend/migrations/0002_best_attempt_tables.sql`, then `0003_…`
+-- and never an edit to one already applied. Each is additive, so the image
+before it still runs on the schema it leaves (`db.rs` ignores migrations it
+does not know, which is what lets a rollback start). The backend applies new
+ones at startup; nothing needs resetting.
+
+sqlx checksums applied migrations, so a database made by an older edit of an
+applied migration (a local database from before 2026-10-13, when `0001` was
+edited in place) makes the backend refuse to start. Reset it:
 
 ```bash
 docker compose exec postgres \
@@ -617,9 +625,11 @@ every one of the 431 leave values.
   it fetches only the files a build uses.
 - birdtest is AGPL-3.0 and MAGPIE GPL-3.0; shipping the GPL binary in an AGPL
   service image is compatible.
-- `MAGPIE_VERSION` (0.1.2 at the time of writing) moves with every change that
-  can alter what a task computes or submits, and birdtest's version floor moves
-  with it.
+- `MAGPIE_VERSION` (0.1.3 at the time of writing) moves with every change that
+  can alter what a task computes or submits. birdtest's version floor (0.1.2)
+  moves with it when the change fixes results, so a build that computes
+  something wrong is kept off the fleet; a release that only adds behaviour
+  leaves it alone.
 
 ### What it costs a contributor
 
@@ -630,12 +640,39 @@ every one of the 431 leave values.
 - **Memory:** a process that plays with a rack info table holds it — about
   1.9 GB for CSW24 — so several `magpie contribute` processes on one machine
   hold one copy each.
-- **Disk, still unbounded:** 179 MB per wordmap, 122 MB per word info table and
-  1.9 GB per `(.kwg, .klv2)` pair with a rack info table, and nothing evicts them. Player configs use both by
-  default, so a contributor on many lexicons accumulates tables; one who runs
-  out of disk gets a failed build and a declined task, not a wrong result. The
-  fix is a size cap with least-recently-used eviction in `contribute.txt`,
-  which is a change to MAGPIE's `contribute.c` and to no protocol.
+- **Disk and memory, as much as there is (MAGPIE 0.1.3):** 179 MB per wordmap,
+  122 MB per word info table and 1.9 GB per `(.kwg, .klv2)` pair with a rack
+  info table. The tables are a best attempt. Before a task, `magpie contribute`
+  picks the tables it uses from those the task's players ask for, in the
+  order they speed it up -- wordmap, then word info table, then rack info
+  table, and never a rack info table or word info table without its
+  wordmap -- keeping each that fits both:
+  - the disk: free space on the data directory less `diskreserve` (GB,
+    default 2, in `contribute.txt`), plus the tables it built earlier for
+    other jobs, which it evicts least recently used first when it needs the
+    room (only files its own manifest, `contribute_tables.txt`, lists);
+  - the memory: `MemAvailable` less `memreserve` (GB, default 1), for the
+    build's peak (about 710 MB for a wordmap, 310 MB for a word info table,
+    2.4 GB for a rack info table) and for holding the table while it plays.
+
+  It runs the task without the rest, says which and why, and lists them in
+  its result's `derived_skipped`; the admin job page counts them under
+  **Tables skipped**. A disk that fills during a build skips that table the
+  same way (PLAN.md KL-51). The claim states each table's size (`bytes`), so
+  the choice is made before anything is built. Without a table a task is
+  slower; a static player plays the same moves, and a simming player equally
+  valid games that need not be the same, since the wordmap's move generator
+  orders equal moves differently. What each is worth, on CSW24 with four
+  cores (MAGPIE `scripts/bench_tables.sh`, 2026-10-14), in movegens a second:
+
+  | Tables | Static player | 2-ply simmer |
+  |---|---|---|
+  | none | 17,217 | 15,884 |
+  | word info table alone | 18,248 | 15,893 |
+  | wordmap | 65,136 | 47,735 |
+  | wordmap, word info table | 63,027 | 51,926 |
+  | wordmap, rack info table | 69,185 | 55,808 |
+  | all three | 69,723 | 70,870 |
 
 ### What is not covered
 
@@ -898,8 +935,8 @@ worker set to `http://` fails at once rather than sending its credential in
 the clear on every request. `public_url`, `ses_domain` and `mail_from_address` have
 none: they are what every confirmation and reset mail links to and is sent
 from, and a placeholder left in is refused. `min_magpie_version` defaults to
-`0.1.2`, the version of the MAGPIE `main` commit the backend image pins; raise it
-whenever a MAGPIE release changes results, since it is the only way to keep a
+`0.1.2`, the oldest MAGPIE whose results are right (the backend image pins
+`0.1.3`); raise it whenever a MAGPIE release fixes results, since it is the only way to keep a
 build that computes something wrong off the fleet. `derived_builder_image`
 has no default — it is the backend image built with `--target derived-builder`,
 and it must carry the same MAGPIE as `backend_image`, since the builder version
@@ -1095,7 +1132,7 @@ Session Manager plugin for ECS Exec), `terraform`, `jq`, `git`, `gh`,
 
 | Script | Does |
 | --- | --- |
-| `deploy.sh [--all] [--reset-db] [--set KEY=VALUE]` | Deploys the checked-out commit of main, only what it changed: a clean tree, CI green for it (`gh`); then, from the image each service runs (its tag is a commit), `git diff` to HEAD by path -- `frontend/` deploys the frontend; `backend/`, `docker/` (the MAGPIE pin), `Cargo.*` and `.dockerignore` the backend and the derived-data builder with it; `infra/` (and the scripts its task definitions read) a plan; anything else nothing, and it says so. `--all` deploys both. For the backend, the MAGPIE pin on `main` (`MAGPIE_DIR`, default `~/MAGPIE`). Builds and pushes the images ECR lacks (`linux/amd64`, `CARGO_BUILD_JOBS=2`, `MAKE_JOBS=3`), retags those services in `prod.tfvars`, plans, applies, uploads, waits for both services and target groups. A frontend release never stops the backend. Refuses a backend whose migrations the live backend applied changed (until launch `0001_initial.sql`, edited in place) unless `--reset-db`, and a service ECS's circuit breaker rolled back until `rollback.sh` has run. |
+| `deploy.sh [--all] [--reset-db] [--set KEY=VALUE]` | Deploys the checked-out commit of main, only what it changed: a clean tree, CI green for it (`gh`); then, from the image each service runs (its tag is a commit), `git diff` to HEAD by path -- `frontend/` deploys the frontend; `backend/`, `docker/` (the MAGPIE pin), `Cargo.*` and `.dockerignore` the backend and the derived-data builder with it; `infra/` (and the scripts its task definitions read) a plan; anything else nothing, and it says so. `--all` deploys both. For the backend, the MAGPIE pin on `main` (`MAGPIE_DIR`, default `~/MAGPIE`). Builds and pushes the images ECR lacks (`linux/amd64`, `CARGO_BUILD_JOBS=2`, `MAKE_JOBS=3`), retags those services in `prod.tfvars`, plans, applies, uploads, waits for both services and target groups. A frontend release never stops the backend. Refuses a backend whose migrations the live backend applied changed (an edit to an applied migration; since 2026-10-13 a schema change is a new numbered one, which this never refuses) unless `--reset-db`, and a service ECS's circuit breaker rolled back until `rollback.sh` has run. |
 | `reset-prod-db.sh [--no-start]` | RUNBOOK "Resetting the production database": empties it (the hostname typed, in a prompt that names both backup buckets and their dump count): the backend's service stopped, the schema dropped and made again, every version under `pg/` in the backups bucket and its DR replica deleted, the backend started so it applies `0001`. RDS's automated backups are left to expire (30 days). Then: register, `confirm-user.sh --admin`, import the input data. `deploy.sh --reset-db` does the same once its plan is approved and before the new task starts. |
 | `rollback.sh [--to TAG] [--reset-db]` | RUNBOOK "Rolling back a deploy": the previous release from the log (its backend and frontend images, which may be at different tags), or what a circuit breaker went back to. |
 | `set-setting.sh KEY=VALUE...` | Changes `prod.tfvars` values (e.g. `mail_max_per_second=14`) and applies them. The task time limit is not Terraform's, nor the site's: each job has its own, set when it is created and changed on its admin page, and a change takes effect at the job's next claim. |

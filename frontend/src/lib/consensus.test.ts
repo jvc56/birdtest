@@ -3,8 +3,10 @@ import {
   analysesPerRack,
   consensusFields,
   consensusProblem,
+  consensusStage,
   rackConsensus,
-  type ConsensusSettings
+  type ConsensusSettings,
+  type RackStage
 } from './consensus';
 
 describe('F-CONS-1 analysesPerRack', () => {
@@ -85,6 +87,50 @@ describe('F-CONS-4 consensusFields', () => {
       min_results_per_rack: 2,
       max_results_per_rack: 3,
       consensus_pct: 75
+    });
+  });
+});
+
+describe('F-CONS-5 consensusStage', () => {
+  const stage = (over: Partial<RackStage> = {}) => ({
+    racks_analyzed: 2060000,
+    racks_settled: 0,
+    racks_without_consensus: 0,
+    racks_total: 3199724,
+    fewest_open_analyses: null,
+    min_results_per_rack: 3,
+    max_results_per_rack: 7,
+    ...over
+  });
+
+  it('says nothing for a job analysing each rack once', () => {
+    expect(consensusStage(stage({ min_results_per_rack: 1, max_results_per_rack: 1 }), false)).toBeNull();
+  });
+
+  it('reads the first pass, and when no rack can settle yet', () => {
+    expect(consensusStage(stage(), false)).toEqual({
+      stage: 'First pass.',
+      text: '64.4% of racks have their first analysis. None can settle before its 3rd. Re-analysis starts when every rack has one.'
+    });
+    // A rack can settle at its first analysis when the fewest is one.
+    expect(consensusStage(stage({ min_results_per_rack: 1 }), false)?.text).toBe(
+      '64.4% of racks have their first analysis. Re-analysis starts when every rack has one.'
+    );
+  });
+
+  it('reads the re-analysis from the fewest analyses an open rack has', () => {
+    const s = stage({ racks_analyzed: 3199724, racks_settled: 1144000, fewest_open_analyses: 2 });
+    expect(consensusStage(s, false)).toEqual({
+      stage: 'Re-analysis.',
+      text: 'Every open rack has at least 2 analyses, and racks with the fewest are analysed first.'
+    });
+  });
+
+  it('reads finished, agreed and not', () => {
+    const s = stage({ racks_analyzed: 3199724, racks_settled: 3199724, racks_without_consensus: 24967 });
+    expect(consensusStage(s, true)).toEqual({
+      stage: 'Finished.',
+      text: `Every rack is settled: ${(3174757).toLocaleString()} agreed, ${(24967).toLocaleString()} without a consensus after 7 analyses.`
     });
   });
 });

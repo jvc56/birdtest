@@ -53,6 +53,11 @@ test('E-11: an admin job page whose first read fails shows only what the server 
     });
   });
 
+  // Some of its workers ran without the rack info table for want of space.
+  await page.route(`**/api/admin/jobs/${id}/skipped-tables`, (route) =>
+    route.fulfill({ json: [{ role: 'rit', tasks: 41, workers: 3, last_completed_at: new Date().toISOString() }] })
+  );
+
   await page.goto(`/admin/jobs/${id}`);
   await expect(page.getByRole('heading', { name: 'Controls' })).toBeVisible({ timeout: 20_000 });
   const gapsCard = page.locator('.card', { has: page.getByRole('heading', { name: 'Data gaps' }) });
@@ -70,6 +75,8 @@ test('E-11: an admin job page whose first read fails shows only what the server 
   await expect(page.getByRole('button', { name: 'Deactivate', exact: true })).toHaveCount(0);
 
   await expect(gapsCard.getByRole('cell', { name: /NWL23/ })).toBeVisible({ timeout: 20_000 });
+  const skippedCard = page.getByTestId('skipped-tables');
+  await expect(skippedCard.getByRole('row', { name: /Rack info table\s+3\s+41/ })).toBeVisible();
   expect(gapReads).toBeGreaterThanOrEqual(3);
   expect(jobReads).toBeGreaterThanOrEqual(2);
   await expect(page.getByText(/Could not load all of this job/)).toBeHidden();

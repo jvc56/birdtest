@@ -140,7 +140,9 @@ async fn list_jobs(
          LEFT JOIN player_configs p1 ON p1.id = COALESCE(gc.player1_config_id, pc.player1_config_id)
          LEFT JOIN player_configs p2 ON p2.id = COALESCE(gc.player2_config_id, pc.player2_config_id)
          WHERE $3::job_status IS NULL OR j.status = $3
-         ORDER BY j.created_at DESC, j.id DESC
+         -- Active jobs first, then inactive, then completed; newest first in each.
+         ORDER BY CASE j.status WHEN 'active' THEN 0 WHEN 'inactive' THEN 1 ELSE 2 END,
+                  j.created_at DESC, j.id DESC
          LIMIT $1 OFFSET $2",
     )
     .bind(limit)
@@ -422,7 +424,7 @@ async fn player_config(
     .bind(id)
     .fetch_optional(&state.read_pool)
     .await?
-    .ok_or_else(|| AppError::not_found("no such player config"))?;
+    .ok_or_else(|| AppError::not_found("no such player"))?;
     Ok(Json(config.into()))
 }
 

@@ -629,7 +629,7 @@ async fn throughput_is_recent_claims_times_the_batch_in_the_jobs_unit() {
     .await
     .unwrap();
     claim(&db, racks, worker, "completed", 10).await;
-    assert_eq!(throughput(stats(&db, racks).await), Some((25.0, "rack")));
+    assert_eq!(throughput(stats(&db, racks).await), Some((25.0, "analysis")));
 
     // A hundred games a task; no ETA, but a pace.
     let leaves = leave_job(&db, 2).await;

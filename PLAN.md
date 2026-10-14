@@ -2440,7 +2440,7 @@ being able to express once every job depends on the client honouring a protocol,
 so the columns are `NOT NULL` and default to **`0.1.2`**, the same value as the
 server's `MIN_MAGPIE_VERSION`, which `create_job` writes explicitly.
 
-`0.1.2` is the version of the MAGPIE `main` commit the backend image pins. The version
+`0.1.2` is the floor; the MAGPIE `main` commit the backend image pins reports `0.1.3`. The version
 was incremented through `0.5.1` as birdtest and MAGPIE changed together during
 development and reset to `0.1.0` when the protocol settled; none of those numbers
 shipped. **The version moves with every change that can alter what a task
@@ -2453,7 +2453,17 @@ played a leave task after its first with the previous task's KLV — so the bran
 went to `0.1.1` and the floor with it. `0.1.2` (October 2026) followed a fix to
 the move generator's rack info table cache, which across two lexicons in one
 contributor process crashed or used the other lexicon's leaves, together with
-captured positions naming their mover. The
+captured positions naming their mover. `0.1.3` (October 2026) made the
+wordmap, word info table and rack info table a best attempt -- a contributor
+short of disk or memory runs a task without the tables that do not fit and
+says so in its result (`derived_skipped`) -- and read each table's size from
+the claim. **The floor stayed at `0.1.2`** (owner, 2026-10-14): a 0.1.2 build
+computes nothing wrong, it only needs every table its players ask for, so
+existing contributors keep running and upgrade at their own pace. So the floor
+rises for a release that fixes results, not for one that only adds behaviour,
+and MAGPIE's version may be ahead of it. Since the first deploy, a floor change
+moves the `jobs` column defaults in a numbered migration rather than in
+`0001`. The
 one place the floor lives is the server's configuration: the column default,
 the Terraform variable, the compose file and the env examples all carry the
 same value so no path writes a lower one.
@@ -10336,18 +10346,23 @@ says so in its implemented option, rather than being removed.
   decision.
 
 **KL-51. A full disk while writing a wordmap or rack info table ends the worker.**
-- **Context:** The writers are MAGPIE's CLI writers (`fwrite_or_die`), which
+*Closed in MAGPIE 0.1.3 (2026-10-14).*
+- **Context:** The writers were MAGPIE's CLI writers (`fwrite_or_die`), which
   exit.
-- **Problem:** On the contribute path, the claim then waits out the heartbeat
-  timeout, and the partial temporary is removed by the next write, an hour on.
-- **Options considered:** decline the task.
-- **Option implemented:** None.
-- **Justification:** Declining means error returns through writers the CLI
-  shares.
+- **Problem:** On the contribute path, the claim then waited out the heartbeat
+  timeout, and the partial temporary was removed by the next write, an hour on.
+- **Options considered:** decline the task; run it without the table.
+- **Option implemented:** Run it without the table. The writers return an
+  error, the partial temporary is removed at once, and the task runs without
+  that table and reports it in `derived_skipped`. The tables became a best
+  attempt in the same release (README, "What it costs a contributor").
+- **Justification:** No task needs a table; declining would leave work undone
+  that the worker can do.
 
 **KL-52. Local write failures are counted, not remembered.**
-- **Context:** A worker that cannot write a table or a fetched KLV, for example
-  because its data directory is read-only, counts a failure.
+- **Context:** A worker that cannot write a fetched KLV, for example because
+  its data directory is read-only, counts a failure. (Since MAGPIE 0.1.3 a
+  table it cannot write is skipped, not counted: KL-51.)
 - **Problem:** A success on another job resets the count, so the worker keeps
   claiming the job it cannot run, between the ones it can.
 - **Options considered:** set the job aside, as for other failures.

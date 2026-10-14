@@ -598,16 +598,16 @@ async fn a_job_naming_something_that_does_not_exist_is_a_clean_400() {
     let cases = [
         (games_body(missing, layout, player, player), format!("no input data row {missing}")),
         (games_body(ld, missing, player, player), format!("no input data row {missing}")),
-        (games_body(ld, layout, player, missing), "player config not found".to_string()),
-        (pairs_body(ld, layout, missing, player), "player config not found".to_string()),
+        (games_body(ld, layout, player, missing), "player not found".to_string()),
+        (pairs_body(ld, layout, missing, player), "player not found".to_string()),
         (
             json!({
                 "job_type": "opening_rack", "variant": "classic", "letterdist_id": ld,
                 "layout_id": layout, "player_config_id": missing,
             }),
-            "no such player config".to_string(),
+            "no such player".to_string(),
         ),
-        (leave(missing), "no such player config".to_string()),
+        (leave(missing), "no such player".to_string()),
     ];
     for (body, message) in cases {
         let (status, refused) = admin.create_job(body.clone()).await;
@@ -1418,7 +1418,7 @@ async fn a_player_config_in_use_by_any_job_cannot_be_deleted() {
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
         assert_eq!(
             body["message"],
-            "a job, a rating pool, a rating history or a clone references this player config"
+            "a job, a rating pool, a rating history or a clone references this player"
         );
         let (status, _) = admin.call("GET", &format!("/api/admin/player-configs/{config}"), None).await;
         assert_eq!(status, StatusCode::OK, "the refused config is still there");
@@ -1474,7 +1474,7 @@ async fn a_leave_job_refuses_a_player_it_cannot_generate_leaves_with() {
     for (player, reason) in cases {
         let (status, refused) = admin.create_job(leave(player)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{reason}: {refused}");
-        assert_eq!(refused["message"], "this player config cannot generate leaves", "{refused}");
+        assert_eq!(refused["message"], "this player cannot generate leaves", "{refused}");
         assert_eq!(refused["fields"][0]["field"], "player_config_id", "{refused}");
         let why = refused["fields"][0]["message"].as_str().unwrap();
         assert!(why.contains(reason), "{reason}: {why}");

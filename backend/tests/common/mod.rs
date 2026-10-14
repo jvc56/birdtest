@@ -25,7 +25,10 @@ use uuid::Uuid;
 /// itself is built by `db::migrate`, which applies them properly; this is what
 /// makes an edit to any of them produce a fresh template rather than a stale
 /// one.
-const MIGRATIONS: [&str; 1] = [include_str!("../../migrations/0001_initial.sql")];
+const MIGRATIONS: [&str; 2] = [
+    include_str!("../../migrations/0001_initial.sql"),
+    include_str!("../../migrations/0002_best_attempt_tables.sql"),
+];
 const TESTDIST: &[u8] = include_bytes!("../../src/jobs/testdata/testdist.csv");
 
 fn server_url() -> String {
@@ -123,7 +126,7 @@ async fn ensure_template() {
 /// and the contract fixtures move together.
 pub fn test_builders() -> birdtest::magpie::Builders {
     birdtest::magpie::Builders {
-        magpie_version: "0.1.2".into(),
+        magpie_version: "0.1.3".into(),
         build_target: "nehalem".into(),
         wmp_builder_version: 1,
         rit_builder_version: 1,

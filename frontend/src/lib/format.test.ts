@@ -457,11 +457,12 @@ describe('F-FMT-21 throughputParts', () => {
       unit: 'games/hour'
     });
     expect(throughputParts({ per_hour: 8, unit: 'pair' })).toEqual({ value: '8', unit: 'pairs/hour' });
-    expect(throughputParts({ per_hour: 10.5, unit: 'rack' })).toEqual({ value: '11', unit: 'racks/hour' });
+    expect(throughputParts({ per_hour: 10.5, unit: 'analysis' })).toEqual({ value: '11', unit: 'analyses/hour' });
+    expect(throughputParts({ per_hour: 1, unit: 'analysis' })).toEqual({ value: '1', unit: 'analysis/hour' });
   });
 
   it('keeps a decimal below ten, and one unit is singular', () => {
-    expect(throughputParts({ per_hour: 2.46, unit: 'rack' })?.value).toBe('2.5');
+    expect(throughputParts({ per_hour: 2.46, unit: 'analysis' })?.value).toBe('2.5');
     expect(throughputParts({ per_hour: 9.96, unit: 'game' })?.value).toBe('10');
     expect(throughputParts({ per_hour: 1, unit: 'game' })).toEqual({ value: '1', unit: 'game/hour' });
   });

@@ -45,6 +45,15 @@ test.afterAll(async () => {
 
 test('E-13: an opening-rack job offers analysed racks to look up', async ({ page }) => {
   await page.goto(`/jobs/${jobId}`);
+  // Its Progress card: racks settled over racks analysed, a Done and a Time
+  // left for each (one row, "Analysed and settled", for a job analysing each
+  // rack once), its pace in analyses, and its tasks split into the first pass
+  // and, seeking a consensus, re-analysis.
+  const progress = page.getByTestId('job-progress');
+  await expect(progress.getByTestId('rack-fronts')).toContainText('Time left');
+  await expect(progress.getByTestId('rack-front-settled')).toContainText(/settled/i);
+  await expect(progress.getByTestId('task-counts')).toContainText('first pass');
+  await expect(progress.getByTestId('task-counts')).toContainText('to be handed out again');
   await expect(page.getByText('Analysed racks to try:')).toBeVisible();
   const samples = page.getByTestId('rack-sample');
   await expect(samples).toHaveCount(10);
@@ -61,8 +70,19 @@ test('E-13: an opening-rack job offers analysed racks to look up', async ({ page
   await expect(panel.locator('tbody tr').first()).toBeVisible();
   // A static player's analyses: the move, its score and equity, and none of
   // a simulation's columns (E-12 shows a simmer's).
-  await expect(panel.locator('thead th')).toContainText(['#', 'Move', 'Score', 'Equity']);
+  await expect(panel.locator('thead th')).toContainText(['#', 'Move', 'Leave', 'Score', 'Equity']);
   for (const column of ['Win %', 'Iters', 'P1-S', 'P1-BP']) {
     await expect(panel.locator('thead th', { hasText: column })).toHaveCount(0);
   }
+  // Each move's leave is the rack less the tiles it plays: letters of the
+  // rack, or a dash when it keeps none.
+  const leave = (await panel.locator('tbody tr').first().locator('td').nth(2).innerText()).trim();
+  expect(leave === '—' || [...leave].every((t) => rack.includes(t))).toBe(true);
+
+  // "Random" looks up one analysed rack, drawn at random, and fills the box.
+  const random = page.waitForResponse((r) => r.url().includes(`/api/jobs/${jobId}/rack-samples?n=1`));
+  await page.getByTestId('rack-random').click();
+  await random;
+  await expect(page.getByLabel('Look up a rack')).not.toHaveValue('');
+  await expect(panel.locator('tbody tr').first()).toBeVisible();
 });

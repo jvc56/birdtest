@@ -230,6 +230,13 @@ pub struct ExpectedDerived {
     /// file, finds the hash differs, and declines with both -- which is the
     /// outcome that makes it visible instead of assumed.
     pub build_target: String,
+    /// The size of the server's reference build, in bytes: what the worker
+    /// needs free to build its own. The tables are a best attempt -- a worker
+    /// short of disk or memory runs the task without the ones that do not
+    /// fit, which is slower; a static player plays the same moves, a simming
+    /// one equally valid games that need not be the same -- and this is how it
+    /// decides which fit before spending minutes building one that will not.
+    pub bytes: i64,
 }
 
 /// What a job's derived files look like right now.
@@ -278,7 +285,7 @@ pub async fn status_for_job(
 
     let rows = sqlx::query(&format!(
         "{NEEDS_CTE}
-         SELECT n.role, n.name, d.state, d.sha256, d.build_target
+         SELECT n.role, n.name, d.state, d.sha256, d.build_target, d.bytes
          FROM needs n
          LEFT JOIN derived_data d
            ON d.role = n.role AND d.name = n.name
@@ -318,6 +325,8 @@ pub async fn status_for_job(
                 build_target: row
                     .get::<Option<String>, _>("build_target")
                     .unwrap_or_else(|| builders.build_target.clone()),
+                // Set whenever the row is built (`derived_data_built_has_hash`).
+                bytes: row.get::<Option<i64>, _>("bytes").unwrap_or(0),
             }),
             Some("failed") => status.failed.push(label),
             _ => status.pending.push(label),
@@ -877,6 +886,7 @@ mod tests {
             sha256: "0".repeat(64),
             builder: "wmp-1".into(),
             build_target: "nehalem".into(),
+            bytes: 104_000_000,
         };
         assert!(DerivedStatus { ready: vec![], pending: vec![], failed: vec![], unrequested: 0 }.dispatchable());
         assert!(DerivedStatus {

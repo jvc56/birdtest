@@ -223,6 +223,45 @@ export function placedTiles(move: string | null | undefined): PlacedTile[] {
 }
 
 /**
+ * What a move leaves on `rack`: the rack less the tiles a play puts down (a
+ * blank, written in lower case, takes a `?`), less the tiles an exchange puts
+ * back, or the whole rack for a pass. Squares a play goes through take
+ * nothing, nor does one MAGPIE named only as `.`. In the rack's own order, as
+ * MAGPIE spells letters (`[CH]` bracketed); `''` when nothing is left (a
+ * bingo). `null` for a move that cannot be read, or one that uses a tile the
+ * rack does not hold, rather than a leave that would be wrong.
+ */
+export function leaveOf(rack: string, move: string): string | null {
+  const parsed = parseMove(move);
+  const left = splitLetters(rack.trim());
+  if (!parsed || !left) return null;
+  let used: string[];
+  if (parsed.kind === 'pass') used = [];
+  else if (parsed.kind === 'exchange') used = parsed.tiles;
+  else {
+    used = parsed.squares.flatMap((s) => {
+      if (s.through || s.letter === null) return [];
+      return [s.letter === s.letter.toUpperCase() ? s.letter : '?'];
+    });
+  }
+  for (const t of used) {
+    const at = left.indexOf(t);
+    if (at < 0) return null;
+    left.splice(at, 1);
+  }
+  return left.map((t) => (Array.from(t).length > 1 ? `[${t}]` : t)).join('');
+}
+
+/**
+ * A rack however it was typed, spelt as an opening-rack job stores it --
+ * upper case, no spaces, its characters in order, so the blank `?` first --
+ * exactly as the server's `RackIndex::spelling` does for a lookup.
+ */
+export function rackSpelling(typed: string): string {
+  return Array.from(typed.replace(/\s+/g, '').toUpperCase()).sort().join('');
+}
+
+/**
  * Which seat holds `rack` -- the rack of the player to move, as a saved
  * position states it -- or `null` when neither does. Compared as tiles, in any
  * order. Both racks the same is the same picture either way; the first wins.

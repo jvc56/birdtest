@@ -132,7 +132,7 @@
     try {
       await loadChoices();
     } catch (e) {
-      error = `Could not load player configs and input data: ${e instanceof Error ? e.message : String(e)}`;
+      error = `Could not load the players and input data: ${e instanceof Error ? e.message : String(e)}`;
     }
   });
 
@@ -371,7 +371,7 @@
   </div>
   <p class="text-xs text-muted-foreground">
     One distribution and one board per job: MAGPIE takes a single bag and board for the whole game.
-    Each player's lexicon and leaves come from its own config.
+    Each player brings its own lexicon and leaves.
   </p>
 
   <div class="grid grid-cols-2 gap-3">
@@ -395,7 +395,7 @@
     <!-- One player, in both cases: an opening-rack job's analyses every rack,
          a leave job's plays both seats of every game. -->
     <div>
-      <label class="label" for="pc">Player Config</label>
+      <label class="label" for="pc">Player</label>
       <select id="pc" class="input" bind:value={playerConfigId} required>
         {#each configs as config}
           <option value={config.id}>
@@ -418,7 +418,7 @@
   {#if jobType === 'opening_rack'}
     {#if openingRackConflict}
       <p class="field-error">
-        {openingRackConflict} Pick a static config whose recorder is <strong>all</strong>
+        {openingRackConflict} Pick a static player whose recorder is <strong>all</strong>
         and that generates at least as many plays as it records, a simulating one that
         does, or one that records a single play.
       </p>
@@ -481,7 +481,7 @@
     <p class="text-xs text-muted-foreground">
       The recorder is shown because it decides whether a static player can rank anything at
       all: <strong>best</strong> keeps only the top move, so every rack would come back with one
-      analysis however many plays the config says to record. A simulating player ranks every
+      analysis however many plays it is set to record. A simulating player ranks every
       play up to its number of plays, whatever its recorder. Tasks address <em>ranges</em> of the
       rack space and are generated as workers claim them, so creating the job writes no rows
       however large the space is.
@@ -490,7 +490,7 @@
     <fieldset class="space-y-2" data-testid="players">
       <legend class="label">Players</legend>
       <p class="text-xs text-muted-foreground">
-        Tick one config for a self-play job, or several for a round robin: a job for every
+        Tick one player for a self-play job, or several for a round robin: a job for every
         pairing, player 1 the one ticked first.
       </p>
       <ul class="grid gap-1 sm:grid-cols-2">
@@ -632,7 +632,7 @@
     </div>
   {:else}
     {#if leaveConflict}
-      <p class="field-error">{leaveConflict} Pick a static config that sorts on equity.</p>
+      <p class="field-error">{leaveConflict} Pick a static player that sorts on equity.</p>
     {/if}
     <p class="text-xs text-muted-foreground">
       The bot plays both seats as this player, with its lexicon and its wordmap setting. Its

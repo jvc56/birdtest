@@ -32,6 +32,13 @@ pub struct JobStats {
     /// The move generations the job's accepted claims reported: the work done
     /// for it, whatever the machines (`jobs.movegens`).
     pub movegens: i64,
+    /// The compute time the job's accepted claims were credited with, claim
+    /// to submission (`jobs.compute_ms`): with `movegens` and
+    /// `tasks_completed`, the Contributors card's totals row. Every
+    /// contributor's, the ones past [`MAX_WORKER_CONTRIBUTIONS`] included, and
+    /// added by the same submission that adds the claim to its contributor,
+    /// so the listed rows add up to it when every contributor is listed.
+    pub compute_seconds: f64,
     /// How fast the job is going: the rate [`Self::eta_seconds`] extrapolates,
     /// in the job's own unit. `None` exactly when there is no recent work to
     /// measure -- the job is not active, or nothing finished in the window.
@@ -67,7 +74,7 @@ pub struct JobStats {
 pub struct Throughput {
     pub per_hour: f64,
     /// What a task is made of: "game" for games and leave-generation jobs,
-    /// "pair" for game pairs, "rack" for opening racks (each rack analysis).
+    /// "pair" for game pairs, "analysis" for opening racks (each rack analysis).
     pub unit: &'static str,
 }
 
@@ -187,6 +194,26 @@ pub struct OpeningRackStats {
     pub racks_without_consensus: i64,
     /// Size of the rack space; the denominator for progress.
     pub racks_total: i64,
+    /// Completed tasks by kind. A first-pass task analyses a slice of the
+    /// rack space (its seed is the slice's start, below `racks_total`); a
+    /// re-analysis task lists unsettled racks again for a consensus (its seed
+    /// at or past `racks_total`). The two add up to the job's completed tasks.
+    pub first_pass_tasks_done: i64,
+    pub reissue_tasks_done: i64,
+    /// How many first-pass tasks cover the rack space: one per
+    /// `racks_per_batch` racks, rounded up. Known from the start.
+    pub first_pass_tasks_total: i64,
+    /// The fewest analyses an unsettled rack has, once the first pass has
+    /// analysed every rack and the job seeks a consensus: which analysis the
+    /// re-analysis is giving racks now, since it picks the fewest first.
+    /// `None` before then, for a job wanting one analysis per rack, and once
+    /// every rack is settled.
+    pub fewest_open_analyses: Option<i32>,
+    /// The job's consensus bounds, so the Progress card can tell a job
+    /// seeking a consensus (most above 1) from one analysing each rack once
+    /// without reading the job's config.
+    pub min_results_per_rack: i32,
+    pub max_results_per_rack: i32,
 }
 
 /// Two kinds of figure, and the page says which is which.
@@ -234,6 +261,8 @@ pub struct WorkerContribution {
     /// Those claims held from claim to submission, as the contributor list
     /// counts compute (`routes::worker::CLAIM_COMPUTE_MS`).
     pub compute_seconds: f64,
+    /// The move generations those claims reported (`task_claims.movegens`).
+    pub movegens: i64,
 }
 
 pub async fn load_job(pool: &PgPool, job_id: Uuid) -> AppResult<Job> {
@@ -484,7 +513,8 @@ async fn compute_inner(conn: &mut PgConnection, job: &Job) -> AppResult<JobStats
              COUNT(*)                                            AS total,
              COUNT(*) FILTER (WHERE state = 'completed')         AS completed,
              COUNT(*) FILTER (WHERE state = 'available')         AS available,
-             COUNT(*) FILTER (WHERE state = 'claimed')           AS claimed
+             COUNT(*) FILTER (WHERE state = 'claimed')           AS claimed,
+             (SELECT compute_ms FROM jobs WHERE id = $1)         AS compute_ms
          FROM tasks WHERE job_id = $1",
     )
     .bind(job.id)
@@ -560,6 +590,7 @@ async fn compute_inner(conn: &mut PgConnection, job: &Job) -> AppResult<JobStats
         tasks_available: counts.get("available"),
         tasks_claimed: counts.get("claimed"),
         movegens: job.movegens,
+        compute_seconds: counts.get::<Option<i64>, _>("compute_ms").unwrap_or(0) as f64 / 1000.0,
         throughput,
         games,
         opening_racks,
@@ -865,15 +896,52 @@ async fn opening_rack_stats(conn: &mut PgConnection, job_id: Uuid) -> AppResult<
         .fetch_one(&mut *conn)
         .await?;
 
-    let racks_total = sqlx::query_scalar::<_, i64>(
-        "SELECT total_racks FROM job_opening_rack_config WHERE job_id = $1",
+    let (racks_total, racks_per_batch, min_results, max_results) = sqlx::query_as::<_, (i64, i32, i32, i32)>(
+        "SELECT total_racks, racks_per_batch, min_results_per_rack, max_results_per_rack
+         FROM job_opening_rack_config WHERE job_id = $1",
     )
     .bind(job_id)
     .fetch_optional(&mut *conn)
     .await?
-    .unwrap_or(0);
+    .unwrap_or((0, 1, 1, 1));
 
-    Ok(OpeningRackStats { racks_analyzed, racks_settled, racks_without_consensus, racks_total })
+    // The job's completed tasks by kind, in one pass over its tasks -- the
+    // same rows the stats' task counts already read.
+    let (first_pass_tasks_done, reissue_tasks_done) = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT COUNT(*) FILTER (WHERE seed < $2), COUNT(*) FILTER (WHERE seed >= $2)
+         FROM tasks WHERE job_id = $1 AND state = 'completed'",
+    )
+    .bind(job_id)
+    .bind(racks_total)
+    .fetch_one(&mut *conn)
+    .await?;
+    let first_pass_tasks_total = (racks_total + i64::from(racks_per_batch.max(1)) - 1) / i64::from(racks_per_batch.max(1));
+
+    // One probe of the unsettled index, `(job_id, results, rack) WHERE NOT
+    // settled`: its first entry is the fewest analyses an open rack has.
+    let fewest_open_analyses = if max_results > 1 && racks_total > 0 && racks_analyzed >= racks_total {
+        sqlx::query_scalar::<_, Option<i32>>(
+            "SELECT MIN(results) FROM opening_rack_progress WHERE job_id = $1 AND NOT settled",
+        )
+        .bind(job_id)
+        .fetch_one(&mut *conn)
+        .await?
+    } else {
+        None
+    };
+
+    Ok(OpeningRackStats {
+        racks_analyzed,
+        racks_settled,
+        racks_without_consensus,
+        racks_total,
+        first_pass_tasks_done,
+        reissue_tasks_done,
+        first_pass_tasks_total,
+        fewest_open_analyses,
+        min_results_per_rack: min_results,
+        max_results_per_rack: max_results,
+    })
 }
 
 async fn leave_gen_stats(conn: &mut PgConnection, job_id: Uuid) -> AppResult<LeaveGenStats> {
@@ -953,11 +1021,12 @@ async fn worker_contributions_on(
         "SELECT w.user_id,
                 left(encode(sha256(convert_to(w.anon_uuid::text, 'UTF8')), 'hex'), 16) AS anon_id,
                 u.username,
-                w.tasks_completed, w.compute_ms, w.contributors
+                w.tasks_completed, w.compute_ms, w.movegens, w.contributors
          FROM (
              SELECT c.claimed_by_user_id AS user_id, c.claimed_by_anon_uuid AS anon_uuid,
                     COUNT(*)::bigint AS tasks_completed,
                     SUM({compute})::bigint AS compute_ms,
+                    SUM(c.movegens)::bigint AS movegens,
                     COUNT(*) OVER ()::bigint AS contributors
              FROM task_claims c
              JOIN tasks t ON t.id = c.task_id
@@ -993,6 +1062,7 @@ async fn worker_contributions_on(
                 username: r.get("username"),
                 tasks_completed: r.get("tasks_completed"),
                 compute_seconds: r.get::<i64, _>("compute_ms") as f64 / 1000.0,
+                movegens: r.get("movegens"),
             })
             .collect(),
         other_workers,
@@ -1067,7 +1137,9 @@ async fn estimate_pace(
             .bind(job.id)
             .fetch_one(&mut *conn)
             .await?;
-            let (throughput, per_second) = pace("rack", racks_per_batch);
+            // Analyses, not distinct racks: a re-analysis task's racks were
+            // analysed before.
+            let (throughput, per_second) = pace("analysis", racks_per_batch);
             // Racks not yet analysed want at least their fewest analyses each;
             // racks analysed and not yet settled at least one more. A consensus
             // that is slow to come makes this an underestimate.
