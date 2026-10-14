@@ -1,7 +1,7 @@
 # Updates plan — the 2026-10-13 batch
 
 Source: `~/Dropbox/birdtest_todo.txt` (2026-10-13), nine items, numbered here
-in the file's order:
+in the file's order, and two the owner added the same day (10, 11):
 
 1. Active jobs come first on `/jobs`.
 2. The Significance Test card's middle tile shows the player who is winning,
@@ -18,6 +18,9 @@ in the file's order:
 8. "Players", not "configs", on the ratings page and anywhere else a player
    config is meant.
 9. The Time Left card's expected end date includes the year.
+10. Every move list shows the move's leave, in the column after the move.
+11. In a games or game-pairs job's move list, the played move loses its
+    **PLAYED** tag and keeps its highlight.
 
 **Branches.** birdtest: `updates-2026-10-13`, off `main` at `f6e4913`.
 MAGPIE (item 7 only): a new branch off `origin/main`, which already contains
@@ -26,7 +29,7 @@ check it out fresh rather than building on that branch.
 
 | Phase | Items | Repo | Deploy |
 |---|---|---|---|
-| 1 | 9, 2, 3, 5 | birdtest frontend | frontend only |
+| 1 | 9, 2, 3, 5, 10, 11 | birdtest frontend | frontend only |
 | 2 | 8 | birdtest frontend, backend messages, e2e, JOURNEYS | frontend and backend, no migration |
 | 3 | 1, 4 | birdtest backend and frontend | backend and frontend, no migration |
 | 4 | 6 | birdtest backend and frontend | **migration (database reset)** |
@@ -37,7 +40,8 @@ check it out fresh rather than building on that branch.
 - **Phase 1 needs no server change.** Each of its items uses data the page
   already has: `test.mean` says who leads, the toggle between differing and
   all settings already exists, `GET /api/jobs/:id/rack-samples` already draws
-  random racks, and the date is a formatting option.
+  random racks, and the date is a formatting option. A move's leave is its
+  rack less the tiles the move uses, both of which the page has.
 - **The wording comes next, on its own.** It touches dozens of strings, the
   e2e specs that match them, and JOURNEYS.md. A commit with nothing else in
   it is easy to review and easy to revert.
@@ -74,9 +78,11 @@ Each has a recommendation. Confirm or override before the phase that needs it.
 | D7 | Item 8: do the URLs and API names change too (`/player-configs`, `/api/player-configs`, `player_config_ids`)? | No. Only user-facing text changes, including backend error messages. URLs and fields stay as they are: renaming them means churning routes, the contract and the e2e helpers for no gain a reader sees. The download filename `player-config-{id}.json` stays too. |
 | D8 | Item 7: the priority order when not everything fits. No benchmark of the three tables exists. Only qualitative claims do: WMP "dramatically faster", RIT "further still", WIT "costs little". | Measure first (phase 5, step 1), then fix the order from the numbers. The order expected: WMP (179 MB), then WIT (122 MB), then RIT (1.9 GB). An RIT is built from a WMP, so it is never kept without one. |
 | D9 | Item 7: how much space counts as available, and is anything evicted? | Available = free space on the data directory's filesystem (`statvfs`), minus a reserve, plus the bytes of tables this client built earlier that the task does not need. A new `contribute.txt` key `diskreserve` (in GB) sets the reserve, default 2 GB. When a table does not fit otherwise, evict tables the client built for other jobs, least recently used first, and only files listed in its own manifest. It never deletes a file it did not build. |
+| D11 | Item 10: where does a move's leave come from? Neither move list shows one, and no API sends one. A saved position has `rack`; a rack lookup has the rack looked up. | Computed on the page: `leaveOf(rack, move)` in `lib/cgp.ts`. It reuses `parseMove`. A placement's leave is the rack less the tiles it puts down (a lowercase letter uses a `?`). Played-through squares and `.` squares use nothing. An exchange's leave is the rack less the exchanged tiles, and a pass's is the whole rack. Letters are shown in the rack's order. An empty leave (a bingo) shows "—". A move that cannot be read, or tiles the rack does not hold, also shows "—", rather than a wrong leave. No server or contract change. |
+| D12 | Item 11: the **PLAYED** tag is also the row's only non-colour cue. | Drop the visible tag and keep the row's tint. Keep the `(played)` text for screen readers only (`sr-only`), and keep `data-played` for tests. The line above the board ("· played 8G HUH (24)") stays. |
 | D10 | Item 7: does the server learn which tables a task skipped? | Yes, in the result: a `derived_skipped` list of roles, stored on the claim and shown on the admin's task view. Nothing depends on it for correctness, since results are identical with or without the tables. But a slow worker's timeouts count against the job and can set it aside, and an admin needs to see why. |
 
-## Phase 1 — four page fixes (items 9, 2, 3, 5)
+## Phase 1 — six page fixes (items 9, 2, 3, 5, 10, 11)
 
 **Item 9: the year in Time Left.** `lib/jobProgress.ts:83-84`'s `when` adds
 `year: 'numeric'`. That gives "Oct 14, 2026, 4:00 AM" for both "finished …"
@@ -107,7 +113,33 @@ the games-job journeys).
 `lookupRack()`. It is disabled while a lookup is running, and shows the
 lookup's error line if no rack comes back.
 
-**Verify:** vitest, svelte-check, and tier 5 E-1, E-4, E-7, E-14.
+**Item 10: the leave after the move (D11).**
+- `lib/cgp.ts` gains `leaveOf(rack, move)`. Unit tests in `cgp.test.ts`
+  cover:
+  - a placement;
+  - a placement through tiles on the board;
+  - a blank;
+  - a bingo (empty leave);
+  - an exchange and a pass;
+  - a multi-letter tile (`[CH]`);
+  - a move the rack cannot make ("—").
+- In `lib/components/PositionPane.svelte` (the games and game-pairs move
+  list), a **Leave** header goes right after **Move**, and each row gets a
+  `font-mono` cell holding `leaveOf(position.rack, move.move)`.
+- The opening-rack lookup table in `routes/jobs/[id]/+page.svelte` (around
+  line 222) gets the same column, using the rack the lookup returned. Use the
+  canonical spelling, not what was typed.
+- Any other table listing ranked moves gets it too. Grep for the
+  `<th>Move</th>` header to find them.
+
+**Item 11: no PLAYED tag (D12).** In `PositionPane.svelte:121-125`, remove
+the coloured `played` span and replace it with
+`<span class="sr-only">(played)</span>`. The row's `PLAYED_TINTS` background
+and `data-played` stay. Update any vitest or e2e check that looks for the
+visible tag.
+
+**Verify:** vitest, svelte-check, and tier 5 E-1, E-4, E-7, E-14, plus the
+saved-positions journey (the move list).
 
 ## Phase 2 — "player", not "config" (item 8, D7)
 
@@ -325,7 +357,7 @@ What exists today:
 
 | Phase | Unit | Backend | e2e (tier 5) | MAGPIE | Tier 6 |
 |---|---|---|---|---|---|
-| 1 | vitest, svelte-check | — | E-1, E-4, E-7, E-14 | — | — |
+| 1 | vitest, svelte-check | — | E-1, E-4, E-7, E-14, saved positions | — | — |
 | 2 | vitest, svelte-check | nextest | full | — | — |
 | 3 | vitest, svelte-check | nextest | E-1, E-4 | — | — |
 | 4 | vitest, svelte-check | nextest | opening-rack journeys | — | an opening-rack consensus job |
