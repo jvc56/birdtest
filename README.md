@@ -275,8 +275,8 @@ magpie BUILD=portable_release`) and set `MAGPIE_ROOT` if the checkout is not at
 server's builder and the fleet's identical.
 
 **The version floor stops an old MAGPIE from contributing.**
-`MIN_MAGPIE_VERSION` defaults to `0.1.3`, the version MAGPIE's `main`
-reports. A checkout that reports something
+`MIN_MAGPIE_VERSION` defaults to `0.1.2`, the oldest release whose results are
+right; MAGPIE's `main` reports `0.1.3`, which only adds behaviour. A checkout that reports something
 lower has every task declined with "update MAGPIE" until you update it or lower
 the floor — on the server *and* on the job, which records its own floor at
 creation:
@@ -626,8 +626,10 @@ every one of the 431 leave values.
 - birdtest is AGPL-3.0 and MAGPIE GPL-3.0; shipping the GPL binary in an AGPL
   service image is compatible.
 - `MAGPIE_VERSION` (0.1.3 at the time of writing) moves with every change that
-  can alter what a task computes or submits, and birdtest's version floor moves
-  with it.
+  can alter what a task computes or submits. birdtest's version floor (0.1.2)
+  moves with it when the change fixes results, so a build that computes
+  something wrong is kept off the fleet; a release that only adds behaviour
+  leaves it alone.
 
 ### What it costs a contributor
 
@@ -933,8 +935,8 @@ worker set to `http://` fails at once rather than sending its credential in
 the clear on every request. `public_url`, `ses_domain` and `mail_from_address` have
 none: they are what every confirmation and reset mail links to and is sent
 from, and a placeholder left in is refused. `min_magpie_version` defaults to
-`0.1.3`, the version of the MAGPIE `main` commit the backend image pins; raise it
-whenever a MAGPIE release changes results, since it is the only way to keep a
+`0.1.2`, the oldest MAGPIE whose results are right (the backend image pins
+`0.1.3`); raise it whenever a MAGPIE release fixes results, since it is the only way to keep a
 build that computes something wrong off the fleet. `derived_builder_image`
 has no default — it is the backend image built with `--target derived-builder`,
 and it must carry the same MAGPIE as `backend_image`, since the builder version

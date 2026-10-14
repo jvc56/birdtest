@@ -65,13 +65,15 @@ check it out fresh rather than building on that branch.
   deploy. Prefer designs that need no schema change: only phase 5 changes
   the schema.
 - MAGPIE version: the floor went to 0.1.2 on 2026-10-12, and a contract
-  change now comes with a bump. Phase 5 goes to 0.1.3, with a fixture
-  recapture.
-  - The `jobs` table's floor defaults now change in a migration
-    (`ALTER COLUMN min_magpie_patch SET DEFAULT 3`).
-  - `U-CFG-5`'s check (`every_copy_of_the_version_floor_agrees`) must read
-    the default from the latest migration that sets it, not from `0001`.
-  - Existing jobs keep their stored floor of 0.1.2.
+  change now comes with a bump. Phase 5 takes MAGPIE to 0.1.3, with a fixture
+  recapture. **As decided (owner, 2026-10-14): the floor stays at 0.1.2**, so
+  existing contributors keep running and upgrade at their own pace; only
+  0.1.3 clients get the best-attempt tables. The floor rises for a release
+  that fixes results, not for one that only adds behaviour.
+  - When the floor does rise, the `jobs` table's defaults change in a
+    migration (`ALTER COLUMN … SET DEFAULT`), and `U-CFG-5`'s check
+    (`every_copy_of_the_version_floor_agrees`) reads them from the latest
+    migration that sets them, not from `0001`.
 - Builds stay light: cap `cargo`/`make` parallelism, no cppcheck or
   clang-tidy on MAGPIE, and ask before any Docker image build.
 - No `cargo fmt`.
@@ -423,9 +425,10 @@ and every contributor stays eligible for every job.
      `ALTER TABLE task_claims ADD COLUMN derived_skipped TEXT[]`. The column
      is nullable and additive, so the previous image runs on it unchanged.
    - Shown on the admin's task and worker views.
-5. **The contract.** `MAGPIE_VERSION` / `MIN_MAGPIE_VERSION` go to 0.1.3.
-   - The same migration sets the `jobs` floor defaults to 0.1.3
-     (`ALTER COLUMN ... SET DEFAULT`), and `U-CFG-5` reads them from it.
+5. **The contract.** `MAGPIE_VERSION` goes to 0.1.3. `MIN_MAGPIE_VERSION`
+   stays at 0.1.2 (decided 2026-10-14; it went to 0.1.3 in the first build of
+   this phase and was put back), so the `jobs` floor defaults are unchanged
+   and `0002` does not touch them.
    - Existing jobs keep their floor of 0.1.2, so 0.1.2 builds still claim
      them. Check that a 0.1.2 build accepts the new `bytes` key in
      `expected_data.derived`. If it refuses unknown keys there, send `bytes`

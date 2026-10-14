@@ -434,11 +434,13 @@ process environment, so no test mutates `std::env` under another.
   its description), which `ecs.tf` and `derived.tf` pass through; both compose
   files; `scripts/e2e_magpie_native.sh`; `backend/.env.example`, which a
   backend run on the host starts from; the root `.env.example`, which a
-  compose user copies to `.env` (its commented value and the version it says
-  MAGPIE's `main` reports; thirty-third audit, pass 3); the same
-  "MAGPIE's `main` reports" sentence in `backend/.env.example` and
-  `docker-compose.yml` (thirty-third audit, pass 4); the `jobs`
-  table's three column defaults; and `scripts/dev.py`'s note. A raise that missed Terraform passed
+  compose user copies to `.env` (its commented value; thirty-third audit,
+  pass 3); the `jobs` table's three column defaults, as the latest migration
+  to set them left them; and `scripts/dev.py`'s note. The "MAGPIE's `main`
+  reports" sentence in both `.env.example`s and `docker-compose.yml`
+  (thirty-third audit, pass 4) names one version in all three, at or above
+  the floor: since 0.1.3, a release that only adds behaviour leaves the floor
+  where it is. A raise that missed Terraform passed
   CI and left production admitting the builds it was meant to keep out
   (thirty-third audit, pass 1). *(Covered:
   `config::tests::every_copy_of_the_version_floor_agrees`.)*
@@ -3050,7 +3052,7 @@ below.
 - `A-WORKER-2` A claim with a malformed `magpie_version` is rejected rather than
   assumed. Unparseable text reads as `0.0.0`, below the floor, so the worker is
   handed nothing and told to update (a floor of `0.0.0` would admit it; the
-  shipped floor is `0.1.3`); a version that is not a string is a `400` naming
+  shipped floor is `0.1.2`); a version that is not a string is a `400` naming
   the field. *(Covered:
   `worker_routes::a_malformed_magpie_version_is_refused_rather_than_assumed`.)*
 - `A-WORKER-3` An `unsupported_jobs` list over 200 is **truncated, not
@@ -4272,7 +4274,7 @@ works — the directory it lays out, the names it invokes, the bytes it gets
 back.
 
 **Correctness is established by version and capability probe.**
-MAGPIE's `main` reports `0.1.3`, the shipped `MIN_MAGPIE_VERSION` default; a checkout reporting anything lower is refused. The
+MAGPIE's `main` reports `0.1.3`; the shipped `MIN_MAGPIE_VERSION` default is `0.1.2`, and a checkout reporting anything lower is refused. The
 probe additionally asks the binary what it can do: that `contribute` is a
 registered command, and that it accepts the current required claim body.
 
