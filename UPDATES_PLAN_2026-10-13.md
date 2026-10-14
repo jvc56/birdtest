@@ -32,8 +32,8 @@ check it out fresh rather than building on that branch.
 | 1 | 9, 2, 3, 5, 10, 11 | birdtest frontend | frontend only |
 | 2 | 8 | birdtest frontend, backend messages, e2e, JOURNEYS | frontend and backend, no migration |
 | 3 | 1, 4 | birdtest backend and frontend | backend and frontend, no migration |
-| 4 | 6 | birdtest backend and frontend | **migration (database reset)** |
-| 5 | 7 | MAGPIE, then birdtest | a MAGPIE release, a contract change, a version floor |
+| 4 | 6 | birdtest backend and frontend | backend and frontend, no migration |
+| 5 | 7 | MAGPIE, then birdtest | a MAGPIE release, a contract change, a version floor, **migration `0002`** |
 
 ## Why this order
 
@@ -47,18 +47,30 @@ check it out fresh rather than building on that branch.
   it is easy to review and easy to revert.
 - **Phase 3 is two small query changes.** One is the jobs list's `ORDER BY`,
   the other the contributor query's sums.
-- **The opening-rack cards come after those.** They need decisions on layout
-  (D6), new per-job counters, and a database reset.
+- **The opening-rack cards come after those.** Their layout is settled (D6).
+  They need a split of the task counts and one index lookup, with no schema
+  change.
 - **The storage policy goes last.** It spans two repos, needs a benchmark
   before its order can be set (D8), and changes the contract.
 
 ## Rules carried over
 
-- Pre-launch: no compat shims. Edit `0001_initial.sql` in place, and reset
-  the database on deploy (phase 4 only).
+- **Schema changes ship as numbered migrations** (owner, 2026-10-13:
+  birdtest is deployed). Each change is a new `backend/migrations/0002_<name>.sql`,
+  never an edit to `0001_initial.sql`, and there is no database reset. It is
+  additive, so the previous image still runs on it: `db.rs` ignores
+  migrations it does not know, for rollbacks (README, "After a schema
+  change"). Old MAGPIE builds and existing rows must keep working across a
+  deploy. Prefer designs that need no schema change: only phase 5 changes
+  the schema.
 - MAGPIE version: the floor went to 0.1.2 on 2026-10-12, and a contract
   change now comes with a bump. Phase 5 goes to 0.1.3, with a fixture
   recapture.
+  - The `jobs` table's floor defaults now change in a migration
+    (`ALTER COLUMN min_magpie_patch SET DEFAULT 3`).
+  - `U-CFG-5`'s check (`every_copy_of_the_version_floor_agrees`) must read
+    the default from the latest migration that sets it, not from `0001`.
+  - Existing jobs keep their stored floor of 0.1.2.
 - Builds stay light: cap `cargo`/`make` parallelism, no cppcheck or
   clang-tidy on MAGPIE, and ask before any Docker image build.
 - No `cargo fmt`.
@@ -74,13 +86,13 @@ Each has a recommendation. Confirm or override before the phase that needs it.
 | D3 | Item 3: what does the card show by default when the two players are identical, and for a one-player job? | Two players: differences by default. If none differ, a line "The players' settings are identical" in place of an empty table, with the same **All settings** button. One player: unchanged (key settings, with an **All settings** toggle), because nothing can differ. |
 | D4 | Item 4: where do the totals come from? The card lists the top 50 contributors and "and N more". | A **Total** row at the foot of the table, summed over *all* contributors (the query's window sums, not the visible rows), so it is right when "and N more" is shown. It replaces the "N movegens for this job" line under the table. Movegens is a new column; on narrow screens it hides with Compute time. |
 | D5 | Item 5: does **Random** fill the box and look the rack up, or only fill the box? | Fill and look up, as clicking a sample chip does today. It asks for one rack (`rackSamples(id, 1)`). The "Analysed racks to try" chips and **Shuffle** stay. |
-| D6 | Item 6: what the two cards say. See the phase 4 section for the proposal. | The proposal in phase 4: the Progress card counts tasks as first-pass and re-analysis tasks, and the Opening racks card gets a coverage table of analyses per rack. |
+| D6 | Item 6: what the two cards say. Options were mocked up at https://claude.ai/artifact/KZL6a53wyeo5uC8iuPPbYA. | **Decided (owner, 2026-10-13):** Progress **C2** and Opening racks **B**. C2 is a layered bar (settled, analysed, not yet) with a small table giving Done and Time left for analysed and for settled. B is a sentence saying where the consensus stands, plus four figures. Neither needs a schema change. See phase 4. |
 | D7 | Item 8: do the URLs and API names change too (`/player-configs`, `/api/player-configs`, `player_config_ids`)? | No. Only user-facing text changes, including backend error messages. URLs and fields stay as they are: renaming them means churning routes, the contract and the e2e helpers for no gain a reader sees. The download filename `player-config-{id}.json` stays too. |
 | D8 | Item 7: the priority order when not everything fits. No benchmark of the three tables exists. Only qualitative claims do: WMP "dramatically faster", RIT "further still", WIT "costs little". | Measure first (phase 5, step 1), then fix the order from the numbers. The order expected: WMP (179 MB), then WIT (122 MB), then RIT (1.9 GB). An RIT is built from a WMP, so it is never kept without one. |
 | D9 | Item 7: how much space counts as available, and is anything evicted? | Available = free space on the data directory's filesystem (`statvfs`), minus a reserve, plus the bytes of tables this client built earlier that the task does not need. A new `contribute.txt` key `diskreserve` (in GB) sets the reserve, default 2 GB. When a table does not fit otherwise, evict tables the client built for other jobs, least recently used first, and only files listed in its own manifest. It never deletes a file it did not build. |
 | D11 | Item 10: where does a move's leave come from? Neither move list shows one, and no API sends one. A saved position has `rack`; a rack lookup has the rack looked up. | Computed on the page: `leaveOf(rack, move)` in `lib/cgp.ts`. It reuses `parseMove`. A placement's leave is the rack less the tiles it puts down (a lowercase letter uses a `?`). Played-through squares and `.` squares use nothing. An exchange's leave is the rack less the exchanged tiles, and a pass's is the whole rack. Letters are shown in the rack's order. An empty leave (a bingo) shows "—". A move that cannot be read, or tiles the rack does not hold, also shows "—", rather than a wrong leave. No server or contract change. |
 | D12 | Item 11: the **PLAYED** tag is also the row's only non-colour cue. | Drop the visible tag and keep the row's tint. Keep the `(played)` text for screen readers only (`sr-only`), and keep `data-played` for tests. The line above the board ("· played 8G HUH (24)") stays. |
-| D10 | Item 7: does the server learn which tables a task skipped? | Yes, in the result: a `derived_skipped` list of roles, stored on the claim and shown on the admin's task view. Nothing depends on it for correctness, since results are identical with or without the tables. But a slow worker's timeouts count against the job and can set it aside, and an admin needs to see why. |
+| D10 | Item 7: does the server learn which tables a task skipped? | Yes, in the result: a `derived_skipped` list of roles, stored on the claim (a nullable column, migration `0002`) and shown on the admin's task view. Nothing depends on it for correctness, since results are identical with or without the tables. But a slow worker's timeouts count against the job and can set it aside, and an admin needs to see why. |
 
 ## Phase 1 — six page fixes (items 9, 2, 3, 5, 10, 11)
 
@@ -217,72 +229,126 @@ What a reader cannot see from either:
 - The tasks have two kinds. First-pass tasks cover the rack space once, in
   slices of `racks_per_batch`. Re-analysis tasks list unsettled racks again,
   for consensus.
-- How much redundancy the job is actually paying for: how many analyses
-  racks have had, and how many racks agreed.
+- That the job is moving during the first pass. With consensus, no rack
+  can settle before its `min_results_per_rack`-th analysis, so the bar
+  (racks settled) sits at 0.0% for the whole first pass.
+- Where the consensus stands: which analysis open racks are getting now,
+  how many are waiting for agreement, and how many agreed.
 - "Waiting to be reissued" means a task that was given back or timed out.
   That is a different thing from a consensus re-analysis, and the two words
   collide.
 
-**Proposal.**
+**What changes (D6: C2 and B).** Both cards change only on opening-rack
+jobs, except the "to be handed out again" wording, which applies to every
+job type. No schema change, and no database reset.
 
-*Progress card*, for opening-rack jobs only:
-- "Done" stays racks settled of the total.
-- The tasks line becomes two lines:
-  - **First pass:** "1,240 of 6,433 tasks done (500 racks each)". The total
-    is `ceil(total_racks / racks_per_batch)`, which the job knows up front.
-  - **Re-analysis:** "312 tasks done, listing racks again until they agree".
-    This line appears only when `max_results_per_rack > 1`.
-  - Then "4 in progress · 2 to be handed out again". The latter replaces
-    "waiting to be reissued" on every job type.
-- Throughput counts analyses, not distinct racks (it is tasks ×
-  `racks_per_batch`), so label it "analyses/h" on these jobs.
+*Progress card (C2).*
+- **Headline:** with consensus, "35.8% settled · 100.0% analysed". A job
+  analysing each rack once keeps a single percentage.
+- **Layered bar:**
+  - settled racks are solid (`bg-primary`);
+  - analysed but not settled racks are faint (`bg-primary/35`);
+  - the rest is the track.
+  - `aria-valuenow` stays the settled share, and `aria-valuetext` reads
+    "35.8% settled, 100% analysed".
+- **A small table** with columns Done and Time left. It replaces the Done
+  and Time left figures.
 
-*Opening racks card*:
-- **One analysis per rack** (`max_results_per_rack = 1`): "Each rack is
-  analysed once; no rack is checked by a second contributor." Then racks
-  analysed of the total, as today.
-- **With consensus**, a **Coverage** table replaces the three figures:
+  |  | Done | Time left |
+  |---|---|---|
+  | ▨ Analysed | 3,199,724 (of 3,199,724 · 100.0%) | — (every rack analysed) |
+  | ■ Settled | 1,144,000 (of 3,199,724 · 35.8%) | 22.3h (about Oct 14, 2026, 1:20 PM) |
 
-  | Analyses | Racks | Agreed | Settled without consensus | Still open |
-  |---|---|---|---|---|
-  | 0 | 120,000 | — | — | 120,000 |
-  | 1 | … | … | — | … |
-  | … | | | | |
-  | 7 (max) | … | … | … | — |
-  | **All** | 3,199,724 | … | … | … |
+  - A job analysing each rack once has one row, **Analysed and settled**.
+  - **Analysed time left is computed on the page.** Re-analysis starts only
+    once the first pass covers the rack space, so until then every analysis
+    goes to a new rack. The figure is racks not analysed divided by the
+    current throughput. Once every rack is analysed it shows "—", with
+    "every rack analysed".
+  - **Settled time left** is today's server estimate (`eta_seconds`, via
+    `timeLeftFigure`). A finished job shows "finished <date>".
+  - Both rows use the existing idle wording ("paused while inactive", "no
+    estimate yet").
+- **Throughput and Allocation** stay as figures under the table.
+  - Throughput is labelled **analyses/hour**: it counts tasks ×
+    `racks_per_batch`, which is analyses, not distinct racks.
+  - Change the opening-rack throughput unit in `jobstats.rs` to
+    `analysis`, and make sure `throughputParts` gives the plural
+    "analyses".
+- **The tasks line:** "Tasks: 4,120 of 6,400 first pass · 9,000
+  re-analysis · 40 in progress · 3 to be handed out again".
+  - The first-pass total is `ceil(total_racks / racks_per_batch)`.
+  - The re-analysis count appears only when `max_results_per_rack > 1`.
+  - "To be handed out again" replaces "waiting to be reissued" on every job
+    type.
 
-  Under it, one line: "N analyses so far, X per settled rack on average; P%
-  of settled racks agreed." The existing rule sentence stays above the table.
+*Opening racks card (B).*
+- **One analysis per rack:** "Each rack is analysed once, by one
+  contributor. No second analysis checks it." Then racks analysed of the
+  total, as today.
+- **With consensus:** first a bordered sentence saying where the consensus
+  stands.
+  - **First pass:** "First pass. 64.4% of racks have their first analysis.
+    None can settle before its 3rd. Re-analysis starts when every rack has
+    one." When `min_results_per_rack` is 1, a rack can settle at its first
+    analysis, so the middle sentence goes.
+  - **Re-analysis:** "Re-analysis. Every open rack has at least 2 analyses,
+    and racks with the fewest are analysed first." This is phrased loosely
+    on purpose. The reissue picks fewest first, but it also skips racks in
+    flight and prefers racks the claimant has not analysed, within a window
+    of 4 batches.
+  - **Finished:** "Finished. Every rack is settled: 3,174,757 agreed, 24,967
+    without consensus after 7 analyses."
+- Then four figures:
+  - **Waiting for agreement:** analysed − settled.
+  - **Agreed:** settled − without consensus, with "x% of settled racks".
+  - **Without consensus:** "split after 7 analyses".
+  - **Racks analysed:** of the total.
+- The rule sentence stays under them. The rack lookup is unchanged.
 
-**Backend.** A rack space is up to about 3.2 million racks, so grouping
-`opening_rack_progress` on every stats payload is too slow. Keep counters
-instead:
-- New table `opening_rack_coverage (job_id, results, agreed, settled, racks)`,
-  primary key `(job_id, results, agreed, settled)`, in `0001_initial.sql`.
-- `record_consensus` (`jobs/opening_rack.rs:481-559`) moves a rack from its
-  old bucket to its new one in the same transaction.
-- `restate_racks` (572-610) rebuilds the job's buckets when an admin changes
-  the consensus settings.
-- Racks with no analysis are `total_racks − sum(racks)`, not stored.
-- Count reissue tasks by `seed >= total_racks` alongside the existing task
-  counts in `jobstats.rs`.
-- The payload's `opening_racks` gains:
-  - `first_pass_tasks { done, total }`
-  - `reissue_tasks_done`
-  - `analyses`
-  - `coverage: [{ results, racks, agreed, without_consensus, open }]`
-- Tests: buckets match a `GROUP BY` over `opening_rack_progress` after a run
-  of results, after a consensus change, and after a job reset.
+**Backend.** No schema change. Both reads go into the cached stats payload
+(`jobstats.rs`).
+- Split the completed-task counts by kind:
+  - a first-pass task's seed is below `total_racks`, a re-analysis task's
+    is at or above it;
+  - one `FILTER` on the existing count, joined to the job's opening-rack
+    config.
+- `fewest_open_analyses`:
+  - `SELECT MIN(results) FROM opening_rack_progress WHERE job_id = $1 AND NOT settled`;
+  - one probe of the existing partial index `opening_rack_progress_unsettled_idx`;
+  - read only once every rack is analysed and `max_results_per_rack > 1`,
+    otherwise null.
+- The payload's `opening_racks` gains `first_pass_tasks_done`,
+  `first_pass_tasks_total`, `reissue_tasks_done` and
+  `fewest_open_analyses`. The fields it already has (`racks_analyzed`,
+  `racks_settled`, `racks_without_consensus`, `racks_total`) cover the
+  rest.
+- Tests:
+  - the split adds up to `tasks_completed`;
+  - `fewest_open_analyses` matches a direct query after a run of results,
+    after a consensus change (`restate_racks`), and is null once every rack
+    is settled.
 
-**Frontend.** `JobProgressCard`'s opening-rack branch in
-`lib/jobProgress.ts`, the Opening racks card in `routes/jobs/[id]/+page.svelte`
-(a small `RackCoverage.svelte`), and `lib/consensus.ts` for the wording. Unit
-tests for the figures with and without consensus.
+**Frontend.**
+- `lib/jobProgress.ts` gains `rackFronts(stats, now)`, giving the table's
+  rows, and the layered fractions.
+- `JobProgressCard.svelte` gets an opening-rack branch: the headline, the
+  bar, the table, Throughput and Allocation.
+- The Opening racks card in `routes/jobs/[id]/+page.svelte` takes the stage
+  sentence and the figures. The sentence comes from a `consensusStage(stats,
+  config)` in `lib/consensus.ts`.
+- Unit tests cover: first pass, re-analysis, nearly done, finished, one
+  analysis per rack, inactive, and `min_results_per_rack = 1`.
+- Update the e2e checks that read the Progress card's figures or "waiting to
+  be reissued" (E-1, E-4, the opening-rack journeys).
 
-**Verify:** backend nextest (`-j 2`), vitest, svelte-check, tier 5 (the
-opening-rack journeys), and tier 6 with an opening-rack job at
-`min 2 / max 3`, whose coverage table must end with every rack settled.
-**Reset the database on deploy.**
+**Verify:**
+- backend nextest (`-j 2`);
+- vitest and svelte-check;
+- tier 5 (E-1, E-4, the opening-rack journeys);
+- tier 6 with an opening-rack job at `min 2 / max 3`. The stage sentence
+  must move from the first pass to re-analysis to finished, and end with 0
+  waiting for agreement.
 
 ## Phase 5 — tables as storage allows (item 7, D8–D10)
 
@@ -329,14 +395,26 @@ What exists today:
      full disk and declines gracefully.
 4. **The result says what was skipped (D10).**
    - `derived_skipped` joins the result body.
-   - birdtest stores it on the claim, in a new `task_claims.derived_skipped
-     TEXT[]` column. That is a migration, so the database is reset. Shown on
-     the admin's task and worker views.
+   - The server accepts the field missing (a result from a 0.1.2 build) and
+     stores null.
+   - birdtest stores it on the claim. Migration
+     `0002_claim_derived_skipped.sql` does
+     `ALTER TABLE task_claims ADD COLUMN derived_skipped TEXT[]`. The column
+     is nullable and additive, so the previous image runs on it unchanged.
+   - Shown on the admin's task and worker views.
 5. **The contract.** `MAGPIE_VERSION` / `MIN_MAGPIE_VERSION` go to 0.1.3.
-   Fixtures: the hand-written `assignment-*.json` gain `bytes` on derived
+   - The same migration sets the `jobs` floor defaults to 0.1.3
+     (`ALTER COLUMN ... SET DEFAULT`), and `U-CFG-5` reads them from it.
+   - Existing jobs keep their floor of 0.1.2, so 0.1.2 builds still claim
+     them. Check that a 0.1.2 build accepts the new `bytes` key in
+     `expected_data.derived`. If it refuses unknown keys there, send `bytes`
+     only to claims reporting 0.1.3 or later (the claim body carries
+     `magpie_version`).
+   - Fixtures: the hand-written `assignment-*.json` gain `bytes` on derived
    entries. Recapture the captured ones with `scripts/e2e_magpie_native.sh
    --cases capture --capture-out contract-fixtures` and copy them to MAGPIE's
-   `test/birdtest_contract/`. Pin birdtest to the merged MAGPIE commit.
+   `test/birdtest_contract/`.
+   - Pin birdtest to the merged MAGPIE commit.
 6. **Docs.**
    - README.md's contributor-cost section: the policy and `diskreserve`. Also
      correct the stale "WIT off by default" and the inaccurate "a full disk
@@ -349,6 +427,9 @@ What exists today:
   `BUILD=test_no_pgo_release`, plus a compile check on `BUILD=dev`, with
   `-j3` and `taskset -c 0-3`.
 - birdtest: backend nextest and the contract-fixture test.
+- The migration: it applies to a database at `0001` that already holds jobs
+  and claims, and the previous image (`main` before this phase) still starts
+  and serves against the migrated schema, which is the rollback case.
 - Tier 6, plus a case run with a small filesystem (a loop mount or tmpfs as
   the data directory) where the RIT cannot fit. The job must complete and the
   admin view must show the RIT skipped.
@@ -360,8 +441,8 @@ What exists today:
 | 1 | vitest, svelte-check | — | E-1, E-4, E-7, E-14, saved positions | — | — |
 | 2 | vitest, svelte-check | nextest | full | — | — |
 | 3 | vitest, svelte-check | nextest | E-1, E-4 | — | — |
-| 4 | vitest, svelte-check | nextest | opening-rack journeys | — | an opening-rack consensus job |
-| 5 | — | nextest, contract | full | new and contribute | full, plus a small-disk case |
+| 4 | vitest, svelte-check | nextest | E-1, E-4, opening-rack journeys | — | an opening-rack consensus job |
+| 5 | — | nextest, contract, migration and rollback | full | new and contribute | full, plus a small-disk case |
 
 ## Not in this plan
 
