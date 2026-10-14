@@ -66,7 +66,7 @@ test.afterAll(async () => {
 /** A config's row in the pool's table (not in the cross table below it). */
 function configRow(page: Page, name: string) {
   return page
-    .locator('.card', { has: page.getByRole('heading', { name: 'All configs' }) })
+    .locator('.card', { has: page.getByRole('heading', { name: 'All players' }) })
     .locator('tbody tr')
     .filter({ has: page.locator('td:first-child', { hasText: name }) });
 }
@@ -88,7 +88,7 @@ async function rating(page: Page, name: string): Promise<string> {
 }
 
 async function addMember(page: Page, name: string) {
-  await page.getByLabel('Add a player config').selectOption({ label: name });
+  await page.getByLabel('Add a player').selectOption({ label: name });
   await page.getByRole('button', { name: 'Add', exact: true }).click();
   await expect(configRow(page, name)).toHaveCount(1);
 }
@@ -100,7 +100,7 @@ test('E-7: an admin builds a rating pool and watches membership move the ratings
   await page.getByLabel('Variant').selectOption('classic');
   await page.getByLabel('Letter distribution').selectOption(letterdistId);
   await page.getByLabel('Board layout').selectOption(layoutId);
-  await page.getByLabel('Anchor player config').selectOption({ label: ANCHOR });
+  await page.getByLabel('Anchor player').selectOption({ label: ANCHOR });
   await page.getByLabel('Anchor rating').fill('1500');
   await page.getByRole('button', { name: 'Create rating pool' }).click();
   // Created with only its anchor: the rest are added on the pool's page, below.
@@ -162,7 +162,7 @@ test('E-7: an admin builds a rating pool and watches membership move the ratings
   await visitor.goto(page.url());
   await expect(visitor.getByTestId('cross-table').locator('tbody tr')).toHaveCount(3);
   await expect(visitor.locator('.card > h2')).toHaveText(['Cross table', 'Ratings']);
-  await expect(visitor.getByRole('heading', { name: 'All configs' })).toHaveCount(0);
+  await expect(visitor.getByRole('heading', { name: 'All players' })).toHaveCount(0);
   await expect(visitor.getByText('WESPA players')).toBeVisible();
   // Each config's name, in the cross table and the plot, links to its page.
   await expect(visitor.getByTestId('cross-table').locator('tbody th a')).toHaveCount(3);
@@ -183,7 +183,7 @@ test('E-7: an admin builds a rating pool and watches membership move the ratings
   // Move the anchor to the other member, pinned at 1600: the pool refits on
   // the new scale, and the old anchor sits as far from it as before, the other
   // way (to the table's rounding).
-  await page.getByLabel('Anchor player config').selectOption({ label: RATED });
+  await page.getByLabel('Anchor player').selectOption({ label: RATED });
   await page.getByLabel('Anchor rating').fill('1600');
   await page.getByRole('button', { name: 'Save', exact: true }).click();
   await expect(fitLine(page)).toContainText('(anchor)');

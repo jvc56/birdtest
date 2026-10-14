@@ -24,7 +24,7 @@
   <div class="space-y-2">
     <div class="flex flex-wrap items-center justify-between gap-2">
       <h1 class="text-2xl font-semibold">Players</h1>
-      {#if isAdmin}<a class="btn-primary no-underline hover:no-underline" href="/admin/player-configs/new">New player config</a>{/if}
+      {#if isAdmin}<a class="btn-primary no-underline hover:no-underline" href="/admin/player-configs/new">New player</a>{/if}
     </div>
     <p class="max-w-3xl text-sm text-muted-foreground">
       A player is a collection of settings that determine which moves are played and recorded for
@@ -33,11 +33,11 @@
   </div>
 
   {#if error}
-    <p class="text-sm text-destructive">Could not load the player configs: {error}</p>
+    <p class="text-sm text-destructive">Could not load the players: {error}</p>
   {:else if !loaded}
     <p class="text-sm text-muted-foreground">Loading…</p>
   {:else if !configs.length}
-    <p class="text-sm text-muted-foreground">No player configs yet.</p>
+    <p class="text-sm text-muted-foreground">No players yet.</p>
   {:else}
     <div class="card overflow-x-auto p-0">
       <table class="table">

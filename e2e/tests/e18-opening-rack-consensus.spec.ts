@@ -71,7 +71,7 @@ test("E-18: an opening-rack job made on the form has the Racks Per Task it was g
   const layout = page.getByLabel('Board', { exact: true });
   const board = layout.locator('option', { hasText: `standard15 (${SEEDED_DATA},` });
   await layout.selectOption((await board.getAttribute('value'))!);
-  await page.getByLabel('Player Config').selectOption(configId);
+  await page.getByLabel('Player', { exact: true }).selectOption(configId);
   // The server's default until changed.
   const racks = page.getByLabel('Racks Per Task');
   await expect(racks).toHaveValue('500');

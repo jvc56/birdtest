@@ -43,7 +43,7 @@
         {playerSummary(config)} · created {new Date(config.created_at).toLocaleString()}
         {#if config.cloned_from_id}
           · cloned from
-          {#if clonedFrom}<a href="/player-configs/{clonedFrom.id}">{clonedFrom.name}</a>{:else}a deleted config{/if}
+          {#if clonedFrom}<a href="/player-configs/{clonedFrom.id}">{clonedFrom.name}</a>{:else}a deleted player{/if}
           onto newer data; ratings restart on new data
         {/if}
       </p>

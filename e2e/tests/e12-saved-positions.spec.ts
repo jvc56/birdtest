@@ -37,7 +37,7 @@ test.beforeAll(async ({ browser, playwright }) => {
   // Two players ticked: one job between them.
   await form.getByLabel(a, { exact: true }).check();
   await form.getByLabel(b, { exact: true }).check();
-  await expect(form.getByTestId('matchups')).toContainText('2 configs → 1 job');
+  await expect(form.getByTestId('matchups')).toContainText('2 players → 1 job');
   await form.getByLabel('Games Per Task').fill('2');
   // No match test, the form's default: the job plays its four games and stops.
   await expect(form.getByLabel('Significance Test')).not.toBeChecked();

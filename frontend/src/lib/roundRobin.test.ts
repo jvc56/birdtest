@@ -34,12 +34,12 @@ describe('F-RR-1 matchups', () => {
 
 describe('F-RR-2 matchupSummary', () => {
   it('counts the jobs, and says why none or too many cannot be sent', () => {
-    expect(matchupSummary(1)).toBe('1 config → 1 self-play job');
-    expect(matchupSummary(2)).toBe('2 configs → 1 job');
-    expect(matchupSummary(4)).toBe('4 configs → 6 jobs');
-    expect(matchupSummary(12)).toBe('12 configs → 66 jobs');
-    expect(matchupSummary(0)).toBe('Tick at least one player config.');
-    expect(matchupSummary(13)).toBe('At most 12 player configs: 13 are ticked.');
+    expect(matchupSummary(1)).toBe('1 player → 1 self-play job');
+    expect(matchupSummary(2)).toBe('2 players → 1 job');
+    expect(matchupSummary(4)).toBe('4 players → 6 jobs');
+    expect(matchupSummary(12)).toBe('12 players → 66 jobs');
+    expect(matchupSummary(0)).toBe('Tick at least one player.');
+    expect(matchupSummary(13)).toBe('At most 12 players: 13 are ticked.');
     expect([0, 1, 12, 13].map(matchupsAllowed)).toEqual([false, true, true, false]);
     expect(MAX_ROUND_ROBIN_CONFIGS).toBe(12);
   });

@@ -32,7 +32,7 @@ async function pairsCompleted(page: Page): Promise<number> {
 }
 
 /**
- * E-4: an admin creates two player configs and a game-pairs job between them
+ * E-4: an admin creates two players and a game-pairs job between them
  * -- previewing a round robin of three on the way, the job's players being a
  * checklist -- lands on the Allocation page with the new job marked, activates
  * it there by giving it an allocation, and watches its
@@ -40,7 +40,7 @@ async function pairsCompleted(page: Page): Promise<number> {
  * where the built app, the stream, the scheduler and a worker are all in play
  * at once.
  */
-test('E-4: an admin creates configs and a job, activates it, and watches it fill live', async ({ page }) => {
+test('E-4: an admin creates players and a job, activates it, and watches it fill live', async ({ page }) => {
   const suffix = crypto.randomUUID().slice(0, 8);
   const p1 = `e2e-equity-${suffix}`;
   const p2 = `e2e-score-${suffix}`;
@@ -64,15 +64,15 @@ test('E-4: an admin creates configs and a job, activates it, and watches it fill
   // ticked are a round robin of three jobs, two are one job between them.
   const matchups = page.getByTestId('matchups');
   await page.getByLabel(p1, { exact: true }).check();
-  await expect(matchups).toContainText('1 config → 1 self-play job');
+  await expect(matchups).toContainText('1 player → 1 self-play job');
   await page.getByLabel(p2, { exact: true }).check();
   await page.getByLabel('static-score', { exact: true }).check();
-  await expect(matchups).toContainText('3 configs → 3 jobs');
+  await expect(matchups).toContainText('3 players → 3 jobs');
   await expect(matchups.getByRole('listitem')).toHaveCount(3);
   await expect(page.getByRole('button', { name: 'Create 3 jobs' })).toBeVisible();
   await page.getByLabel('static-score', { exact: true }).uncheck();
-  await expect(matchups).toContainText('2 configs → 1 job');
-  // Named for its pairing, player 1 the config ticked first.
+  await expect(matchups).toContainText('2 players → 1 job');
+  // Named for its pairing, player 1 the one ticked first.
   await expect(matchups.getByRole('listitem')).toHaveText([`${jobName}: ${p1} vs ${p2}`]);
   // One pair per task, so results arrive steadily rather than in lumps.
   await page.getByLabel('Pairs Per Task').fill('1');

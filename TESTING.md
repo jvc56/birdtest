@@ -1023,7 +1023,7 @@ Each entry's tests are the `describe` block named for its id.
   A vs A", every pairing once for more -- seated in the order given (3 → 3,
   4 → 6) -- and names each "{title}: A vs B", or "A vs B" with no title, as
   the server does (`I-JOB-15`). *(Covered: `roundRobin.test.ts`.)*
-- `F-RR-2` `matchupSummary` reads "4 configs → 6 jobs", "1 config → 1
+- `F-RR-2` `matchupSummary` reads "4 players → 6 jobs", "1 player → 1
   self-play job", and why none or more than twelve cannot be sent;
   `matchupsAllowed` is one to twelve. *(Covered: `roundRobin.test.ts`.)*
 
@@ -3990,9 +3990,9 @@ admin in once and the admin journeys reuse its storage state.
   `e2-register-and-api-key.spec.ts`, reading its code from the outbox.)*
 - `E-3` An admin imports input data, reviews the staged diff, and confirms it.
   *(Covered: `e3-input-data-import.spec.ts`, against the fixture tarballs.)*
-- `E-4` An admin creates two player configs and a game-pairs job between them
+- `E-4` An admin creates two players and a game-pairs job between them
   with **Significance Test** ticked -- its players a checklist whose preview
-  says "3 configs → 3 jobs" with a third ticked and "2 configs → 1 job", the
+  says "3 players → 3 jobs" with a third ticked and "2 players → 1 job", the
   job named for its pairing -- lands on `/admin/allocation` with the new job
   marked and first, activates it there by giving it an allocation (and
   deactivates it there at the end), and watches the dashboard
@@ -4090,7 +4090,7 @@ admin in once and the admin journeys reuse its storage state.
   `e13-opening-rack-samples.spec.ts`.)* (Thirty-third audit, pass 1: `E-12`
   and `E-13` ran static players and asserted simulation columns, which only
   the fake worker's simulating every position whatever its config let pass.)
-- `E-14` A signed-out visitor reaches the player configs from the nav, opens
+- `E-14` A signed-out visitor reaches the players from the nav, opens
   one, reads how it searches beside its name and its key settings in a table
   (Lexicon first), grows the table to every setting with **All settings**,
   Lexicon still first, and shrinks it back. *(Covered:

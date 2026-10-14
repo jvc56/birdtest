@@ -506,8 +506,8 @@ pub(crate) fn unknown_config(err: AppError, constraint: &str, field: &str, id: U
     if err.db_code.as_deref() == Some(crate::error::FOREIGN_KEY_VIOLATION)
         && err.db_constraint.as_deref() == Some(constraint)
     {
-        AppError::bad_request("that player config does not exist")
-            .with_field(field, format!("no player config {id}"))
+        AppError::bad_request("that player does not exist")
+            .with_field(field, format!("no player {id}"))
     } else {
         err
     }
@@ -634,7 +634,7 @@ async fn remove_member(
         .await?
         .rows_affected();
     if removed == 0 {
-        return Err(AppError::not_found("that player config is not in this pool"));
+        return Err(AppError::not_found("that player is not in this pool"));
     }
     audit::log(
         &mut tx,
