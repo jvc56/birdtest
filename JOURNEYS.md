@@ -182,9 +182,11 @@ Open "dev game pairs (first divergences saved)".
   bar full and green, "Done", and under it "Stopped at N of up to M pairs:
   the significance test decided at K."
 - [ ] **Expect** a Contributors table: `dev-contributor-1`,
-  `dev-contributor-2` and "Anonymous · <16 characters>" rows, with compute time
-  (on a wide screen) and tasks completed, and under it "N movegens for this
-  job".
+  `dev-contributor-2` and "Anonymous · <16 characters>" rows, with movegens
+  and compute time (on a wide screen) and tasks completed, and a bold
+  **Total** row at the foot: the job's movegens, compute time and tasks, the
+  column sums while every contributor is listed (past fifty, "and N more,
+  counted in the total" under it).
 - [ ] **Expect** last a **Job settings** card showing every row, with no **All
   settings** button, each label in Title Case: Type "Game Pairs", Variant,
   Letter Distribution, Board, Bingo Bonus 50, Maximum Pairs 100,000,

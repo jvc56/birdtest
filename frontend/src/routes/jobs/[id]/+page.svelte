@@ -4,7 +4,7 @@
   import { api, type JobStats, type RackLookupRow } from '$lib/api';
   import { subscribeToJob } from '$lib/sse';
   import { session } from '$lib/auth';
-  import { datetime, exactCount } from '$lib/format';
+  import { datetime } from '$lib/format';
   import JobHeader from '$lib/components/JobHeader.svelte';
   import JobStatusCard from '$lib/components/JobStatusCard.svelte';
   import JobProgressCard from '$lib/components/JobProgressCard.svelte';
@@ -360,16 +360,14 @@
 
     <div class="card">
       <h2 class="mb-3 text-lg font-medium">Contributors</h2>
-      <WorkerTable workers={stats.workers} />
+      <!-- The totals are the job's own, every contributor's: right when the
+           list stops short of them all. -->
+      <WorkerTable workers={stats.workers} totals={stats} />
       {#if stats.other_workers > 0}
         <p class="mt-2 text-sm text-muted-foreground">
-          and {stats.other_workers.toLocaleString()} more
+          and {stats.other_workers.toLocaleString()} more, counted in the total
         </p>
       {/if}
-      <p class="mt-2 text-sm text-muted-foreground" data-testid="job-movegens">
-        <span class="break-all tabular-nums text-foreground">{exactCount(stats.movegens)}</span> movegens
-        for this job
-      </p>
     </div>
 
     <!-- The settings last: what the job is doing comes before how it was

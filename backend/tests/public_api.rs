@@ -372,6 +372,36 @@ async fn the_job_list_paginates_and_clamps_its_page_size() {
     assert_eq!(body["items"][0]["id"].as_str(), Some(jobs[0].as_str()));
 }
 
+/// A-PUBLIC-1g: the job list puts active jobs first, then inactive, then
+/// completed, newest first within each -- whatever order they were made in.
+#[tokio::test]
+async fn the_job_list_lists_active_jobs_first() {
+    let db = TestDb::new().await;
+    let app = birdtest::app(db.state().await);
+    let admin = db.user("root", true).await;
+    let mut made = Vec::new();
+    for (day, status) in [(1, "active"), (2, "completed"), (3, "inactive"), (4, "active"), (5, "completed")] {
+        let job = db.bare_job("games", admin).await;
+        sqlx::query(
+            "UPDATE jobs SET created_at = $2::timestamptz, status = $3::job_status,
+                             allocation = CASE WHEN $3 = 'active' THEN allocation ELSE 0 END
+             WHERE id = $1",
+        )
+        .bind(job)
+        .bind(format!("2026-01-0{day}T00:00:00Z"))
+        .bind(status)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        made.push(job.to_string());
+    }
+    let (status, body) = send(&app, get_request("/api/jobs", &[])).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let listed: Vec<&str> = body["items"].as_array().unwrap().iter().map(|j| j["id"].as_str().unwrap()).collect();
+    let want = [&made[3], &made[0], &made[2], &made[4], &made[1]].map(|s| s.as_str());
+    assert_eq!(listed, want, "active, inactive, completed, each newest first");
+}
+
 /// A-PUBLIC-2: each job type's detail carries its own stats block and no
 /// other -- games and pairs the match-test block in their own unit, an opening-rack
 /// job its rack progress, a leave job its generation -- and an unknown job is
@@ -2108,6 +2138,20 @@ async fn contributions_are_broken_down_by_job_type() {
         let (_, detail) = get(format!("/api/jobs/{job}")).await;
         let want: i64 = done.iter().filter(|d| d.1 == job).map(|d| d.2).sum();
         assert_eq!(detail["movegens"], want, "the job's own movegens on its page");
+        // The Contributors card: each contributor's movegens on the job, and
+        // its totals row (the job's movegens, compute and tasks) the listed
+        // rows' sums when every contributor is listed.
+        let workers = detail["workers"].as_array().unwrap();
+        assert_eq!(detail["other_workers"], 0, "{detail}");
+        for who in ["user", "a"] {
+            let mine: i64 = done.iter().filter(|d| d.0 == who && d.1 == job).map(|d| d.2).sum();
+            let listed = workers.iter().find(|w| (w["user_id"] == json!(user)) == (who == "user"));
+            assert_eq!(listed.map_or(0, |w| w["movegens"].as_i64().unwrap()), mine, "{who}: {detail}");
+        }
+        let sum = |key: &str| workers.iter().map(|w| w[key].as_f64().unwrap()).sum::<f64>();
+        assert_eq!(sum("movegens") as i64, want, "{detail}");
+        assert_eq!(sum("tasks_completed") as i64, detail["tasks_completed"].as_i64().unwrap(), "{detail}");
+        assert!((sum("compute_seconds") - detail["compute_seconds"].as_f64().unwrap()).abs() < 1e-6, "{detail}");
     }
     let (status, site) = get("/api/workers/movegens".to_string()).await;
     assert_eq!(status, StatusCode::OK, "{site}");

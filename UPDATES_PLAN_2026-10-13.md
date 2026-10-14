@@ -85,7 +85,7 @@ Each has a recommendation. Confirm or override before the phase that needs it.
 | D1 | Item 1: after the active jobs, how are the rest ordered? Statuses are `active`, `inactive` (0% allocation) and `completed`. | Active, then inactive, then completed, each newest first. The `status` filter and pagination keep working because the order is in SQL, not the page. |
 | D2 | Item 2: whose score does the middle tile show before anyone leads (no games, or exactly 50%)? | Player 1's, as today. Otherwise the leader's: "{leader}'s score", `1 − mean` with the interval flipped for player 2, in the leader's colour. The bar below keeps its current orientation (player 1 on the left), so it does not jump around when the lead changes. |
 | D3 | Item 3: what does the card show by default when the two players are identical, and for a one-player job? | Two players: differences by default. If none differ, a line "The players' settings are identical" in place of an empty table, with the same **All settings** button. One player: unchanged (key settings, with an **All settings** toggle), because nothing can differ. |
-| D4 | Item 4: where do the totals come from? The card lists the top 50 contributors and "and N more". | A **Total** row at the foot of the table, summed over *all* contributors (the query's window sums, not the visible rows), so it is right when "and N more" is shown. It replaces the "N movegens for this job" line under the table. Movegens is a new column; on narrow screens it hides with Compute time. |
+| D4 | Item 4: where do the totals come from? The card lists the top 50 contributors and "and N more". | A **Total** row at the foot of the table, over *all* contributors, so it is right when "and N more" is shown. As built: the job's own counters (`jobs.movegens`, `jobs.compute_ms`, the completed tasks), which every submission adds to alongside its contributor's figures, so no window sums are needed. It replaces the "N movegens for this job" line under the table. Movegens is a new column; on narrow screens it hides with Compute time. |
 | D5 | Item 5: does **Random** fill the box and look the rack up, or only fill the box? | Fill and look up, as clicking a sample chip does today. It asks for one rack (`rackSamples(id, 1)`). The "Analysed racks to try" chips and **Shuffle** stay. |
 | D6 | Item 6: what the two cards say. Options were mocked up at https://claude.ai/artifact/KZL6a53wyeo5uC8iuPPbYA. | **Decided (owner, 2026-10-13):** Progress **C2** and Opening racks **B**. C2 is a layered bar (settled, analysed, not yet) with a small table giving Done and Time left for analysed and for settled. B is a sentence saying where the consensus stands, plus four figures. Neither needs a schema change. See phase 4. |
 | D7 | Item 8: do the URLs and API names change too (`/player-configs`, `/api/player-configs`, `player_config_ids`)? | No. Only user-facing text changes, including backend error messages. URLs and fields stay as they are: renaming them means churning routes, the contract and the e2e helpers for no gain a reader sees. The download filename `player-config-{id}.json` stays too. |
@@ -198,13 +198,13 @@ own query. Test: three jobs created completed, active, inactive come back
 active, inactive, completed.
 
 **Item 4 (D4).**
-- **Backend:** in `jobstats.rs`, `worker_contributions_on` (942-1001) adds
-  `SUM(c.movegens)` to each row. It also adds the window totals
-  `SUM(SUM(c.movegens)) OVER ()`, the same for compute and tasks, beside the
-  existing `COUNT(*) OVER ()`. `WorkerContribution` gains `movegens`. The
-  payload gains a `worker_totals { movegens, compute_seconds, tasks_completed }`.
-  Totals come from the same completed claims as the rows, so the column adds
-  up when every contributor is shown.
+- **Backend:** in `jobstats.rs`, `worker_contributions_on` adds
+  `SUM(c.movegens)` to each row, and `WorkerContribution` gains `movegens`.
+  The totals are the job's own counters: `movegens` and `tasks_completed`
+  were already in the payload, and it gains `compute_seconds` from
+  `jobs.compute_ms`. Each submission adds to those counters and to its
+  contributor's figures together, so the column adds up when every
+  contributor is shown. (As built; the first draft summed window totals.)
 - **Test:** the totals equal the rows' sums for a job under 50 contributors,
   and exceed the visible rows' when there are more. Compare the movegens
   total with `jobs.movegens` and note any reason they could differ (a

@@ -32,6 +32,13 @@ pub struct JobStats {
     /// The move generations the job's accepted claims reported: the work done
     /// for it, whatever the machines (`jobs.movegens`).
     pub movegens: i64,
+    /// The compute time the job's accepted claims were credited with, claim
+    /// to submission (`jobs.compute_ms`): with `movegens` and
+    /// `tasks_completed`, the Contributors card's totals row. Every
+    /// contributor's, the ones past [`MAX_WORKER_CONTRIBUTIONS`] included, and
+    /// added by the same submission that adds the claim to its contributor,
+    /// so the listed rows add up to it when every contributor is listed.
+    pub compute_seconds: f64,
     /// How fast the job is going: the rate [`Self::eta_seconds`] extrapolates,
     /// in the job's own unit. `None` exactly when there is no recent work to
     /// measure -- the job is not active, or nothing finished in the window.
@@ -234,6 +241,8 @@ pub struct WorkerContribution {
     /// Those claims held from claim to submission, as the contributor list
     /// counts compute (`routes::worker::CLAIM_COMPUTE_MS`).
     pub compute_seconds: f64,
+    /// The move generations those claims reported (`task_claims.movegens`).
+    pub movegens: i64,
 }
 
 pub async fn load_job(pool: &PgPool, job_id: Uuid) -> AppResult<Job> {
@@ -484,7 +493,8 @@ async fn compute_inner(conn: &mut PgConnection, job: &Job) -> AppResult<JobStats
              COUNT(*)                                            AS total,
              COUNT(*) FILTER (WHERE state = 'completed')         AS completed,
              COUNT(*) FILTER (WHERE state = 'available')         AS available,
-             COUNT(*) FILTER (WHERE state = 'claimed')           AS claimed
+             COUNT(*) FILTER (WHERE state = 'claimed')           AS claimed,
+             (SELECT compute_ms FROM jobs WHERE id = $1)         AS compute_ms
          FROM tasks WHERE job_id = $1",
     )
     .bind(job.id)
@@ -560,6 +570,7 @@ async fn compute_inner(conn: &mut PgConnection, job: &Job) -> AppResult<JobStats
         tasks_available: counts.get("available"),
         tasks_claimed: counts.get("claimed"),
         movegens: job.movegens,
+        compute_seconds: counts.get::<Option<i64>, _>("compute_ms").unwrap_or(0) as f64 / 1000.0,
         throughput,
         games,
         opening_racks,
@@ -953,11 +964,12 @@ async fn worker_contributions_on(
         "SELECT w.user_id,
                 left(encode(sha256(convert_to(w.anon_uuid::text, 'UTF8')), 'hex'), 16) AS anon_id,
                 u.username,
-                w.tasks_completed, w.compute_ms, w.contributors
+                w.tasks_completed, w.compute_ms, w.movegens, w.contributors
          FROM (
              SELECT c.claimed_by_user_id AS user_id, c.claimed_by_anon_uuid AS anon_uuid,
                     COUNT(*)::bigint AS tasks_completed,
                     SUM({compute})::bigint AS compute_ms,
+                    SUM(c.movegens)::bigint AS movegens,
                     COUNT(*) OVER ()::bigint AS contributors
              FROM task_claims c
              JOIN tasks t ON t.id = c.task_id
@@ -993,6 +1005,7 @@ async fn worker_contributions_on(
                 username: r.get("username"),
                 tasks_completed: r.get("tasks_completed"),
                 compute_seconds: r.get::<i64, _>("compute_ms") as f64 / 1000.0,
+                movegens: r.get("movegens"),
             })
             .collect(),
         other_workers,

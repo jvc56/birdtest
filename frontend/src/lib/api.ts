@@ -439,6 +439,8 @@ export interface JobStats {
   tasks_claimed: number;
   /** The move generations the job's accepted claims reported: the work done for it. */
   movegens: number;
+  /** The compute time the job's accepted claims were credited with, claim to submission. */
+  compute_seconds: number;
   /**
    * Units finished an hour, over the last hour (or since activation): the
    * rate `eta_seconds` extrapolates. Null when the job is not active or
@@ -484,6 +486,8 @@ export interface JobStats {
     tasks_completed: number;
     /** Those claims held from claim to submission. */
     compute_seconds: number;
+    /** The move generations those claims reported. */
+    movegens: number;
   }[];
   /** Contributors beyond the ones listed; the list is capped. */
   other_workers: number;

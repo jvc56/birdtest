@@ -11,7 +11,7 @@
     type JobStats
   } from '$lib/api';
   import { subscribeToJob } from '$lib/sse';
-  import { computeTime, exactCount, exportSummary } from '$lib/format';
+  import { computeTime, exportSummary } from '$lib/format';
   import type { JobConfig } from '$lib/jobSettings';
   import JobHeader from '$lib/components/JobHeader.svelte';
   import JobStatusCard from '$lib/components/JobStatusCard.svelte';
@@ -646,11 +646,7 @@
 
     <div class="card">
       <h2 class="mb-3 text-lg font-medium">Contributors</h2>
-      <WorkerTable workers={stats.workers} />
-      <p class="mt-2 text-sm text-muted-foreground" data-testid="job-movegens">
-        <span class="break-all tabular-nums text-foreground">{exactCount(stats.movegens)}</span> movegens
-        for this job
-      </p>
+      <WorkerTable workers={stats.workers} totals={stats} />
     </div>
 
     <!-- The settings last, as on the public page. -->

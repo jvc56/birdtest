@@ -126,7 +126,7 @@ test('E-10: a visitor on a phone reads the job list, a job page and the rankings
     const body = await response.json();
     body.job.created_by = LONGEST;
     body.workers = [
-      { username: LONGEST, anon_id: null, tasks_completed: 123456789012, compute_seconds: 9.9e10 },
+      { username: LONGEST, anon_id: null, tasks_completed: 123456789012, compute_seconds: 9.9e10, movegens: 987654321098765 },
       ...(body.workers ?? [])
     ];
     await route.fulfill({ response, json: body });

@@ -3515,7 +3515,8 @@ below.
 
 ### `A-PUBLIC-*` — `routes/public.rs`
 
-- `A-PUBLIC-1` Job list paginates, and `per_page` is clamped to the maximum;
+- `A-PUBLIC-1` Job list paginates (jobs of one status newest first; see
+  `A-PUBLIC-1g`), and `per_page` is clamped to the maximum;
   jobs that tie on the sort key are each listed exactly once. *(Covered:
   `public_api::the_job_list_paginates_and_clamps_its_page_size`,
   `public_api::tied_jobs_and_users_are_each_listed_exactly_once`; ties had no
@@ -3544,6 +3545,10 @@ below.
   racks analysed, so a job seeking a consensus read finished while it
   re-analysed. *(Covered:
   `worker_api::an_opening_rack_jobs_consensus_can_change_and_the_job_follows`.)*
+- `A-PUBLIC-1g` The job list puts active jobs first, then inactive, then
+  completed, newest first within each, so a running job is never pages
+  down behind finished ones. *(Covered:
+  `public_api::the_job_list_lists_active_jobs_first`.)*
 - `A-PUBLIC-1b` `?status=` filters the job list and its total. *(Covered:
   `public_api::the_job_list_filters_by_status`.)* (Eighteenth audit.) Deleting
   a job ends its open streams (`sse::tests::closing_a_job_ends_its_streams`).
@@ -3682,7 +3687,10 @@ below.
   time and tasks counted from completed claims only; the jobs' compute time
   by type is the contributors' together; and all of them add up to the
   contributor list's columns, before and after a purge or a delete takes a
-  job's out of all three. Only a contributor the list shows is answered -- an
+  job's out of all three. A job page's Contributors card lists each
+  contributor's movegens on the job, and its totals row (the job's own
+  movegens, `compute_seconds` and `tasks_completed`) is the listed rows' sums
+  when every contributor is listed. Only a contributor the list shows is answered -- an
   anonymous one by pseudonym, never by its UUID -- and anyone else is a `404`.
   The breakdown is an index-only walk of the contributor's own index, which
   carries each claim's movegens and claim time. *(Covered:
