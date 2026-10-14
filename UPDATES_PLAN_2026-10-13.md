@@ -12,9 +12,10 @@ in the file's order, and two the owner added the same day (10, 11):
 5. Rack lookup gets a **Random** button beside **Search**.
 6. On an opening-rack job, the Progress and Opening racks cards are rethought
    to show the tasks and the redundancy.
-7. A contributor builds wordmaps, word info tables and rack info tables as
-   best it can for the storage it has, building the ones that speed it up
-   most first.
+7. When a job's players use a wordmap, word info table or rack info table,
+   the contributor builds them as a best attempt for the storage it has,
+   the ones that speed it up most first. No task ever requires one: without
+   it the task runs slower, with the same results.
 8. "Players", not "configs", on the ratings page and anywhere else a player
    config is meant.
 9. The Time Left card's expected end date includes the year.
@@ -363,6 +364,15 @@ What exists today:
   proposes this fix).
 - A full disk during an RIT build ends the worker (`fwrite_or_die`, KL-51).
 - A local write failure is counted, not remembered (KL-52).
+- So today a player's `use_wordmap`, `use_wit` or `use_rit` behaves like a
+  requirement. A contributor that cannot build the table declines the task
+  or crashes; it never runs the task without the table.
+
+**What changes in meaning.** These settings become "use the table if the
+contributor can". A contributor short of space runs the task without the
+tables that do not fit. That is slower, but the moves and the movegen counts
+are the same. Nothing about a job asks for a contributor with more storage,
+and every contributor stays eligible for every job.
 
 1. **Benchmark (D8).** A script in MAGPIE's `scripts/` plays a fixed set of
    CSW24 games with a static player and a 2-ply simmer, under each of: none,
@@ -374,8 +384,8 @@ What exists today:
    `expected_data.derived`), so a worker knows how big a table will be before
    it builds it.
 3. **MAGPIE: the policy.**
-   - One function, `contribute_choose_tables`, takes the task's requested
-     tables (both players') with their sizes, the free space, the reserve
+   - One function, `contribute_choose_tables`, takes the tables the task's
+     players use (both players') with their sizes, the free space, the reserve
      (`diskreserve`), and the manifest. It returns the tables to use, in the
      priority order from step 1, never an RIT without its WMP.
    - It replaces the `contribute_wants_*` calls (`config.c:8430-8455`) in the
@@ -449,6 +459,4 @@ What exists today:
 - Memory as a constraint on tables: an RIT holds 1.9 GB of RAM while it
   plays. Item 7 is about storage only. A RAM-aware chooser would extend the
   same function.
-- Telling the scheduler a worker's storage, so that jobs needing big tables
-  go to workers that can hold them.
 - Renaming `/player-configs` and the API's `player_config` names (D7).
