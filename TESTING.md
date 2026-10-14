@@ -74,7 +74,7 @@ at tier 5 names a symptom.
 | 3 API | 250 | `backend/tests/`: `worker_api.rs` (52), `admin_api.rs` (59), `auth_routes.rs` (28), `worker_routes.rs` (24), `boundaries.rs` (18), `public_api.rs` (24), `admin_routes.rs` (13), `authz.rs` (7), `account.rs` (10), `auth_api.rs` (5), `finish.rs` (9), `fake_worker.rs` (1) |
 | 4 Contract | 15 | `routes::worker::contract_fixtures`, over 18 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
 | 5 End-to-end | 23 | Playwright journeys `E-1`..`E-18` (`E-11` in three tests, `E-10`, `E-12` and `E-18` in two each) in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
-| 6 MAGPIE smoke | 17 cases + 16 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-18` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 16 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (6), `magpie_leave.rs` (7), `magpie_routes.rs` (3) |
+| 6 MAGPIE smoke | 18 cases + 16 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-19` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 16 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (6), `magpie_leave.rs` (7), `magpie_routes.rs` (3) |
 
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
@@ -4360,7 +4360,10 @@ surfacing the mismatch as a red build rather than as a dead job in production.
   analyses a rack, 100%), with a real 1-ply simmer on the two-letter data,
   covers its eight racks, reissues them as lists from seeds past the end of
   the space, and completes with every rack settled after at least two
-  analyses. *(Covered: `case_consensus`, one task a run until the job
+  analyses; its page's stats split the completed tasks into two first-pass
+  tasks and the re-analysis ones (adding up to `tasks_completed`), count
+  throughput in analyses, and leave no open rack (`fewest_open_analyses`
+  null). *(Covered: `case_consensus`, one task a run until the job
   completes.)*
 - `M-16` A games job between two real 2-ply simmers that infer, capturing
   positions: every position past a game's first turn keeps its inference
@@ -4379,6 +4382,12 @@ surfacing the mismatch as a red build rather than as a dead job in production.
   the budgeted job reports less than half the movegens a game. Every run
   that started a task also prints how long it took ("finished task #N: … in
   …"). *(Covered: `case_movegen_budget`, one task each.)*
+- `M-19` The tables are a best attempt: a worker whose `diskreserve` no disk
+  can leave free, on a games job whose players ask for a wordmap and a rack
+  info table, says it is skipping both, builds neither, plays its two tasks
+  without them, and reports `derived_skipped` `["rit","wmp"]` on both claims,
+  which the admin's skipped-tables view counts. *(Covered:
+  `case_best_attempt_tables`.)*
 - `M-13` A job with `use_wit` dispatches only once its word info table is
   built; a worker whose table does not match the recorded hash declines with
   `derived_mismatch` and both digests reach `worker_data_gaps`; with the right
