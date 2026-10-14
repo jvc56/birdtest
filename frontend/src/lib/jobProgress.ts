@@ -113,3 +113,95 @@ export function timeLeftFigure(stats: JobStats, now: number): Figure {
   }
   return { value: duration(eta), sub: `about ${when(now + eta * 1000)}` };
 }
+
+/** One row of an opening-rack job's Progress table: its racks analysed, or settled, and the time left to all of them. */
+export interface RackFront {
+  key: 'analysed' | 'settled';
+  label: string;
+  done: number;
+  total: number;
+  fraction: number;
+  left: Figure;
+}
+
+/** An opening-rack job's Progress card: the bar's two layers, the headline, and the table's rows. */
+export interface RackProgress {
+  /** Whether the job seeks a consensus: analyses a rack more than once. */
+  consensus: boolean;
+  analysed: number;
+  settled: number;
+  headline: string;
+  rows: RackFront[];
+}
+
+/**
+ * The rows of an opening-rack job's Progress table, and its headline; null
+ * for another job type. With a consensus, racks analysed and racks settled
+ * each have a Done and a Time left: re-analysis starts only once the first
+ * pass covers the rack space, so until then every analysis goes to a new
+ * rack, and the time to analyse them all is the racks not yet analysed at
+ * the current pace. Settled keeps the server's estimate. A job analysing each
+ * rack once settles a rack as it analyses it: one row. `now` in ms.
+ */
+export function rackProgress(stats: JobStats, now: number): RackProgress | null {
+  const r = stats.opening_racks;
+  if (!r) return null;
+  const of = (n: number) => (r.racks_total > 0 ? Math.min(1, n / r.racks_total) : 0);
+  const consensus = r.max_results_per_rack > 1;
+  const finished = stats.job.status === 'completed';
+  const settledLeft = timeLeftFigure(stats, now);
+  const front = (key: RackFront['key'], label: string, done: number, left: Figure): RackFront => ({
+    key,
+    label,
+    done,
+    total: r.racks_total,
+    fraction: of(done),
+    left
+  });
+  if (!consensus) {
+    const headline = finished ? 'Done' : pct(of(r.racks_settled));
+    return {
+      consensus,
+      analysed: of(r.racks_analyzed),
+      settled: of(r.racks_settled),
+      headline,
+      rows: [front('settled', 'Analysed and settled', r.racks_settled, settledLeft)]
+    };
+  }
+  let analysedLeft: Figure;
+  const perSecond = stats.throughput ? stats.throughput.per_hour / 3600 : 0;
+  if (r.racks_analyzed >= r.racks_total || finished) analysedLeft = { value: '—', sub: 'every rack analysed' };
+  else if (stats.job.status !== 'active' || !(perSecond > 0)) analysedLeft = { value: '—', sub: idle(stats) ?? 'no estimate yet' };
+  else {
+    const eta = (r.racks_total - r.racks_analyzed) / perSecond;
+    analysedLeft = { value: duration(eta), sub: `about ${when(now + eta * 1000)}` };
+  }
+  return {
+    consensus,
+    analysed: of(r.racks_analyzed),
+    settled: of(r.racks_settled),
+    headline: finished ? 'Done' : `${pct(of(r.racks_settled))} settled · ${pct(of(r.racks_analyzed))} analysed`,
+    rows: [
+      front('analysed', 'Analysed', r.racks_analyzed, analysedLeft),
+      front('settled', 'Settled', r.racks_settled, settledLeft)
+    ]
+  };
+}
+
+/**
+ * The Progress card's tasks line, after "Tasks:". An opening-rack job's done
+ * tasks split into first-pass ones, of the total that covers the rack space,
+ * and -- seeking a consensus -- re-analysis ones; "to be handed out again" is
+ * a task given back or timed out, waiting for its next claim.
+ */
+export function taskCounts(stats: JobStats): { value: number; label: string }[] {
+  const r = stats.opening_racks;
+  const inFlight = [
+    { value: stats.tasks_claimed, label: 'in progress' },
+    { value: stats.tasks_available, label: 'to be handed out again' }
+  ];
+  if (!r) return [...inFlight, { value: stats.tasks_completed, label: 'done' }];
+  const done = [{ value: r.first_pass_tasks_done, label: `of ${fmt(r.first_pass_tasks_total)} first pass` }];
+  if (r.max_results_per_rack > 1) done.push({ value: r.reissue_tasks_done, label: 're-analysis' });
+  return [...done, ...inFlight];
+}

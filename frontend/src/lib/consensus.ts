@@ -95,3 +95,53 @@ export function rackConsensus(moves: LookupMove[]): RackConsensus | null {
   )[0];
   return { analyses, top, count, share: ((100 * count) / analyses).toFixed(1) };
 }
+
+/** An English ordinal: 1st, 2nd, 3rd, 4th, 11th, 21st. */
+function ordinal(n: number): string {
+  const tens = n % 100;
+  if (tens >= 11 && tens <= 13) return `${n}th`;
+  return `${n}${({ 1: 'st', 2: 'nd', 3: 'rd' } as Record<number, string>)[n % 10] ?? 'th'}`;
+}
+
+/** What the Opening racks card's stage sentence reads from the job's stats. */
+export interface RackStage {
+  racks_analyzed: number;
+  racks_settled: number;
+  racks_without_consensus: number;
+  racks_total: number;
+  fewest_open_analyses: number | null;
+  min_results_per_rack: number;
+  max_results_per_rack: number;
+}
+
+/**
+ * Where a job seeking a consensus stands, as the Opening racks card says it:
+ * its first pass (no rack can settle before its fewest analyses), its
+ * re-analysis (open racks are analysed fewest first), or finished. `null` for
+ * a job analysing each rack once, which has no consensus to stand anywhere.
+ */
+export function consensusStage(s: RackStage, finished: boolean): { stage: string; text: string } | null {
+  if (s.max_results_per_rack <= 1) return null;
+  const pct = (n: number) => `${((100 * n) / Math.max(1, s.racks_total)).toFixed(1)}%`;
+  const count = (n: number) => n.toLocaleString();
+  if (finished || (s.racks_total > 0 && s.racks_settled >= s.racks_total)) {
+    const agreed = s.racks_settled - s.racks_without_consensus;
+    return {
+      stage: 'Finished.',
+      text: `Every rack is settled: ${count(agreed)} agreed, ${count(s.racks_without_consensus)} without a consensus after ${s.max_results_per_rack} analyses.`
+    };
+  }
+  if (s.racks_analyzed < s.racks_total) {
+    const wait =
+      s.min_results_per_rack > 1 ? ` None can settle before its ${ordinal(s.min_results_per_rack)}.` : '';
+    return {
+      stage: 'First pass.',
+      text: `${pct(s.racks_analyzed)} of racks have their first analysis.${wait} Re-analysis starts when every rack has one.`
+    };
+  }
+  const fewest = s.fewest_open_analyses ?? 1;
+  return {
+    stage: 'Re-analysis.',
+    text: `Every open rack has at least ${fewest} ${fewest === 1 ? 'analysis' : 'analyses'}, and racks with the fewest are analysed first.`
+  };
+}

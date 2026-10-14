@@ -45,6 +45,15 @@ test.afterAll(async () => {
 
 test('E-13: an opening-rack job offers analysed racks to look up', async ({ page }) => {
   await page.goto(`/jobs/${jobId}`);
+  // Its Progress card: racks settled over racks analysed, a Done and a Time
+  // left for each (one row, "Analysed and settled", for a job analysing each
+  // rack once), its pace in analyses, and its tasks split into the first pass
+  // and, seeking a consensus, re-analysis.
+  const progress = page.getByTestId('job-progress');
+  await expect(progress.getByTestId('rack-fronts')).toContainText('Time left');
+  await expect(progress.getByTestId('rack-front-settled')).toContainText('Settled');
+  await expect(progress.getByTestId('task-counts')).toContainText('first pass');
+  await expect(progress.getByTestId('task-counts')).toContainText('to be handed out again');
   await expect(page.getByText('Analysed racks to try:')).toBeVisible();
   const samples = page.getByTestId('rack-sample');
   await expect(samples).toHaveCount(10);

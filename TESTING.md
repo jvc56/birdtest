@@ -979,8 +979,9 @@ Each entry's tests are the `describe` block named for its id.
   `format.test.ts`.)*
 - `F-FMT-21` `throughputParts` reads a job's pace an hour in its unit, the
   figure and the unit apart ("1,240" and "games/hour", "8" and
-  "pairs/hour"): whole units from ten up, a decimal below, "game/hour"
-  singular, and nothing with no recent work. *(Covered:
+  "pairs/hour", an opening-rack job's "analyses/hour"): whole units from ten
+  up, a decimal below, "game/hour" and "analysis/hour" singular, and nothing
+  with no recent work. *(Covered:
   `format.test.ts`.)*
 
 ### `F-PROG-*` — `lib/jobProgress.ts`
@@ -997,6 +998,17 @@ Each entry's tests are the `describe` block named for its id.
   with why (not measured yet, paused while inactive, finished); its Time
   left the time at the current pace and the clock time it reaches, only
   while the job is active, and when a completed job finished. *(Covered:
+  `jobProgress.test.ts`.)*
+- `F-PROG-3` An opening-rack job's Progress card (`rackProgress`,
+  `taskCounts`): seeking a consensus, its headline is "x% settled · y%
+  analysed" and its table gives racks analysed and racks settled each a Done
+  and a Time left -- analysed at the current pace from the racks not yet
+  analysed, "every rack analysed" once they all are; settled the server's
+  estimate, "finished …" once completed; the idle wording while inactive.
+  Analysing each rack once, one row, "Analysed and settled". Its tasks line
+  splits done tasks into "of N first pass" and "re-analysis" (the latter
+  only with a consensus), then in progress and "to be handed out again";
+  any other job keeps in flight, then done. *(Covered:
   `jobProgress.test.ts`.)*
 
 ### `F-STATUS-*` — `lib/status.ts`
@@ -1059,6 +1071,12 @@ Each entry's tests are the `describe` block named for its id.
 - `F-CONS-4` `consensusFields` is what both forms send: the fewest and most
   as numbers, and the share only past one analysis per rack, so a share left
   in the disabled box at a most of 1 is never sent for the server to refuse.
+  *(Covered: `consensus.test.ts`.)*
+- `F-CONS-5` `consensusStage` says where a job seeking a consensus stands:
+  "First pass." with the share of racks analysed (and, when the fewest is
+  above one, that none can settle before that analysis), "Re-analysis."
+  from the fewest analyses an open rack has, "Finished." with racks agreed
+  and without a consensus; nothing for a job analysing each rack once.
   *(Covered: `consensus.test.ts`.)*
 
 ### `F-TEST-*` — `lib/matchTest.ts`
@@ -1856,6 +1874,12 @@ job creation touches needs one caller here.
   every line of its corpus then carries its rack's standing, each rack having
   two analyses, though the maximum is one again (it was gated on the maximum
   alone, and hid the disagreements `racks_without_consensus` counts).
+  Throughout, the job page's `opening_racks` splits the completed tasks into
+  first-pass (seed below the rack total; two of two) and re-analysis tasks,
+  the two adding up to `tasks_completed`, and gives `fewest_open_analyses`:
+  null with one analysis a rack, 1 once reopened with every rack analysed
+  once, still 1 while two racks wait for a second, null once every rack is
+  settled.
   Asking for what every rack already has leaves a completed job completed,
   and still demotes its final export and fails one building from before the
   edit ("the job's consensus settings changed while this export was

@@ -15,7 +15,7 @@
   import MatchTestCard from '$lib/components/MatchTestCard.svelte';
   import SavedPositions from '$lib/components/SavedPositions.svelte';
   import type { JobConfig } from '$lib/jobSettings';
-  import { analysesPerRack, rackConsensus } from '$lib/consensus';
+  import { analysesPerRack, consensusStage, rackConsensus } from '$lib/consensus';
   import { leaveOf, rackSpelling } from '$lib/cgp';
   import { plyAt, plyColumns, plyHeaders, showsIterations } from '$lib/moveList';
 
@@ -38,7 +38,8 @@
   $: lookupWinPct = rackMoves?.some((m) => m.win_percentage !== null) ?? false;
   $: lookupPlies = rackMoves ? plyColumns(rackMoves) : 0;
   $: lookupIters = rackMoves ? showsIterations(rackMoves) : false;
-  $: seeksConsensus = (config?.opening_racks?.max_results_per_rack ?? 1) > 1;
+  $: racks = stats?.opening_racks ?? null;
+  $: stage = racks ? consensusStage(racks, stats?.job.status === 'completed') : null;
   let rackError = '';
   // A few racks the job has analysed, to try the search on, drawn at random
   // across the job: the newest results' were the tail of one batch, racks a
@@ -167,41 +168,60 @@
          about a player config across every pair it has played, not something
          one job owns. -->
 
-    {#if stats.opening_racks}
+    {#if racks}
       <div class="card space-y-4">
         <h2 class="text-lg font-medium">Opening racks</h2>
-        <dl class="grid grid-cols-2 gap-4 text-sm sm:grid-cols-3">
-          <div>
-            <dt class="text-muted-foreground">Racks analyzed</dt>
-            <dd class="text-xl tabular-nums">
-              {stats.opening_racks.racks_analyzed.toLocaleString()}
-              <span class="text-sm text-muted-foreground">
-                / {stats.opening_racks.racks_total.toLocaleString()}
-              </span>
-            </dd>
-          </div>
-          {#if seeksConsensus}
-            <div>
-              <dt class="text-muted-foreground" title="Agreed on, or analysed the most times the job allows">
-                Racks settled
+        {#if stage}
+          <!-- Where the consensus stands, then its figures. -->
+          <p class="rounded-md border border-border px-3 py-2 text-sm" data-testid="consensus-stage">
+            <span class="font-semibold">{stage.stage}</span> {stage.text}
+          </p>
+          <dl class="grid grid-cols-2 gap-4 text-sm sm:grid-cols-4" data-testid="consensus-figures">
+            <div class="min-w-0">
+              <dt class="text-muted-foreground" title="Analysed, and not yet agreed on or analysed the most times">
+                Waiting for agreement
               </dt>
-              <dd class="text-xl tabular-nums">{stats.opening_racks.racks_settled.toLocaleString()}</dd>
+              <dd class="text-xl tabular-nums">{(racks.racks_analyzed - racks.racks_settled).toLocaleString()}</dd>
             </div>
-            <div>
-              <dt class="text-muted-foreground" title="Analysed the most times the job allows, their analyses still split">
-                Settled without a consensus
-              </dt>
-              <dd class="text-xl tabular-nums">
-                {stats.opening_racks.racks_without_consensus.toLocaleString()}
+            <div class="min-w-0">
+              <dt class="text-muted-foreground">Agreed</dt>
+              <dd class="text-xl tabular-nums">{(racks.racks_settled - racks.racks_without_consensus).toLocaleString()}</dd>
+              <dd class="text-xs tabular-nums text-muted-foreground">
+                {racks.racks_settled
+                  ? `${((100 * (racks.racks_settled - racks.racks_without_consensus)) / racks.racks_settled).toFixed(1)}% of settled racks`
+                  : `needs ${racks.min_results_per_rack} analyses`}
               </dd>
             </div>
+            <div class="min-w-0">
+              <dt class="text-muted-foreground" title="Analysed the most times the job allows, their analyses still split">
+                Without consensus
+              </dt>
+              <dd class="text-xl tabular-nums">{racks.racks_without_consensus.toLocaleString()}</dd>
+              <dd class="text-xs text-muted-foreground">split after {racks.max_results_per_rack} analyses</dd>
+            </div>
+            <div class="min-w-0">
+              <dt class="text-muted-foreground">Racks analyzed</dt>
+              <dd class="text-xl tabular-nums">{racks.racks_analyzed.toLocaleString()}</dd>
+              <dd class="text-xs tabular-nums text-muted-foreground">of {racks.racks_total.toLocaleString()}</dd>
+            </div>
+          </dl>
+          {#if config?.opening_racks}
+            <p class="text-xs text-muted-foreground">
+              Each rack is analysed {analysesPerRack(config.opening_racks)}; a rack is settled once
+              they agree, or once it has been analysed the most times, and is not analysed again.
+            </p>
           {/if}
-        </dl>
-        {#if seeksConsensus && config?.opening_racks}
-          <p class="text-xs text-muted-foreground">
-            Each rack is analysed {analysesPerRack(config.opening_racks)}; a rack is settled once
-            they agree, or once it has been analysed the most times, and is not analysed again.
-          </p>
+        {:else}
+          <p class="text-sm">Each rack is analysed once, by one contributor. No second analysis checks it.</p>
+          <dl class="grid grid-cols-2 gap-4 text-sm sm:grid-cols-3">
+            <div>
+              <dt class="text-muted-foreground">Racks analyzed</dt>
+              <dd class="text-xl tabular-nums">
+                {racks.racks_analyzed.toLocaleString()}
+                <span class="text-sm text-muted-foreground">/ {racks.racks_total.toLocaleString()}</span>
+              </dd>
+            </div>
+          </dl>
         {/if}
 
         <div class="space-y-2 border-t border-border pt-4">

@@ -446,7 +446,7 @@ export interface JobStats {
    * rate `eta_seconds` extrapolates. Null when the job is not active or
    * nothing finished recently.
    */
-  throughput: { per_hour: number; unit: 'game' | 'pair' | 'rack' } | null;
+  throughput: { per_hour: number; unit: 'game' | 'pair' | 'analysis' } | null;
   games?: GameStats;
   opening_racks?: {
     racks_analyzed: number;
@@ -459,6 +459,23 @@ export interface JobStats {
     racks_without_consensus: number;
     /** Size of the rack space — the denominator for progress. */
     racks_total: number;
+    /**
+     * Completed tasks by kind: first-pass tasks analyse a slice of the rack
+     * space, re-analysis tasks list unsettled racks again for a consensus.
+     * They add up to `tasks_completed`. The first pass's total is known from
+     * the start.
+     */
+    first_pass_tasks_done: number;
+    first_pass_tasks_total: number;
+    reissue_tasks_done: number;
+    /**
+     * The fewest analyses an open rack has, once every rack is analysed and
+     * the job seeks a consensus; null before then and once all are settled.
+     */
+    fewest_open_analyses: number | null;
+    /** The job's consensus bounds: a most above 1 seeks a consensus. */
+    min_results_per_rack: number;
+    max_results_per_rack: number;
   };
   leave_generation?: {
     current_generation: number;

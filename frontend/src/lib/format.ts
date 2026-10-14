@@ -80,7 +80,7 @@ export function exactCount(n: number | null): string {
 
 /**
  * A job's pace in its own unit, as a figure and its unit: "1,240" and
- * "games/hour", "8" and "pairs/hour", "2.5" and "racks/hour". Whole units from
+ * "games/hour", "8" and "pairs/hour", "2.5" and "analyses/hour". Whole units from
  * ten up and a decimal below, where a rounded slow job read the same at twice
  * the speed. Null with no recent work.
  */
@@ -89,7 +89,8 @@ export function throughputParts(
 ): { value: string; unit: string } | null {
   if (!t || !isFinite(t.per_hour) || t.per_hour < 0) return null;
   const value = t.per_hour >= 10 ? Math.round(t.per_hour).toLocaleString() : String(Math.round(t.per_hour * 10) / 10);
-  return { value, unit: `${value === '1' ? t.unit : `${t.unit}s`}/hour` };
+  const plural = t.unit === 'analysis' ? 'analyses' : `${t.unit}s`;
+  return { value, unit: `${value === '1' ? t.unit : plural}/hour` };
 }
 
 export function datetime(value: string | null): string {

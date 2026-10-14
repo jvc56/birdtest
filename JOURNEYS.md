@@ -175,7 +175,7 @@ Open "dev game pairs (first divergences saved)".
   over "pairs/hour"; "—" once nothing has finished in the hour), **Time
   left** ("2.3d" over "about <date, time>", the date with its year: "about
   Oct 14, 2026, 4:00 AM") and **Allocation** ("20%" over
-  "of claims"); then "Tasks: N in progress · N waiting to be reissued · N
+  "of claims"); then "Tasks: N in progress · N to be handed out again · N
   done", and "Created by dev, <date>" and "requires MAGPIE ≥ …". No row of
   four cards above it.
 - [ ] On a job its significance test finished before its cap, **expect** the
@@ -300,10 +300,26 @@ and [A-12](#a-12-a-leave-generation-job-start-to-finish), then check:
 
 Open "dev opening racks (english_ab)".
 
-- [ ] **Expect** a "racks settled" bar, and once it has finished (within
-  minutes) "Racks analyzed 8 / 8", Racks settled 8 and Settled without a
-  consensus figures, and "Each rack is analysed 2 to 5, until 80% agree on the
-  best move; …" (its player, `ab-sim-2ply-rack`, simulates; its Job settings
+- [ ] **Expect** a Progress card whose bar has two layers, racks settled
+  solid over racks analysed faint, a headline "x% settled · y% analysed", and
+  under it a table with an **Analysed** row and a **Settled** row, each with
+  its Done ("N" over "of 8 · z%") and its Time left (racks analysed: the
+  racks not yet analysed at the current pace, "—" and "every rack analysed"
+  once they all are; racks settled: the server's estimate); then Throughput
+  in "analyses/hour", Allocation, and "Tasks: N of 4 first pass · N
+  re-analysis · N in progress · N to be handed out again".
+- [ ] **Expect** an **Opening racks** card that starts with where the
+  consensus stands, in a box: "First pass. …% of racks have their first
+  analysis. None can settle before its 2nd. …", then "Re-analysis. Every open
+  rack has at least N analyses, and racks with the fewest are analysed
+  first.", and once it has finished (within minutes) "Finished. Every rack is
+  settled: N agreed, N without a consensus after 5 analyses." Under it the
+  figures Waiting for agreement, Agreed ("x% of settled racks"), Without
+  consensus ("split after 5 analyses") and Racks analyzed ("of 8"), and
+  "Each rack is analysed 2 to 5, until 80% agree on the best move; …" (A job
+  analysing each rack once says instead "Each rack is analysed once, by one
+  contributor. No second analysis checks it." over Racks analyzed, and its
+  Progress table has one row, **Analysed and settled**.) (Its player, `ab-sim-2ply-rack`, simulates; its Job settings
   say Minimum Analyses Per Rack 2, Maximum Analyses Per Rack 5, Consensus %
   80%, and no Racks in all or Rack size rows), a **Look up a rack** box, and
   under it "Analysed racks to try:" with its racks as buttons, each of A and B
@@ -819,9 +835,9 @@ board start on "Choose…": pick `english` and `standard15` each time.
   or 3 times. **Do** set the maximum to 1 first. **Expect** the Consensus %
   box disabled and "One analysis per rack." Created and activated, **expect**
   its Job settings to say Minimum Analyses Per Rack 2, Maximum Analyses Per
-  Rack 3 and Consensus % 100%, Racks analyzed / Racks settled / Settled
-  without a consensus figures, and, once it finishes, every one of its 8
-  racks settled. **Do** look up one of its racks. **Expect** "MOVE is the best
+  Rack 3 and Consensus % 100%, the consensus stage and its Waiting for
+  agreement / Agreed / Without consensus / Racks analyzed figures, and, once
+  it finishes, "Finished. Every rack is settled: …" with all 8 racks. **Do** look up one of its racks. **Expect** "MOVE is the best
   move in k of n analyses (…%)" and an Analysis column numbering each
   analysis's ranked moves, each with its Win % and P1-S…P2-BP.
 - [ ] **Do** change "tester consensus" once it has completed, on its
