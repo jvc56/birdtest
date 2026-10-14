@@ -41,12 +41,18 @@ test('E-8: a finished game-pairs job shows its labelled pentanomial and signific
     await expect(card.getByTestId('test-verdict')).toContainText('Neither better');
   }
 
-  // Player 1's score and its interval to two places; the pairs played against
-  // the cap; the test explained with the job's own confidence, folded away.
+  // The leader's score and its interval to two places -- player 2's turned
+  // over, player 1's at an even score; the pairs played against the cap; the
+  // test explained with the job's own confidence, folded away.
   const result = stats.games.test;
-  await expect(card.getByTestId('test-score')).toContainText(pct(result.mean));
+  const p2 = result.mean < 0.5;
+  const lead = p2
+    ? { name: 'static-score', mean: 1 - result.mean, lower: 1 - result.upper, upper: 1 - result.lower }
+    : { name: 'static-equity', mean: result.mean, lower: result.lower, upper: result.upper };
+  await expect(card.getByTestId('test-score')).toContainText(`${lead.name}'s score`);
+  await expect(card.getByTestId('test-score')).toContainText(pct(lead.mean));
   await expect(card.getByTestId('test-score')).toContainText(
-    `95% interval ${pct(result.lower)} to ${pct(result.upper)}`
+    `95% interval ${pct(lead.lower)} to ${pct(lead.upper)}`
   );
   await expect(card.getByTestId('test-progress')).toContainText(pairs.toLocaleString('en-US'));
   await expect(card.getByTestId('test-explained')).toContainText('What does the interval mean?');

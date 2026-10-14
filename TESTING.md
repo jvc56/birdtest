@@ -1080,6 +1080,10 @@ Each entry's tests are the `describe` block named for its id.
   form checks it on submit and under the input, which has no `min` or `max`
   (`min="50.1" max="99.99"` blocked values the server takes; thirty-third
   audit, pass 3). *(Covered: `matchTest.test.ts`.)*
+- `F-TEST-4` `leaderScore` gives the score tile the leading player's score
+  per game: player 1's as it is, player 2's turned over (`1 − mean`, the
+  interval `1 − upper` to `1 − lower`), and player 1's while neither leads,
+  at no games or exactly 50%. *(Covered: `matchTest.test.ts`.)*
 
 ### `F-MOVES-*` — `lib/moveList.ts`
 
@@ -1123,6 +1127,12 @@ refuse what it could not have written, rather than draw a wrong board.
   -- a blank as its letter, flagged -- skipping the squares it plays through,
   and nothing for a pass, an exchange or text it cannot read: what the board
   draws for the move played from a position. *(Covered: `cgp.test.ts`.)*
+- `F-CGP-6` `leaveOf` gives the Leave column of a move list: the rack less
+  the tiles a play puts down (a lower-case blank takes a `?`, squares played
+  through take nothing), less an exchange's tiles, the whole rack for a pass,
+  `''` for a bingo, multi-character letters kept bracketed, and `null` for a
+  move it cannot read or the rack cannot make. `rackSpelling` spells a typed
+  rack as `RackIndex::spelling` does. *(Covered: `cgp.test.ts`.)*
 
 ### `F-API-*` — `lib/api.ts`
 

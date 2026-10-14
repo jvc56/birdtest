@@ -173,7 +173,8 @@ Open "dev game pairs (first divergences saved)".
   on a wide screen and two by two on a narrower one: **Done** ("N" over "of
   up to M pairs"), **Throughput** (the job's pace over the last hour, "N"
   over "pairs/hour"; "—" once nothing has finished in the hour), **Time
-  left** ("2.3d" over "about <date, time>") and **Allocation** ("20%" over
+  left** ("2.3d" over "about <date, time>", the date with its year: "about
+  Oct 14, 2026, 4:00 AM") and **Allocation** ("20%" over
   "of claims"); then "Tasks: N in progress · N waiting to be reissued · N
   done", and "Created by dev, <date>" and "requires MAGPIE ≥ …". No row of
   four cards above it.
@@ -195,7 +196,10 @@ Open "dev game pairs (first divergences saved)".
   headed "Player 1" and "Player 2", each with its colour dot (blue, orange:
   the colours their moves are drawn in under Saved positions) and its name
   linking to its config's page, and beside its heading how many settings
-  they differ in ("1 of 21 differ"). It lists every setting, the key rows
+  they differ in ("1 of 21 differ"). By default it lists only that
+  setting, Sorted By, as an ordinary row with no tint (two players alike say
+  "These players' settings are identical."), and an **All settings** button.
+- [ ] **Do** press **All settings**. **Expect** every setting, the key rows
   first -- Lexicon, Leaves, Sorted By, Move Recorder, Moves Generated, Plies,
   Uses Inference "no", Uses Preendgame "no" and Uses Endgame "no" -- then the
   rest (no simulation rows: neither simulates), Moves Recorded, Plies
@@ -204,11 +208,8 @@ Open "dev game pairs (first divergences saved)".
   edge and tint, its label and values in bold; no other row does. On a job
   that records no positions ("tester no test", A-7), Moves Recorded is in
   grey: it never reads it, and it is never marked. (One player lists its key
-  rows, with an **All settings** toggle.)
-- [ ] **Do** press **Different settings only** on the Player settings card.
-  **Expect** only Sorted By, as an ordinary row with no tint (two players
-  alike say "These players' settings are identical."). The button now reads
-  **All settings** and puts the card back.
+  rows, with an **All settings** toggle.) The button now reads **Different
+  settings only** and puts the card back.
 - [ ] At phone width, **expect** the tables to wrap (or scroll inside the
   card), never the page.
 - [ ] **Do** open `/jobs/00000000-0000-4000-8000-000000000000`. **Expect** "no
@@ -241,7 +242,10 @@ On the same job:
   whose games did not play identically."
 - [ ] **Expect** after it a **Significance Test** card with a "running" badge
   and three tiles: **Verdict** "Too early", "requires at least 50,000 pairs";
-  **static-equity's score** "x%" to two places and "95% interval a% to b%";
+  the leading player's score -- **static-equity's score** "x%" to two places
+  and "95% interval a% to b%" while static-equity leads or the score is
+  even, **static-score's score** (100% less static-equity's, the interval
+  turned over) in orange while static-score leads;
   **Pairs** the pairs played, "of up to N, test requires at least 50,000", over a
   small progress bar with an amber mark at the minimum. No Elo or rating
   figure anywhere on the card, and no W/L/D line of its own. Under the
@@ -307,11 +311,14 @@ Open "dev opening racks (english_ab)".
   alphabet rather than a run of neighbours).
 - [ ] **Do** click one. **Expect** it fills the box, says which move is best
   in how many of its analyses, and shows each analysis's ranked moves
-  (Analysis, #, Move, Score, Equity, Win %, and P1-S, P1-BP, P2-S and P2-BP:
+  (Analysis, #, Move, Leave -- the rack less the tiles the move plays --
+  Score, Equity, Win %, and P1-S, P1-BP, P2-S and P2-BP:
   the reply's and the next turn's average score and bingo percentage, each
   header explained on hover), every cell on one line.
 - [ ] **Do** type that rack in lower case and in another order. **Expect** the
-  same moves.
+  same moves, with the same leaves.
+- [ ] **Do** press **Random** beside **Search**. **Expect** an analysed rack
+  in the box and its moves under it, as if it had been typed.
 - [ ] **Do** search `QQQQQQQ`. **Expect** "No analysis stored for that rack
   yet."
 
@@ -356,10 +363,11 @@ Open "dev game pairs (first divergences saved)".
   none), the tiles MOVE placed bordered in lavender, the previous move's own colour, the
   tiles PLAY puts down washed in its player's colour with a solid border
   (player 1 blue, player 2 orange), a key naming each ("OTHER PLAYER's
-  previous move, MOVE (score)", "PLAYER played PLAY (score)"), the move
-  list's **played** chip in the same colour, both racks and scores with **to move** on the
-  player whose rack it is, and no CGP text -- and its ranked moves, the one
-  played tinted and marked **played**. **Do** press the other button.
+  previous move, MOVE (score)", "PLAYER played PLAY (score)"), both racks
+  and scores with **to move** on the player whose rack it is, and no CGP
+  text -- and its ranked moves, each with its **Leave** (the rack less the
+  tiles it plays, "—" for a bingo) in the column after **Move**, the one
+  played tinted in its player's colour with no tag beside it. **Do** press the other button.
   **Expect** "Game 2 of the pair · OTHER PLAYER to move", the same board and
   rack, the other player's move drawn instead, and its own ranked moves, the
   top differing from the first's. (A pairs job saving every turn toggles the
@@ -383,7 +391,7 @@ Open "dev game pairs (first divergences saved)".
   board with the previous move bordered in lavender and the
   move played washed in its player's -- player 2's in orange, not player
   1's blue -- both racks and scores under it, "played PLAY (score)" in the summary,
-  and the played move marked in the list.
+  and the played move tinted in the list.
 - [ ] **Do** **Random position** a few times. **Expect** another position
   each time (now and then the same one again), the board, racks and scores agreeing with each other; on a turn 1
   position an empty board and nothing outlined, and after an exchange

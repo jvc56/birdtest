@@ -10,6 +10,21 @@ export function testPct(score: number): string {
   return `${(score * 100).toFixed(2)}%`;
 }
 
+/**
+ * The score tile: the leading player's score per game and its interval --
+ * player 2's is player 1's turned over -- or player 1's while neither leads
+ * (no games yet, or exactly even).
+ */
+export function leaderScore(test: Pick<TestResult, 'lower' | 'upper' | 'mean'>): {
+  player: 0 | 1;
+  mean: number;
+  lower: number;
+  upper: number;
+} {
+  if (test.mean < 0.5) return { player: 1, mean: 1 - test.mean, lower: 1 - test.upper, upper: 1 - test.lower };
+  return { player: 0, mean: test.mean, lower: test.lower, upper: test.upper };
+}
+
 /** Where the interval and its mean sit on the chart, each 0 to 100 (%), and its ticks. */
 export interface TestScale {
   lower: number;

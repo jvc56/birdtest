@@ -61,8 +61,19 @@ test('E-13: an opening-rack job offers analysed racks to look up', async ({ page
   await expect(panel.locator('tbody tr').first()).toBeVisible();
   // A static player's analyses: the move, its score and equity, and none of
   // a simulation's columns (E-12 shows a simmer's).
-  await expect(panel.locator('thead th')).toContainText(['#', 'Move', 'Score', 'Equity']);
+  await expect(panel.locator('thead th')).toContainText(['#', 'Move', 'Leave', 'Score', 'Equity']);
   for (const column of ['Win %', 'Iters', 'P1-S', 'P1-BP']) {
     await expect(panel.locator('thead th', { hasText: column })).toHaveCount(0);
   }
+  // Each move's leave is the rack less the tiles it plays: letters of the
+  // rack, or a dash when it keeps none.
+  const leave = (await panel.locator('tbody tr').first().locator('td').nth(2).innerText()).trim();
+  expect(leave === '—' || [...leave].every((t) => rack.includes(t))).toBe(true);
+
+  // "Random" looks up one analysed rack, drawn at random, and fills the box.
+  const random = page.waitForResponse((r) => r.url().includes(`/api/jobs/${jobId}/rack-samples?n=1`));
+  await page.getByTestId('rack-random').click();
+  await random;
+  await expect(page.getByLabel('Look up a rack')).not.toHaveValue('');
+  await expect(panel.locator('tbody tr').first()).toBeVisible();
 });

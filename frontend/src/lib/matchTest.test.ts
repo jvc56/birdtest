@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { confidenceProblem, testPct, testScale, testVerdict } from './matchTest';
+import { confidenceProblem, leaderScore, testPct, testScale, testVerdict } from './matchTest';
 
 describe('F-TEST-1 testScale', () => {
   it('puts an even score in the middle, wide enough for the interval, snapped to a round width', () => {
@@ -62,5 +62,17 @@ describe('F-TEST-3 confidenceProblem', () => {
     }
     // A cleared number input binds null.
     expect(confidenceProblem(null)).not.toBeNull();
+  });
+});
+
+describe('F-TEST-4 leaderScore', () => {
+  it("gives the leader's score, player 2's turned over, and player 1's while neither leads", () => {
+    expect(leaderScore({ mean: 0.57, lower: 0.52, upper: 0.62 })).toEqual({ player: 0, mean: 0.57, lower: 0.52, upper: 0.62 });
+    const p2 = leaderScore({ mean: 0.4, lower: 0.35, upper: 0.45 });
+    expect(p2.player).toBe(1);
+    expect(p2.mean).toBeCloseTo(0.6);
+    expect(p2.lower).toBeCloseTo(0.55);
+    expect(p2.upper).toBeCloseTo(0.65);
+    expect(leaderScore({ mean: 0.5, lower: 0.45, upper: 0.55 })).toEqual({ player: 0, mean: 0.5, lower: 0.45, upper: 0.55 });
   });
 });

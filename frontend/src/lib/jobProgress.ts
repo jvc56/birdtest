@@ -79,9 +79,15 @@ export function jobProgress(stats: JobStats): JobProgress {
   return { fraction: done ? 1 : fraction, done, headline: done ? 'Done' : pct(fraction), stopped, work };
 }
 
-/** A clock time a short way off: "Oct 14, 4:00 AM". */
-const when = (ms: number) =>
-  new Date(ms).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+/** A clock time, with its year so a long job's end reads unambiguously: "Oct 14, 2026, 4:00 AM". */
+export const when = (ms: number) =>
+  new Date(ms).toLocaleString(undefined, {
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit'
+  });
 
 /** Nothing moves while a job is off; a finished one has nothing left. */
 function idle(stats: JobStats): string | null {

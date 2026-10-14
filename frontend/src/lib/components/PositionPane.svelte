@@ -3,14 +3,15 @@
    * One saved position: what it is, the board -- the previous move bordered in
    * its player's colour, the move played from here drawn where it goes in its
    * own -- and the moves the player
-   * to move ranked, the one played marked, each with its win percentage and
+   * to move ranked, each with the leave it keeps, the one played tinted in its
+   * player's colour, each with its win percentage and
    * its first two plies' statistics when it was simulated: the board beside
    * the moves on a wide screen, above them on a narrow one. Under the moves,
    * what the player inferred of the opponent's leave before simulating, when
    * it did.
    */
   import type { BoardData, SavedPosition } from '$lib/api';
-  import { parseCgp, seatToMove } from '$lib/cgp';
+  import { leaveOf, parseCgp, seatToMove } from '$lib/cgp';
   import { drawShare, inferenceSummary, plyAt, plyColumns, plyHeaders, showsIterations } from '$lib/moveList';
   import Board, { PLAYED_COLORS, PLAYED_TINTS } from './Board.svelte';
 
@@ -103,7 +104,7 @@
       <table class="moves table text-xs" data-testid="position-moves">
         <thead>
           <tr>
-            <th>#</th><th>Move</th><th class="text-right">Score</th><th class="text-right">Equity</th>
+            <th>#</th><th>Move</th><th title="What the move keeps on the rack">Leave</th><th class="text-right">Score</th><th class="text-right">Equity</th>
             {#if showWinPct}<th class="text-right">Win %</th>{/if}
             {#if showIters}<th class="text-right" title="How often the simulation played the move out">Iters</th>{/if}
             {#each headers as header}<th class="text-right" title={header.title}>{header.label}</th>{/each}
@@ -118,12 +119,9 @@
             {@const playedHere = move.move === position.played_move}
             <tr style={playedHere ? `background: ${PLAYED_TINTS[seat]}` : undefined} data-played={playedHere || undefined}>
               <td class="tabular-nums">{move.rank}</td>
-              <td class="font-mono">
-                {move.move}{#if playedHere}<span
-                    class="ml-1 rounded px-1 font-sans text-[10px] uppercase"
-                    style="background: {playedColor}; color: hsl(222 47% 8%)">played</span
-                  >{/if}
-              </td>
+              <!-- The tint marks the move played; a screen reader is told in words. -->
+              <td class="font-mono">{move.move}{#if playedHere}<span class="sr-only"> (played)</span>{/if}</td>
+              <td class="font-mono">{leaveOf(position.rack, move.move) || '—'}</td>
               <td class="text-right tabular-nums">{move.score}</td>
               <td class="text-right tabular-nums">{move.equity.toFixed(2)}</td>
               {#if showWinPct}

@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { parseCgp, parseMove, placedSquares, placedTiles, seatToMove, splitLetters } from './cgp';
+import { leaveOf, parseCgp, parseMove, placedSquares, placedTiles, rackSpelling, seatToMove, splitLetters } from './cgp';
 
 // Turn 3 of the first game of an earlier contract-fixtures/result-games.json,
 // MAGPIE's own output: after 8G HUH, 9C FLEAMS and E9 (E)RUVIM.
@@ -241,5 +241,40 @@ describe('F-CGP-5 placedTiles', () => {
     expect(placedTiles('(exch AB)')).toEqual([]);
     expect(placedTiles('nonsense')).toEqual([]);
     expect(placedTiles(null)).toEqual([]);
+  });
+});
+
+describe('F-CGP-6 leaveOf and rackSpelling', () => {
+  it('leaves the rack less the tiles a play puts down', () => {
+    expect(leaveOf('AEFLMST', '8D FLAME')).toBe('ST');
+    // Through a tile on the board, which the rack does not give.
+    expect(leaveOf('HHIRRUV', '10E QI(S)')).toBeNull();
+    expect(leaveOf('AIQRRVY', '10E QI(S)')).toBe('ARRVY');
+    // A blank, played as a lower-case letter, takes the rack's ?.
+    expect(leaveOf('?AEINST', '8D SaTINE')).toBe('A');
+    expect(leaveOf('AEINST?', '8D SaTINE')).toBe('A');
+    // A bingo leaves nothing; a '.' square MAGPIE could not name takes nothing.
+    expect(leaveOf('AEINRST', '8B RETAINS')).toBe('');
+    expect(leaveOf('AEINRST', '8B RET.INS')).toBe('A');
+  });
+
+  it('leaves the rack less an exchange, and all of it for a pass', () => {
+    expect(leaveOf('HHIRRUV', '(exch HHIUV)')).toBe('RR');
+    expect(leaveOf('HHIRRUV', 'pass')).toBe('HHIRRUV');
+  });
+
+  it('keeps a letter of more than one character bracketed', () => {
+    expect(leaveOf('A[CH]EOS[LL]', '8H [CH]E')).toBe('AOS[LL]');
+  });
+
+  it('gives null for a move it cannot read or the rack cannot make', () => {
+    expect(leaveOf('AEINRST', 'nonsense')).toBeNull();
+    expect(leaveOf('AEINRST', '8D ZAX')).toBeNull();
+    expect(leaveOf('AEINRS', '8D aEIOU')).toBeNull();
+  });
+
+  it('spells a typed rack as the server stores it', () => {
+    expect(rackSpelling(' te ar?s ')).toBe('?AERST');
+    expect(rackSpelling('AABCELT')).toBe('AABCELT');
   });
 });

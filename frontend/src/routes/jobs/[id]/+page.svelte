@@ -16,6 +16,7 @@
   import SavedPositions from '$lib/components/SavedPositions.svelte';
   import type { JobConfig } from '$lib/jobSettings';
   import { analysesPerRack, rackConsensus } from '$lib/consensus';
+  import { leaveOf, rackSpelling } from '$lib/cgp';
   import { plyAt, plyColumns, plyHeaders, showsIterations } from '$lib/moveList';
 
   // The [id] route only matches when the param is present.
@@ -29,6 +30,10 @@
   // Opening-rack search
   let rackQuery = '';
   let rackMoves: RackLookupRow[] | null = null;
+  // The rack the shown moves are for, spelt as the job stores it: what each
+  // move's leave is taken from, whatever is typed in the box since.
+  let lookedUp = '';
+  let lookingUp = false;
   $: lookupConsensus = rackMoves ? rackConsensus(rackMoves) : null;
   $: lookupWinPct = rackMoves?.some((m) => m.win_percentage !== null) ?? false;
   $: lookupPlies = rackMoves ? plyColumns(rackMoves) : 0;
@@ -84,13 +89,38 @@
   async function lookupRack() {
     rackError = '';
     rackMoves = null;
+    lookingUp = true;
     try {
-      const result = await api.rackLookup(jobId, rackQuery);
+      const rack = rackQuery;
+      const result = await api.rackLookup(jobId, rack);
+      lookedUp = rackSpelling(rack);
       rackMoves = result.items;
       if (!rackMoves.length) rackError = 'No analysis stored for that rack yet.';
     } catch (e) {
       rackError = (e as Error).message;
+    } finally {
+      lookingUp = false;
     }
+  }
+
+  /** Looks up one rack the job has analysed, drawn at random. */
+  async function lookupRandom() {
+    rackError = '';
+    lookingUp = true;
+    try {
+      const [rack] = (await api.rackSamples(jobId, 1)).racks;
+      if (!rack) {
+        rackError = 'No rack has been analysed yet.';
+        lookingUp = false;
+        return;
+      }
+      rackQuery = rack;
+    } catch (e) {
+      rackError = (e as Error).message;
+      lookingUp = false;
+      return;
+    }
+    await lookupRack();
   }
 </script>
 
@@ -184,7 +214,8 @@
               placeholder="AABCELT"
               on:keydown={(e) => e.key === 'Enter' && lookupRack()}
             />
-            <button class="btn-primary" on:click={lookupRack}>Search</button>
+            <button class="btn-primary" disabled={lookingUp} on:click={lookupRack}>Search</button>
+            <button class="btn-secondary" disabled={lookingUp} on:click={lookupRandom} data-testid="rack-random">Random</button>
           </div>
           {#if sampleRacks.length}
             <div class="flex flex-wrap items-center gap-2 text-sm">
@@ -219,7 +250,8 @@
               <thead>
                 <tr>
                   {#if lookupConsensus && lookupConsensus.analyses > 1}<th>Analysis</th>{/if}
-                  <th>#</th><th>Move</th><th class="text-right">Score</th><th class="text-right">Equity</th>
+                  <th>#</th><th>Move</th><th title="What the move keeps on the rack">Leave</th>
+                  <th class="text-right">Score</th><th class="text-right">Equity</th>
                   {#if lookupWinPct}<th class="text-right">Win %</th>{/if}
                   {#if lookupIters}
                     <th class="text-right" title="How often the simulation played the move out">Iters</th>
@@ -237,6 +269,7 @@
                     {/if}
                     <td class="tabular-nums">{move.rank}</td>
                     <td class="font-mono text-xs">{move.move}</td>
+                    <td class="font-mono text-xs">{leaveOf(lookedUp, move.move) || '—'}</td>
                     <td class="text-right tabular-nums">{move.score}</td>
                     <td class="text-right tabular-nums">{move.equity.toFixed(2)}</td>
                     {#if lookupWinPct}

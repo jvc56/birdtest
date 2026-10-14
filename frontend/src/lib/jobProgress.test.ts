@@ -75,7 +75,7 @@ describe('F-PROG-2 throughput and time left', () => {
     const left = timeLeftFigure(job({ eta_seconds: 960 }), now);
     expect(left.value).toBe('16m');
     expect(left.sub).toBe(
-      `about ${new Date(now + 960_000).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}`
+      `about ${new Date(now + 960_000).toLocaleString(undefined, { year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}`
     );
     expect(timeLeftFigure(job({}), now)).toEqual({ value: '—', sub: 'no estimate yet' });
     expect(timeLeftFigure(job({ status: 'inactive', eta_seconds: 960 }), now)).toEqual({
