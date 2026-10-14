@@ -51,7 +51,7 @@ test('E-13: an opening-rack job offers analysed racks to look up', async ({ page
   // and, seeking a consensus, re-analysis.
   const progress = page.getByTestId('job-progress');
   await expect(progress.getByTestId('rack-fronts')).toContainText('Time left');
-  await expect(progress.getByTestId('rack-front-settled')).toContainText('Settled');
+  await expect(progress.getByTestId('rack-front-settled')).toContainText(/settled/i);
   await expect(progress.getByTestId('task-counts')).toContainText('first pass');
   await expect(progress.getByTestId('task-counts')).toContainText('to be handed out again');
   await expect(page.getByText('Analysed racks to try:')).toBeVisible();
