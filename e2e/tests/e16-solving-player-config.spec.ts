@@ -9,7 +9,7 @@ test.use({ storageState: ADMIN_STATE });
  * list that is not whole numbers is named rather than sent; and the config's
  * page says how it solves, beside its search.
  */
-test('E-16: a player config solves its endgame and pre-endgame', async ({ page }) => {
+test('E-16: a player solves its endgame and pre-endgame', async ({ page }) => {
   const name = `e16-${crypto.randomUUID().slice(0, 8)}`;
   await page.goto('/admin/player-configs/new');
   await page.getByLabel('Name').fill(name);

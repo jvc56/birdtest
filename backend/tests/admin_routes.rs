@@ -178,7 +178,7 @@ async fn a_player_config_round_trips_and_one_in_use_cannot_be_deleted() {
     let alpha_path = format!("/api/admin/player-configs/{}", alpha["id"].as_str().unwrap());
     let (status, body) = admin.delete(&alpha_path).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert!(message(&body).contains("references this player config"), "{body}");
+    assert!(message(&body).contains("references this player"), "{body}");
     let (status, _) = admin.get(&alpha_path).await;
     assert_eq!(status, StatusCode::OK, "a refused delete deleted it anyway");
 
@@ -187,7 +187,7 @@ async fn a_player_config_round_trips_and_one_in_use_cannot_be_deleted() {
     assert_eq!((status, &body), (StatusCode::NO_CONTENT, &Value::Null));
     let (status, body) = admin.get(&beta_path).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
-    assert_eq!(message(&body), "no such player config");
+    assert_eq!(message(&body), "no such player");
     let (status, body) = admin.delete(&beta_path).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     let (_, list) = admin.get("/api/admin/player-configs").await;
@@ -405,7 +405,7 @@ async fn job_creation_refuses_each_impossible_combination_and_says_which() {
         ("a layout that does not exist", with(&|body| body["layout_id"] = json!(Uuid::new_v4())), "no input data row"),
         ("a lexicon given as the letter distribution", with(&|body| body["letterdist_id"] = json!(files.kwg)), "expected a letterdist row"),
         ("a letter distribution MAGPIE cannot hold", with(&|body| body["letterdist_id"] = json!(oversized)), "cannot be used"),
-        ("a player config that does not exist", with(&|body| body["player_config_ids"] = json!([plain["id"], Uuid::new_v4()])), "player config not found"),
+        ("a player config that does not exist", with(&|body| body["player_config_ids"] = json!([plain["id"], Uuid::new_v4()])), "player not found"),
     ];
     for (name, body, says) in cases {
         let (status, refusal) = admin.post("/api/admin/jobs", body).await;

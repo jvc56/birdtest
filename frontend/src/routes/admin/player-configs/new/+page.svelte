@@ -179,7 +179,7 @@
   }
 </script>
 
-<h1 class="mb-6 text-2xl font-semibold">New player config</h1>
+<h1 class="mb-6 text-2xl font-semibold">New player</h1>
 
 <form class="card max-w-2xl space-y-4" on:submit|preventDefault={submit} on:input={() => { if (fromSubmit) { error = ''; fromSubmit = false; } }}>
   <div>
@@ -197,7 +197,7 @@
       </select>
       <p class="mt-1 text-xs text-muted-foreground">
         This decides what move generation <em>keeps</em>, not which move is played.
-        <strong>best</strong> throws away every candidate but the winner, so a static config
+        <strong>best</strong> throws away every candidate but the winner, so a static player
         using it can only ever report one move per position. A simmer is unaffected: it ranks
         every play up to its number of plays, whatever the recorder. Right for games jobs, where
         only the move played matters. A static opening-rack player wants a ranking, so it needs
@@ -228,9 +228,9 @@
     {/if}
   </div>
   <p class="text-xs text-muted-foreground">
-    Files are pinned by content, not by name: a config names exact bytes, and a
+    Files are pinned by content, not by name: a player names exact bytes, and a
     worker whose copy does not match declines the task rather than contributing
-    something incomparable. New data means a new config — clone this one once
+    something incomparable. New data means a new player — clone this one once
     the newer files are imported. A static player must not name a win% model,
     because MAGPIE never loads one for it.
   </p>
@@ -241,7 +241,7 @@
     <p class="mt-1 text-xs text-muted-foreground">
       How many ranked plays birdtest stores per analysed position. Separate from
       how many are generated or simulated, and never more than that: an
-      opening-rack job refuses a config that reports more plays than it generates.
+      opening-rack job refuses a player that reports more plays than it generates.
     </p>
   </div>
 

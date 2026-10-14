@@ -424,7 +424,7 @@ async fn player_config(
     .bind(id)
     .fetch_optional(&state.read_pool)
     .await?
-    .ok_or_else(|| AppError::not_found("no such player config"))?;
+    .ok_or_else(|| AppError::not_found("no such player"))?;
     Ok(Json(config.into()))
 }
 

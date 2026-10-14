@@ -42,7 +42,7 @@
       // imported first.
       anchorId = configs[0]?.id ?? '';
     } catch (e) {
-      error = `Could not load player configs and input data: ${e instanceof Error ? e.message : String(e)}`;
+      error = `Could not load the players and input data: ${e instanceof Error ? e.message : String(e)}`;
     }
   });
 
@@ -136,7 +136,7 @@
 
   <div class="grid grid-cols-2 gap-3">
     <div>
-      <label class="label" for="anchor">Anchor player config</label>
+      <label class="label" for="anchor">Anchor player</label>
       <select id="anchor" class="input" bind:value={anchorId} required>
         {#each configs as config}<option value={config.id}>{config.name}</option>{/each}
       </select>

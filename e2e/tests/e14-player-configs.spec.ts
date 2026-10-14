@@ -5,7 +5,7 @@ import { test, expect } from '@playwright/test';
  * configs from the nav, opens one, reads its key settings in a table, and
  * can open every setting in the same table.
  */
-test('E-14: a visitor reads a player config and all of its settings', async ({ page }) => {
+test('E-14: a visitor reads a player and all of its settings', async ({ page }) => {
   await page.goto('/');
   await page.getByRole('link', { name: 'Players', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'Players', exact: true })).toBeVisible();

@@ -200,7 +200,7 @@
           <table class="table text-xs" data-testid="cross-table">
             <thead>
               <tr>
-                <th class="sticky left-0 z-10 bg-card">Player config</th>
+                <th class="sticky left-0 z-10 bg-card">Player</th>
                 {#each table.configs as col, c}
                   <th class="whitespace-nowrap text-center" title={col.name}>{columnLabels[c]}</th>
                 {/each}
@@ -269,12 +269,12 @@
          visitor reads the ratings off the plot and the cross table. -->
     {#if isAdmin}
       <div class="card space-y-3">
-        <h2 class="text-lg font-medium">All configs</h2>
+        <h2 class="text-lg font-medium">All players</h2>
         <div class="overflow-x-auto">
         <table class="table">
           <thead>
             <tr>
-              <th>Player config</th>
+              <th>Player</th>
               <th class="text-right">Rating (WESPA scale)</th>
               <th class="text-right">± SE</th>
               <th class="text-right">Pairs</th>
@@ -341,7 +341,7 @@
 
         <div class="flex flex-wrap items-end gap-2 border-t border-border pt-3">
           <div class="min-w-56 flex-1">
-            <label class="label" for="add-config">Add a player config</label>
+            <label class="label" for="add-config">Add a player</label>
             <select id="add-config" class="input" bind:value={addConfigId} disabled={busy}>
               <option value="">Select…</option>
               {#each others as config}
@@ -374,7 +374,7 @@
           </button>
         </div>
         <p class="text-xs text-muted-foreground">
-          Adding or removing a config refits the whole pool. A config's games are evidence for
+          Adding or removing a player refits the whole pool. A player's games are evidence for
           everyone else's rating too, so taking it out moves every other number — that is correct,
           and it is why this is not a per-row edit.
         </p>
@@ -386,7 +386,7 @@
         <h2 class="text-lg font-medium">Anchor</h2>
         <div class="flex flex-wrap items-end gap-2">
           <div class="min-w-56 flex-1">
-            <label class="label" for="anchor-config">Anchor player config</label>
+            <label class="label" for="anchor-config">Anchor player</label>
             <select id="anchor-config" class="input" bind:value={anchorId} disabled={busy}>
               <optgroup label="Members">
                 {#each members as member}
@@ -394,7 +394,7 @@
                 {/each}
               </optgroup>
               {#if others.length}
-                <optgroup label="Other player configs (joins the pool)">
+                <optgroup label="Other players (joins the pool)">
                   {#each others as config}
                     <option value={config.id}>{config.name}</option>
                   {/each}
@@ -421,7 +421,7 @@
         </div>
         <p class="text-xs text-muted-foreground">
           Every rating is measured from the anchor, so moving it or its rating refits the pool on
-          the new scale. Earlier runs keep the scale they were fitted on. A config that is not a
+          the new scale. Earlier runs keep the scale they were fitted on. A player that is not a
           member joins the pool as its anchor.
         </p>
         <div class="flex flex-wrap items-center gap-3 border-t border-border pt-3">

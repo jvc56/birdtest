@@ -161,7 +161,7 @@
 
 <h1 class="mb-2 text-2xl font-semibold">Input data</h1>
 <p class="mb-6 text-sm text-muted-foreground">
-  One row per distinct file, identified by content. Jobs and player configs pin these rows, so a
+  One row per distinct file, identified by content. Jobs and players pin these rows, so a
   worker whose copy of a file does not match the digest declines the task instead of contributing
   something incomparable.
 </p>

@@ -20,7 +20,7 @@
     try {
       [configs, files] = await Promise.all([api.playerConfigs(), api.inputData()]);
     } catch (e) {
-      error = `Could not load player configs and input data: ${e instanceof Error ? e.message : String(e)}`;
+      error = `Could not load the players and input data: ${e instanceof Error ? e.message : String(e)}`;
     }
   }
   onMount(load);
@@ -38,12 +38,12 @@
 </script>
 
 <div class="mb-4 flex items-center justify-between">
-  <h1 class="text-2xl font-semibold">Player configs</h1>
+  <h1 class="text-2xl font-semibold">Players</h1>
   <a href="/admin/player-configs/new" class="btn-primary no-underline hover:no-underline">New</a>
 </div>
 <p class="mb-4 text-sm text-muted-foreground">
-  Configs are immutable once created — there is no edit endpoint. Deletion is only allowed while no
-  job references them. A config pins exact file contents, so updating data means cloning the config
+  Players are immutable once created — there is no edit endpoint. Deletion is only allowed while no
+  job references them. A player pins exact file contents, so updating data means cloning the player
   onto the new rows rather than editing this one.
 </p>
 {#if error}<p class="mb-4 text-destructive">{error}</p>{/if}
@@ -74,14 +74,14 @@
         {#if config.cloned_from_id}
           <tr>
             <td colspan="9" class="text-xs text-muted-foreground">
-              Cloned from {byConfigId.get(config.cloned_from_id)?.name ?? 'a deleted config'} —
+              Cloned from {byConfigId.get(config.cloned_from_id)?.name ?? 'a deleted player'} —
               ratings restart on new data, because they are only comparable
               between players that ran on identical files.
             </td>
           </tr>
         {/if}
       {:else}
-        <tr><td colspan="9" class="text-muted-foreground">No player configs yet.</td></tr>
+        <tr><td colspan="9" class="text-muted-foreground">No players yet.</td></tr>
       {/each}
     </tbody>
   </table>

@@ -892,7 +892,7 @@ async fn an_input_file_in_use_cannot_be_deleted() {
     for id in pinned {
         let (status, body) = admin.call("DELETE", &format!("/api/admin/input-data/{id}"), None).await;
         assert_eq!(status, StatusCode::CONFLICT, "{id}: {body}");
-        assert_eq!(body["message"], "this file is pinned by 1 job, player config or rating pool");
+        assert_eq!(body["message"], "this file is pinned by 1 job, player or rating pool");
     }
     let (status, body) = admin.call("DELETE", &format!("/api/admin/input-data/{unused}"), None).await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");

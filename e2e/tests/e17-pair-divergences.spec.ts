@@ -37,7 +37,7 @@ test.beforeAll(async ({ browser, playwright }) => {
   // Two players ticked: one job between them.
   await form.getByLabel(names[0], { exact: true }).check();
   await form.getByLabel(names[1], { exact: true }).check();
-  await expect(form.getByTestId('matchups')).toContainText('2 configs → 1 job');
+  await expect(form.getByTestId('matchups')).toContainText('2 players → 1 job');
   await form.getByLabel('Pairs Per Task').fill('5');
   await form.getByLabel('Pairs To Play').fill('30');
   // Offered only once positions are saved.
