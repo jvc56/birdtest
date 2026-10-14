@@ -93,7 +93,7 @@ Each has a recommendation. Confirm or override before the phase that needs it.
 | D9 | Item 7: how much space counts as available, and is anything evicted? | Available = free space on the data directory's filesystem (`statvfs`), minus a reserve, plus the bytes of tables this client built earlier that the task does not need. A new `contribute.txt` key `diskreserve` (in GB) sets the reserve, default 2 GB. When a table does not fit otherwise, evict tables the client built for other jobs, least recently used first, and only files listed in its own manifest. It never deletes a file it did not build. |
 | D11 | Item 10: where does a move's leave come from? Neither move list shows one, and no API sends one. A saved position has `rack`; a rack lookup has the rack looked up. | Computed on the page: `leaveOf(rack, move)` in `lib/cgp.ts`. It reuses `parseMove`. A placement's leave is the rack less the tiles it puts down (a lowercase letter uses a `?`). Played-through squares and `.` squares use nothing. An exchange's leave is the rack less the exchanged tiles, and a pass's is the whole rack. Letters are shown in the rack's order. An empty leave (a bingo) shows "—". A move that cannot be read, or tiles the rack does not hold, also shows "—", rather than a wrong leave. No server or contract change. |
 | D12 | Item 11: the **PLAYED** tag is also the row's only non-colour cue. | Drop the visible tag and keep the row's tint. Keep the `(played)` text for screen readers only (`sr-only`), and keep `data-played` for tests. The line above the board ("· played 8G HUH (24)") stays. |
-| D10 | Item 7: does the server learn which tables a task skipped? | Yes, in the result: a `derived_skipped` list of roles, stored on the claim (a nullable column, migration `0002`) and shown on the admin's task view. Nothing depends on it for correctness, since results are identical with or without the tables. But a slow worker's timeouts count against the job and can set it aside, and an admin needs to see why. |
+| D10 | Item 7: does the server learn which tables a task skipped? | Yes, in the result: a `derived_skipped` list of roles, stored on the claim (a nullable column, migration `0002`) and shown on the admin's task view. Nothing depends on it for correctness: a static player's moves are identical without the tables, and a simmer's games are equally valid (they may differ, as measured in phase 5). But a slow worker's timeouts count against the job and can set it aside, and an admin needs to see why. |
 
 ## Phase 1 — six page fixes (items 9, 2, 3, 5, 10, 11)
 
@@ -356,10 +356,14 @@ job type. No schema change, and no database reset.
 What exists today:
 - A worker never downloads a wordmap, word info table or rack info table. It
   builds each one locally and checks it against the SHA-256 the claim pins.
-- All three are optional accelerators. MAGPIE's tests show identical moves
-  with and without them, and movegens count calls to the move generator, so
-  the count does not change either. Skipping one is safe for results and for
-  accounting.
+- All three are optional accelerators. For a static player MAGPIE's tests
+  show identical moves with and without them. **As built (benchmark,
+  2026-10-14):** a simming player's games do change with the wordmap -- its
+  move generator orders equal moves differently -- by a little and
+  reproducibly (20 CSW24 2-ply games: 345,126 movegens without, 346,259
+  with). They are equally valid games, and each task runs on one worker with
+  one set of tables, so a pair's two games still match; nothing in birdtest
+  compares one worker's games with another's move for move.
 - There is no disk check, size cap or eviction (README.md:633-638 says so and
   proposes this fix).
 - A full disk during an RIT build ends the worker (`fwrite_or_die`, KL-51).

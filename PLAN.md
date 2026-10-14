@@ -10341,18 +10341,23 @@ says so in its implemented option, rather than being removed.
   decision.
 
 **KL-51. A full disk while writing a wordmap or rack info table ends the worker.**
-- **Context:** The writers are MAGPIE's CLI writers (`fwrite_or_die`), which
+*Closed in MAGPIE 0.1.3 (2026-10-14).*
+- **Context:** The writers were MAGPIE's CLI writers (`fwrite_or_die`), which
   exit.
-- **Problem:** On the contribute path, the claim then waits out the heartbeat
-  timeout, and the partial temporary is removed by the next write, an hour on.
-- **Options considered:** decline the task.
-- **Option implemented:** None.
-- **Justification:** Declining means error returns through writers the CLI
-  shares.
+- **Problem:** On the contribute path, the claim then waited out the heartbeat
+  timeout, and the partial temporary was removed by the next write, an hour on.
+- **Options considered:** decline the task; run it without the table.
+- **Option implemented:** Run it without the table. The writers return an
+  error, the partial temporary is removed at once, and the task runs without
+  that table and reports it in `derived_skipped`. The tables became a best
+  attempt in the same release (README, "What it costs a contributor").
+- **Justification:** No task needs a table; declining would leave work undone
+  that the worker can do.
 
 **KL-52. Local write failures are counted, not remembered.**
-- **Context:** A worker that cannot write a table or a fetched KLV, for example
-  because its data directory is read-only, counts a failure.
+- **Context:** A worker that cannot write a fetched KLV, for example because
+  its data directory is read-only, counts a failure. (Since MAGPIE 0.1.3 a
+  table it cannot write is skipped, not counted: KL-51.)
 - **Problem:** A success on another job resets the count, so the worker keeps
   claiming the job it cannot run, between the ones it can.
 - **Options considered:** set the job aside, as for other failures.

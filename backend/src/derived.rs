@@ -232,9 +232,10 @@ pub struct ExpectedDerived {
     pub build_target: String,
     /// The size of the server's reference build, in bytes: what the worker
     /// needs free to build its own. The tables are a best attempt -- a worker
-    /// short of space runs the task without the ones that do not fit, which
-    /// is slower and plays the same moves -- and this is how it decides which
-    /// fit before spending minutes building one that will not.
+    /// short of disk or memory runs the task without the ones that do not
+    /// fit, which is slower; a static player plays the same moves, a simming
+    /// one equally valid games that need not be the same -- and this is how it
+    /// decides which fit before spending minutes building one that will not.
     pub bytes: i64,
 }
 

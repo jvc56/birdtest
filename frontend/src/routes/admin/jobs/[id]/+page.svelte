@@ -658,8 +658,9 @@
       <h2 class="mb-1 text-lg font-medium">Tables skipped</h2>
       <p class="mb-3 text-sm text-muted-foreground">
         Wordmaps, word info tables and rack info tables are a best attempt: a contributor short of
-        space runs a task without the ones that do not fit, which is slower and plays the same
-        moves. Tasks here run slow, and may reach the job's time limit, for that reason alone.
+        disk or memory runs a task without the ones that do not fit. That is slower, and its games
+        are as valid (a static player plays the same moves). Tasks here run slow, and may reach the
+        job's time limit, for that reason alone.
       </p>
       {#if skipped === null}
         <p class="text-sm text-muted-foreground">

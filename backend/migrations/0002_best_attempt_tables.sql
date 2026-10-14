@@ -3,15 +3,16 @@
 --
 -- The first migration after deploy (UPDATES_PLAN_2026-10-13, "Schema changes
 -- ship as numbered migrations"). Additive, so the image before it still runs
--- on the schema it leaves: a column that image never names, an index, and two
+-- on the schema it leaves: a column that image never names, an index, and
 -- column defaults it never relies on (create_job writes a job's floor
 -- explicitly).
 
--- The derived files a completed claim's worker ran without for want of
--- space -- 'wmp', 'wit', 'rit', sorted and once each -- or NULL when it ran
+-- The derived files a completed claim's worker ran without for want of disk
+-- or memory -- 'wmp', 'wit', 'rit', sorted and once each -- or NULL when it ran
 -- with every one its players use (and for a build before 0.1.3, which does
--- not say). The moves are the same without them, so nothing decides anything
--- from this; an admin reads it to see why a job's tasks run slow.
+-- not say). Without them a static player plays the same moves, and a simming
+-- one equally valid games that need not be the same; nothing decides
+-- anything from this. An admin reads it to see why a job's tasks run slow.
 ALTER TABLE task_claims ADD COLUMN derived_skipped TEXT[]
     CONSTRAINT task_claims_derived_skipped_roles CHECK (
         derived_skipped <@ ARRAY['wmp', 'wit', 'rit']::text[]

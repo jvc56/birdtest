@@ -3316,7 +3316,7 @@ below.
 - `A-ADMIN-8` `job/:id/data-gaps` reports what workers declined for. *(Covered:
   `admin_routes::data_gaps_report_what_workers_declined_for`.)*
 - `A-ADMIN-8b` A result's `derived_skipped` (the derived files its worker ran
-  without for want of space; the tables are a best attempt) is kept on the
+  without for want of disk or memory; the tables are a best attempt) is kept on the
   claim sorted and once each, null for `[]` or a build that leaves it out
   (migration `0002`), and `job/:id/skipped-tables` counts each role's tasks
   and workers; anything but a list of `wmp`, `wit` and `rit` is a `400`

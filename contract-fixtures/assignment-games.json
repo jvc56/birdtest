@@ -66,7 +66,7 @@
         "sha256": "2547e017e64a5f4f91b75736fd7a4666faa20961ce92abfe6a813e4f85f55475",
         "builder": "wit-1",
         "build_target": "nehalem",
-        "bytes": 92056576
+        "bytes": 92123868
       }
     ]
   },

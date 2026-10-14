@@ -522,10 +522,11 @@ struct SkippedTable {
     last_completed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-/// The derived files the job's workers ran without for want of space, by
-/// role. The tables are a best attempt: a task runs without one that does not
-/// fit, slower and with the same moves, so this explains a job whose tasks run
-/// slow or time out rather than anything wrong with its results. Reads only
+/// The derived files the job's workers ran without for want of disk or
+/// memory, by role. The tables are a best attempt: a task runs without one
+/// that does not fit, slower, its games equally valid (a static player's the
+/// same moves), so this explains a job whose tasks run slow or time out rather
+/// than anything wrong with its results. Reads only
 /// the claims that skipped one (`task_claims_derived_skipped_idx`).
 async fn job_skipped_tables(
     State(state): State<AppState>,

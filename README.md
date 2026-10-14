@@ -327,9 +327,11 @@ MAGPIE's `data/`, or a link to it: MAGPIE loads its default board from
 `./data` before it reads anything else.) Settings never
 go on the command line, so an API
 key stays out of shell history and `ps` output. A job's players decide whether
-a wordmap (`.wmp`) and a rack info table (`.rit`) are used — both are on by
-default, since they make game play much faster — and a word info table
-(`.wit`), which is off by default, as it is in MAGPIE. MAGPIE builds each from
+a wordmap (`.wmp`), a word info table (`.wit`) and a rack info table (`.rit`)
+are used -- all three are on by default, since they make game play much faster
+-- and each is a best attempt: a contributor short of disk or memory plays
+without the ones that do not fit (see [What it costs a
+contributor](#what-it-costs-a-contributor)). MAGPIE builds each from
 files it already has the first time a job asks (a wordmap or a word info table
 in a couple of seconds, a rack info table in one to three minutes and about
 2.4 GB of memory, 1.9 GB on disk and in memory after), checks it against the
@@ -636,12 +638,39 @@ every one of the 431 leave values.
 - **Memory:** a process that plays with a rack info table holds it — about
   1.9 GB for CSW24 — so several `magpie contribute` processes on one machine
   hold one copy each.
-- **Disk, still unbounded:** 179 MB per wordmap, 122 MB per word info table and
-  1.9 GB per `(.kwg, .klv2)` pair with a rack info table, and nothing evicts them. Player configs use both by
-  default, so a contributor on many lexicons accumulates tables; one who runs
-  out of disk gets a failed build and a declined task, not a wrong result. The
-  fix is a size cap with least-recently-used eviction in `contribute.txt`,
-  which is a change to MAGPIE's `contribute.c` and to no protocol.
+- **Disk and memory, as much as there is (MAGPIE 0.1.3):** 179 MB per wordmap,
+  122 MB per word info table and 1.9 GB per `(.kwg, .klv2)` pair with a rack
+  info table. The tables are a best attempt. Before a task, `magpie contribute`
+  picks the tables it uses from those the task's players ask for, in the
+  order they speed it up -- wordmap, then word info table, then rack info
+  table, and never a rack info table or word info table without its
+  wordmap -- keeping each that fits both:
+  - the disk: free space on the data directory less `diskreserve` (GB,
+    default 2, in `contribute.txt`), plus the tables it built earlier for
+    other jobs, which it evicts least recently used first when it needs the
+    room (only files its own manifest, `contribute_tables.txt`, lists);
+  - the memory: `MemAvailable` less `memreserve` (GB, default 1), for the
+    build's peak (about 710 MB for a wordmap, 310 MB for a word info table,
+    2.4 GB for a rack info table) and for holding the table while it plays.
+
+  It runs the task without the rest, says which and why, and lists them in
+  its result's `derived_skipped`; the admin job page counts them under
+  **Tables skipped**. A disk that fills during a build skips that table the
+  same way (PLAN.md KL-51). The claim states each table's size (`bytes`), so
+  the choice is made before anything is built. Without a table a task is
+  slower; a static player plays the same moves, and a simming player equally
+  valid games that need not be the same, since the wordmap's move generator
+  orders equal moves differently. What each is worth, on CSW24 with four
+  cores (MAGPIE `scripts/bench_tables.sh`, 2026-10-14), in movegens a second:
+
+  | Tables | Static player | 2-ply simmer |
+  |---|---|---|
+  | none | 17,217 | 15,884 |
+  | word info table alone | 18,248 | 15,893 |
+  | wordmap | 65,136 | 47,735 |
+  | wordmap, word info table | 63,027 | 51,926 |
+  | wordmap, rack info table | 69,185 | 55,808 |
+  | all three | 69,723 | 70,870 |
 
 ### What is not covered
 

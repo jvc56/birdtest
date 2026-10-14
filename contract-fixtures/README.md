@@ -72,9 +72,11 @@ anything else is a `400` listing them.
 Each entry of `expected_data.derived` states, beside its role, name, hash,
 builder and build target, `bytes`: the size of the server's reference build.
 The wordmap, word info table and rack info table are a best attempt (MAGPIE
-0.1.3): a worker short of space runs a task without the ones that do not fit,
-which is slower and plays the same moves, and `bytes` is how it knows what
-fits before it builds anything. A result states what it ran without, beside
+0.1.3): a worker short of disk or memory runs a task without the ones that do
+not fit, which is slower (a static player plays the same moves; a simming
+one's games are equally valid but need not be the same, since the wordmap's
+move generator orders equal moves differently), and `bytes` is how it knows
+what fits before it builds anything. A result states what it ran without, beside
 `movegens`: `"derived_skipped"`, a sorted list of `"wmp"`, `"wit"` and
 `"rit"`, `[]` for none. The server accepts the key missing (a build before
 0.1.3) and refuses anything but those three roles.

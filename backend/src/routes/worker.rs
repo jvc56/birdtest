@@ -845,10 +845,10 @@ struct ResultBody {
     #[serde(default)]
     movegens: Option<serde_json::Value>,
     /// The derived files the task's players use that this worker ran without,
-    /// for want of space: `"wmp"`, `"wit"`, `"rit"`. The tables are a best
-    /// attempt and the moves are the same without them, so nothing depends on
-    /// it; it is kept on the claim so an admin can see why a job's tasks run
-    /// slow. Absent from a build before 0.1.3, which is read as none skipped.
+    /// for want of disk or memory: `"wmp"`, `"wit"`, `"rit"`. The tables are a
+    /// best attempt -- without them a static player plays the same moves and a
+    /// simming one equally valid games -- so nothing depends on it; it is kept
+    /// on the claim so an admin can see why a job's tasks run slow. Absent from a build before 0.1.3, which is read as none skipped.
     #[serde(default)]
     derived_skipped: Option<serde_json::Value>,
 }
