@@ -4694,7 +4694,7 @@ contributor's `settings.txt` — or an earlier command in the same process —
 cannot carry one into a task. Built from the lexicon on disk a table prunes
 nothing legal; built from an older one, or by an older builder, it prunes plays
 that exist. So it is handled like the other two: the server builds one from the
-`.kwg` alone (`convert kwg2wit`, builder `wit-1`, about three seconds and
+`.kwg` alone (`convert kwg2witv4`, builder `wit-1`, about three seconds and
 122 MB for CSW24), pins its hash as a `wit` entry in `expected_data.derived`,
 and the worker builds its own and uses it only if the bytes agree. Unlike a
 rack info table it holds nothing a leave generation changes, so a leave job's

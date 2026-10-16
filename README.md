@@ -465,7 +465,7 @@ Linux):
 |---|---|---|---|---|---|
 | `CSW24.wmp` (`convert dawg2wordmap`) | 2.4 s | 1.7 s | **yes** | 179 MB | 710 MB |
 | `CSW24.rit` (`convert klvwmp2rit`) | 169 s | 59 s | **yes** | 1.9 GB | 2.4 GB |
-| `CSW24.wit` (`convert kwg2wit`, MAGPIE `birdtest-contribute`, 2026-10) | — | 2.8 s at 2 threads | **yes** (`NWL23`, 1 and 4 threads) | 122 MB | 310 MB |
+| `CSW24.wit` (`convert kwg2wit`, MAGPIE `birdtest-contribute`, 2026-10; now `kwg2witv4`, the same bytes) | — | 2.8 s at 2 threads | **yes** (`NWL23`, 1 and 4 threads) | 122 MB | 310 MB |
 
 | Comparison | `CSW21_ab.wmp` | `NWL23.wmp` | `CSW21_ab.rit` |
 |---|---|---|---|
@@ -495,7 +495,7 @@ compared" below.
    creation: a config has no letter distribution until a job gives it one.
 3. **A builder task runs MAGPIE**: it writes the inputs and the job's letter
    distribution into a scratch data directory, runs `convert dawg2wordmap`,
-   `convert klvwmp2rit` or `convert kwg2wit`, records the hash, and deletes the directory (in a
+   `convert klvwmp2rit` or `convert kwg2witv4`, records the hash, and deletes the directory (in a
    `Drop`, deliberately blocking, so an early return cannot leak 1.9 GB).
 4. **Dispatch waits for the hash**, the same way a leave-generation job waits
    for its rack universe. `/admin/derived-data` shows what is waiting, what

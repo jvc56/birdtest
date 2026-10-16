@@ -216,7 +216,7 @@ async fn a_word_info_table_is_built_from_the_lexicon_alone() {
         let scratch = ScratchData::empty().await.unwrap();
         scratch.write("letterdistributions", "english_ab", ".csv", &ld).await.unwrap();
         scratch.write("lexica", "CSW21_ab", ".kwg", &kwg).await.unwrap();
-        magpie.convert(&scratch, "kwg2wit", "CSW21_ab", "english_ab").await.unwrap();
+        magpie.convert(&scratch, "kwg2witv4", "CSW21_ab", "english_ab").await.unwrap();
         assert!(!scratch.lexicon_path("CSW21_ab", ".wmp").exists(), "no wordmap is built for it");
         let bytes = tokio::fs::read(scratch.lexicon_path("CSW21_ab", ".wit")).await.unwrap();
         digests.push(hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&bytes)));
