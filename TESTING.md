@@ -4952,7 +4952,7 @@ GitHub Actions.
    `magpie_test builderhash` (the wordmap, rack info table, word info table
    and both KLV builders -- `createdata klv` and `rackequity2klv` -- against
    their pinned hashes), and then every command the server invokes (`convert
-   dawg2wordmap`, `convert klvwmp2rit`, `convert kwg2wit`, `createdata klv`,
+   dawg2wordmap`, `convert klvwmp2rit`, `convert kwg2witv4`, `createdata klv`,
    `convert rackequity2klv`), run as
    the server runs it on MAGPIE's two-letter test data, each required to exit 0
    with no error and to write its file. A fixture

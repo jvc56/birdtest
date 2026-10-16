@@ -454,7 +454,7 @@ jobs:
           }
           run convert dawg2wordmap CSW21_ab english_ab -threads 1
           run convert klvwmp2rit CSW21_ab english_ab CSW21_ab CSW21_ab -threads 1
-          run convert kwg2wit CSW21_ab english_ab -threads 1
+          run convert kwg2witv4 CSW21_ab english_ab -threads 1
           run createdata klv zero english_ab
           run convert rackequity2klv racks english_ab -threads 1
           for f in CSW21_ab.wmp CSW21_ab.rit CSW21_ab.wit zero.klv2 racks.klv2; do
