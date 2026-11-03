@@ -558,7 +558,8 @@ compared" below.
   `ecs:RunTask` the moment a job is created; that would start a minutes-long
   build seconds sooner, at the price of an AWS control-plane call on the
   job-creation path, permission to run tasks and pass roles, and a retry story
-  of its own. The builder task runs every five minutes.
+  of its own. The builder task runs hourly, and `scripts/build-derived-now.sh`
+  starts one at once.
 - **The server keeps no derived file.** A copy would cost 1.9 GB per table for
   inspections nobody has needed, and the bytes are reproducible from inputs
   the object store holds.
@@ -575,7 +576,7 @@ compared" below.
 
 | Build | Where | Why |
 |---|---|---|
-| Wordmap (about 2 s, 710 MB peak), word info table (about 3 s, 310 MB peak, 122 MB file) and rack info table (1 to 3 min, 2.4 GB peak, 1.9 GB file) | the `birdtest-derived-builder` scheduled task ([infra/derived.tf](infra/derived.tf)): 4 vCPU, 8 GB, 30 GB of ephemeral storage, every five minutes, up to eight files a run under a lease | neither fits the web task's 1 vCPU and 2 GB |
+| Wordmap (about 2 s, 710 MB peak), word info table (about 3 s, 310 MB peak, 122 MB file) and rack info table (1 to 3 min, 2.4 GB peak, 1.9 GB file) | the `birdtest-derived-builder` scheduled task ([infra/derived.tf](infra/derived.tf)): 4 vCPU, 8 GB, 30 GB of ephemeral storage, hourly (or at once by `scripts/build-derived-now.sh`), up to eight files a run under a lease | neither fits the web task's half a vCPU and 2 GB |
 | A generation's KLV (`convert rackequity2klv`) | the web task, off the claim path | the same derivation the Rust port did in about 13 s for English; the transition already runs on its own task |
 | The generation-0 KLV (`createdata klv`) | the web task, at job creation | built from the letter distribution alone |
 
@@ -614,6 +615,11 @@ every one of the 431 leave values.
   `main` at a pinned commit (`MAGPIE_COMMIT`, recorded as the
   image label `org.birdtest.magpie-commit`) and builds it; the backend and `derived-builder` targets both carry
   it. Merge the MAGPIE change first — the image fetches the commit.
+- A pin that changes a builder version leaves every job's derived files
+  unbuilt under the new builder, and those jobs dispatch nothing until the
+  hourly builder has rebuilt them: up to two hours, a run builds at most eight
+  files. After the deploy, run `scripts/build-derived-now.sh` (again for more
+  than eight) once the first claims have queued them.
 - It is built `BUILD=portable_release`, which targets `-march=nehalem` rather
   than the `-march=native` every other optimised MAGPIE build uses: a binary
   built on a CI runner could otherwise use instructions a Fargate CPU lacks.
@@ -823,8 +829,9 @@ A first deployment, in order (each step is described below):
    `github_token_parameter_arn`; set it first (below, after the two SSM
    parameters) if more than a few imports are expected. Then make player configs and jobs. A job whose players need a
    wordmap, a rack info table or a word info table is not dispatched until
-   the derived-data builder (every five minutes) has built them:
-   `/admin/derived-data` shows the queue.
+   the derived-data builder (hourly, or at once with
+   `scripts/build-derived-now.sh`) has built them: `/admin/derived-data` shows
+   the queue.
 
 `infra/` is a complete Terraform description of the AWS side. Keep the stack's
 variables in `infra/prod.tfvars` (not committed: it names the account's
@@ -837,7 +844,7 @@ writes them, so their values stay out of its state — so make the first apply
 with `-var desired_count=0 -var scheduled_tasks_enabled=false`, create them as
 below, and apply again with each service at one task and the schedules on:
 started before they exist, the backend's tasks cannot start, the
-derived-data builder fails every five minutes, and a 03:00 backup fails
+derived-data builder fails every hour, and a 03:00 backup fails
 without starting, which only the 36-hour staleness alarm reports.
 
 **Keep Terraform's state off the machine that applies.** The repository
@@ -1107,8 +1114,9 @@ bytes a job pins, so nothing server-side reads a data file off its own disk.
 
 Wordmap, rack info table and word info table builds run in a separate scheduled task
 (`birdtest-derived-builder`), because a table peaks at about 2.4 GB of memory
-and writes a 1.9 GB file — neither of which fits the web task's 1 vCPU and
-2 GB. A job whose derived files are not built yet is not dispatched; the admin
+and writes a 1.9 GB file — neither of which fits the web task's half a vCPU
+and 2 GB. The builder runs hourly; `scripts/build-derived-now.sh` starts it at
+once. A job whose derived files are not built yet is not dispatched; the admin
 page at `/admin/derived-data` is where that wait is visible.
 
 ### Operator scripts
@@ -1133,10 +1141,11 @@ Session Manager plugin for ECS Exec), `terraform`, `jq`, `git`, `gh`,
 | Script | Does |
 | --- | --- |
 | `deploy.sh [--all] [--reset-db] [--set KEY=VALUE]` | Deploys the checked-out commit of main, only what it changed: a clean tree, CI green for it (`gh`); then, from the image each service runs (its tag is a commit), `git diff` to HEAD by path -- `frontend/` deploys the frontend; `backend/`, `docker/` (the MAGPIE pin), `Cargo.*` and `.dockerignore` the backend and the derived-data builder with it; `infra/` (and the scripts its task definitions read) a plan; anything else nothing, and it says so. `--all` deploys both. For the backend, the MAGPIE pin on `main` (`MAGPIE_DIR`, default `~/MAGPIE`). Builds and pushes the images ECR lacks (`linux/amd64`, `CARGO_BUILD_JOBS=2`, `MAKE_JOBS=3`), retags those services in `prod.tfvars`, plans, applies, uploads, waits for both services and target groups. A frontend release never stops the backend. Refuses a backend whose migrations the live backend applied changed (an edit to an applied migration; since 2026-10-13 a schema change is a new numbered one, which this never refuses) unless `--reset-db`, and a service ECS's circuit breaker rolled back until `rollback.sh` has run. |
-| `reset-prod-db.sh [--no-start]` | RUNBOOK "Resetting the production database": empties it (the hostname typed, in a prompt that names both backup buckets and their dump count): the backend's service stopped, the schema dropped and made again, every version under `pg/` in the backups bucket and its DR replica deleted, the backend started so it applies `0001`. RDS's automated backups are left to expire (30 days). Then: register, `confirm-user.sh --admin`, import the input data. `deploy.sh --reset-db` does the same once its plan is approved and before the new task starts. |
+| `reset-prod-db.sh [--no-start]` | RUNBOOK "Resetting the production database": empties it (the hostname typed, in a prompt that names both backup buckets and their dump count): the backend's service stopped, the schema dropped and made again, every version under `pg/` in the backups bucket and its DR replica deleted, the backend started so it applies `0001`. RDS's automated backups are left to expire (7 days, `db_backup_retention_days`). Then: register, `confirm-user.sh --admin`, import the input data. `deploy.sh --reset-db` does the same once its plan is approved and before the new task starts. |
 | `rollback.sh [--to TAG] [--reset-db]` | RUNBOOK "Rolling back a deploy": the previous release from the log (its backend and frontend images, which may be at different tags), or what a circuit breaker went back to. |
 | `set-setting.sh KEY=VALUE...` | Changes `prod.tfvars` values (e.g. `mail_max_per_second=14`) and applies them. The task time limit is not Terraform's, nor the site's: each job has its own, set when it is created and changed on its admin page, and a change takes effect at the job's next claim. |
 | `check-alerts.sh` | The alert-path checks above. |
+| `build-derived-now.sh` | Starts the derived-data builder now instead of at its next hourly run, and exits with its exit code: up to eight files, the same as a scheduled run, honouring the wait after a failed build. |
 | `confirm-user.sh [--admin] NAME` | Confirms an address by hand while SES is in the sandbox, as the confirm-email route does; `--admin` promotes too. |
 | `rotate-db-password.sh [--signing-key] [--resume]` | RUNBOOK "Rotating the database password", never leaving the password only in a shell. |
 | `set-github-token.sh` | The optional GitHub token, then `github_token_parameter_arn`. |
@@ -1155,8 +1164,8 @@ SQL against a real Postgres (nightly).
 Two mechanisms, covering different failures — see
 [Backups and Restore](PLAN.md#backups-and-restore) for which answers which:
 
-- **RDS point-in-time recovery**, 30 days. The fast path for instance failure
-  or a bad migration.
+- **RDS point-in-time recovery**, 7 days. The fast path for instance failure
+  or a bad migration found within a week; past that, the nightly dump.
 - **A nightly `pg_dump`** to an encrypted, versioned, Object-Locked and
   cross-region-replicated bucket, run by a scheduled Fargate task
   (`scripts/backup.sh`). This is the one that can be restored selectively,
@@ -1170,7 +1179,7 @@ silently producing unusable output.
 
 Until launch a production reset (`scripts/reset-prod-db.sh`, `deploy.sh
 --reset-db`) deletes the nightly dumps with the database, in both buckets;
-RDS's point-in-time backups are the one way back across it, for their 30 days.
+RDS's point-in-time backups are the one way back across it, for their 7 days.
 
 Recovering from anything is [RUNBOOK.md](RUNBOOK.md).
 

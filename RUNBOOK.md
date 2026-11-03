@@ -1192,10 +1192,12 @@ leaderboard visible.
 - **Derived data** (`derived_data`): the SHA-256 of each wordmap and rack info
   table the server built. Derived by definition, and **a job whose rows are
   missing does not dispatch** — which is the symptom a restore produces here:
-  active jobs handing out nothing, for a few minutes. The first claim that
+  active jobs handing out nothing, for up to two hours. The first claim that
   considers an active job queues whatever of its files has no row (so does
-  activating it), and the builder task fills them in; `/admin/derived-data`
-  shows the queue. The files themselves are not restored because none is kept:
+  activating it), and the builder task fills them in at its next hourly run;
+  `/admin/derived-data` shows the queue. To fill them at once, run
+  `scripts/build-derived-now.sh` after the first claim has queued them (it
+  builds up to eight files a run; run it again for more). The files themselves are not restored because none is kept:
   the server hashes and discards them.
 
   A row whose `kwg_id` or `klv_id` points at an `input_data` row restored
@@ -1211,10 +1213,12 @@ leaderboard visible.
   failed three times, press **Retry** on it at `/admin/derived-data`: it stays
   failed until someone does, and its job hands out nothing meanwhile. A row
   still `pending` between attempts has no Retry and needs none: it is tried
-  again on its own within about 20 minutes (a 15-minute wait, then the next
-  scheduled builder run). (A
-  build that fails is tried again after 5 and then 15 minutes on its own, so
-  a passing S3 outage heals without anyone.)
+  again on its own within about an hour and a quarter (a 15-minute wait, then
+  the next hourly builder run), or as soon as the wait ends with
+  `scripts/build-derived-now.sh`, which honours the wait: started inside it,
+  it leaves that row alone. (A build that fails is tried again after 5 and then
+  15 minutes on its own, at the next hourly run after each wait, so a passing
+  S3 outage heals without anyone.)
 
 ### 2.5 Start the job again
 
@@ -2034,7 +2038,7 @@ both buckets and the dump count. Then:
 
 **What a reset leaves: RDS's automated backups.** A point-in-time restore (§1)
 to a moment before the reset stays possible until those expire,
-`db_backup_retention_days` (30) days after it. That is the only way back from
+`db_backup_retention_days` (7) days after it. That is the only way back from
 a reset, and after those days there is none.
 
 The deletes need `s3:ListBucketVersions`, `s3:DeleteObjectVersion` and

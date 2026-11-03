@@ -6,16 +6,18 @@
 # with a pinned MAGPIE and publishing the hash. This is where those builds run.
 #
 # Not in the web task. A rack info table build peaks at about 2.4 GB of memory,
-# writes a 1.9 GB file, and takes one to three minutes; the web task has 1 vCPU
-# and 2 GB (`task_cpu`, `task_memory`) and does not fit it. A wordmap's 710 MB
+# writes a 1.9 GB file, and takes one to three minutes; the web task has half a
+# vCPU and 2 GB (`task_cpu`, `task_memory`) and does not fit it. A wordmap's 710 MB
 # peak is a third of that task's memory alongside everything else it is doing.
 #
 # Not triggered on demand, either. The web task could call ecs:RunTask the
 # moment an admin creates a job, which would start a build seconds earlier and
 # would cost an AWS control-plane call on the job-creation path, permission for
 # the web task to run tasks and pass roles, and a retry story for a call that
-# can be throttled. A build takes minutes; a poll every few minutes is a small
-# fraction of that, and the admin UI shows the queue, so the wait is visible.
+# can be throttled. The schedule polls hourly, because a builder started every
+# few minutes cost more than the rest of the builder's work; an admin who cannot
+# wait runs scripts/build-derived-now.sh, and the admin UI shows the queue, so
+# the wait is visible.
 #
 # The image is the backend image with a different entrypoint (`--target
 # derived-builder`), which is what keeps the builder's MAGPIE and the server's
@@ -119,10 +121,12 @@ variable "derived_builder_schedule" {
   description = <<-EOT
     How often to drain the queue. Most runs find it empty and exit in seconds,
     which is the intended steady state; the interval only bounds how long an
-    admin waits after creating a job that needs a table.
+    admin waits after creating a job that needs a table, and
+    scripts/build-derived-now.sh starts a run at once. Hourly rather than every
+    five minutes, which cost about $27 a month in mostly empty runs.
   EOT
   type        = string
-  default     = "rate(5 minutes)"
+  default     = "rate(1 hour)"
 }
 
 # --- Roles -----------------------------------------------------------------
@@ -184,8 +188,8 @@ resource "aws_ecs_task_definition" "derived_builder" {
       essential = true
       # Stated rather than left to the image's CMD. Given the backend image by
       # mistake -- the same repository, a different target -- the CMD is the
-      # web server, which never exits: a 4-vCPU task started every five
-      # minutes, each running the startup reapers that fail the live server's
+      # web server, which never exits: a 4-vCPU task started every hour,
+      # each running the startup reapers that fail the live server's
       # exports and imports. Stated, the wrong image has no `build-derived`
       # and the task fails at once, which the scheduler's failures show.
       command = ["build-derived"]
@@ -296,7 +300,9 @@ resource "aws_scheduler_schedule" "derived_builder" {
     # No retries. The queue is the retry: a row whose build failed is left
     # `pending` with its attempt counter raised and a wait before its next
     # attempt (5, then 15 minutes), and the first scheduled run after the
-    # wait takes it again; after three it is `failed` until an admin retries
+    # wait takes it again -- with an hourly schedule, up to an hour after the
+    # wait ends, or at once by scripts/build-derived-now.sh; after three it is
+    # `failed` until an admin retries
     # it. Retrying the task instead would start a second builder against the
     # same queue for no gain.
     retry_policy {

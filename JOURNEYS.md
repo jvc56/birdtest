@@ -77,7 +77,7 @@ within minutes -- there are only eight racks -- and stay listed as completed.
   [A-12](#a-12-a-leave-generation-job-start-to-finish).
 - **Wordmaps, rack info tables and word info tables** are built by dev.py itself, within about
   fifteen seconds of a job needing one; on the real site a scheduled task does
-  it every five minutes.
+  it hourly, and `scripts/build-derived-now.sh` does it at once.
 
 Job types, as the site names them:
 
@@ -1311,7 +1311,8 @@ These differ on the real site, and are checked there (README, "Deploying"):
   over plain HTTP answers `426` rather than redirecting.
 - `/api/dev/login` does not exist: `404`.
 - Wordmaps, rack info tables and word info tables are built by a scheduled
-  task every five minutes, not within seconds.
+  task every hour (or at once by `scripts/build-derived-now.sh`), not within
+  seconds.
 - Backups run nightly and **Backups** shows them; alarms mail on failure.
 - Contributors connect from other machines.
 

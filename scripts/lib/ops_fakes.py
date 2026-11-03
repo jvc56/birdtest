@@ -28,7 +28,8 @@ during the apply), FAKE_ROLLBACK (backend, frontend or 1 for the backend:
 that service keeps running the old image), FAKE_NO_FRONTEND_SERVICE (a stack
 from before the frontend had a service of its own, until an apply makes it:
 frontend_service_made), FAKE_CI ("completed
-success <url>"), FAKE_WORKSPACE (default).
+success <url>"), FAKE_WORKSPACE (default), FAKE_TASK_EXIT (0: a one-off task's
+container exit code).
 """
 import base64
 import io
@@ -303,7 +304,7 @@ def ecs(op, opt, q):
             # A shell's task (prod-psql.sh --task) runs on; a one-off stops.
             out("RUNNING" if "shelltask" in opt.get("--tasks", "") else "STOPPED")
         elif "exitCode" in q and "stoppedReason" not in q:
-            out("0")
+            out(os.environ.get("FAKE_TASK_EXIT", "0"))
         else:
             out("Essential container in task exited\t0")
     elif op in ("execute-command", "stop-task", "wait"):

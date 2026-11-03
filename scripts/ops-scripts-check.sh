@@ -47,6 +47,9 @@
 #   - pitr-restore.sh: a restore time not in UTC refused, `swap` in order
 #     (rename, rename, state rm, import), resumed from half-way, and `count`
 #     refused once the swap has begun;
+#   - build-derived-now.sh: the builder's family in the service's network
+#     with no overrides, its log stream shown, and the container's exit code
+#     as the script's own;
 #   - RUNBOOK.md §4's checks 2 and 3 are scripts/ops-sql/check-restore.sql's.
 #
 # With PG_EXEC set (e.g. "docker exec -i <postgres 16 container>", as
@@ -64,7 +67,7 @@ trap 'rm -rf "$WORK"' EXIT
 fail() { echo "FAIL: $*" >&2; [[ -s "$WORK/out" ]] && sed 's/^/  | /' "$WORK/out" >&2; exit 1; }
 pass() { echo "ok: $*"; }
 
-for s in "$ROOT"/scripts/lib/ops.sh "$ROOT"/scripts/{deploy,reset-prod-db,rollback,set-setting,check-alerts,confirm-user,assess-damage,onboard-deployer,set-github-token,restore-artifact,rotate-db-password,prod-psql,pitr-restore}.sh; do
+for s in "$ROOT"/scripts/lib/ops.sh "$ROOT"/scripts/{deploy,reset-prod-db,rollback,set-setting,check-alerts,build-derived-now,confirm-user,assess-damage,onboard-deployer,set-github-token,restore-artifact,rotate-db-password,prod-psql,pitr-restore}.sh; do
   bash -n "$s" || fail "$s does not parse"
 done
 pass "every script parses"
@@ -264,7 +267,7 @@ run reset-prod-db.sh || fail "reset-prod-db.sh failed"
 for want in "birdtest-backups-123 (us-east-1): 3 dumps, 4804 object versions, 3 delete markers" \
             "birdtest-backups-dr-123 (eu-west-1): 2 dumps, 1202 object versions, 0 delete markers" \
             "delete the dumps in birdtest-backups-123 and birdtest-backups-dr-123 (5 in all)" \
-            "until they expire, 30 days from now"; do
+            "until they expire, 7 days from now"; do
   grep -qF -- "$want" "$WORK/out" || fail "the reset's warning does not say: $want"
 done
 [[ "$(pg_left "$DUMPS")" == 0 && "$(pg_left "$DUMPS_DR")" == 0 ]] || fail "reset-prod-db.sh left dumps"
@@ -618,6 +621,26 @@ run pitr-restore.sh swap || fail "pitr swap did not resume"
 in_order "--new-db-instance-identifier birdtest " "state rm" "import"
 [[ "$(cat "$FAKE_DIR/tfstate_db")" == db-RESTORED ]] || fail "the resumed swap did not import the restored instance"
 pass "pitr-restore.sh: time checked, one restore, swap in order and resumable, count refused after it"
+
+# ---------------------------------------------------------------------------
+# build-derived-now.sh
+# ---------------------------------------------------------------------------
+fresh "$B"
+if run build-derived-now.sh now; then fail "build-derived-now.sh took an argument"; fi
+! called "ecs run-task" || fail "build-derived-now.sh started a task for a bad argument"
+run build-derived-now.sh || fail "build-derived-now.sh failed"
+called "ecs run-task --cluster birdtest --task-definition birdtest-derived-builder --launch-type FARGATE --network-configuration awsvpcConfiguration={subnets=[subnet-1,subnet-2],securityGroups=[sg-service],assignPublicIp=ENABLED}" \
+  || fail "build-derived-now.sh did not start the builder's family in the service's network"
+[[ "$(cat "$FAKE_DIR/runtask/1.json")" == "{}" ]] || fail "build-derived-now.sh overrode the builder's task"
+called "logs get-log-events --log-group-name /ecs/birdtest --log-stream-name derived-builder/derived-builder/task1" \
+  || fail "build-derived-now.sh did not read the builder's log stream"
+grep -q "psql printed this" "$WORK/out" || fail "build-derived-now.sh did not show the builder's log"
+fresh "$B"
+rc=0
+FAKE_TASK_EXIT=3 run build-derived-now.sh || rc=$?
+[[ "$rc" == 3 ]] || fail "build-derived-now.sh exited $rc for a builder that exited 3"
+grep -q "the builder exited 3" "$WORK/out" || fail "build-derived-now.sh did not say the builder failed"
+pass "build-derived-now.sh: the builder's family in the service's network, its log, and its exit code"
 
 # ---------------------------------------------------------------------------
 # RUNBOOK §4 and check-restore.sql say the same.

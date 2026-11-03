@@ -4712,7 +4712,7 @@ none for a `leave_generation` job and the client loads none.
 
 On the server, in a separate scheduled ECS task (`infra/derived.tf`), not in the
 web task: a table build peaks at about 2.4 GB and writes a 1.9 GB file, against
-the web task's 1 vCPU and 2 GB. It builds from a queue (`derived_data`), at most eight files a run, under a lease
+the web task's half a vCPU and 2 GB. It builds from a queue (`derived_data`), at most eight files a run, under a lease
 and exits. **A job whose derived files are not built is not dispatched** — the
 same wait as a leave-generation job whose universe is not seeded — because
 dispatching without the hash would carry no hash for a file its player asks
@@ -6069,7 +6069,7 @@ Protected by a layout guard (`/admin/+layout.svelte`) that requires `is_admin = 
 | `/admin/audit-log` | Audit log viewer — filterable by action and target type; paginated. (Not by actor: the page has no actor filter.) |
 | `/admin/input-data` | Input data browser and import wizard — pick a tarball date, watch the import, review the staged diff, confirm. |
 | `/admin/fleet` | What MAGPIE versions have claimed work recently, from `task_claims.magpie_version`. |
-| `/admin/derived-data` | The wordmap, rack info table and word info table build queue: what is built, pending or failed, and a retry for the failures. It reads the queue again for as long as it is open — every 3 s while anything is pending or building, every 10 s otherwise, not while the tab is hidden (`lib/poller.ts`) — so a build queued later shows up by itself; the admin job page's list of the files a job waits on does the same. Polled rather than pushed: the builder is a separate process on a five-minute schedule, and a push would need Postgres `LISTEN`/`NOTIFY` for little gain. |
+| `/admin/derived-data` | The wordmap, rack info table and word info table build queue: what is built, pending or failed, and a retry for the failures. It reads the queue again for as long as it is open — every 3 s while anything is pending or building, every 10 s otherwise, not while the tab is hidden (`lib/poller.ts`) — so a build queued later shows up by itself; the admin job page's list of the files a job waits on does the same. Polled rather than pushed: the builder is a separate process on an hourly schedule, and a push would need Postgres `LISTEN`/`NOTIFY` for little gain. |
 | `/admin/backups` | Recent backup runs and the staleness of the newest successful one. |
 
 ---
@@ -8763,7 +8763,7 @@ says so in its implemented option, rather than being removed.
   that considers it, until the build lands (minutes; at worst three attempts
   of up to 70 minutes each, 5 and 15 minutes apart, each attempt a builder
   killed mid-build holds for its 75-minute lease, and the next scheduled run
-  up to five minutes away) — or, for a build that has failed for good, until
+  up to an hour away unless `scripts/build-derived-now.sh` starts one) — or, for a build that has failed for good, until
   an admin retries it.
 - **Problem:** A few milliseconds on every such claim, and a waiting job heads
   the candidate list because its claim count does not move — for as long as a
@@ -8859,7 +8859,10 @@ says so in its implemented option, rather than being removed.
 **KL-19. `rebuild-artifacts` runs every generation inline in the admin request.**
 - **Context:** About 13 seconds a generation in a release build.
 - **Problem:** Past roughly twenty generations, the request outlasts the load
-  balancer's 300-second idle timeout and stops part-way.
+  balancer's 300-second idle timeout and stops part-way. Measured at 1 vCPU;
+  since November 2026 the web task has half a vCPU (`task_cpu` 512,
+  COST_REDUCTION_PLAN.md), so a generation can take up to twice as long and
+  the limit is likely nearer ten generations.
 - **Options considered:** a spawned task with a status row, like exports.
 - **Option implemented:** None.
 - **Justification:** Each upload is idempotent, so running it again repairs a
@@ -10539,7 +10542,7 @@ later.
 
 | | Where |
 |---|---|
-| 30-day PITR, `copy_tags_to_snapshot`, optional Multi-AZ | [infra/rds.tf](infra/rds.tf) |
+| 7-day PITR, `copy_tags_to_snapshot`, optional Multi-AZ | [infra/rds.tf](infra/rds.tf) |
 | Artifact bucket lifecycle and cross-region replication | [infra/s3.tf](infra/s3.tf) |
 | Backup bucket (KMS, Object Lock, lifecycle, CRR), the nightly task, its schedule, the alarms, and the monthly restore drill | [infra/backup.tf](infra/backup.tf) |
 | The dump itself | [scripts/backup.sh](scripts/backup.sh) |
@@ -10647,8 +10650,11 @@ The scenarios worth designing against, in descending order of likelihood:
 | C — AWS Backup | One place for policy, retention and cross-region copy; Vault Lock gives genuine ransomware/insider resistance | Another service and IAM surface; still snapshot-shaped, so it does nothing for selective restore; Vault Lock in compliance mode is irreversible |
 | D — Streaming replica / logical replication | Near-zero RPO and RTO | Doubles the database cost at `db.t4g.micro` scale, and replicates logical errors instantly — a purge is replicated in milliseconds. It is availability, not backup |
 
-**Built: A + B, with C as a later hardening step.** RDS automated backups at 30-day
-retention are the primary mechanism and the fast path for infrastructure failure.
+**Built: A + B, with C as a later hardening step.** RDS automated backups at 7-day
+retention are the primary mechanism and the fast path for infrastructure failure
+(30 days until November 2026, cut to save about $6 a month in backup storage:
+COST_REDUCTION_PLAN.md). Past seven days the nightly dump is the only way back,
+with up to a day of writes lost.
 Nightly `pg_dump` to a separate, versioned, cross-region-replicated backup bucket is
 the secondary: it is what makes selective restore, local reproduction, and
 out-of-AWS survival possible. AWS Backup with a locked vault is worth adding once
@@ -10928,6 +10934,7 @@ log says what was lost.
 |---|---|---|
 | Instance/AZ failure | RDS PITR restore to new instance, repoint `DATABASE_URL` | ≤ 5 min |
 | Bad migration / dropped schema | RDS PITR to just before the statement | ≤ 5 min |
+| Bad migration or corruption found after 7 days | Restore the last dump before it (RUNBOOK §2's tooling; the PITR window has passed) | Up to a day before the damage, plus everything since |
 | Mistaken purge/delete of one job | Restore latest dump into a **scratch** instance, extract, re-insert (RUNBOOK §2) | Whatever arrived after the last dump, for those rows only |
 | Mistaken deletion of an account | None documented: its work is kept; the owner registers again and makes new keys (the old name is free once deleted) | The account's name, address, password, admin flag, sessions and keys, and its credit on the account list: the work stays under the tombstone, which `/api/users` omits (the Contributors ranking, `/api/workers`, lists the tombstone with its count), so the new account starts at zero |
 | Corrupted or overwritten artifact | S3 object version restore, or rebuild from `leave_rack_progress` | None |
@@ -11009,7 +11016,7 @@ reset (`scripts/reset-prod-db.sh`, `deploy.sh --reset-db`) deletes the nightly d
 with the database -- every version under `pg/`, in the backups bucket and its DR
 replica, past the governance lock -- so no dump of an older `0001` outlives the
 schema it was taken under, nor the accounts it holds. RDS's point-in-time backups
-are left to expire: for `db_backup_retention_days` (30) after a reset they are the
+are left to expire: for `db_backup_retention_days` (7) after a reset they are the
 one way back across it (RUNBOOK, "Resetting the production database").
 
 **Verifying a restore.** Do not declare one finished on "the page loads":
@@ -11101,7 +11108,8 @@ birdtest ever wants to publish its analysis corpus.
 7 → 30, `copy_tags_to_snapshot`; CRR from the artifacts bucket to a DR-region bucket;
 lifecycle rules expiring noncurrent versions after 90 days and aborting incomplete
 multipart uploads after 7. Delivers a 30-day PITR window and artifacts that survive a
-region.
+region. (The window went back to 7 days in November 2026, for cost:
+COST_REDUCTION_PLAN.md.)
 
 **Phase 2 — the nightly dump.** The backup bucket with versioning, public access
 block, SSE-KMS, lifecycle and Object Lock; the `birdtest-backup` ECS task definition;

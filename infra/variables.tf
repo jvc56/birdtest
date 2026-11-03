@@ -158,7 +158,7 @@ variable "db_apply_immediately" {
 variable "db_backup_retention_days" {
   description = "Length of the RDS point-in-time recovery window, in days."
   type        = number
-  default     = 30
+  default     = 7
 
   # 0 turns point-in-time recovery off and deletes the automated backups.
   validation {
@@ -357,7 +357,7 @@ variable "alert_email" {
 
 variable "task_cpu" {
   type    = number
-  default = 1024
+  default = 512
 
   validation {
     condition     = contains([256, 512, 1024, 2048, 4096, 8192, 16384], var.task_cpu)
