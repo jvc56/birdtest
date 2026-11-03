@@ -1,7 +1,43 @@
 # AWS cost reduction plan
 
 **Goal:** take the monthly bill from about $148 to about $94 without removing a feature.
-**Status:** in progress (started 2026-11-03). Phases 0–2 done; the change is on branch `cost-reduction-2026-11`.
+**Status:** done, 2026-11-03. Every phase ran and every check passed; see "Outcome" below for the results and the deviations.
+
+## Outcome (2026-11-03)
+
+| Phase | Result |
+|---|---|
+| 0 Preflight | All passed: account `824858782304`, clean `main` at `origin/main`, both services on one task with a `COMPLETED` deployment, `prod.tfvars` identical to the bucket's copy, no drift |
+| 1–2 Change and local tests | PR #32. `fmt`, `validate`, `terraform test` (58 of 58), `ops-scripts-check.sh` and `runbook-check.sh` passed |
+| 3 Merge | Merged as `58762a0`; `ci.yml` green on the PR and on the merge commit, after the runner fix below |
+| 4 Plan check | Exactly the six allowed changes. The task definition's only other differences were `hostPort` filled in by ECS and `ipc_mode`/`pid_mode` going from empty to null |
+| 5 Deploy | `deploy.sh` at 16:26 UTC: 3 added, 3 changed, 1 destroyed; both services healthy |
+| 6 Verify | Backend task on revision 7 at **512** CPU and 2048 MB, target healthy; `/health` and `/` 200; `rate(1 hour)`; retention 7, `available`; both new alarms `OK`; `birdtest-backup` `ENABLED`, `birdtest-backup-stale` `OK`; `build-derived-now.sh` exited 0 |
+| 7 Cost alerts | Budget limit $125, its three notifications and one subscriber unchanged. The forecast notification went to `ALARM` at once (AWS's forecast still reflects October's rate), as expected. Anomaly alert at $20 or more |
+| 8 Database disk | See below |
+| 9 randomracer | `t3a.nano`, same IP, `standard` credits; gp3; kernel `5.15.0-1084-aws`; 434 MB memory, 1 GB swap, 254 MB available; apache2 and ssh active, no failed units; both URLs 200; snapshot deleted |
+
+**Deviations**
+
+- **CI runner.** The first `ci.yml` run failed only in `e2e`: `ubuntu-latest` had moved to Ubuntu 26.04, where Playwright 1.60.0 cannot install chromium-headless-shell. The run stopped there, as the stop rule says. With the owner's approval the `e2e` job was pinned to `ubuntu-24.04` in PR #32. Unpin it when Playwright is bumped. Until then any commit would have failed `ci.yml`, and `deploy.sh` with it.
+- **randomracer, extra checks.** Before the swap, also checked that the instance has `EnaSupport`, that fstab mounts root by label, and that the 1084 kernel has NVMe built in and ENA in its initramfs. All of these are needed on Nitro, and all were fine.
+- **Snapshot time.** The volume's first snapshot took about 25 minutes, past `aws ec2 wait snapshot-completed`'s 10 minutes. It was polled until complete before anything changed.
+- **`build-derived-now.sh` prints no log on an empty queue.** The builder's "starting" and "finished" lines use the binary's own tracing target, which `RUST_LOG=birdtest=info` filters out. Only `birdtest::derived` lines (one per build) reach the log, so a run with nothing to build has an empty stream. Scheduled runs are the same. A later change could say so when the stream is empty, or widen `RUST_LOG` in `infra/derived.tf`.
+
+**Phase 8: database disk (read-only, 16:35 UTC)**
+
+The `birdtest` database is 9.6 GB; `rdsadmin` and `postgres` are under 8 MB each. Temp files since the last stats reset total 29 MB. Dead tuples are negligible: `task_claims` has 7,820 and `tasks` 5,233. So the growth is live rows, not bloat, WAL or temp files.
+
+| Table | Total | Heap | Indexes | Live rows |
+|---|---|---|---|---|
+| `position_analysis_plies` | 4,320 MB | 2,832 MB | 1,487 MB | 49.3 M |
+| `position_analysis_moves` | 3,711 MB | 2,438 MB | 1,271 MB | 24.6 M |
+| `position_analysis_records` | 827 MB | 276 MB | 551 MB | 2.46 M |
+| `opening_rack_progress` | 481 MB | 184 MB | 297 MB | 2.46 M |
+| `task_claims` | 133 MB | 49 MB | 84 MB | 247 K |
+| Everything else | under 50 MB each | | | |
+
+Position analysis makes up about 93% of the database. The largest indexes are `position_analysis_plies_pkey` (1,487 MB), `position_analysis_moves_record_idx` (743 MB) and `position_analysis_moves_pkey` (528 MB). Storage autoscaling will follow this data's growth. Slowing it would mean keeping less position-analysis detail, or fewer or smaller indexes on it. That is a product decision, not part of this plan.
 **Evidence date:** 2026-11-02, from Cost Explorer, CloudWatch, ECS, RDS and a read-only `terraform plan`. An independent review found one blocker and two serious errors in the first draft; all its findings are addressed here. Phase 9 and the `api_5xx` alarm were added after that review.
 
 ## What you need to do
