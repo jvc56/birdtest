@@ -87,9 +87,12 @@ resource "aws_db_instance" "main" {
   vpc_security_group_ids = [aws_security_group.db.id]
   publicly_accessible    = false
 
-  # Thirty days of point-in-time recovery. See PLAN.md's "Backups and Restore"; this window
-  # is the primary mechanism for infrastructure failure and for a bad
-  # migration, and the nightly logical dump is the secondary.
+  # Seven days of point-in-time recovery (db_backup_retention_days). See
+  # PLAN.md's "Backups and Restore"; this window is the primary mechanism for
+  # infrastructure failure and for a bad migration found within a week, and
+  # the nightly logical dump (kept 365 days) is the secondary, and the only
+  # one past seven days. Thirty days cost about $6 a month more in backup
+  # storage (COST_REDUCTION_PLAN.md).
   backup_retention_period = var.db_backup_retention_days
   backup_window           = "07:00-08:00" # UTC; deliberately clear of the 03:00 dump
   copy_tags_to_snapshot   = true

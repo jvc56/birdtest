@@ -544,6 +544,45 @@ resource "aws_ecs_service" "backend" {
   tags       = local.tags
 }
 
+# Sustained load only: a long export can trip it, which is a reason to look,
+# not by itself a reason to raise task_cpu.
+resource "aws_cloudwatch_metric_alarm" "backend_cpu_high" {
+  count               = var.desired_count > 0 ? 1 : 0
+  alarm_name          = "${local.name}-backend-cpu-high"
+  alarm_description   = "birdtest's backend has been over 85% CPU for fifteen minutes: look at task_cpu"
+  namespace           = "AWS/ECS"
+  metric_name         = "CPUUtilization"
+  dimensions          = { ClusterName = aws_ecs_cluster.main.name, ServiceName = aws_ecs_service.backend.name }
+  statistic           = "Average"
+  period              = 300
+  evaluation_periods  = 3
+  threshold           = 85
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  ok_actions          = [aws_sns_topic.alerts.arn]
+  tags                = local.tags
+}
+
+# Fifteen minutes so that a deploy's two-minute gap never trips it. No errors
+# means no datapoints, which is healthy here.
+resource "aws_cloudwatch_metric_alarm" "api_5xx" {
+  count               = var.desired_count > 0 ? 1 : 0
+  alarm_name          = "${local.name}-api-5xx"
+  alarm_description   = "birdtest's load balancer has answered 5xx for fifteen minutes"
+  namespace           = "AWS/ApplicationELB"
+  metric_name         = "HTTPCode_ELB_5XX_Count"
+  dimensions          = { LoadBalancer = aws_lb.main.arn_suffix }
+  statistic           = "Sum"
+  period              = 300
+  evaluation_periods  = 3
+  threshold           = 5
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  ok_actions          = [aws_sns_topic.alerts.arn]
+  tags                = local.tags
+}
+
 # Nginx and the static build, and nothing else: no secrets, no task role, no
 # database. A quarter of a vCPU serves static files with room to spare.
 resource "aws_ecs_task_definition" "frontend" {

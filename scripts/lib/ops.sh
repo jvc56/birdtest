@@ -649,7 +649,8 @@ ops_site_host() {
 
 OPS_RESET_SQL="
 -- Nothing else may hold the schema: the service is stopped, but a derived-data
--- build (every five minutes) or the 03:00 backup may be connected. Only this
+-- build (hourly, or started by build-derived-now.sh) or the 03:00 backup may be
+-- connected. Only this
 -- role's sessions: RDS's own are not this database's.
 SET client_min_messages = warning;
 SET lock_timeout = '1min';
@@ -751,7 +752,7 @@ ops_reset_database() {
       "${OPS_DUMP_BUCKETS[$i]}" "${OPS_DUMP_REGIONS[$i]}" "${census[0]}" "${census[1]}" "${census[2]}")
   done
   pitr=$(ops_tfvar db_backup_retention_days)
-  pitr=${pitr:-30}
+  pitr=${pitr:-7}
   cat >&2 <<EOF
 
   RESETTING THE PRODUCTION DATABASE of $host

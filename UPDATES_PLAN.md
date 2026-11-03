@@ -108,7 +108,7 @@ Decisions taken on 2026-10-09:
 - **New step:** delete every object version under `pg/` in the backups bucket **and** the DR bucket. Version-specific deletes don't replicate, so each bucket is done explicitly. Each delete carries `x-amz-bypass-governance-retention` (both buckets use a GOVERNANCE Object Lock).
 - **IAM:** the operator needs `s3:ListBucketVersions`, `s3:DeleteObjectVersion` and `s3:BypassGovernanceRetention` on both buckets, plus `kms:Decrypt` if the listing needs it. Add these in `infra/` (`onboard-deployer.sh` / deployer policy). The backup task's role stays write-only.
 - **Prompts:** the typed-hostname confirmation now names both buckets and the dump count. Remove "The nightly dumps … are kept".
-- **Not touched:** RDS PITR. It expires in 30 days; say so in the banner and in RUNBOOK.
+- **Not touched:** RDS PITR. It expires in 30 days (7 since COST_REDUCTION_PLAN.md, 2026-11); say so in the banner and in RUNBOOK.
 - **Tests:** add `aws s3api list-object-versions` / `delete-objects` stand-ins to `ops-scripts-check.sh`, and run `runbook-check.sh`.
 
 **2b. Split deploys: the frontend deploys without downtime**
