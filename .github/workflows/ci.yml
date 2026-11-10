@@ -369,6 +369,17 @@ jobs:
         run: |
           rm -f magpie/test/birdtest_contract/*.json
           cp contract-fixtures/*.json magpie/test/birdtest_contract/
+      # download_data.sh fetches MAGPIE-DATA's `main` by raw URL, and a
+      # versioned tarball there is not immutable: data-20260925 was replaced in
+      # place on 2026-11-02 with new leaves. Keyed on the scripts alone, the
+      # cache kept the old files, and every job's NWL23.klv2 check refused
+      # them ("Cannot contribute"). So the key carries MAGPIE-DATA's commit.
+      - name: MAGPIE-DATA revision
+        id: magpie-data-rev
+        run: |
+          rev="$(git ls-remote https://github.com/jvc56/MAGPIE-DATA.git refs/heads/main | cut -f1)"
+          [ -n "$rev" ] || { echo "could not read MAGPIE-DATA's main" >&2; exit 1; }
+          echo "rev=$rev" >> "$GITHUB_OUTPUT"
       - name: Cache MAGPIE data
         id: magpie-data
         uses: actions/cache@v4
@@ -376,7 +387,7 @@ jobs:
           path: |
             magpie/data/*
             magpie/testdata/*
-          key: magpie-data-${{ hashFiles('magpie/download_data.sh', 'magpie/convert_lexica.sh') }}
+          key: magpie-data-${{ hashFiles('magpie/download_data.sh', 'magpie/convert_lexica.sh') }}-${{ steps.magpie-data-rev.outputs.rev }}
       - name: Download MAGPIE data
         if: steps.magpie-data.outputs.cache-hit != 'true'
         working-directory: magpie
@@ -457,7 +468,17 @@ jobs:
           }
           run convert dawg2wordmap CSW21_ab english_ab -threads 1
           run convert klvwmp2rit CSW21_ab english_ab CSW21_ab CSW21_ab -threads 1
-          run convert kwg2wit CSW21_ab english_ab -threads 1
+          # As Magpie::convert_word_info_table runs it: the version 4 layout
+          # through `kwg2witv4` (MAGPIE #749 and later), and `kwg2wit` only on
+          # a MAGPIE that does not know that conversion.
+          out=$("$magpie" convert kwg2witv4 CSW21_ab english_ab -threads 1 2>&1) || { echo "$out" >&2; exit 1; }
+          if grep -q 'unrecognized conversion type' <<<"$out"; then
+            run convert kwg2wit CSW21_ab english_ab -threads 1
+          elif grep -q '(error ' <<<"$out"; then
+            echo "$out" >&2; exit 1
+          else
+            echo "+ magpie convert kwg2witv4 CSW21_ab english_ab -threads 1"
+          fi
           run createdata klv zero english_ab
           run convert rackequity2klv racks english_ab -threads 1
           for f in CSW21_ab.wmp CSW21_ab.rit CSW21_ab.wit zero.klv2 racks.klv2; do

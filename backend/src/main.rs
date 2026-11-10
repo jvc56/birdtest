@@ -51,6 +51,12 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    // A runtime that has stopped running tasks ends the process, so ECS
+    // replaces it at once instead of after the health checks, the drain and
+    // the stop timeout -- and the log says what each thread was waiting on
+    // (2026-11-10's outage left nothing). See `watchdog`.
+    birdtest::watchdog::start(birdtest::watchdog::STALL_LIMIT, birdtest::watchdog::exit_on_stall);
+
     let cfg = Arc::new(config::Config::from_env()?);
 
     // Before anything else: the server builds every wordmap, rack info table

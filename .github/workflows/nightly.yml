@@ -59,6 +59,17 @@ jobs:
           repository: jvc56/MAGPIE
           ref: ${{ steps.magpie-ref.outputs.ref }}
           path: magpie
+      # download_data.sh fetches MAGPIE-DATA's `main` by raw URL, and a
+      # versioned tarball there is not immutable: data-20260925 was replaced in
+      # place on 2026-11-02 with new leaves. Keyed on the scripts alone, the
+      # cache kept the old files, and every job's NWL23.klv2 check refused
+      # them ("Cannot contribute"). So the key carries MAGPIE-DATA's commit.
+      - name: MAGPIE-DATA revision
+        id: magpie-data-rev
+        run: |
+          rev="$(git ls-remote https://github.com/jvc56/MAGPIE-DATA.git refs/heads/main | cut -f1)"
+          [ -n "$rev" ] || { echo "could not read MAGPIE-DATA's main" >&2; exit 1; }
+          echo "rev=$rev" >> "$GITHUB_OUTPUT"
       - name: Cache MAGPIE data
         id: magpie-data
         uses: actions/cache@v4
@@ -66,7 +77,7 @@ jobs:
           path: |
             magpie/data/*
             magpie/testdata/*
-          key: magpie-data-${{ hashFiles('magpie/download_data.sh', 'magpie/convert_lexica.sh') }}
+          key: magpie-data-${{ hashFiles('magpie/download_data.sh', 'magpie/convert_lexica.sh') }}-${{ steps.magpie-data-rev.outputs.rev }}
       - name: Download MAGPIE data
         if: steps.magpie-data.outputs.cache-hit != 'true'
         working-directory: magpie
