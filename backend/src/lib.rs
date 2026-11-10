@@ -30,6 +30,7 @@ pub mod sse;
 pub mod state;
 pub mod stats;
 pub mod version;
+pub mod watchdog;
 
 use axum::routing::get;
 use axum::Router;

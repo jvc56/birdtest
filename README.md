@@ -495,7 +495,8 @@ compared" below.
    creation: a config has no letter distribution until a job gives it one.
 3. **A builder task runs MAGPIE**: it writes the inputs and the job's letter
    distribution into a scratch data directory, runs `convert dawg2wordmap`,
-   `convert klvwmp2rit` or `convert kwg2wit`, records the hash, and deletes the directory (in a
+   `convert klvwmp2rit` or `convert kwg2witv4` (`kwg2wit` on a MAGPIE from before #749, whose
+   `kwg2wit` writes the same version 4 bytes), records the hash, and deletes the directory (in a
    `Drop`, deliberately blocking, so an early return cannot leak 1.9 GB).
 4. **Dispatch waits for the hash**, the same way a leave-generation job waits
    for its rack universe. `/admin/derived-data` shows what is waiting, what

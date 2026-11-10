@@ -798,10 +798,10 @@ async fn build(
     let built = match lease.role.as_str() {
         "wmp" => scratch.lexicon_path(&lexicon, ".wmp"),
         // From the .kwg alone, named for the lexicon as MAGPIE's load finds
-        // it. `kwg2wit` rather than `kwg2witifneeded`, as the worker runs it:
-        // the scratch directory is empty, so the two would write the same.
+        // it, in the layout WIT builder 1 always wrote -- see
+        // `Magpie::convert_word_info_table`.
         "wit" => {
-            magpie.convert(&scratch, "kwg2wit", &lexicon, &letterdist).await?;
+            magpie.convert_word_info_table(&scratch, &lexicon, &letterdist).await?;
             scratch.lexicon_path(&lexicon, ".wit")
         }
         "rit" => {

@@ -154,6 +154,32 @@ impl Magpie {
         .map(|_| ())
     }
 
+    /// A word info table for `name`, in the version 4 layout every worker
+    /// builds.
+    ///
+    /// MAGPIE #749 (2026-10-16) moved `convert kwg2wit` to a version 5 layout
+    /// without changing the WIT builder version, and added `convert kwg2witv4`
+    /// for the bytes builder 1 always wrote; `magpie contribute` builds with
+    /// that one. A server that ran `kwg2wit` on such a MAGPIE recorded a
+    /// version 5 hash, and every worker declined the job as
+    /// `derived_mismatch` (the nightly's M-13 on MAGPIE `main`, from
+    /// 2026-10-17). A MAGPIE before #749 has no `kwg2witv4`, and its
+    /// `kwg2wit` already writes version 4, so that refusal -- and only that
+    /// one -- falls back to `kwg2wit`.
+    pub async fn convert_word_info_table(
+        &self,
+        scratch: &ScratchData,
+        name: &str,
+        letterdist: &str,
+    ) -> AppResult<()> {
+        match self.convert(scratch, "kwg2witv4", name, letterdist).await {
+            Err(err) if err.message.contains("unrecognized conversion type") => {
+                self.convert(scratch, "kwg2wit", name, letterdist).await
+            }
+            other => other,
+        }
+    }
+
     /// `magpie convert klvwmp2rit <name> <ld> <klv_name> <wmp_name>`.
     ///
     /// The three names are separate because a rack info table is named for the

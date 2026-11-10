@@ -201,7 +201,8 @@ async fn a_wordmap_is_a_function_of_its_inputs() {
 
 /// A word info table is built from the `.kwg` alone -- no wordmap, no leaves --
 /// named for its lexicon, and the same bytes on every build: two builds agree,
-/// and both are the bytes MAGPIE's own `builderhash` test pins for `wit-1`.
+/// and both are the bytes MAGPIE's own `builderhash` test pins for `wit-1`,
+/// on a MAGPIE from before #749's version 5 layout and on one after it.
 #[tokio::test]
 #[ignore]
 async fn a_word_info_table_is_built_from_the_lexicon_alone() {
@@ -216,7 +217,7 @@ async fn a_word_info_table_is_built_from_the_lexicon_alone() {
         let scratch = ScratchData::empty().await.unwrap();
         scratch.write("letterdistributions", "english_ab", ".csv", &ld).await.unwrap();
         scratch.write("lexica", "CSW21_ab", ".kwg", &kwg).await.unwrap();
-        magpie.convert(&scratch, "kwg2wit", "CSW21_ab", "english_ab").await.unwrap();
+        magpie.convert_word_info_table(&scratch, "CSW21_ab", "english_ab").await.unwrap();
         assert!(!scratch.lexicon_path("CSW21_ab", ".wmp").exists(), "no wordmap is built for it");
         let bytes = tokio::fs::read(scratch.lexicon_path("CSW21_ab", ".wit")).await.unwrap();
         digests.push(hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&bytes)));
