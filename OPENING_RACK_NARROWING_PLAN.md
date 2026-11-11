@@ -4,92 +4,122 @@
 **Status:** plan only. Nothing is implemented yet.
 **Written:** 2026-11-11, against `main` at 9395521 and MAGPIE `main`.
 
+**Decided in review:**
+- The first pass's result counts toward the 2-vote lead.
+- X defaults to 10, is set per job, and can be changed while the job runs.
+- The new rule replaces the percentage rule and applies to existing jobs, including one that is still on its first pass.
+
 ## How it works today
 
 - **First pass.** `next_request` (`backend/src/jobs/opening_rack.rs`) splits the rack space into slices of `racks_per_batch`. Each task sends its racks to MAGPIE, which generates every move for the rack (`config_contribute_generate_for_rack`) and, for a simming player, simulates the top `num_plays` of them. The ranked moves come back, capped at `num_plays_recorded`, and are stored in `position_analysis_records` and `position_analysis_moves`.
 - **Reissues.** If `max_results_per_rack > 1`, `next_reissue` hands out unsettled racks once the space is covered, fewest analyses first, as a task that lists its racks in `opening_rack_requests.racks`. **Every reissue analyses the rack from scratch with all N candidates.**
-- **Settling.** `record_consensus` counts each move's rank-1 finishes across a rack's analyses and calls `standing`. A rack is settled once it has at least `min_results_per_rack` analyses and the top move holds at least `consensus_pct`% of them, or once it reaches `max_results_per_rack`. `restate_racks` applies the same rule in SQL when an admin edits the settings.
+- **Settling.** `record_consensus` counts each move's rank-1 finishes across a rack's analyses and calls `standing`. A rack is settled once it has at least `min_results_per_rack` analyses and the top move holds at least `consensus_pct`% of them, or once it reaches `max_results_per_rack`. `restate_racks` applies the same rule in SQL when an admin edits the settings, and an edit that unsettles racks of a completed job reopens it.
 
 The cost is in the reissues. A rack's first pass already ranks its N candidates, and almost all of them are clearly worse than the leaders. Simulating them again on every pass spends most of the iteration budget on moves that cannot win.
 
 ## The new behaviour
 
 1. **Pass 1 is unchanged.** Every rack is analysed once with the full N candidates.
-2. **Fixing the candidates.** When a rack's first analysis is recorded, its top X ranked moves become the rack's **candidates**. They are stored once and never change.
-3. **Passes 2 and later.** A reissue sends each rack with its candidates. MAGPIE simulates only those moves, and its rank-1 move is that pass's vote.
-4. **Settling.** After each pass, the rack is settled if its leading move has at least `win_margin` (default 2) more rank-1 finishes than the runner-up, or if it has had `max_passes` analyses. The second case is "settled without consensus", as it is today, and records the leading move (the alphabetically first one if tied).
-5. **Which passes vote.** The first pass votes. Its rank-1 move is always one of the candidates, so the rule stays "first to lead by 2". The fastest settle is two passes, the first plus one reissue that agrees with it. See open question 1.
+2. **Passes 2 and later.** A reissue sends each rack with its **candidates**: the top X moves, by rank, of that rack's first-pass analysis, which is already stored. MAGPIE simulates only those moves, and its rank-1 move is that pass's vote.
+3. **Settling.** After each pass, the rack is settled if its leading move has at least `win_margin` (2) more rank-1 finishes than the runner-up, or if it has had `max_passes` analyses. The second case is "settled without consensus", as it is today, and records the leading move (the alphabetically first one if tied).
+4. **The first pass votes.** Its rank-1 move is always one of the candidates. A rack therefore settles after two passes if the first reissue agrees with the first pass.
 
-Example with X = 5, margin 2 and max 7 passes. Pass 1 ranks 8H AEINRST first. Pass 2 also ranks it first (2–0), so the rack settles after two analyses. On a split rack the votes might go A, B, A, B, A, A (4–2), and it settles after six. A rack still within 1 after seven passes settles without consensus.
+Example with X = 10, margin 2 and max 7 passes. Pass 1 ranks 8H AEINRST first. Pass 2 also ranks it first (2–0), so the rack settles after two analyses. On a split rack the votes might go A, B, A, B, A, A (4–2), and it settles after six. A rack still within 1 after seven passes settles without consensus.
+
+**Candidates are derived when a reissue is dispatched, not stored on the rack.** Because they come from the rack's stored first-pass analysis, racks analysed before this change get candidates just as new ones do, with no backfill. Each reissue task records the candidates it sent, so a reclaim gets the same list and the submission is checked against it.
 
 ## Settings
 
-| Setting | Where | Rule | Editable after creation? |
+| Setting | Where | Rule | Editable while running? |
 |---|---|---|---|
-| `reissue_top_moves` (X) | `job_opening_rack_config`, new | 2 ≤ X ≤ player's `num_plays_recorded`. Only the stored moves can become candidates. | No. Candidates are fixed at each rack's first analysis, and changing X partway would give racks different candidate sets. |
-| `win_margin` | `job_opening_rack_config`, new, default 2 | 1 ≤ margin ≤ `max_passes`. The UI suggests 2. | Yes, through the existing consensus editor, and `restate_racks` restates the racks. |
-| `max_passes` | the existing `max_results_per_rack`, relabelled in the UI | Unchanged: 1 to 100. 1 means one analysis per rack, with no reissues and no candidates. | Yes, as today. |
-| `min_results_per_rack`, `consensus_pct` | existing | Not used by jobs on the new rule. | n/a |
+| `reissue_top_moves` (X) | `job_opening_rack_config`, new, default 10 | 2 ≤ X ≤ 100. A rack's candidates are its first `min(X, stored moves)` moves, so the effective X is capped at the player's `num_plays_recorded`. The admin form warns when X is larger than that. | Yes. The new X applies to reissues dispatched after the edit. Votes already cast stay. A move that falls outside a smaller X keeps its votes but cannot gain more. |
+| `win_margin` | `job_opening_rack_config`, new, default 2 | 1 ≤ margin ≤ 100 | Yes, and the edit restates the job's racks. |
+| `max_passes` | the existing `max_results_per_rack`, relabelled in the UI | Unchanged: 1 to 100. 1 means one analysis per rack and no reissues. | Yes, as today. |
+| `min_results_per_rack`, `consensus_pct` | existing | No longer read. Dropped from the API and UI. The columns stay, because a migration must not drop what the previous image reads, and a later migration can remove them. | n/a |
 
 The existing simmer requirement for `max > 1` (`validate_opening_rack_player`) still applies. A static player would return the same order on every pass.
 
-### Existing jobs
+## Applying it to existing jobs, including the running one
 
-The project is deployed, so the schema changes go in additive migrations. Both new columns are nullable. A job with `reissue_top_moves IS NULL` keeps the current rule (full reissues and a percentage consensus) unchanged, so every job created before this change behaves as it does now. New jobs created through the admin form get the new rule. The API still accepts the old fields for one release, so scripts and e2e helpers that create jobs keep working (open question 3).
+- **Migration.** Migration 0003 adds `reissue_top_moves` and `win_margin` as `NOT NULL` with defaults 10 and 2, so every job, old and new, is on the new rule from the moment it deploys. There is no legacy branch in the code.
+- **Restating.** Racks keep the settled flags they have until something restates them. A submission recomputes the standing of the racks it touches, and a consensus edit restates the whole job under its existing locks and hold. The migration does not restate in place: restating a full English job rewrites millions of rows, and the edit path already does that safely.
+- **The running job (first pass).** Every rack it has analysed has one result, so `runner_up_count` 0 is already correct and nothing needs backfilling. After deploy, set the job's max passes, for example 7, in the consensus editor. That edit restates the racks: every rack with one vote becomes unsettled, because 1–0 is not a lead of 2, and reissues follow as soon as the first pass is covered. If the first pass finishes before the deploy and the job completes, the same edit reopens it, as it does today. Either way, no analysis is lost or repeated.
+- **Effective X on that job.** Candidates can only come from moves that were stored. Check its player's `num_plays_recorded` before deploying. If it is below 10, its reissues use that many candidates, and there is no way to recover moves that were never stored.
+- **Other unfinished jobs.** Any job already in its reissue phase should get a consensus edit after deploy, to restate it under the new rule. Before deploying, list the opening-rack jobs that are not completed. Completed jobs are left as they are unless an edit reopens one.
+- **During the deploy.** Pause opening-rack jobs (set them inactive) for the rollout. The old image doesn't write `runner_up_count`, so a reissue it accepted during the rollout window could leave that column stale on a rack with more than one result.
 
 ## Changes
 
 ### MAGPIE (first, as its own PR and release)
 
-- **Request.** Each `opening_rack` task request may carry an optional `candidates` field: an array parallel to `racks`, where element *i* is the list of move strings for rack *i*. It is present only on narrowed reissues.
-- **Analysis.** In `config_contribute_generate_for_rack`, when a rack has candidates, skip move generation. Build the move list from the strings with the same path `addmoves` uses (`validated_moves_create` → `validated_moves_add_to_sorted_move_list`), then simulate as normal. `num_moves` reports how many candidates were simulated, which is at most X.
+- **Request.** Each `opening_rack` task request may carry an optional `candidates` field: an array parallel to `racks`, where element *i* is the list of move strings for rack *i*. It is present only on reissues.
+- **Analysis.** In `config_contribute_generate_for_rack`, when a rack has candidates, skip move generation. Build the move list from the strings with the same path `addmoves` uses (`validated_moves_create` → `validated_moves_add_to_sorted_move_list`), then simulate as normal. `num_moves` reports how many candidates were simulated.
 - **Refusals.** A request with candidates for a static player, an array whose length doesn't match `racks`, an empty candidate list, or a move that doesn't validate on the empty board with that rack is an `ERROR_STATUS_CONTRIBUTE_SERVER_ERROR`. That is the same class as an unusable rack.
 - **Round trip.** The move strings birdtest stores are the ones MAGPIE wrote (`autoplay_results_write_ranked_plays_json`). Add a test that every kind it writes, including placements, exchanges and blank designations, parses back through `validated_moves_create` and produces the same move. **This is the main technical risk.** If any format fails to round-trip, fix it in MAGPIE before anything else.
 - **Contract fixture.** Add `test/birdtest_contract/assignment-opening-rack-candidates.json`.
-- **Version.** Ship as a feature release, 0.1.4. Per the floor policy, `DEFAULT_MIN_MAGPIE_VERSION` stays at 0.1.2. Narrowed jobs set the **per-job** `min_magpie_version` to 0.1.4 instead (next section).
+- **Version.** Ship as a feature release, 0.1.4. Per the floor policy, `DEFAULT_MIN_MAGPIE_VERSION` stays at 0.1.2, and so does every job's own floor. Raising the running job's floor would lock older workers out of its remaining first pass. Gating happens per task instead (next section).
 
 ### Birdtest backend
 
 - **Migration `0003_opening_rack_narrowing.sql`** (additive):
-  - `job_opening_rack_config`: add `reissue_top_moves INT NULL CHECK (reissue_top_moves >= 2)` and `win_margin INT NULL CHECK (win_margin >= 1)`, with a check that both are null or both are set.
-  - `opening_rack_progress`: add `candidates TEXT[] NULL` (non-empty when set) and `runner_up_count INT NOT NULL DEFAULT 0`. Backfill `runner_up_count` for existing rows in the migration, so a legacy job switched to the margin rule later would restate correctly. That switch is not offered, but the column should not hold wrong data.
-- **`models/job.rs`.** `OpeningRackConfig` and `ConsensusSettings` gain `reissue_top_moves: Option<i32>` and `win_margin: Option<i32>`. `ConsensusSettings::load` reads both. Add `ConsensusSettings::narrowed()`.
-- **`standing`.** Compute `runner_up_count` (the second-highest rank-1 count, or 0). On the new rule, `agreed = top_count - runner_up_count >= win_margin`. A rack with only one candidate also counts as agreed: no other move can win it. Otherwise the rule is unchanged. Update `restate_racks` to match. It must continue to implement the same rule as `standing`, and the existing tests that keep the two in step should cover the new branch.
-- **`record_consensus`.** When a rack has no progress row yet (its first analysis) and the job is narrowed, take the first X moves of that analysis by rank and write them to `candidates`, along with `runner_up_count`. This is the one point where the candidates are chosen.
-- **Dispatch.** `next_reissue` does not change: it still selects racks, and fewest-analyses-first already works through the racks pass by pass. `OpeningRackRequest` gains `candidates: Option<Vec<Vec<String>>>` with `skip_serializing_if = "Option::is_none"`, so first-pass tasks and legacy jobs send exactly what they send today. Both `next_request` and `load_request` (which rebuilds the request on a reclaim) fill it for a listed-racks task on a narrowed job, from `opening_rack_progress.candidates`, in the order of `racks`. The candidates never change, so a reclaim reproduces the original request exactly.
-- **Submissions.** In `process_response` and `check_batch_against_task`, a narrowed reissue's analysis must return only that rack's candidates, and `num_moves` must not exceed the number of candidates. That requires the task's candidates, so read them alongside `task_racks` in `check_batch_against_task`, inside the same row lock and with one extra column, not an extra query.
-- **Job creation (`routes/admin.rs`).** Accept `reissue_top_moves` and `win_margin`. Validate X against the player's `num_plays_recorded` and `num_plays`. When `max_results_per_rack > 1` and X is set, raise the job's `min_magpie_version` to at least 0.1.4. Extend `consensus_problems` for the margin. `PATCH …/consensus` accepts `win_margin` and `max_results_per_rack`, and refuses `reissue_top_moves`.
-- **Read paths.** `jobstats.rs` (the job settings shown), `exports.rs` (the `consensus` object gains `runner_up_count`, and `candidates` for narrowed jobs), and `routes/public.rs` where they expose consensus settings.
+  - `job_opening_rack_config`: add `reissue_top_moves INT NOT NULL DEFAULT 10 CHECK (reissue_top_moves BETWEEN 2 AND 100)` and `win_margin INT NOT NULL DEFAULT 2 CHECK (win_margin BETWEEN 1 AND 100)`.
+  - `opening_rack_progress`: add `runner_up_count INT NOT NULL DEFAULT 0`. Backfill it only for rows with `results > 1`, from their rank-1 tallies. These are bounded by the reissues already made, and are zero for the running job.
+  - `opening_rack_requests`: add `candidates JSONB NULL`, an array of string arrays parallel to `racks`, set only on reissue tasks.
+- **`models/job.rs`.** `OpeningRackConfig` and `ConsensusSettings` replace `consensus_pct` and `min_results_per_rack` with `reissue_top_moves` and `win_margin`. Update `ConsensusSettings::load` to match.
+- **`standing`.** Compute `runner_up_count` (the second-highest rank-1 count, or 0). `agreed = top_count - runner_up_count >= win_margin`, and `settled = agreed || results >= max_passes`. A rack whose candidate list has only one move also counts as agreed, because no other move can win it. Update `restate_racks` to the same rule, and replace its old tests and `standing`'s with ones for the margin.
+- **`record_consensus`.** Also write `runner_up_count`. Otherwise unchanged.
+- **Dispatch.**
+  - `next_reissue` still chooses the racks, unchanged.
+  - `next_request` then derives their candidates in one query, bounded by the batch: each rack's record whose task has `seed < total_racks` (the first-pass task), with its moves where `rank <= X`, in rank order. It puts them in `OpeningRackRequest.candidates: Option<Vec<Vec<String>>>`, marked `skip_serializing_if = "Option::is_none"` so first-pass tasks send exactly what they send today.
+  - `insert_request` writes them to `opening_rack_requests.candidates`, and `load_request` reads them back from there.
+- **Per-task version gate.** A worker below 0.1.4 can still claim a job's first-pass tasks but not its reissues. Pass the claim's `WorkerCapabilities` into `registry::acquire`. For a worker below 0.1.4, `next_request` creates no reissue, and re-dispatching an available task skips tasks whose request carries candidates. The worker then gets `NoWork` for this job, and the scheduler moves on to other jobs.
+- **Submissions.** In `process_response` and `check_batch_against_task`, a reissue's analysis must return only that rack's candidates, and `num_moves` must not exceed the number of candidates. `check_batch_against_task` already reads the request row inside the task's row lock, so this adds one column to that read, not another query.
+- **Job creation and edits (`routes/admin.rs`).**
+  - Creation accepts `reissue_top_moves` (default 10) and `win_margin` (default 2), and stops accepting `consensus_pct` and `min_results_per_rack`. To keep scripts working for one release, sending them is accepted and ignored.
+  - `PATCH …/consensus` edits all three settings: `reissue_top_moves`, `win_margin` and `max_results_per_rack`. Changing X alone writes the setting without a restate, because it doesn't change any rack's standing. Changing the margin or max passes restates the job, and can reopen a completed one, as today.
+  - `consensus_problems` checks the new ranges.
+- **Read paths.** `jobstats.rs` (the job settings shown), `exports.rs` (the `consensus` object gains `runner_up_count` and loses nothing), and `routes/public.rs` where they expose consensus settings.
 
 ### Frontend
 
-- **`lib/consensus.ts`.** Add the margin rule to `consensusFields`, `consensusProblem` and `analysesPerRack`, for example "up to 7 passes, first to lead by 2, reissues over the top 5".
-- **`admin/jobs/new`.** Replace the minimum and share boxes with "Reanalyse top X moves" and "Win by" (default 2). Relabel "most analyses" as "Max passes". Show the per-job version floor that will be applied.
-- **`ConsensusEditor.svelte`.** Edit the margin and max passes. Show X as read-only.
-- **`jobs/[id]`.** On a rack sample, show the candidates and the current lead, for example "A 3 – B 1".
+- **`lib/consensus.ts`.** Change `consensusFields`, `consensusProblem` and `analysesPerRack` to the new rule, for example "up to 7 passes, first to lead by 2, reissues over the top 10".
+- **`admin/jobs/new`.** Replace the minimum and share boxes with "Reanalyse top X moves" (default 10) and "Win by" (default 2). Relabel "most analyses" as "Max passes". Warn when X is larger than the player's `num_plays_recorded`.
+- **`ConsensusEditor.svelte`.** Edit X, the margin and max passes. Note beside X that a change applies to reissues from then on.
+- **`jobs/[id]`.** On a rack sample, show the current lead, for example "A 3 – B 1". On a reissued analysis, also show the candidates it ran over.
 
 ### Worker stub, fixtures, tests, docs
 
 - **`worker/fake_worker.py`.** When `candidates` is present, rank only those moves, with a deterministic rank-1 that can be forced to split, so the e2e tests can exercise both a margin settle and a max-passes settle.
-- **Contract fixtures.** Add `contract-fixtures/` request and response pairs for a narrowed reissue. The existing fixtures don't change.
-- **Unit tests** (`opening_rack.rs`): settling by margin (2–0, 3–1, 4–2); no settle at 2–1; a tie at max settles without consensus; a single candidate settles; the legacy rule is unchanged for null settings; `restate_racks` matches `standing` for both rules.
-- **Integration tests** (`backend/tests/scheduler.rs`, `worker_api.rs`): the first pass sends no candidates; a reissue sends exactly the stored top X; a reclaim gets the same candidates; a submission containing a move outside the candidates is refused with a 400; a narrowed job's floor keeps a 0.1.3 worker from claiming its reissues while it can still claim legacy jobs.
-- **e2e.** Extend `e18-opening-rack-consensus` to cover a narrowed job end to end.
-- **Docs.** Update the job description in `README.md`, the admin steps in `RUNBOOK.md`, and the rows in `SETTINGS_COMPARISON.md`.
+- **Contract fixtures.** Add `contract-fixtures/` request and response pairs for a reissue with candidates. The existing first-pass fixtures don't change.
+- **Unit tests** (`opening_rack.rs`):
+  - Settling by margin (2–0, 3–1, 4–2), and no settle at 1–0 or 2–1.
+  - A tie at max settles without consensus.
+  - A single candidate settles.
+  - `restate_racks` agrees with `standing`.
+- **Integration tests** (`backend/tests/scheduler.rs`, `worker_api.rs`):
+  - A first-pass task sends no candidates.
+  - A reissue sends exactly the first-pass analysis's top X, capped at the stored moves.
+  - A reclaim gets the same candidates, even after an edit to X.
+  - A job created before the migration gets candidates for racks analysed before it.
+  - A submission containing a move outside the candidates is refused with a 400.
+  - A 0.1.3 worker can still claim first-pass tasks but no reissues.
+  - A consensus edit on a first-pass job unsettles its 1–0 racks.
+  - The same edit reopens a completed job.
+- **e2e.** Update `e18-opening-rack-consensus` to the new settings, end to end.
+- **Docs.** Update the job description in `README.md`, the admin steps in `RUNBOOK.md` (including the post-deploy edit for unfinished jobs), and the rows in `SETTINGS_COMPARISON.md`.
 
 ## Order of work
 
 1. MAGPIE: candidates in the request, the round-trip test and the contract fixture. Release 0.1.4.
-2. Birdtest: migration 0003, the models, `standing`/`restate_racks` and `record_consensus`, with unit tests.
-3. Dispatch and submission checks, the fake worker and integration tests.
+2. Birdtest: migration 0003, the models, and `standing`/`restate_racks`, with unit tests.
+3. Dispatch, the version gate, the submission checks, the fake worker and integration tests.
 4. Admin API and frontend, then e2e.
-5. Deploy. Create a small narrowed job (rack size 2 or 3) on prod to check it end to end before running a full-size one.
+5. Before deploying, list the unfinished opening-rack jobs and check the running job's `num_plays_recorded`.
+6. Deploy with opening-rack jobs paused. Then set max passes on the running job (and edit any other unfinished job) and reactivate them. Watch the running job's first reissues: candidate counts, the time per rack, and racks settling at 2–0.
 
-Steps 2–4 are one birdtest PR, deployable whenever it's ready. Until 0.1.4 workers are running, a narrowed job's reissues just wait for them, and legacy jobs are unaffected.
+Steps 2–4 are one birdtest PR. It can deploy before 0.1.4 workers are running: the running job keeps doing its first pass on any worker, and its reissues wait for a 0.1.4 worker.
 
 ## Open questions
 
-1. **Does the first pass vote?** The plan says yes: it is a real analysis, its winner is a candidate, and counting it allows a two-pass settle. The case against is that it simulated N moves with the same budget, so each candidate got fewer iterations and its vote is noisier. The alternative is to tally reissues only, which means at least two reissues per rack and roughly one extra pass per rack. That is a one-line difference in `record_consensus` and the read paths, so it can be decided during review.
-2. **Is the margin counted in votes, or in equity or win%?** The plan uses rank-1 votes, as the request describes. A simulated win% gap would settle sooner but needs a statistical threshold, so it is left out.
-3. **Retire the percentage rule?** The plan keeps it for existing jobs only. Once none are running, a later change can drop `min_results_per_rack` and `consensus_pct` from the API and UI, and the columns in a later migration.
-4. **Default X.** The UI default could be 5, or `min(5, num_plays_recorded)`. This is worth measuring on a small job by checking how often pass 1's winner lies outside the top X of a later full reanalysis. If the true best move often falls outside the top 5, X should be larger.
+1. **Is the margin counted in votes, or in equity or win%?** The plan uses rank-1 votes, as the request describes. A simulated win% gap would settle sooner but needs a statistical threshold, so it is left out.
+2. **Is X = 10 wide enough?** Once the running job has reissued a sample of racks, measure how often a full-N reanalysis puts a move outside the first pass's top 10 in first place. If that happens often, raise X for that job; the edit takes effect on the next reissues.
