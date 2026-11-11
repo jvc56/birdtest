@@ -43,7 +43,7 @@ The existing simmer requirement for `max > 1` (`validate_opening_rack_player`) s
 
 - **Migration.** Migration 0003 adds `reissue_top_moves` and `win_margin` as `NOT NULL` with defaults 10 and 2, so every job, old and new, is on the new rule from the moment it deploys. There is no legacy branch in the code.
 - **Restating.** Racks keep the settled flags they have until something restates them. A submission recomputes the standing of the racks it touches, and a consensus edit restates the whole job under its existing locks and hold. The migration does not restate in place: restating a full English job rewrites millions of rows, and the edit path already does that safely.
-- **The running job (first pass).** Every rack it has analysed has one result, so `runner_up_count` 0 is already correct and nothing needs backfilling. After deploy, set the job's max passes, for example 7, in the consensus editor. That edit restates the racks: every rack with one vote becomes unsettled, because 1–0 is not a lead of 2, and reissues follow as soon as the first pass is covered. If the first pass finishes before the deploy and the job completes, the same edit reopens it, as it does today. Either way, no analysis is lost or repeated.
+- **The running job (first pass).** Every rack it has analysed has one result, so `runner_up_count` 0 is already correct and nothing needs backfilling. After deploy, set the job's max passes, for example 7, in the consensus editor. That edit restates the racks: every rack with one vote becomes unsettled, because 1–0 is not a lead of 2, and reissues follow as soon as the first pass is covered. If the first pass finishes before the deploy and the job completes, the same edit reopens it, as it does today. Either way, no analysis is lost or repeated. The edit also raises the job's `min_magpie_version` to 0.1.5, so workers older than 0.1.5 stop taking its tasks from then on. Making the edit after the first pass is covered loses nothing, because older workers would have nothing left to do on the job anyway. Making it earlier is also fine: the last first-pass racks then wait for 0.1.5 workers.
 - **Effective X on that job.** Candidates can only come from moves that were stored. Check its player's `num_plays_recorded` before deploying. If it is below 10, its reissues use that many candidates, and there is no way to recover moves that were never stored.
 - **Other unfinished jobs.** Any job already in its reissue phase should get a consensus edit after deploy, to restate it under the new rule. Before deploying, list the opening-rack jobs that are not completed. Completed jobs are left as they are unless an edit reopens one.
 - **During the deploy.** Pause opening-rack jobs (set them inactive) for the rollout. The old image doesn't write `runner_up_count`, so a reissue it accepted during the rollout window could leave that column stale on a rack with more than one result.
@@ -57,7 +57,7 @@ The existing simmer requirement for `max > 1` (`validate_opening_rack_player`) s
 - **Refusals.** A request with candidates for a static player, an array whose length doesn't match `racks`, an empty candidate list, or a move that doesn't validate on the empty board with that rack is an `ERROR_STATUS_CONTRIBUTE_SERVER_ERROR`. That is the same class as an unusable rack.
 - **Round trip.** The move strings birdtest stores are the ones MAGPIE wrote (`autoplay_results_write_ranked_plays_json`). Add a test that every kind it writes, including placements, exchanges and blank designations, parses back through `validated_moves_create` and produces the same move. **This is the main technical risk.** If any format fails to round-trip, fix it in MAGPIE before anything else.
 - **Contract fixture.** Add `test/birdtest_contract/assignment-opening-rack-candidates.json`.
-- **Version.** Ship as a feature release, 0.1.5 (0.1.4, the current release, has no candidates support). No floor changes: `DEFAULT_MIN_MAGPIE_VERSION` stays at 0.1.2 under the floor policy, and no job's own `min_magpie_version` is raised, the running job's included. A job floor of 0.1.5 would lock 0.1.2–0.1.4 workers out of its remaining first pass, which needs nothing new from MAGPIE. Only reissues need 0.1.5, so gating happens per task instead (next section). The gate's version is a constant in the backend (`CANDIDATES_MIN_MAGPIE_VERSION`), not a setting.
+- **Version.** Ship as a feature release, 0.1.5 (0.1.4, the current release, has no candidates support). The fleet-wide floor `DEFAULT_MIN_MAGPIE_VERSION` stays at 0.1.2, under the floor policy. Only jobs that reissue are raised to 0.1.5, through their own `min_magpie_version` (see "Job version floor" below). The version is a backend constant, `CANDIDATES_MIN_MAGPIE_VERSION`, not a setting.
 
 ### Birdtest backend
 
@@ -72,11 +72,15 @@ The existing simmer requirement for `max > 1` (`validate_opening_rack_player`) s
   - `next_reissue` still chooses the racks, unchanged.
   - `next_request` then derives their candidates in one query, bounded by the batch: each rack's record whose task has `seed < total_racks` (the first-pass task), with its moves where `rank <= X`, in rank order. It puts them in `OpeningRackRequest.candidates: Option<Vec<Vec<String>>>`, marked `skip_serializing_if = "Option::is_none"` so first-pass tasks send exactly what they send today.
   - `insert_request` writes them to `opening_rack_requests.candidates`, and `load_request` reads them back from there.
-- **Per-task version gate.** A worker below 0.1.5 can still claim a job's first-pass tasks but not its reissues. Pass the claim's `WorkerCapabilities` into `registry::acquire`. For a worker below 0.1.5, `next_request` creates no reissue, and re-dispatching an available task skips tasks whose request carries candidates. The worker then gets `NoWork` for this job, and the scheduler moves on to other jobs.
+- **Job version floor.** Any opening-rack job with `max_results_per_rack > 1` has a `jobs.min_magpie_version` of at least 0.1.5. The scheduler's existing per-job filter then keeps older workers off it, so no new gating code is needed. The floor is applied in two places:
+  - **At creation:** a new job's floor is the higher of 0.1.5 and the floor the admin entered.
+  - **At a consensus edit:** an edit that leaves the job with `max_results_per_rack > 1` raises the floor to 0.1.5 in the same transaction, if it is lower. This is how existing jobs get it. Today the floor can only be set at creation.
+
+  The floor is never lowered automatically, including when max passes goes back to 1. Older workers being able to claim a job's first pass, but not its reissues, isn't worth a per-task gate.
 - **Submissions.** In `process_response` and `check_batch_against_task`, a reissue's analysis must return only that rack's candidates, and `num_moves` must not exceed the number of candidates. `check_batch_against_task` already reads the request row inside the task's row lock, so this adds one column to that read, not another query.
 - **Job creation and edits (`routes/admin.rs`).**
   - Creation accepts `reissue_top_moves` (default 10) and `win_margin` (default 2), and stops accepting `consensus_pct` and `min_results_per_rack`. To keep scripts working for one release, sending them is accepted and ignored.
-  - `PATCH …/consensus` edits all three settings: `reissue_top_moves`, `win_margin` and `max_results_per_rack`. Changing X alone writes the setting without a restate, because it doesn't change any rack's standing. Changing the margin or max passes restates the job, and can reopen a completed one, as today.
+  - `PATCH …/consensus` edits all three settings: `reissue_top_moves`, `win_margin` and `max_results_per_rack`. Changing X alone writes the setting without a restate, because it doesn't change any rack's standing. Changing the margin or max passes restates the job, and can reopen a completed one, as today. The edit also applies the job version floor described above, and the response includes the new floor.
   - `consensus_problems` checks the new ranges.
 - **Read paths.** `jobstats.rs` (the job settings shown), `exports.rs` (the `consensus` object gains `runner_up_count` and loses nothing), and `routes/public.rs` where they expose consensus settings.
 
@@ -84,7 +88,7 @@ The existing simmer requirement for `max > 1` (`validate_opening_rack_player`) s
 
 - **`lib/consensus.ts`.** Change `consensusFields`, `consensusProblem` and `analysesPerRack` to the new rule, for example "up to 7 passes, first to lead by 2, reissues over the top 10".
 - **`admin/jobs/new`.** Replace the minimum and share boxes with "Reanalyse top X moves" (default 10) and "Win by" (default 2). Relabel "most analyses" as "Max passes". Warn when X is larger than the player's `num_plays_recorded`.
-- **`ConsensusEditor.svelte`.** Edit X, the margin and max passes. Note beside X that a change applies to reissues from then on.
+- **`ConsensusEditor.svelte`.** Edit X, the margin and max passes. Note beside X that a change applies to reissues from then on. When the edit will raise the job's floor to 0.1.5, say so before saving.
 - **`jobs/[id]`.** On a rack sample, show the current lead, for example "A 3 – B 1". On a reissued analysis, also show the candidates it ran over.
 
 ### Worker stub, fixtures, tests, docs
@@ -102,7 +106,7 @@ The existing simmer requirement for `max > 1` (`validate_opening_rack_player`) s
   - A reclaim gets the same candidates, even after an edit to X.
   - A job created before the migration gets candidates for racks analysed before it.
   - A submission containing a move outside the candidates is refused with a 400.
-  - A 0.1.4 worker can still claim first-pass tasks but no reissues.
+  - A job created with max passes above 1 gets a floor of 0.1.5. A consensus edit that raises max passes above 1 on an older job raises its floor to 0.1.5, and a 0.1.4 worker can then claim nothing from it.
   - A consensus edit on a first-pass job unsettles its 1–0 racks.
   - The same edit reopens a completed job.
 - **e2e.** Update `e18-opening-rack-consensus` to the new settings, end to end.
@@ -112,12 +116,12 @@ The existing simmer requirement for `max > 1` (`validate_opening_rack_player`) s
 
 1. MAGPIE: candidates in the request, the round-trip test and the contract fixture. Release 0.1.5.
 2. Birdtest: migration 0003, the models, and `standing`/`restate_racks`, with unit tests.
-3. Dispatch, the version gate, the submission checks, the fake worker and integration tests.
-4. Admin API and frontend, then e2e.
+3. Dispatch, the submission checks, the fake worker and integration tests.
+4. Admin API (including the job version floor) and frontend, then e2e.
 5. Before deploying, list the unfinished opening-rack jobs and check the running job's `num_plays_recorded`.
 6. Deploy with opening-rack jobs paused. Then set max passes on the running job (and edit any other unfinished job) and reactivate them. Watch the running job's first reissues: candidate counts, the time per rack, and racks settling at 2–0.
 
-Steps 2–4 are one birdtest PR. It can deploy before 0.1.5 workers are running: the running job keeps doing its first pass on any worker, and its reissues wait for a 0.1.5 worker.
+Steps 2–4 are one birdtest PR. It can deploy before 0.1.5 workers are running: the running job keeps its current floor, and its first pass continues on any worker until the max-passes edit in step 6. If the first pass is close to done when you deploy, wait for it to be covered before making that edit, so older workers aren't cut off from its last racks.
 
 ## Open questions
 
