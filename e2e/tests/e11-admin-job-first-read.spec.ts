@@ -91,6 +91,17 @@ test('E-11: an admin job page whose first read fails shows only what the server 
   await expect(page.getByTestId('job-settings').getByRole('row', { name: /Task Time Limit/ })).toContainText(
     '30m (1,800 seconds)'
   );
+
+  // The job's MAGPIE floor, changed here for a job in any state; the job's
+  // settings then show the new one.
+  const floor = page.getByTestId('job-min-magpie').getByLabel('Oldest MAGPIE');
+  await floor.fill('v1');
+  await expect(page.getByTestId('job-min-magpie').getByRole('button', { name: 'Save' })).toBeDisabled();
+  await floor.fill('0.1');
+  await page.getByTestId('job-min-magpie').getByRole('button', { name: 'Save' }).click();
+  await expect(page.getByText(/need this MAGPIE version or newer/)).toBeVisible();
+  await expect(floor).toHaveValue('0.1.0');
+  await expect(page.getByTestId('job-settings').getByRole('row', { name: /Oldest MAGPIE/ })).toContainText('0.1.0');
   await api.dispose();
 });
 

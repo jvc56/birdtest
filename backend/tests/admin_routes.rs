@@ -1090,3 +1090,90 @@ async fn a_games_jobs_threading_mode_is_on_its_settings_and_every_task() {
     );
     assert_eq!(assignment["task_request"]["threading_mode"], "pgp", "{assignment}");
 }
+
+// --- A-ADMIN-32 --------------------------------------------------------------
+
+/// A-ADMIN-32: a job's MAGPIE floor is changed on its own
+/// (`PATCH .../min-magpie-version`), for any job and in any state, up or down.
+/// Read strictly: anything that is not `major.minor[.patch]` is a `400` on the
+/// field. Each change is audited once (`job.min_magpie_version_changed`, from
+/// what to what), and a change to what it already is writes nothing. Claims
+/// made after it are filtered by it -- a worker below it is told the version
+/// to upgrade to -- while a claim already made keeps its task and submits. A
+/// completed job stays completed.
+#[tokio::test]
+async fn a_jobs_magpie_floor_is_changed_on_its_own_in_any_state() {
+    let db = TestDb::new().await;
+    let admin = Admin::new(&db).await;
+    let changes = "SELECT COUNT(*) FROM audit_log WHERE action = 'job.min_magpie_version_changed'";
+    let job = db.games_job(2).await;
+    let path = format!("/api/admin/jobs/{job}/min-magpie-version");
+    let floor = |job: Uuid| {
+        let admin = &admin;
+        async move { admin.get(&format!("/api/jobs/{job}/config")).await.1["job"]["min_magpie_version"].clone() }
+    };
+    let before = floor(job).await;
+    assert!(before.is_string(), "{before}");
+
+    for refused in ["", "1", "v1.0.0", "1.x", "1.2.3.4", "1.-2.0"] {
+        let (status, body) = admin.patch(&path, json!({ "min_magpie_version": refused })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{refused:?}: {body}");
+        assert_eq!(body["fields"][0]["field"], "min_magpie_version", "{refused:?}: {body}");
+    }
+    let (status, _) = admin
+        .patch(&format!("/api/admin/jobs/{}/min-magpie-version", Uuid::new_v4()), json!({ "min_magpie_version": "1.0.0" }))
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(count(&db, changes).await, 0);
+
+    // A worker at 1.0.0 claims a task before the floor rises past it.
+    let (status, open) = claim(&admin.app, &[], "1.0.0", &[]).await;
+    assert_eq!(status, StatusCode::OK, "{open}");
+
+    let (status, changed) = admin.patch(&path, json!({ "min_magpie_version": "1.5" })).await;
+    assert_eq!((status, &changed), (StatusCode::OK, &json!({ "min_magpie_version": "1.5.0" })));
+    let (actor, target, reason): (Uuid, String, String) = sqlx::query_as(
+        "SELECT actor_user_id, target_id, reason FROM audit_log WHERE action = 'job.min_magpie_version_changed'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let expected = format!("min_magpie_version {} -> 1.5.0", before.as_str().unwrap());
+    assert_eq!((actor, target, reason), (admin.id, job.to_string(), expected));
+    assert_eq!(floor(job).await, json!("1.5.0"));
+    let (status, _) = admin.patch(&path, json!({ "min_magpie_version": "1.5.0" })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(count(&db, changes).await, 1, "an unchanged floor is not a change");
+
+    // A new claim below it is told what to upgrade to; the open claim submits.
+    let (status, body) = claim(&admin.app, &[], "1.0.0", &[]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["shutdown"]["required_magpie_version"], json!("1.5.0"), "{body}");
+    let uuid = open["worker_uuid"].as_str().unwrap();
+    let (status, body) = send(
+        &admin.app,
+        post_json(
+            "/api/worker/result",
+            &[("x-worker-uuid", uuid)],
+            json!({ "claim_token": open["claim_token"], "movegens": 10, "result": games_result(2, 1) }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "a claim made under the old floor keeps its task: {body}");
+    let (status, body) = claim(&admin.app, &[], "1.5.0", &[]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["claim_token"].is_string(), "a worker at the floor is given work: {body}");
+
+    // Down again, and on a completed job, which stays completed.
+    let (status, body) = admin.post(&format!("/api/admin/jobs/{job}/complete"), json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, changed) = admin.patch(&path, json!({ "min_magpie_version": "0.1.0" })).await;
+    assert_eq!((status, &changed["min_magpie_version"]), (StatusCode::OK, &json!("0.1.0")), "{changed}");
+    let status: String = sqlx::query_scalar("SELECT status::text FROM jobs WHERE id = $1")
+        .bind(job)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "completed");
+    assert_eq!(count(&db, changes).await, 2);
+}

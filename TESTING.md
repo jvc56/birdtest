@@ -3476,6 +3476,17 @@ below.
   request says `pgp`, anything else a `400` on the field; its settings show
   it, and its tasks' requests carry it, beside the job's name. *(Covered:
   `admin_routes::a_games_jobs_threading_mode_is_on_its_settings_and_every_task`.)*
+- `A-ADMIN-32` A job's MAGPIE floor is changed by
+  `PATCH /api/admin/jobs/:id/min-magpie-version`, any job type and any status,
+  up or down: anything but `major.minor[.patch]` a `400` on the field, an
+  unknown job a `404`, and each change audited once
+  (`job.min_magpie_version_changed`, "min_magpie_version 0.1.2 -> 1.5.0") -- a
+  change to what it already is writes nothing. Claims made after it are
+  filtered by it (a worker below it gets the shutdown naming it), a claim made
+  before it still submits, and a completed job stays completed. *(Covered:
+  `admin_routes::a_jobs_magpie_floor_is_changed_on_its_own_in_any_state`,
+  `audit::every_destructive_admin_action_writes_exactly_its_record`; that only
+  an admin may, by `A-AUTHZ`.)*
 
 ### `A-RATE-*` — `routes/ratings.rs`
 

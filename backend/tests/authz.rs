@@ -205,6 +205,7 @@ const ROUTES: &[(&str, &str, Access, &str)] = &[
     ("POST", "/api/admin/jobs/:id/complete", Admin, ""),
     ("PATCH", "/api/admin/jobs/:id/consensus", Admin, r#"{"consensus_pct":80}"#),
     ("PATCH", "/api/admin/jobs/:id/time-limit", Admin, r#"{"max_task_seconds":1800}"#),
+    ("PATCH", "/api/admin/jobs/:id/min-magpie-version", Admin, r#"{"min_magpie_version":"0.1.5"}"#),
     ("POST", "/api/admin/jobs/:id/purge", Admin, ""),
     ("DELETE", "/api/admin/jobs/:id", Admin, ""),
     ("DELETE", "/api/admin/users/:id", Admin, ""),
@@ -461,8 +462,8 @@ async fn every_cookie_backed_write_requires_the_csrf_pair() {
         }
         checked += 1;
     }
-    // 25 admin writes, 3 account writes, logout and sign-out-everywhere.
-    assert_eq!(checked, 30);
+    // 26 admin writes, 3 account writes, logout and sign-out-everywhere.
+    assert_eq!(checked, 31);
 
     // Nothing was done under any of them: the admin is still signed in, and
     // the audit log is empty.

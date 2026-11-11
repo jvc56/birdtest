@@ -1040,7 +1040,7 @@ closes in seconds rather than never.
   recorded." in red: nothing backs up a local stack.
 - [ ] **Do** **Audit log**. **Expect** everything done above, newest first:
   `job.created`, `job.activated`, `job.deactivated`, `job.completed`,
-  `job.consensus_changed`, `job.time_limit_changed`, `job.purged`, `job.deleted`, `job.export_started`,
+  `job.consensus_changed`, `job.time_limit_changed`, `job.min_magpie_version_changed`, `job.purged`, `job.deleted`, `job.export_started`,
   `input_data.import_staged`, `input_data.import_confirmed`,
   `input_data.import_nothing_new`,
   `rating_pool.created`, `rating_pool.member_added`, `user.deleted`,
@@ -1073,6 +1073,13 @@ claim. A claim whose worker had stopped heartbeating counts toward nothing.
   new limit; those already made keep their deadlines.", its Job settings
   saying "11m 40s (700 seconds)", and `job.time_limit_changed` in the audit
   log ("max_task_seconds 600 -> 700"). **Do** set it back to 600.
+- [ ] **Do** in the same Controls card, set Oldest MAGPIE to one minor version
+  above the contributing MAGPIE's own (its `magpie --version`) and **Save**.
+  **Expect** "Saved. Claims made from now on need this MAGPIE version or
+  newer; those already made keep their tasks.", its Job settings showing the
+  new version, `job.min_magpie_version_changed` in the audit log, and MAGPIE's
+  next claim told to upgrade to it once its open task is in. **Do** set it back
+  to the version it had, and **Expect** MAGPIE to be given tasks again.
 - [ ] **Do** give it an allocation.
   **Expect** each task MAGPIE claims to stop at ten minutes, and the job's
   page to say "1 task hit this job's 10m time limit — lower the batch size, or
