@@ -7182,22 +7182,19 @@ CREATE TABLE job_opening_rack_config (
     -- Size of the rack space, computed at job creation. Tasks address ranges of
     -- it, so this is what tells the scheduler when the job is exhausted.
     total_racks       BIGINT NOT NULL CHECK (total_racks >= 0),
-    -- Consensus: a rack is analysed until enough of its analyses agree on its
-    -- best move, each analysis a task of its own. Its consensus is the share
-    -- of its analyses whose rank-1 move is the most common rank-1 move. It is
-    -- settled once it has at least `min_results_per_rack` analyses and its
-    -- consensus is at least `consensus_pct`, or once it has
-    -- `max_results_per_rack` analyses (settled without consensus), and not
-    -- analysed again unless an admin changes these three (the only settings a
-    -- job's config may change after creation), which restates every rack.
-    -- One and one is one analysis per rack, which is what a static player
-    -- gets: its analyses are deterministic and always agree.
-    consensus_pct          DOUBLE PRECISION NOT NULL DEFAULT 100
-                           CHECK (consensus_pct > 50 AND consensus_pct <= 100),
-    min_results_per_rack   INT NOT NULL DEFAULT 1 CHECK (min_results_per_rack >= 1),
+    -- Consensus (migrations 0003, 0004): a rack's first analysis ranks every
+    -- play, and each later one, a task of its own, only the first's top
+    -- `reissue_top_moves`. It is settled once its most common rank-1 move
+    -- leads the runner-up by `win_margin` analyses, or once it has
+    -- `max_results_per_rack` (settled without consensus), and not analysed
+    -- again unless an admin changes these, which restates every rack. A most
+    -- of one is one analysis per rack, which is what a static player gets:
+    -- its analyses are deterministic and always agree.
     max_results_per_rack   INT NOT NULL DEFAULT 1
-                           CHECK (max_results_per_rack >= min_results_per_rack
-                                  AND max_results_per_rack <= 100)
+                           CHECK (max_results_per_rack BETWEEN 1 AND 100),
+    reissue_top_moves      INT NOT NULL DEFAULT 10
+                           CHECK (reissue_top_moves BETWEEN 2 AND 100),
+    win_margin             INT NOT NULL DEFAULT 2 CHECK (win_margin BETWEEN 1 AND 100)
 );
 
 CREATE TABLE job_game_config (
