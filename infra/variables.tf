@@ -432,9 +432,8 @@ variable "acm_certificate_arn" {
 variable "min_magpie_version" {
   description = <<-EOT
     The oldest MAGPIE that may contribute (MIN_MAGPIE_VERSION). 0.1.2 is the
-    oldest release whose results are right (the backend image pins 0.1.3, which
-    only adds behaviour), and a build reporting a lower version is offered
-    nothing. Raise it whenever a MAGPIE release fixes results: it is the only
+    oldest release whose results are right (the backend image pins 0.1.5), and
+    a build reporting a lower version is offered nothing. Raise it whenever a MAGPIE release fixes results: it is the only
     way to keep a build known to compute something wrong off the fleet. Must not exceed the version the backend image's own
     pinned MAGPIE reports (docker/Dockerfile's MAGPIE_COMMIT), or the backend
     refuses to start: it will not hand out hashes built by a MAGPIE its

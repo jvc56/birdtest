@@ -2440,7 +2440,7 @@ being able to express once every job depends on the client honouring a protocol,
 so the columns are `NOT NULL` and default to **`0.1.2`**, the same value as the
 server's `MIN_MAGPIE_VERSION`, which `create_job` writes explicitly.
 
-`0.1.2` is the floor; the MAGPIE `main` commit the backend image pins reports `0.1.3`. The version
+`0.1.2` is the floor; the MAGPIE `main` commit the backend image pins reports `0.1.5`. The version
 was incremented through `0.5.1` as birdtest and MAGPIE changed together during
 development and reset to `0.1.0` when the protocol settled; none of those numbers
 shipped. **The version moves with every change that can alter what a task
