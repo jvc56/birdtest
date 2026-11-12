@@ -282,9 +282,6 @@ async fn each_job_type_stores_every_setting_it_was_created_with() {
             // One analysis per rack unless the body asks for a consensus; ten
             // first-pass moves a reissue ranks, and a lead of two to settle.
             "max_results_per_rack": 1, "reissue_top_moves": 10, "win_margin": 2,
-            // The replaced rule's columns, at their defaults until a later
-            // migration drops them.
-            "consensus_pct": 100.0, "min_results_per_rack": 1,
         }),
     );
     assert_eq!(job_row(&db, racks).await["job_type"], "opening_rack");
