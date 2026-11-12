@@ -43,6 +43,16 @@ class SeedError(RuntimeError):
     pass
 
 
+
+# The oldest MAGPIE that reads an opening-rack reissue's candidates.
+CANDIDATES_MIN_MAGPIE = "0.1.5"
+
+
+def version_key(version: str) -> tuple:
+    """`major.minor[.patch]` as numbers, for comparing floors."""
+    parts = [int(p) for p in version.strip().split(".")[:3] if p.isdigit()]
+    return tuple(parts + [0] * (3 - len(parts)))
+
 def log(message: str) -> None:
     print(f"[seed] {message}", flush=True)
 
@@ -496,6 +506,12 @@ def create_job(client: Client, args, data: dict, players: list,
     # floor is lowered -- so dev passes it explicitly.
     if args.min_magpie_version:
         body["min_magpie_version"] = args.min_magpie_version
+    # A job that analyses a rack more than once sends its later analyses'
+    # moves, which only MAGPIE 0.1.5 and later read: the server refuses one
+    # with an older floor, the server-wide one included.
+    if body.get("max_results_per_rack", 1) > 1:
+        body["min_magpie_version"] = max(
+            body.get("min_magpie_version") or "0.0.0", CANDIDATES_MIN_MAGPIE, key=version_key)
     created = client.json(client.post("/api/admin/jobs", body), "create job")
     # Creation answers with every job it made: here one, since a games or
     # pairs body names two players.
@@ -597,9 +613,9 @@ def create_dev_jobs(client: Client, args, data: dict) -> None:
                 "num_iterations": 1000, "racks_per_task": 50,
                 "target_rack_counts": [100, 200, 500, 1000, 1000, 1000]}
         if job_type == "opening_rack":
-            # A 2-ply simmer ranks every rack's plays, and each rack is
-            # analysed until 80% of its analyses agree on the best move (2 to
-            # 5 of them). A sim per rack is slow, so a task is 20 racks
+            # A 2-ply simmer ranks every rack's plays; each rack is analysed
+            # again over its first analysis's top 10 until one move leads by
+            # 2 (2 to 5 analyses). A sim per rack is slow, so a task is 20 racks
             # (english_ab's eight, two to a task). english_ab brings no win%
             # model, so its simmer uses the main data's.
             if not data["winpct"]:
@@ -609,7 +625,7 @@ def create_dev_jobs(client: Client, args, data: dict) -> None:
                 "winpct_id": data["winpct"], "num_plies": 2, "num_plays": 10,
                 "max_iterations": 200, "time_limit_secs": 0})], {
                 "racks_per_batch": 2 if on_small else 20, "rack_size": 7,
-                "min_results_per_rack": 2, "max_results_per_rack": 5, "consensus_pct": 80}
+                "max_results_per_rack": 5, "win_margin": 2, "reissue_top_moves": 10}
         rit = args.rit
         if DEV_JOB_KINDS[dev_job_kind(job)][1]:
             # A simmer must sort on equity, so the two differ in depth

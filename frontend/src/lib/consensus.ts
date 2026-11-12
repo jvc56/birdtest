@@ -1,66 +1,68 @@
 /**
- * An opening-rack job's consensus: how many analyses a rack gets, and how
- * much they agree on its best move.
+ * An opening-rack job's consensus: how many analyses a rack gets, and when
+ * they agree on its best move.
  *
  * A job wanting one analysis per rack (`max_results_per_rack` 1) settles each
- * rack at its first. Otherwise a rack is analysed until at least
- * `min_results_per_rack` analyses agree on its best move in `consensus_pct`
- * percent of them, or until it has `max_results_per_rack` analyses.
+ * rack at its first. Otherwise a rack's first analysis ranks every play, and
+ * each later one only the first's top `reissue_top_moves`. The rack settles
+ * once its most common rank-1 move leads the runner-up by `win_margin`
+ * analyses, the first counted, or once it has `max_results_per_rack`.
  */
 
 export interface ConsensusSettings {
-  consensus_pct: number;
-  min_results_per_rack: number;
   max_results_per_rack: number;
+  reissue_top_moves: number;
+  win_margin: number;
 }
 
-/** The consensus fields a request sends: the share only past one analysis per rack. */
-export interface ConsensusFields {
-  min_results_per_rack: number;
-  max_results_per_rack: number;
-  consensus_pct?: number;
+/** The oldest MAGPIE that reads a reissue's candidates: a job that reissues racks needs it. */
+export const CANDIDATES_MIN_MAGPIE = '0.1.5';
+
+/** Whether `version` (`major.minor[.patch]`) is at least `floor`, compared as numbers. */
+export function versionAtLeast(version: string, floor: string): boolean {
+  const parts = (v: string) => v.trim().split('.').map((p) => Number(p));
+  const [a, b] = [parts(version), parts(floor)];
+  for (let i = 0; i < 3; i++) {
+    const [x, y] = [a[i] ?? 0, b[i] ?? 0];
+    if (x !== y) return x > y;
+  }
+  return true;
 }
 
-/**
- * The consensus fields a request sends, from the settings typed: the share
- * only when a rack can have more than one analysis. One analysis per rack
- * seeks no agreement, so its share box is disabled, and whatever it holds is
- * left out rather than refused: the server then checks the share it already
- * has, its default 100% at creation or the job's stored one on a change.
- */
-export function consensusFields(c: ConsensusSettings): ConsensusFields {
-  const min = Number(c.min_results_per_rack);
-  const max = Number(c.max_results_per_rack);
+/** The consensus fields a request sends, as numbers. */
+export function consensusFields(c: ConsensusSettings): ConsensusSettings {
   return {
-    min_results_per_rack: min,
-    max_results_per_rack: max,
-    ...(max > 1 ? { consensus_pct: Number(c.consensus_pct) } : {})
+    max_results_per_rack: Number(c.max_results_per_rack),
+    reissue_top_moves: Number(c.reissue_top_moves),
+    win_margin: Number(c.win_margin)
   };
 }
 
 /**
  * What is wrong with the fields `consensusFields` sends, as the server's
  * `consensus_problems` would refuse them, or null: checked before a job is
- * created with them and before they are changed on one. The fewest and most
- * are checked whatever the most; the share only when it is sent.
+ * created with them and before they are changed on one.
  */
 export function consensusProblem(c: ConsensusSettings): string | null {
-  const { min_results_per_rack: min, max_results_per_rack: max, consensus_pct: pct } =
-    consensusFields(c);
-  if (!(Number.isInteger(min) && min >= 1 && min <= 100)) return 'The fewest analyses must be a whole number from 1 to 100.';
-  if (!(Number.isInteger(max) && max >= min && max <= 100)) return 'The most analyses must be at least the fewest, and at most 100.';
-  if (pct !== undefined && !(pct > 50 && pct <= 100)) return 'The share that must agree must be above 50% and at most 100%.';
+  const { max_results_per_rack: max, reissue_top_moves: top, win_margin: margin } = consensusFields(c);
+  if (!(Number.isInteger(max) && max >= 1 && max <= 100)) return 'The most analyses must be a whole number from 1 to 100.';
+  if (!(Number.isInteger(top) && top >= 2 && top <= 100)) return 'The moves reanalysed must be a whole number from 2 to 100.';
+  if (!(Number.isInteger(margin) && margin >= 1 && margin <= 100)) return 'The lead must be a whole number from 1 to 100.';
   return null;
+}
+
+/** The fewest analyses that can settle a rack: its first, and as many more as the lead needs. */
+export function fewestToSettle(c: ConsensusSettings): number {
+  return c.max_results_per_rack > 1 ? Math.min(c.win_margin, c.max_results_per_rack) : 1;
 }
 
 /** The settings as the job's settings table states them. */
 export function analysesPerRack(c: ConsensusSettings): string {
   if (c.max_results_per_rack <= 1) return '1';
-  const range =
-    c.min_results_per_rack === c.max_results_per_rack
-      ? `${c.min_results_per_rack}`
-      : `${c.min_results_per_rack} to ${c.max_results_per_rack}`;
-  return `${range}, until ${c.consensus_pct}% agree on the best move`;
+  return (
+    `up to ${c.max_results_per_rack}, until one move leads by ${c.win_margin}; ` +
+    `later analyses rank the first's top ${c.reissue_top_moves} moves`
+  );
 }
 
 /** One ranked move of a rack lookup: `analysis` numbers the rack's analyses from 1. */
@@ -76,6 +78,8 @@ export interface RackConsensus {
   top: string;
   /** How many analyses ranked it first. */
   count: number;
+  /** How many ranked the runner-up first: the next most common best move's count, 0 for none. */
+  runnerUp: number;
   /** `count` as a share of `analyses`, to one decimal place: "80.0". */
   share: string;
 }
@@ -90,14 +94,14 @@ export function rackConsensus(moves: LookupMove[]): RackConsensus | null {
     firsts.set(m.move, (firsts.get(m.move) ?? 0) + 1);
   }
   if (!analyses) return null;
-  const [top, count] = [...firsts.entries()].sort(
-    ([a, x], [b, y]) => y - x || (a < b ? -1 : a > b ? 1 : 0)
-  )[0];
-  return { analyses, top, count, share: ((100 * count) / analyses).toFixed(1) };
+  const ranked = [...firsts.entries()].sort(([a, x], [b, y]) => y - x || (a < b ? -1 : a > b ? 1 : 0));
+  const [top, count] = ranked[0];
+  const runnerUp = ranked[1]?.[1] ?? 0;
+  return { analyses, top, count, runnerUp, share: ((100 * count) / analyses).toFixed(1) };
 }
 
 /** An English ordinal: 1st, 2nd, 3rd, 4th, 11th, 21st. */
-function ordinal(n: number): string {
+export function ordinal(n: number): string {
   const tens = n % 100;
   if (tens >= 11 && tens <= 13) return `${n}th`;
   return `${n}${({ 1: 'st', 2: 'nd', 3: 'rd' } as Record<number, string>)[n % 10] ?? 'th'}`;
@@ -110,13 +114,14 @@ export interface RackStage {
   racks_without_consensus: number;
   racks_total: number;
   fewest_open_analyses: number | null;
-  min_results_per_rack: number;
   max_results_per_rack: number;
+  win_margin: number;
+  reissue_top_moves: number;
 }
 
 /**
  * Where a job seeking a consensus stands, as the Opening racks card says it:
- * its first pass (no rack can settle before its fewest analyses), its
+ * its first pass (no rack can settle before the lead it needs), its
  * re-analysis (open racks are analysed fewest first), or finished. `null` for
  * a job analysing each rack once, which has no consensus to stand anywhere.
  */
@@ -132,8 +137,8 @@ export function consensusStage(s: RackStage, finished: boolean): { stage: string
     };
   }
   if (s.racks_analyzed < s.racks_total) {
-    const wait =
-      s.min_results_per_rack > 1 ? ` None can settle before its ${ordinal(s.min_results_per_rack)}.` : '';
+    const fewest = fewestToSettle(s);
+    const wait = fewest > 1 ? ` None can settle before its ${ordinal(fewest)}.` : '';
     return {
       stage: 'First pass.',
       text: `${pct(s.racks_analyzed)} of racks have their first analysis.${wait} Re-analysis starts when every rack has one.`
@@ -142,6 +147,6 @@ export function consensusStage(s: RackStage, finished: boolean): { stage: string
   const fewest = s.fewest_open_analyses ?? 1;
   return {
     stage: 'Re-analysis.',
-    text: `Every open rack has at least ${fewest} ${fewest === 1 ? 'analysis' : 'analyses'}, and racks with the fewest are analysed first.`
+    text: `Every open rack has at least ${fewest} ${fewest === 1 ? 'analysis' : 'analyses'}, and racks with the fewest are analysed first, over their first analysis's top ${s.reissue_top_moves} moves. A rack settles when one move leads by ${s.win_margin}.`
   };
 }

@@ -279,14 +279,16 @@ against it, so a change in ordering silently re-points existing rows.
   longer one and wrote past every per-letter array. *(Covered:
   `racks::tests::a_distribution_past_magpies_alphabet_is_refused`; job creation
   refuses one in `A-ADMIN-3`.)* (Twenty-second audit.)
-- `U-RACK-11` A rack's consensus standing: it settles once it has its fewest
-  analyses and they agree in the share asked for (4 of 5 at 80%, not 3 of 4),
-  not before however much they agree; at its most without agreeing it settles
-  without a consensus, on its most common move; a tie names the alphabetically
-  first; one analysis per rack settles at the first. *(Covered:
-  `opening_rack::tests::a_rack_settles_at_its_minimum_once_its_analyses_agree`,
-  `…::a_split_rack_settles_at_its_maximum_without_a_consensus`,
-  `…::a_tie_names_the_first_move_alphabetically`,
+- `U-RACK-11` A rack's consensus standing: it settles once its most common
+  rank-1 move leads the runner-up by the margin, the first analysis counted
+  (2-0, 3-1, 4-2 at a margin of two; not 1-0 or 2-1), the runner-up being the
+  second-highest count however many moves split the rest; at its most without
+  that lead it settles without a consensus, on its most common move, a tie
+  naming the alphabetically first; one analysis per rack settles, agreed, at
+  the first whatever the margin, and analysed twice before its most came down
+  to one, two that split are without a consensus. *(Covered:
+  `opening_rack::tests::a_rack_settles_once_one_move_leads_by_the_margin`,
+  `…::a_close_rack_settles_at_its_maximum_without_a_consensus`,
   `…::one_analysis_per_rack_settles_at_the_first`.)*
 
 ### `U-ERR-*` — error mapping (`error.rs`)
@@ -1053,33 +1055,30 @@ Each entry's tests are the `describe` block named for its id.
 
 - `F-CONS-1` `analysesPerRack` states an opening-rack job's consensus as the
   job page's explanation of it reads: "1" for one analysis per rack, otherwise
-  the range and the share ("3 to 7, until 80% agree on the best move").
-  *(Covered: `consensus.test.ts`.)*
+  the most, the lead and the moves reanalysed ("up to 7, until one move leads
+  by 2; later analyses rank the first's top 10 moves"). *(Covered:
+  `consensus.test.ts`.)*
 - `F-CONS-2` `rackConsensus` counts each analysis's best move in a rack lookup
   and names the most common (the alphabetically first of a tie), with its
-  count and share; nothing for no analyses. *(Covered: `consensus.test.ts`.)*
+  count, the runner-up's count and its share; nothing for no analyses.
+  *(Covered: `consensus.test.ts`.)*
 - `F-CONS-3` `consensusProblem` refuses what the server's
-  `consensus_problems` refuses of the fields `consensusFields` sends, before a
-  job is created with them (the job form) or they are changed on one (the
-  admin page's Consensus card): a fewest outside 1–100 or not whole, a most
-  below the fewest or above 100, whatever the most (a fewest of 3 and a most
-  of 1 is refused, where the job form once sent it as one analysis per rack),
-  and a share at or below 50%, above 100% or not a number. Past one analysis
-  per rack it accepts any share above 50 (50.5 too: the share box has no
-  `min`, which at 51 blocked it). At one analysis per rack the share is not
-  sent, so not checked: the server checks its default 100% at creation, or
-  the job's stored share (checked when it was set) on a change. *(Covered:
-  `consensus.test.ts`.)*
-- `F-CONS-4` `consensusFields` is what both forms send: the fewest and most
-  as numbers, and the share only past one analysis per rack, so a share left
-  in the disabled box at a most of 1 is never sent for the server to refuse.
-  *(Covered: `consensus.test.ts`.)*
+  `consensus_problems` refuses, before a job is created with them (the job
+  form) or they are changed on one (the admin page's Consensus card): a most
+  outside 1–100 or not whole, moves reanalysed outside 2–100, a lead outside
+  1–100 or not a number. *(Covered: `consensus.test.ts`.)*
+- `F-CONS-4` `consensusFields` is what both forms send: the three settings as
+  numbers, whatever the inputs bound. *(Covered: `consensus.test.ts`.)*
 - `F-CONS-5` `consensusStage` says where a job seeking a consensus stands:
-  "First pass." with the share of racks analysed (and, when the fewest is
-  above one, that none can settle before that analysis), "Re-analysis."
-  from the fewest analyses an open rack has, "Finished." with racks agreed
-  and without a consensus; nothing for a job analysing each rack once.
-  *(Covered: `consensus.test.ts`.)*
+  "First pass." with the share of racks analysed (and, when the lead needs
+  more than the first analysis, that none can settle before that one),
+  "Re-analysis." from the fewest analyses an open rack has, with the moves
+  reanalysed and the lead, "Finished." with racks agreed and without a
+  consensus; nothing for a job analysing each rack once. *(Covered:
+  `consensus.test.ts`.)*
+- `F-CONS-6` `fewestToSettle` is the lead, at most the most, and one for one
+  analysis a rack; `versionAtLeast` compares MAGPIE floors as numbers (0.1.10
+  above 0.1.5, 0.1 below it). *(Covered: `consensus.test.ts`.)*
 
 ### `F-TEST-*` — `lib/matchTest.ts`
 
@@ -1740,19 +1739,23 @@ The single most important group. Every entry is about a decision made in SQL.
   `worker_api::a_restarted_server_does_not_abandon_claims_it_could_not_have_heard_from`,
   `worker_api::a_claim_still_silent_after_the_grace_is_reclaimed`,
   `boundaries::a_freshly_built_production_state_grants_the_restart_grace`.)*
-- `I-SCHED-21` **An opening-rack consensus job reissues its unsettled racks.**
-  It covers its space in ranges, then hands out unsettled racks as lists,
-  from seeds past the end of the space: fewest analyses first, none another
-  reissue holds, and none the claiming worker analysed while others are left
-  -- but those too rather than nothing, so a rack wanting more analyses than
-  the fleet has workers still settles. A rack settles once enough analyses
-  agree, or at its most without a consensus; the running totals (`racks_analyzed`,
-  `racks_settled`, `racks_without_consensus`) follow, and the job completes once
-  every rack is settled. The rack lookup numbers each analysis, and holds
-  their lists together to what one analysis can record: three analyses of
-  12,000 moves list their best 10,922 each (32,767 / 3), from the top. Public,
-  it returned a consensus job's hundred analyses of 32,767 moves whole.
-  *(Covered:
+- `I-SCHED-21` **An opening-rack consensus job reissues its unsettled racks
+  over their first analysis's leaders.** It covers its space in ranges, then
+  hands out unsettled racks as lists, from seeds past the end of the space:
+  fewest analyses first, none another reissue holds, and none the claiming
+  worker analysed while others are left -- but those too rather than nothing,
+  so a rack wanting more analyses than the fleet has workers still settles.
+  A reissue sends each rack's candidates, its first analysis's top
+  `reissue_top_moves` (`candidates` on the request, stored on the request
+  row), a first-pass task none; an answer ranking a move it was not sent is a
+  `400` and its claim stays open. A rack settles once one move leads by two,
+  the first analysis counted, or at its most without a consensus; the running
+  totals (`racks_analyzed`, `racks_settled`, `racks_without_consensus`)
+  follow, and the job completes once every rack is settled. The rack lookup
+  numbers each analysis, and holds their lists together to what one analysis
+  can record: three analyses of 12,000 moves list their best 10,922 each
+  (32,767 / 3), from the top. Public, it returned a consensus job's hundred
+  analyses of 32,767 moves whole. *(Covered:
   `worker_api::a_consensus_job_reissues_its_unsettled_racks_until_each_settles`;
   the standing itself, `U-RACK-11`.)*
 - `I-OR-REISSUE-1` **A reissue's cost does not grow with the racks its
@@ -1840,12 +1843,14 @@ job creation touches needs one caller here.
   shapes (and a NULL element) below the API. *(Covered:
   `routes::admin::tests::a_leave_job_lists_between_one_and_the_most_generations_each_with_a_sane_target`;
   the form's parse, `F-FMT-15`.)*
-- `I-JOB-1e` **An opening-rack job's consensus** -- the share of a rack's
-  analyses that must agree on its best move, after at least and at most so
-  many -- is stored as stated for a simming player (one analysis per rack, 100%,
-  when the body says nothing), and refused by name where it cannot work: a
-  share at or below 50% or above 100%, no analyses, a most below the fewest or
-  above 100, and any consensus for a static player, whose analyses always
+- `I-JOB-1e` **An opening-rack job's consensus** -- the most analyses a rack
+  gets, the lead that settles it and the moves its later analyses rank -- is
+  stored as stated for a simming player (one analysis per rack, a lead of 2,
+  10 moves, when the body says nothing), and refused by name where it cannot
+  work: out of range, the replaced rule's `consensus_pct` and
+  `min_results_per_rack` named at all, a most above 1 with a MAGPIE floor below
+  0.1.5 (typed, or the fleet's when none is), a player that stores one move
+  per rack, and any consensus for a static player, whose analyses always
   agree. *(Covered:
   `jobs::an_opening_rack_jobs_consensus_is_stored_and_refused_where_it_cannot_work`.)*
 - `I-JOB-1f` **The schema holds a games or pairs job's counts** to what
@@ -1866,11 +1871,12 @@ job creation touches needs one caller here.
 - `I-OR-EDIT-1` **An opening-rack job's consensus changes after creation, and
   the job follows** (`PATCH /api/admin/jobs/:id/consensus`). A job wanting one
   analysis per rack still keeps a progress row per rack, so raising its
-  minimum and maximum after it completed restates every rack unsettled,
-  reopens it inactive at 0% (`job.consensus_changed`, "min 1 -> 2, max 1 -> 3;
+  maximum after it completed restates every rack (1-0, a lead of one)
+  unsettled, reopens it inactive at 0% (`job.consensus_changed`, "max 1 -> 3;
   4 racks unsettled", then `job.deactivated` from completed), demotes its final
   export to a snapshot, and, once given an allocation, reissues the racks from
-  those rows; lowering them
+  those rows, each with its first analysis's moves as candidates -- an
+  analysis made before the job reissued anything; lowering it
   again while a reissue is in flight settles every rack, and that reissue's
   submission completes the job without counting its racks a second time, and
   every line of its corpus then carries its rack's standing, each rack having
@@ -1882,19 +1888,21 @@ job creation touches needs one caller here.
   null with one analysis a rack, 1 once reopened with every rack analysed
   once, still 1 while two racks wait for a second, null once every rack is
   settled.
-  Asking for what every rack already has leaves a completed job completed,
+  A smaller margin that every rack already meets leaves a completed job completed,
   and still demotes its final export and fails one building from before the
   edit ("the job's consensus settings changed while this export was
   building"): the standings each line carries were restated (thirty-third
   audit, pass 3; only a reopening demoted them, and the old standings went on
   being served as the completed job's corpus). *(Covered:
   `worker_api::an_opening_rack_jobs_consensus_can_change_and_the_job_follows`.)*
-- `I-OR-EDIT-2` The edit refuses by name what creation refuses (a share at
-  or below 50%, no analyses, a most below the fewest or above 100, any
-  consensus for a static player), and refuses any job but an opening-rack
-  one; a change that changes nothing writes no audit row; and a completed job
-  it reopens comes back inactive at 0%, the 0% every completed job holds.
-  *(Covered: `worker_api::a_consensus_edit_is_checked_and_reopens_inactive`.)*
+- `I-OR-EDIT-2` The edit refuses by name what creation refuses (the replaced
+  rule's settings, a most, lead or moves reanalysed out of range, a most above
+  1 on a job whose MAGPIE floor is below 0.1.5 -- told before a static
+  player's refusal -- and any consensus for a static player), and refuses any
+  job but an opening-rack one; a change that changes nothing writes no audit
+  row; and a completed job it reopens comes back inactive at 0%, the 0% every
+  completed job holds. *(Covered:
+  `worker_api::a_consensus_edit_is_checked_and_reopens_inactive`.)*
 - `I-OR-EDIT-3` **A finish check overtaken by a consensus edit does not
   complete the job.** A check that read every rack settled, completing after
   an edit unsettled them, leaves the job active, and its racks are reissued:
@@ -1914,7 +1922,7 @@ job creation touches needs one caller here.
 - `I-OR-EDIT-5` **An edit that is refused, or changes nothing, holds
   nothing.** It is answered before the hold or a lock is taken, so a lapsed
   claim of the job is reclaimed at once after it: a games job's `400`, an
-  opening-rack job's share out of range, and its settings sent back unchanged.
+  opening-rack job's margin out of range, and its settings sent back unchanged.
   Checked only under the locks, each held the job's claims off while it took
   them and then left the reclaim grace, a heartbeat timeout in which the job's
   lapsed claims were not reclaimed. *(Covered:
@@ -1928,6 +1936,14 @@ job creation touches needs one caller here.
   its hold is gone. *(Covered:
   `routes::admin::tests::an_action_that_waited_on_an_edit_is_not_told_the_job_was_purged`.)*
   (Thirty-third audit, pass 3.)
+- `I-OR-EDIT-7` **A reissue ranks the candidates it was dispatched with.**
+  A change to the moves reanalysed alone restates nothing ("top 10 -> 2; 4
+  racks unsettled") and applies to the reissues dispatched after it; a
+  reissue given back and handed out again sends the candidates it was first
+  sent, whatever the setting is by then; an answer ranking more moves than it
+  was sent is a `400`; and a job that reissues cannot have its MAGPIE floor
+  lowered below 0.1.5. *(Covered:
+  `worker_api::a_reissue_ranks_the_candidates_it_was_dispatched_with`.)*
 - `I-JOB-2` **`validate_shared_player_options` runs against real rows.** Two
   configs with different `winpct_id` are rejected; two with the same are
   accepted; two with different `movegen_margin` are accepted, since autoplay
@@ -3925,6 +3941,14 @@ copy.
 - `C-12` `decline-time-limit.json`, a task stopped at its time limit: the
   token and `"reason": "time_limit"`, nothing missing. *(Covered:
   `contract_fixtures::a_time_limit_decline_parses_as_a_decline_body`.)*
+- `C-13` `assignment-opening-rack-candidates.json`, a reissue: two racks and
+  their `candidates`, one list per rack (placements, a blank designation,
+  exchanges as MAGPIE reports them). Birdtest reads it as a request whose
+  candidates match its racks, and writes a first pass's request with no
+  `candidates` key at all; MAGPIE's copy is byte-identical. *(Covered:
+  `contract_fixtures::a_reissue_carries_one_candidate_list_per_rack`,
+  `contract_fixtures::assignments_carry_a_task_request_this_build_understands`;
+  MAGPIE's `test_contract_fixtures_carry_every_key_contribute_reads`.)*
 - `C-10` `decline-missing-data.json`, a decline naming a file not found and one
   found with other bytes, parses as the body the server takes, with `actual`
   left out reading as its `null`; MAGPIE builds the same body key for key.
@@ -4176,14 +4200,17 @@ admin in once and the admin journeys reuse its storage state.
   games of it. *(Covered: `e17-pair-divergences.spec.ts`, against the fake
   workers' synthetic first divergences.)*
 - `E-18` An admin changes an inactive opening-rack job's consensus from its
-  admin page's Consensus card: it starts at 1 and 1 with Consensus % and
-  Save disabled, a maximum below the minimum is named under the inputs, and 2,
-  3 and 80% save with "Saved: 0 racks unsettled."; the public page's settings
-  then read Minimum Analyses Per Rack 2, Maximum Analyses Per Rack 3 and
-  Consensus % 80%. And an opening-rack job made on the new-job form shows
-  Racks Per Task 500 until changed, and created with 7, its settings read
-  Racks Per Task 7. *(Covered: `e18-opening-rack-consensus.spec.ts`; the
-  reopening and completing it drives are tier 3's, `I-OR-EDIT-1`, `-2`.)*
+  admin page's Consensus card: it starts at a most of 1, Win By 2 and
+  Reanalyse Top Moves 10, those two disabled and Save disabled; one move
+  reanalysed is named under the inputs, and a most of 3 on a job whose
+  Oldest MAGPIE is 0.1.2 is held until the floor is raised to 0.1.5 in its
+  Controls; 3, 2 and 5 then save with "Saved: 0 racks unsettled.", and the
+  public page's settings read Max Passes Per Rack 3, Win By 2, Reanalyse Top
+  Moves 5 and Oldest MAGPIE 0.1.5. And an opening-rack job made on the
+  new-job form shows Racks Per Task 500 until changed, and created with 7,
+  its settings read Racks Per Task 7. *(Covered:
+  `e18-opening-rack-consensus.spec.ts`; the reopening and completing it drives
+  are tier 3's, `I-OR-EDIT-1`, `-2`.)*
 
 ### Reading confirmation codes
 
@@ -4369,14 +4396,18 @@ surfacing the mismatch as a red build rather than as a dead job in production.
   MAGPIE's own side, including that a pair played identically keeps nothing,
   is `magpie_test contribute`'s
   `test_a_pairs_first_divergence_is_both_games_at_one_turn`.
-- `M-15` An opening-rack job seeking a consensus (at least 2, at most 3
-  analyses a rack, 100%), with a real 1-ply simmer on the two-letter data,
-  covers its eight racks, reissues them as lists from seeds past the end of
-  the space, and completes with every rack settled after at least two
-  analyses; its page's stats split the completed tasks into two first-pass
-  tasks and the re-analysis ones (adding up to `tasks_completed`), count
-  throughput in analyses, and leave no open rack (`fewest_open_analyses`
-  null). *(Covered: `case_consensus`, one task a run until the job
+- `M-15` An opening-rack job seeking a consensus (one move ahead of the
+  runner-up by 2, at most 3 analyses a rack, reanalysing each rack's
+  first-pass top 3), with a real 1-ply simmer on the two-letter data and a
+  job floor of 0.1.5, covers its eight racks, reissues them as lists from
+  seeds past the end of the space, and completes with every rack settled
+  after at least two analyses. Every reissue sent its racks' candidates, and
+  every move it stored is among them. Its page's stats split the completed
+  tasks into two first-pass tasks and the re-analysis ones (adding up to
+  `tasks_completed`), count throughput in analyses, and leave no open rack
+  (`fewest_open_analyses` null). Skipped, saying so, when the MAGPIE under
+  test is older than 0.1.5: the nightly's pinned leg builds the server
+  image's MAGPIE. *(Covered: `case_consensus`, one task a run until the job
   completes.)*
 - `M-16` A games job between two real 2-ply simmers that infer, capturing
   positions: every position past a game's first turn keeps its inference

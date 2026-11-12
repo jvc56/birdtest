@@ -473,9 +473,10 @@ export interface JobStats {
      * the job seeks a consensus; null before then and once all are settled.
      */
     fewest_open_analyses: number | null;
-    /** The job's consensus bounds: a most above 1 seeks a consensus. */
-    min_results_per_rack: number;
+    /** The job's consensus settings: a most above 1 seeks a consensus. */
     max_results_per_rack: number;
+    win_margin: number;
+    reissue_top_moves: number;
   };
   leave_generation?: {
     current_generation: number;
@@ -948,7 +949,7 @@ export const api = {
    */
   updateConsensus: (
     id: string,
-    body: { min_results_per_rack?: number; max_results_per_rack?: number; consensus_pct?: number }
+    body: { max_results_per_rack?: number; reissue_top_moves?: number; win_margin?: number }
   ) =>
     patch<{
       job: JobRow;

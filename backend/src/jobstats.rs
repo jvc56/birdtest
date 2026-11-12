@@ -209,11 +209,12 @@ pub struct OpeningRackStats {
     /// `None` before then, for a job wanting one analysis per rack, and once
     /// every rack is settled.
     pub fewest_open_analyses: Option<i32>,
-    /// The job's consensus bounds, so the Progress card can tell a job
-    /// seeking a consensus (most above 1) from one analysing each rack once
-    /// without reading the job's config.
-    pub min_results_per_rack: i32,
+    /// The job's consensus settings, so the Progress card can tell a job
+    /// seeking a consensus (most above 1) from one analysing each rack once,
+    /// and say what settles a rack, without reading the job's config.
     pub max_results_per_rack: i32,
+    pub win_margin: i32,
+    pub reissue_top_moves: i32,
 }
 
 /// Two kinds of figure, and the page says which is which.
@@ -896,14 +897,16 @@ async fn opening_rack_stats(conn: &mut PgConnection, job_id: Uuid) -> AppResult<
         .fetch_one(&mut *conn)
         .await?;
 
-    let (racks_total, racks_per_batch, min_results, max_results) = sqlx::query_as::<_, (i64, i32, i32, i32)>(
-        "SELECT total_racks, racks_per_batch, min_results_per_rack, max_results_per_rack
-         FROM job_opening_rack_config WHERE job_id = $1",
-    )
-    .bind(job_id)
-    .fetch_optional(&mut *conn)
-    .await?
-    .unwrap_or((0, 1, 1, 1));
+    let (racks_total, racks_per_batch, max_results, win_margin, reissue_top_moves) =
+        sqlx::query_as::<_, (i64, i32, i32, i32, i32)>(
+            "SELECT total_racks, racks_per_batch, max_results_per_rack, win_margin,
+                    reissue_top_moves
+             FROM job_opening_rack_config WHERE job_id = $1",
+        )
+        .bind(job_id)
+        .fetch_optional(&mut *conn)
+        .await?
+        .unwrap_or((0, 1, 1, 2, 10));
 
     // The job's completed tasks by kind, in one pass over its tasks -- the
     // same rows the stats' task counts already read.
@@ -939,8 +942,9 @@ async fn opening_rack_stats(conn: &mut PgConnection, job_id: Uuid) -> AppResult<
         reissue_tasks_done,
         first_pass_tasks_total,
         fewest_open_analyses,
-        min_results_per_rack: min_results,
         max_results_per_rack: max_results,
+        win_margin,
+        reissue_top_moves,
     })
 }
 
@@ -1130,17 +1134,22 @@ async fn estimate_pace(
     // Each type counts what it still wants in its own unit instead.
     match job.job_type {
         JobType::OpeningRack => {
-            let (total_racks, racks_per_batch, min_results): (i64, i32, i32) = sqlx::query_as(
-                "SELECT total_racks, racks_per_batch, min_results_per_rack
-                 FROM job_opening_rack_config WHERE job_id = $1",
-            )
-            .bind(job.id)
-            .fetch_one(&mut *conn)
-            .await?;
+            let (total_racks, racks_per_batch, max_results, win_margin): (i64, i32, i32, i32) =
+                sqlx::query_as(
+                    "SELECT total_racks, racks_per_batch, max_results_per_rack, win_margin
+                     FROM job_opening_rack_config WHERE job_id = $1",
+                )
+                .bind(job.id)
+                .fetch_one(&mut *conn)
+                .await?;
+            // The fewest analyses that can settle a rack: one move ranked
+            // first by every one of `win_margin` analyses, the first among
+            // them; one, for a job analysing each rack once.
+            let min_results = if max_results > 1 { win_margin.min(max_results) } else { 1 };
             // Analyses, not distinct racks: a re-analysis task's racks were
             // analysed before.
             let (throughput, per_second) = pace("analysis", racks_per_batch);
-            // Racks not yet analysed want at least their fewest analyses each;
+            // Racks not yet analysed want at least the fewest that settle one;
             // racks analysed and not yet settled at least one more. A consensus
             // that is slow to come makes this an underestimate.
             let unanalysed = (total_racks - job.racks_analyzed).max(0) as f64;

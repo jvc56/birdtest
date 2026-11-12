@@ -136,8 +136,7 @@ async fn generate_opening_rack(
     };
 
     let task_id = insert_on_demand_task(conn, job.id, start).await?;
-    opening_rack::insert_request(conn, task_id, config, &template.data, start, &request.racks)
-        .await?;
+    opening_rack::insert_request(conn, task_id, config, &template.data, start, &request).await?;
     Ok(Acquired::Task { task_id, request: TaskRequest::OpeningRack(request), created: true })
 }
 
@@ -402,9 +401,10 @@ pub async fn store_result(
 ) -> AppResult<ProgressDelta> {
     match decoded {
         DecodedResult::OpeningRack(record) => {
+            opening_rack::check_batch_against_task(conn, template, task_id, &record.positions)
+                .await?;
             let racks: Vec<String> =
                 record.positions.iter().map(|p| p.rack.clone()).collect();
-            opening_rack::check_batch_against_task(conn, template, task_id, &racks).await?;
             opening_rack::OpeningRackHandler::insert_record(conn, template, task_id, claim_id, &record)
                 .await?;
             // What the job's totals gain depends on whether its racks were

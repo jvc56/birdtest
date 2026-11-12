@@ -24,8 +24,9 @@ const racks = (over: Partial<NonNullable<JobStats['opening_racks']>> = {}): NonN
   first_pass_tasks_total: 6400,
   reissue_tasks_done: 0,
   fewest_open_analyses: null,
-  min_results_per_rack: 3,
   max_results_per_rack: 7,
+  win_margin: 2,
+  reissue_top_moves: 10,
   ...over
 });
 const pairs = (over: Record<string, unknown> = {}) =>
@@ -141,7 +142,7 @@ describe('F-PROG-3 an opening-rack job\'s two fronts and its tasks', () => {
   });
 
   it('gives one row to a job analysing each rack once, which settles a rack as it analyses it', () => {
-    const once = racks({ racks_settled: 2060000, min_results_per_rack: 1, max_results_per_rack: 1 });
+    const once = racks({ racks_settled: 2060000, max_results_per_rack: 1 });
     const p = rackProgress(job({ opening_racks: once, throughput: pace, eta_seconds: 44600 }), now)!;
     expect(p.consensus).toBe(false);
     expect(p.headline).toBe('64.4%');

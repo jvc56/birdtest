@@ -46,7 +46,8 @@ Each case is selectable with `--cases` (default: every M case):
 - `M-15` An opening-rack job seeking a consensus, with a real simmer on the
   two-letter data: it covers its eight racks, then reissues them -- as lists,
   from seeds past the end of the space -- until each is settled, and
-  completes once all are; every rack has at least its fewest analyses.
+  completes once all are; every rack has at least its fewest analyses, and
+  every reissue ranks only its candidates. Skipped below MAGPIE 0.1.5.
 - `M-17` A worker at 24 threads runs a job whose players solve: each of its
   24 concurrent games gives its solves one thread. Given every thread each,
   as before, the solves needed 24 + 24 x 24 move generators of a pool of 512,
@@ -137,6 +138,22 @@ class Failure(RuntimeError):
 def expect(condition: bool, message: str) -> None:
     if not condition:
         raise Failure(message)
+
+
+def magpie_version(ctx: "Context") -> str:
+    """The version the binary under test reports, from `magpie builders`.
+
+    MAGPIE prints a line about its tables at startup, so this takes the last
+    line that parses.
+    """
+    output = subprocess.run([str(ctx.args.magpie), "builders"], cwd=ctx.args.magpie_root,
+                            capture_output=True, text=True, timeout=60).stdout
+    for line in reversed(output.splitlines()):
+        try:
+            return json.loads(line)["magpie_version"]
+        except (ValueError, KeyError, TypeError):
+            continue
+    raise Failure(f"magpie builders printed no version:\n{output}")
 
 
 def sha256_file(path: Path) -> str:
@@ -1303,6 +1320,13 @@ def case_derived_mismatch(ctx: Context) -> None:
 
 def case_consensus(ctx: Context) -> None:
     """M-15"""
+    # Reissues send candidates, which MAGPIE reads from 0.1.5. The nightly's
+    # pinned leg builds the server image's MAGPIE, which may be older.
+    version = magpie_version(ctx)
+    if seed.version_key(version) < seed.version_key(seed.CANDIDATES_MIN_MAGPIE):
+        log(f"M-15: skipped: MAGPIE {version} is older than {seed.CANDIDATES_MIN_MAGPIE}, "
+            "the first to read a reissue's candidates")
+        return
     deactivate_everything(ctx)
     remove_small_data(ctx)
     worker = None
@@ -1310,13 +1334,16 @@ def case_consensus(ctx: Context) -> None:
         data = small_data(ctx)
         simmer = create_player(ctx, data, "e2e-ab-consensus", {
             "recorder_type": "all", "winpct_id": ctx.winpct, "num_plies": 1, "num_plays": 5,
-            "num_plies_recorded": 1, "max_iterations": 40, "stopping_pct": 99,
-            "time_limit_secs": 0, "use_wordmap": False, "use_rit": False,
+            "num_plies_recorded": 1, "num_plays_recorded": 5, "max_iterations": 40,
+            "stopping_pct": 99, "time_limit_secs": 0, "use_wordmap": False, "use_rit": False,
         })
+        # Reanalysed over each rack's first-pass top three until one move
+        # leads by two, three analyses at most: MAGPIE 0.1.5 reads the
+        # candidates a reissue sends.
         job_id = create_and_activate(ctx, data, {
             "job_type": "opening_rack", "player_config_id": simmer, "racks_per_batch": 4,
-            "rack_size": 7, "min_results_per_rack": 2, "max_results_per_rack": 3,
-            "consensus_pct": 100,
+            "rack_size": 7, "max_results_per_rack": 3, "win_margin": 2, "reissue_top_moves": 3,
+            "min_magpie_version": "0.1.5",
         })
         # One task a run: how many the consensus takes depends on how often
         # the simulations agree, and a worker asked for more than there are
@@ -1340,6 +1367,21 @@ def case_consensus(ctx: Context) -> None:
             "SELECT COUNT(*) FROM tasks t JOIN opening_rack_requests r ON r.task_id = t.id "
             f"WHERE t.job_id = '{job_id}' AND t.seed >= 8 AND r.racks IS NOT NULL"))
         expect(reissues >= 2, f"{reissues} reissue tasks")
+        # Every reissue sent its racks' candidates, and every analysis it
+        # stored ranks only those: no more than three moves, each among them.
+        without = int(ctx.psql(
+            "SELECT COUNT(*) FROM tasks t JOIN opening_rack_requests r ON r.task_id = t.id "
+            f"WHERE t.job_id = '{job_id}' AND t.seed >= 8 AND r.candidates IS NULL"))
+        expect(without == 0, f"{without} reissues sent no candidates")
+        stray = int(ctx.psql(
+            "SELECT COUNT(*) FROM position_analysis_records a "
+            "JOIN tasks t ON t.id = a.task_id "
+            "JOIN opening_rack_requests r ON r.task_id = t.id "
+            "JOIN position_analysis_moves m ON m.record_id = a.id "
+            f"WHERE a.job_id = '{job_id}' AND t.seed >= 8 AND NOT EXISTS ("
+            "  SELECT 1 FROM jsonb_array_elements(r.candidates) WITH ORDINALITY c(moves, i) "
+            "  WHERE r.racks[c.i] = a.rack AND c.moves ? m.move)"))
+        expect(stray == 0, f"{stray} reissued moves were not among the candidates sent")
         # The job page's task split and consensus stage: two first-pass tasks
         # of four racks, the re-analysis tasks after them, adding up to the
         # job's completed tasks; no open rack left to stand anywhere.

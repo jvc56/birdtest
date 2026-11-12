@@ -203,7 +203,7 @@ const ROUTES: &[(&str, &str, Access, &str)] = &[
     ),
     ("PUT", "/api/admin/jobs/allocations", Admin, r#"{"allocations":[{"job_id":"00000000-0000-4000-8000-000000000001","allocation":50}]}"#),
     ("POST", "/api/admin/jobs/:id/complete", Admin, ""),
-    ("PATCH", "/api/admin/jobs/:id/consensus", Admin, r#"{"consensus_pct":80}"#),
+    ("PATCH", "/api/admin/jobs/:id/consensus", Admin, r#"{"win_margin":3}"#),
     ("PATCH", "/api/admin/jobs/:id/time-limit", Admin, r#"{"max_task_seconds":1800}"#),
     ("PATCH", "/api/admin/jobs/:id/min-magpie-version", Admin, r#"{"min_magpie_version":"0.1.5"}"#),
     ("POST", "/api/admin/jobs/:id/purge", Admin, ""),

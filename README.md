@@ -60,7 +60,7 @@ reused, when an active job of its name is already running -- and they stack:
 | Flag | The job |
 |---|---|
 | `--leavegen-job` | "dev leave generation": six generations, targets 100, 200, 500, 1,000, 1,000 and 1,000 occurrences per rack, played by `static-equity-no-rit` |
-| `--opening-rack-job` | "dev opening racks": every rack, 20 to a task, every play ranked by the 2-ply simmer `sim-2ply-rack`; each rack is analysed until 80% of its analyses agree on the best move, 2 to 5 analyses |
+| `--opening-rack-job` | "dev opening racks": every rack, 20 to a task, every play ranked by the 2-ply simmer `sim-2ply-rack`; each rack is analysed again over its first analysis's top 10 moves until one move leads by 2, 2 to 5 analyses (so its floor is MAGPIE 0.1.5) |
 | `--games-job` | "dev games (positions saved)": `static-equity` against `static-score`, saving every position played |
 | `--pairs-job` | "dev game pairs (first divergences saved)": the same two players in pairs, saving the positions where each pair first diverges |
 | `--sim-games-job` | "dev sim games (positions saved)": `sim-2ply` against `sim-1ply` (10 plays considered, an iteration budget of 200), two games to a task, saving every position played |

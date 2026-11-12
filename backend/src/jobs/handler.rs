@@ -202,6 +202,14 @@ pub struct OpeningRackRequest {
     pub bingo_bonus: i32,
     pub sim_cutoff: f64,
     pub player: PlayerSpec,
+    /// A reissue's moves to rank, parallel to `racks`: element `i` is rack
+    /// `i`'s first analysis's top moves (the job's `reissue_top_moves`), in
+    /// the form MAGPIE reported them, and the analysis ranks those rather
+    /// than every play. Absent on a first-pass task, which sends exactly what
+    /// it sent before this existed. Read by MAGPIE 0.1.5 and later, which a
+    /// job that reissues requires (its `min_magpie_version`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidates: Option<Vec<Vec<String>>>,
 }
 
 /// `seed` crosses the wire as a decimal string, not a JSON number.
