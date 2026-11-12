@@ -309,6 +309,14 @@ async fn every_destructive_admin_action_writes_exactly_its_record() {
     .execute(&db.pool)
     .await
     .unwrap();
+    let racks_floor: String = sqlx::query_scalar(
+        "SELECT format('%s.%s.%s', min_magpie_major, min_magpie_minor, min_magpie_patch)
+         FROM jobs WHERE id = $1",
+    )
+    .bind(racks)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
     let pool_anchor: Uuid = sqlx::query_scalar("SELECT anchor_player_config_id FROM rating_pools")
         .fetch_one(&db.pool)
         .await
@@ -390,6 +398,15 @@ async fn every_destructive_admin_action_writes_exactly_its_record() {
             vec![census(
                 "job.time_limit_changed", "job", racks.to_string(), Some(racks),
                 "max_task_seconds 3600 -> 1800",
+            )],
+        ),
+        (
+            "PATCH",
+            format!("/api/admin/jobs/{racks}/min-magpie-version"),
+            Some(json!({ "min_magpie_version": "9.8.7" })),
+            vec![census(
+                "job.min_magpie_version_changed", "job", racks.to_string(), Some(racks),
+                &format!("min_magpie_version {racks_floor} -> 9.8.7"),
             )],
         ),
         (

@@ -964,6 +964,16 @@ export const api = {
     patch<{ max_task_seconds: number }>(`/api/admin/jobs/${id}/time-limit`, {
       max_task_seconds: maxTaskSeconds
     }),
+  /**
+   * A job's MAGPIE floor (`major.minor[.patch]`), any job in any state, up or
+   * down. Claims made from now on are filtered by it; a claim already made
+   * keeps its task. Answers the floor as stored, `major.minor.patch`. One that
+   * changes nothing writes nothing.
+   */
+  updateMinMagpieVersion: (id: string, version: string) =>
+    patch<{ min_magpie_version: string }>(`/api/admin/jobs/${id}/min-magpie-version`, {
+      min_magpie_version: version
+    }),
   purgeJob: (id: string) => post<{ tasks_reset: number }>(`/api/admin/jobs/${id}/purge`),
   deleteJob: (id: string) => del<void>(`/api/admin/jobs/${id}`),
   deleteUser: (id: string) => del<void>(`/api/admin/users/${id}`),

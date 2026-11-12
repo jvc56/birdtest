@@ -81,6 +81,24 @@
       config = await api.jobConfig(jobId);
     }, 'Saved. Claims made from now on are given the new limit; those already made keep their deadlines.');
   }
+  // The job's MAGPIE floor as typed, following the job's own until it is
+  // edited, as the time limit does.
+  let minMagpie = '';
+  let minMagpieShown: string | null = null;
+  $: if (stats && stats.job.min_magpie_version !== minMagpieShown) {
+    minMagpieShown = stats.job.min_magpie_version;
+    minMagpie = minMagpieShown;
+  }
+  // What the server reads strictly: `major.minor[.patch]`, digits only.
+  $: minMagpieValid = /^\d+\.\d+(\.\d+)?$/.test(minMagpie.trim());
+
+  function saveMinMagpie() {
+    run(async () => {
+      await api.updateMinMagpieVersion(jobId, minMagpie.trim());
+      // The Job settings card shows it too.
+      config = await api.jobConfig(jobId);
+    }, 'Saved. Claims made from now on need this MAGPIE version or newer; those already made keep their tasks.');
+  }
   let rebuild: ArtifactRebuild[] | null = null;
   let jobExport: JobExport | null = null;
   // An export started here that no read has shown yet: the button stays off
@@ -446,6 +464,33 @@
           A worker stops one of this job's tasks that runs this long and hands it back.
           {stats.job.time_limit_declines.toLocaleString()} of its tasks have hit the limit so far. A change
           applies to the claims made from now on; those already made keep their deadlines.
+        </p>
+      </form>
+      <form class="flex flex-wrap items-end gap-3" on:submit|preventDefault={saveMinMagpie} data-testid="job-min-magpie">
+        <div>
+          <label class="label" for="min-magpie">Oldest MAGPIE</label>
+          <input
+            id="min-magpie"
+            type="text"
+            inputmode="decimal"
+            autocomplete="off"
+            spellcheck="false"
+            required
+            class="input w-40"
+            bind:value={minMagpie}
+          />
+        </div>
+        <button
+          class="btn-secondary"
+          disabled={busy || gone || !minMagpieValid || minMagpie.trim() === stats.job.min_magpie_version}
+        >
+          Save
+        </button>
+        <p class="basis-full text-xs text-muted-foreground">
+          {#if !minMagpieValid}<span class="field-error">A version such as 0.1.5.</span>{/if}
+          Workers older than this are not given this job's tasks. A change applies to the claims made from now on;
+          those already made keep their tasks. It never changes the job's status, and a version below the fleet's
+          own minimum has no effect.
         </p>
       </form>
       <div class="flex flex-wrap items-end gap-3">

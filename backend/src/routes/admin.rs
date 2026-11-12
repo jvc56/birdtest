@@ -25,6 +25,7 @@ pub fn router() -> Router<AppState> {
         .route("/jobs/:id/complete", post(complete_job))
         .route("/jobs/:id/consensus", patch(update_consensus))
         .route("/jobs/:id/time-limit", patch(update_time_limit))
+        .route("/jobs/:id/min-magpie-version", patch(update_min_magpie_version))
         .route("/jobs/:id/purge", post(purge_job))
         .route("/jobs/:id", delete(delete_job))
         .route("/users/:id", delete(delete_user))
@@ -141,6 +142,94 @@ async fn update_time_limit(
     // The job's page shows its limit: read again, not from before the change.
     crate::jobstats::forget(id);
     Ok(Json(TimeLimitView { max_task_seconds: body.max_task_seconds }))
+}
+
+// ---------------------------------------------------------------------------
+// A job's MAGPIE version floor
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct MinMagpieVersionBody {
+    min_magpie_version: String,
+}
+
+/// A job's MAGPIE floor as it now stands, as `major.minor.patch`.
+#[derive(Serialize)]
+struct MinMagpieVersionView {
+    min_magpie_version: String,
+}
+
+/// Changes a job's MAGPIE version floor, any job type and any status, up or
+/// down. It never changes the job's status: a completed job stays completed.
+///
+/// The floor applies to claims made from now on. A claim already made keeps
+/// its task and its submission is accepted -- its worker could run the job
+/// when it claimed, and what it computes did not change -- and a task given
+/// back goes through the claim filter again like any other. Raising the floor
+/// of the only job on offer turns its older workers' `204`s into the shutdown
+/// that names the version to upgrade to, as a job created with that floor
+/// does. A floor below the fleet's (`MIN_MAGPIE_VERSION`) is allowed and has
+/// no effect: that floor is checked first.
+///
+/// The text is read as job creation reads it ([`Version::parse_strict`]), so
+/// a typo is a `400` rather than the lowest floor there is. One
+/// `job.min_magpie_version_changed` audit row, from what to what; a request
+/// that changes nothing is a `200` that writes nothing. Under the job's row
+/// lock, which the claim path's `UPDATE jobs` takes too, so a claim reads the
+/// floor before or after the change, never half of it.
+///
+/// [`Version::parse_strict`]: crate::version::Version::parse_strict
+async fn update_min_magpie_version(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    Path(id): Path<Uuid>,
+    method: Method,
+    headers: HeaderMap,
+    jar: CookieJar,
+    ApiJson(body): ApiJson<MinMagpieVersionBody>,
+) -> AppResult<Json<MinMagpieVersionView>> {
+    use crate::version::Version;
+    csrf::verify(&method, &headers, &jar)?;
+    let Some(floor) = Version::parse_strict(&body.min_magpie_version) else {
+        return Err(AppError::bad_request("the MAGPIE version is invalid")
+            .with_field("min_magpie_version", "must be a version such as 0.1.5"));
+    };
+    let mut tx = state.pool.begin().await?;
+    let (major, minor, patch): (i32, i32, i32) = sqlx::query_as(
+        "SELECT min_magpie_major, min_magpie_minor, min_magpie_patch
+         FROM jobs WHERE id = $1 FOR UPDATE",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| AppError::not_found("no such job"))?;
+    let before = Version::new(major, minor, patch);
+    if before != floor {
+        sqlx::query(
+            "UPDATE jobs SET min_magpie_major = $2, min_magpie_minor = $3, min_magpie_patch = $4
+             WHERE id = $1",
+        )
+        .bind(id)
+        .bind(floor.major)
+        .bind(floor.minor)
+        .bind(floor.patch)
+        .execute(&mut *tx)
+        .await?;
+        audit::log_detail(
+            &mut tx,
+            "job.min_magpie_version_changed",
+            admin.0.id,
+            "job",
+            id.to_string(),
+            Some(id),
+            format!("min_magpie_version {before} -> {floor}"),
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    // The job's pages show its floor: read again, not from before the change.
+    crate::jobstats::forget(id);
+    Ok(Json(MinMagpieVersionView { min_magpie_version: floor.to_string() }))
 }
 
 // ---------------------------------------------------------------------------
