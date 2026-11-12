@@ -97,9 +97,11 @@ export interface JobConfig {
     rack_size: number;
     total_racks: number;
     /** See `lib/consensus.ts`: one analysis per rack when the most is 1. */
-    consensus_pct: number;
-    min_results_per_rack: number;
     max_results_per_rack: number;
+    /** How many of a rack's first-pass moves its later analyses rank. */
+    reissue_top_moves: number;
+    /** The lead over the runner-up, in rank-1 finishes, that settles a rack. */
+    win_margin: number;
   };
   /** Its lexicon and wordmap setting are its player's, in `players`. */
   leave_generation?: {
@@ -217,10 +219,11 @@ export function jobSettings(c: JobConfig): JobSetting[] {
   }
   if (o) {
     rows.push(
-      setting('min_results_per_rack', 'Minimum Analyses Per Rack', show(o.min_results_per_rack)),
-      setting('max_results_per_rack', 'Maximum Analyses Per Rack', show(o.max_results_per_rack)),
-      // One analysis per rack settles each rack at its first: no agreement is sought.
-      setting('consensus_pct', 'Consensus %', o.max_results_per_rack > 1 ? `${show(o.consensus_pct)}%` : '—')
+      setting('max_results_per_rack', 'Max Passes Per Rack', show(o.max_results_per_rack)),
+      // One analysis per rack settles each rack at its first: no agreement is
+      // sought and nothing is reanalysed.
+      setting('win_margin', 'Win By', o.max_results_per_rack > 1 ? show(o.win_margin) : '—'),
+      setting('reissue_top_moves', 'Reanalyse Top Moves', o.max_results_per_rack > 1 ? show(o.reissue_top_moves) : '—')
     );
   }
   if (l) {

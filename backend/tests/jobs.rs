@@ -279,19 +279,25 @@ async fn each_job_type_stores_every_setting_it_was_created_with() {
         &json!({
             "job_id": racks, "player_config_id": p1, "racks_per_batch": 50, "rack_size": 5,
             "total_racks": total,
-            // One analysis per rack unless the body asks for a consensus.
-            "consensus_pct": 100.0, "min_results_per_rack": 1, "max_results_per_rack": 1,
+            // One analysis per rack unless the body asks for a consensus; ten
+            // first-pass moves a reissue ranks, and a lead of two to settle.
+            "max_results_per_rack": 1, "reissue_top_moves": 10, "win_margin": 2,
+            // The replaced rule's columns, at their defaults until a later
+            // migration drops them.
+            "consensus_pct": 100.0, "min_results_per_rack": 1,
         }),
     );
     assert_eq!(job_row(&db, racks).await["job_type"], "opening_rack");
 }
 
-/// I-JOB-1e: an opening-rack job's consensus -- the share of a rack's
-/// analyses that must agree on its best move, after at least so many and at
-/// most so many of them -- is stored as stated for a simming player, and
-/// refused where it cannot work: a share at or below half (two moves could
-/// both hold it), too few or too many analyses, a maximum below the minimum,
-/// and any consensus at all for a static player, whose analyses always agree.
+/// I-JOB-1e: an opening-rack job's consensus -- the most analyses a rack
+/// gets, the lead over the runner-up that settles it, and how many of its
+/// first analysis's moves its later ones rank -- is stored as stated for a
+/// simming player, and refused where it cannot work: out of range, the
+/// replaced share-of-analyses rule's settings named at all, a job that
+/// reissues racks with a MAGPIE floor below the 0.1.5 that reads their
+/// candidates, and any consensus at all for a static player, whose analyses
+/// always agree.
 #[tokio::test]
 async fn an_opening_rack_jobs_consensus_is_stored_and_refused_where_it_cannot_work() {
     let db = TestDb::new().await;
@@ -302,6 +308,13 @@ async fn an_opening_rack_jobs_consensus_is_stored_and_refused_where_it_cannot_wo
     let winpct = db.input_data("winpct", "winpct").await;
     let simmer = admin.simmer("simmer", kwg, klv, winpct).await;
     let fixed = admin.static_player("fixed", kwg, klv, json!({})).await;
+    // A rack's later analyses rank the moves its first stored: more than one.
+    let leaders = admin.simmer("leaders", kwg, klv, winpct).await;
+    sqlx::query("UPDATE player_configs SET num_plays_recorded = 5 WHERE id = $1")
+        .bind(leaders)
+        .execute(&db.pool)
+        .await
+        .unwrap();
     let body = |player: Uuid, consensus: Value| {
         let mut body = json!({
             "job_type": "opening_rack", "variant": "classic", "letterdist_id": ld,
@@ -314,29 +327,45 @@ async fn an_opening_rack_jobs_consensus_is_stored_and_refused_where_it_cannot_wo
     };
 
     let (status, created) = admin
-        .create_job(body(simmer, json!({
-            "consensus_pct": 80.0, "min_results_per_rack": 3, "max_results_per_rack": 7,
+        .create_job(body(leaders, json!({
+            "max_results_per_rack": 7, "win_margin": 3, "reissue_top_moves": 12,
+            "min_magpie_version": "0.1.5",
         })))
         .await;
     assert_eq!(status, StatusCode::CREATED, "{created}");
     let job: Uuid = created["jobs"][0]["id"].as_str().unwrap().parse().unwrap();
     let row = config_row(&db, "job_opening_rack_config", job).await;
-    assert_eq!(row["consensus_pct"].as_f64(), Some(80.0));
-    assert_eq!((&row["min_results_per_rack"], &row["max_results_per_rack"]), (&json!(3), &json!(7)));
+    assert_eq!(
+        (&row["max_results_per_rack"], &row["win_margin"], &row["reissue_top_moves"]),
+        (&json!(7), &json!(3), &json!(12))
+    );
 
     for (consensus, field) in [
-        (json!({ "consensus_pct": 50.0 }), "consensus_pct"),
-        (json!({ "consensus_pct": 100.5 }), "consensus_pct"),
-        (json!({ "min_results_per_rack": 0 }), "min_results_per_rack"),
-        (json!({ "min_results_per_rack": 3, "max_results_per_rack": 2 }), "max_results_per_rack"),
-        (json!({ "min_results_per_rack": 3, "max_results_per_rack": 101 }), "max_results_per_rack"),
+        (json!({ "consensus_pct": 80.0 }), "consensus_pct"),
+        (json!({ "min_results_per_rack": 1 }), "min_results_per_rack"),
+        (json!({ "max_results_per_rack": 0 }), "max_results_per_rack"),
+        (json!({ "max_results_per_rack": 101 }), "max_results_per_rack"),
+        (json!({ "reissue_top_moves": 1 }), "reissue_top_moves"),
+        (json!({ "reissue_top_moves": 101 }), "reissue_top_moves"),
+        (json!({ "win_margin": 0 }), "win_margin"),
+        (json!({ "win_margin": 101 }), "win_margin"),
+        // A floor typed below the one reissues need, and none typed: the
+        // fleet's, older still.
+        (json!({ "max_results_per_rack": 3, "min_magpie_version": "0.1.4" }), "min_magpie_version"),
+        (json!({ "max_results_per_rack": 3 }), "min_magpie_version"),
     ] {
-        let (status, refused) = admin.create_job(body(simmer, consensus.clone())).await;
+        let (status, refused) = admin.create_job(body(leaders, consensus.clone())).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{consensus}: {refused}");
         assert_eq!(refused["fields"][0]["field"], field, "{consensus}: {refused}");
     }
+    // A player that stores one move per rack leaves later passes one to rank.
     let (status, refused) = admin
-        .create_job(body(fixed, json!({ "min_results_per_rack": 2, "max_results_per_rack": 3 })))
+        .create_job(body(simmer, json!({ "max_results_per_rack": 3, "min_magpie_version": "0.1.5" })))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    assert_eq!(refused["fields"][0]["field"], "player_config_id", "{refused}");
+    let (status, refused) = admin
+        .create_job(body(fixed, json!({ "max_results_per_rack": 3, "min_magpie_version": "0.1.5" })))
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
     assert_eq!(refused["fields"][0]["field"], "max_results_per_rack", "{refused}");

@@ -3137,25 +3137,43 @@ A job can ask for a rack to be analysed until its analyses agree on its best
 move. A simulation samples, so two analyses of the same rack -- on two
 workers, or from two seeds -- can rank it differently; one analysis says
 nothing about how settled its answer is. Three settings on
-`job_opening_rack_config`:
+`job_opening_rack_config` (since November 2026, OPENING_RACK_NARROWING_PLAN.md):
 
-- `min_results_per_rack` (default 1): the fewest analyses a rack gets;
-- `consensus_pct` (default 100, above 50): the share of a rack's analyses
-  whose rank-1 move must be its most common rank-1 move;
 - `max_results_per_rack` (default 1, at most 100): the most analyses a rack
-  gets.
+  gets, its first included -- its passes;
+- `win_margin` (default 2, 1 to 100): how many more analyses must rank the
+  most common rank-1 move first than rank the runner-up first;
+- `reissue_top_moves` (default 10, 2 to 100): how many of a rack's first
+  analysis's moves, best first, each later analysis ranks.
 
-They are the only settings of a job that change after it is created (see
-**Editing the consensus**, below). Claims and submissions read them fresh
-(`ConsensusSettings::load`) rather than from the job's cached template.
+A rack's **first analysis** ranks every play, as it always has. Every later
+one ranks only that first analysis's top `reissue_top_moves` -- its
+**candidates**, sent on the reissue (`candidates` on the request, read by
+MAGPIE 0.1.5 and later) -- so a reissue spends its simulation on the moves
+that could win rather than on every play again. The first analysis's
+rank-1 move is the first candidate, and its vote counts.
 
-A rack is **settled** once it has at least the fewest analyses and they agree
-in that share, or once it has the most -- then *without a consensus*, on its
-most common best move (the alphabetically first of a tie). A settled rack is
-not analysed again, unless an edit of the settings unsettles it. One and one is one analysis per rack, the job as it was;
-a static player may ask for nothing else, since its analyses are deterministic
-and always agree (job creation refuses it). The share is above half so that
-only one move can hold it.
+They are the only settings of a job that change after it is created, with its
+MAGPIE floor (see **Editing the consensus**, below). Claims and submissions
+read them fresh (`ConsensusSettings::load`) rather than from the job's cached
+template.
+
+A rack is **settled** once its most common rank-1 move leads the runner-up by
+`win_margin` analyses (2-0 at its second analysis, 3-1 at its fourth), or once
+it has the most -- then *without a consensus*, on its most common best move
+(the alphabetically first of a tie). A settled rack is not analysed again,
+unless an edit of the settings unsettles it. A most of 1 is one analysis per
+rack, settled and agreed at its first; a static player may ask for nothing
+else, since its analyses are deterministic and always agree (job creation
+refuses it). A job that analyses a rack more than once needs a player that
+records at least two moves (`num_plays_recorded`), since the candidates are
+the moves its first analysis stored, and a MAGPIE floor of at least 0.1.5
+(`min_magpie_version`, which creation and the edit refuse below it rather
+than raising).
+
+This replaced a share-of-analyses rule (`min_results_per_rack`,
+`consensus_pct`: settled once at least so many analyses agreed in that share),
+under which every reissue ranked every play again.
 
 This replaced `redundancy` for opening racks (removed October 2026): that ran
 every *task* N times and compared nothing, where this re-analyses only the
@@ -5708,7 +5726,7 @@ Every action on a job below — allocations, complete, consensus, purge, delete,
 | `DELETE` | `/api/admin/player-configs/:id` | Delete a player configuration. Rejected if any job, rating pool, rating history or clone references it. |
 | `POST` | `/api/admin/jobs` | Create a new job, with an optional `title` (at most 100 characters, one line; the form asks for it), the job page's heading. A games or pairs job's name, which every list shows and a worker is told, is its title and its players, "{title}: A vs B" ("A vs B" untitled, "A vs A" for self-play); another job's is its title. An optional `max_task_seconds`, 600 to 86,400 (a `400` on the field otherwise), is the job's task time limit; left out, an hour. A games or pairs job names its players as `player_config_ids`: one is self-play, n ≥ 2 (at most 12, none twice) a round robin of C(n, 2) jobs, each titled as given and named for its pairing, created all or none. A games or pairs job may state `threading_mode`, `igp` (the default) or `pgp`, which every task's request carries (see [Task Request Types](#task-request-types)); anything else is a `400` on the field. Answers `201` with `{ "jobs": [...] }`, each created job as stored with its `name`. Created inactive at 0% — `PUT /api/admin/jobs/allocations` sets its allocation and starts dispatching work. Refuses a board layout that is not 15×15 (the fleet's MAGPIE builds are 15×15 -- a claim from any other is answered `unsupported_build` -- so every worker would fail every task) and a match-test confidence outside (50, 100) (at 100% the interval never closes). |
 | `PUT` | `/api/admin/jobs/allocations` | Set several jobs' allocations at once. Body: `{ "allocations": [{ "job_id": uuid, "allocation": int }] }`. Checked as a whole -- the active jobs must sum to at most 100% as the request leaves them -- under the activation lock, every named row locked in id order first. The only way an admin activates or deactivates a job: above 0% a job is active (activated if it was not), and a job the server set aside for its time-limit declines starts a new run of them, its reason cleared; 0% leaves it inactive at 0% (deactivated if it was active). A completed job (even at 0%), a job named twice or an allocation outside 0–100 refuses the whole request. Audited once per job that changes, from what to what in `reason`: `job.activated` / `job.deactivated` for a job switched on or off, `job.allocation_changed` for an active job's new share. Answers `{ "jobs": [...] }`, the named jobs as they now stand. The `/admin/allocation` page sends it. |
-| `PATCH` | `/api/admin/jobs/:id/consensus` | Change an opening-rack job's consensus settings. Body: any of `{ "min_results_per_rack", "max_results_per_rack", "consensus_pct" }`; only those sent change. Refuses (`400`) what creation refuses, and any other job type. Restates every rack, then reopens a completed job left with unsettled racks (inactive at 0%, for the admin to give an allocation) and completes an active one left with none. Answers `{ job, config, unsettled_racks, reopened }`. `409` while a purge, delete or another consensus change of the job is running. Audited as `job.consensus_changed`. See [Editing the consensus](#opening-rack-consensus). |
+| `PATCH` | `/api/admin/jobs/:id/consensus` | Change an opening-rack job's consensus settings. Body: any of `{ "max_results_per_rack", "win_margin", "reissue_top_moves" }`; only those sent change. Refuses (`400`) what creation refuses -- `min_results_per_rack` and `consensus_pct` by name, a most above 1 on a job whose MAGPIE floor is below 0.1.5 -- and any other job type. A change to `reissue_top_moves` alone restates nothing: it applies to the reissues dispatched after it. A change to the most or the margin restates every rack, then reopens a completed job left with unsettled racks (inactive at 0%, for the admin to give an allocation) and completes an active one left with none. Answers `{ job, config, unsettled_racks, reopened }`. `409` while a purge, delete or another consensus change of the job is running. Audited as `job.consensus_changed`. See [Editing the consensus](#opening-rack-consensus). |
 | `PATCH` | `/api/admin/jobs/:id/time-limit` | Change a job's task time limit, any type and any status: `{ "max_task_seconds": int }`, 600 to 86,400 (ten minutes to a day — a first claim may build a rack info table that cannot be stopped; anything else is a `400` on the field, and the column's CHECK refuses it too). The limit applies to the job's claims made after the change; every claim keeps the deadline it was given. Audited as `job.time_limit_changed`, from what to what; a change to what it already is writes nothing. Answers `{ max_task_seconds }`. The job's admin page sends it. |
 | `PATCH` | `/api/admin/jobs/:id/min-magpie-version` | Change a job's MAGPIE floor, any type and any status, up or down: `{ "min_magpie_version": "major.minor[.patch]" }`, read strictly as at creation (anything else is a `400` on the field). The floor applies to claims made after the change -- a worker below it is offered the job no more, and told the version to upgrade to when no job is left for it -- while a claim already made keeps its task and its submission is accepted. It never changes the job's status, and a floor below the fleet's `MIN_MAGPIE_VERSION` has no effect. Audited as `job.min_magpie_version_changed`, from what to what; a change to what it already is writes nothing. Answers `{ min_magpie_version }` as `major.minor.patch`. The job's admin page sends it. |
 | `POST` | `/api/admin/jobs/:id/complete` | Force-complete a job immediately, regardless of task progress, at 0% as every completed job is. Refused (`409`) for a job that is already completed. |
@@ -5808,7 +5826,7 @@ the body omits them:
 | `test_enabled` | **false** — the job plays its `max_games` / `max_pairs` and stops; `min_*` and `confidence_pct` are refused without it |
 | `min_games` / `min_pairs` | none: required when `test_enabled` is true |
 | `confidence_pct` | 95 |
-| `min_results_per_rack` / `max_results_per_rack` / `consensus_pct` | 1 / 1 / 100 |
+| `max_results_per_rack` / `win_margin` / `reissue_top_moves` | 1 / 2 / 10 |
 | `target_rack_counts` (leave generation) | none: required, one occurrence target per generation, 1 to 100 of them, each 1 to 1,000,000 |
 | `capture_positions` | false |
 | `bingo_bonus` | 50, MAGPIE's default (`magpie_defaults::BINGO_BONUS`); 0 to 500 |

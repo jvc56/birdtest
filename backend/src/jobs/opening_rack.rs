@@ -25,7 +25,8 @@ impl JobHandler for OpeningRackHandler {
             return Err(template.mismatch("opening_rack"));
         };
         let row = sqlx::query(
-            "SELECT variant, letter_distribution, board_layout, rack_start, rack_count, racks
+            "SELECT variant, letter_distribution, board_layout, rack_start, rack_count, racks,
+                    candidates
              FROM opening_rack_requests WHERE task_id = $1",
         )
         .bind(task_id)
@@ -35,6 +36,9 @@ impl JobHandler for OpeningRackHandler {
 
         Ok(OpeningRackRequest {
             racks: task_racks(index, &row),
+            // As dispatched: a reclaim ranks the moves the first claim was
+            // sent, whatever the job's X is now.
+            candidates: task_candidates(&row),
             seed: rack_start as u64,
             variant: row.get("variant"),
             letter_distribution: row.get("letter_distribution"),
@@ -114,7 +118,8 @@ impl JobHandler for OpeningRackHandler {
     }
 }
 
-/// Checks an opening-rack submission against the racks the task dispatched.
+/// Checks an opening-rack submission against the racks the task dispatched,
+/// and a reissue's against the moves it sent.
 ///
 /// The counterpart of the batch-size rule game jobs get
 /// ([`super::plausibility::check_batch_size`]), and the same rule: what was
@@ -130,21 +135,27 @@ impl JobHandler for OpeningRackHandler {
 /// analyses of this job and added to `jobs.racks_analyzed`, the progress
 /// counter the dashboard reads.
 ///
+/// A reissue that sent candidates is answered over them alone: a reported
+/// move it did not send, or more moves ranked than it sent, is a worker that
+/// analysed something else (a build that ignored them ranks every play), and
+/// its rank-1 move would vote for a move the pass never weighed.
+///
 /// Expanding the range costs what dispatching it cost: a handful of additions
-/// per rack, against a batch capped at 10,000. One read -- the task's range --
-/// inside the task's row lock, where each round trip is time every other
-/// submission for the task waits.
+/// per rack, against a batch capped at 10,000. One read -- the task's range and
+/// candidates -- inside the task's row lock, where each round trip is time
+/// every other submission for the task waits.
 pub async fn check_batch_against_task(
     conn: &mut PgConnection,
     template: &JobTemplate,
     task_id: Uuid,
-    reported: &[String],
+    reported: &[PositionAnalysis],
 ) -> AppResult<()> {
     let JobKind::OpeningRack { index, .. } = &template.kind else {
         return Err(template.mismatch("opening_rack"));
     };
     let row = sqlx::query(
-        "SELECT rack_start, rack_count, racks FROM opening_rack_requests WHERE task_id = $1",
+        "SELECT rack_start, rack_count, racks, candidates
+         FROM opening_rack_requests WHERE task_id = $1",
     )
     .bind(task_id)
     .fetch_one(&mut *conn)
@@ -159,11 +170,11 @@ pub async fn check_batch_against_task(
         )));
     }
     // Order is not part of the contract, only the set.
-    let dispatched: std::collections::HashSet<&str> =
-        expected.iter().map(String::as_str).collect();
-    if let Some(stray) = reported.iter().find(|rack| !dispatched.contains(rack.as_str())) {
+    let dispatched: HashSet<&str> = expected.iter().map(String::as_str).collect();
+    if let Some(stray) = reported.iter().find(|p| !dispatched.contains(p.rack.as_str())) {
         return Err(AppError::bad_request(format!(
-            "result analyses rack {stray:?}, which this task did not dispatch"
+            "result analyses rack {:?}, which this task did not dispatch",
+            stray.rack
         )));
     }
     // Equal sizes plus containment is equality only if nothing is listed
@@ -171,13 +182,46 @@ pub async fn check_batch_against_task(
     // to refuse, which it did -- as a `409 that already exists`, after the
     // batch had been sent to the database, where every other malformed
     // submission is a `400` that says what is wrong with it.
-    let mut seen = std::collections::HashSet::with_capacity(reported.len());
-    if let Some(twice) = reported.iter().find(|rack| !seen.insert(rack.as_str())) {
+    let mut seen = HashSet::with_capacity(reported.len());
+    if let Some(twice) = reported.iter().find(|p| !seen.insert(p.rack.as_str())) {
         return Err(AppError::bad_request(format!(
-            "result analyses rack {twice:?} twice, so it leaves out a rack this task dispatched"
+            "result analyses rack {:?} twice, so it leaves out a rack this task dispatched",
+            twice.rack
         )));
     }
+
+    let Some(candidates) = task_candidates(&row) else {
+        return Ok(());
+    };
+    let sent: HashMap<&str, HashSet<&str>> = expected
+        .iter()
+        .zip(&candidates)
+        .map(|(rack, moves)| (rack.as_str(), moves.iter().map(String::as_str).collect()))
+        .collect();
+    for position in reported {
+        let moves = &sent[position.rack.as_str()];
+        if position.num_moves as usize > moves.len() {
+            return Err(AppError::bad_request(format!(
+                "rack {:?} ranked {} moves, but this task sent it {} candidates",
+                position.rack,
+                position.num_moves,
+                moves.len()
+            )));
+        }
+        if let Some(other) = position.moves.iter().find(|m| !moves.contains(m.play.as_str())) {
+            return Err(AppError::bad_request(format!(
+                "rack {:?} ranked {:?}, which is not one of the candidates this task sent it",
+                position.rack, other.play
+            )));
+        }
+    }
     Ok(())
+}
+
+/// A reissue's candidates, from its request row: `None` for a first-pass task
+/// and for a reissue made before reissues sent them.
+fn task_candidates(row: &sqlx::postgres::PgRow) -> Option<Vec<Vec<String>>> {
+    row.get::<Option<sqlx::types::Json<Vec<Vec<String>>>>, _>("candidates").map(|json| json.0)
 }
 
 /// How many distinct racks a job over this distribution covers. Recorded at job
@@ -205,6 +249,11 @@ fn task_racks(index: &RackIndex, row: &sqlx::postgres::PgRow) -> Vec<String> {
         }
     }
 }
+
+/// The oldest MAGPIE that reads a reissue's `candidates`: the floor a job that
+/// reissues racks must have (`routes::admin`'s `reissue_floor_problem`).
+pub const CANDIDATES_MIN_MAGPIE_VERSION: crate::version::Version =
+    crate::version::Version { major: 0, minor: 1, patch: 5 };
 
 /// Claim-time task creation: the next unclaimed slice of the rack space, and
 /// once the space is covered, the racks a consensus still wants.
@@ -244,14 +293,19 @@ pub async fn next_request(
     .map(|max| max + config.racks_per_batch as i64)
     .unwrap_or(0);
 
-    let racks = if next_start < config.total_racks {
+    let (racks, candidates) = if next_start < config.total_racks {
         // The final batch of a job comes up short: the range runs off the end
         // of the space and yields only what exists.
-        index.racks_in_range(next_start as u64, config.racks_per_batch as u64)
-    } else if ConsensusSettings::load(conn, job_id).await?.reissues() {
-        next_reissue(conn, job_id, config, identity).await?
+        (index.racks_in_range(next_start as u64, config.racks_per_batch as u64), None)
     } else {
-        Vec::new()
+        let consensus = ConsensusSettings::load(conn, job_id).await?;
+        if consensus.reissues() {
+            let racks = next_reissue(conn, job_id, config, identity).await?;
+            let candidates = first_pass_leaders(conn, job_id, &racks, consensus.reissue_top_moves).await?;
+            (racks, Some(candidates))
+        } else {
+            (Vec::new(), None)
+        }
     };
     if racks.is_empty() {
         return Ok(None);
@@ -268,8 +322,59 @@ pub async fn next_request(
             bingo_bonus: job_data.bingo_bonus,
             sim_cutoff: job_data.sim_cutoff,
             player: player.clone(),
+            candidates,
         },
     )))
+}
+
+/// Each rack's candidates for a reissue, in the order of `racks`: the first
+/// `top` moves, best first, of the rack's first analysis.
+///
+/// A rack's first analysis is its earliest record in the job: a rack is only
+/// reissued once it has a standing, which its first analysis -- a first-pass
+/// task's, ranking every play -- gave it. So racks analysed before reissues
+/// sent candidates have them too, from what is already stored. The moves are
+/// the ones stored, so a job keeping fewer than `top` per rack
+/// (`num_plays_recorded`) sends what it kept.
+///
+/// One statement, bounded by the batch: the earliest record of each rack
+/// through the `(job_id, rack)` index, then its leading moves through the
+/// moves' record index.
+async fn first_pass_leaders(
+    conn: &mut PgConnection,
+    job_id: Uuid,
+    racks: &[String],
+    top: i32,
+) -> AppResult<Vec<Vec<String>>> {
+    let mut leaders: HashMap<String, Vec<String>> = HashMap::with_capacity(racks.len());
+    for (rack, play) in sqlx::query_as::<_, (String, String)>(
+        "WITH first AS (
+             SELECT DISTINCT ON (a.rack) a.rack, a.id
+             FROM position_analysis_records a
+             WHERE a.job_id = $1 AND a.game_index IS NULL AND a.rack = ANY($2)
+             ORDER BY a.rack, a.id
+         )
+         SELECT f.rack, m.move
+         FROM first f
+         JOIN position_analysis_moves m ON m.record_id = f.id AND m.rank <= $3
+         ORDER BY f.rack, m.rank",
+    )
+    .bind(job_id)
+    .bind(racks)
+    .bind(top)
+    .fetch_all(&mut *conn)
+    .await?
+    {
+        leaders.entry(rack).or_default().push(play);
+    }
+    racks
+        .iter()
+        .map(|rack| {
+            leaders.remove(rack).ok_or_else(|| {
+                AppError::internal(format!("rack {rack} is reissued but has no stored analysis"))
+            })
+        })
+        .collect()
 }
 
 /// Up to a batch of a consensus job's unsettled racks to analyse again: fewest
@@ -378,21 +483,23 @@ async fn next_reissue(
 const REISSUE_WINDOW_BATCHES: i64 = 4;
 
 /// Writes the typed request row for a task: the range it covers, or, for a
-/// task reissuing racks a consensus still wants, the racks themselves.
+/// task reissuing racks a consensus still wants, the racks themselves and the
+/// candidates it sends for each.
 pub async fn insert_request(
     conn: &mut PgConnection,
     task_id: Uuid,
     config: &OpeningRackConfig,
     job_data: &JobData,
     start: i64,
-    racks: &[String],
+    request: &OpeningRackRequest,
 ) -> AppResult<()> {
+    let racks = &request.racks;
     let listed = (start >= config.total_racks).then_some(racks);
     sqlx::query(
         "INSERT INTO opening_rack_requests
              (task_id, variant, letter_distribution, board_layout, rack_start,
-              rack_count, racks, player_config_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+              rack_count, racks, player_config_id, candidates)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
     )
     .bind(task_id)
     .bind(&job_data.variant)
@@ -402,6 +509,7 @@ pub async fn insert_request(
     .bind(racks.len() as i32)
     .bind(listed)
     .bind(config.player_config_id)
+    .bind(request.candidates.as_ref().map(sqlx::types::Json))
     .execute(conn)
     .await?;
     Ok(())
@@ -421,31 +529,47 @@ pub struct RackTally {
 }
 
 /// Where a rack stands after its analyses: how many there are, its most
-/// common rank-1 move (the alphabetically first of a tie) and how many ranked
-/// it first, whether it is settled and whether without a consensus.
+/// common rank-1 move (the alphabetically first of a tie), how many ranked it
+/// first and how many the runner-up, whether it is settled and whether
+/// without a consensus.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RackStanding {
     pub results: i32,
     pub top_move: String,
     pub top_count: i32,
+    pub runner_up_count: i32,
     pub settled: bool,
     pub without_consensus: bool,
 }
 
-/// A rack's standing from how many of its analyses ranked each move first.
-/// [`restate_racks`] is the same rule in SQL.
+/// A rack's standing from how many of its analyses ranked each move first,
+/// its first analysis's among them: settled once the most common rank-1 move
+/// leads the runner-up by `win_margin` (2-0 settles at two analyses, 3-1 at
+/// four), or once it has `max_results_per_rack` analyses, without a
+/// consensus if the lead is still short. [`restate_racks`] is the same rule
+/// in SQL, on the counts this returns.
+///
+/// A job's first analysis of each rack is counted like any other: its rank-1
+/// move is the first of the candidates every later pass ranks.
 pub fn standing(config: &ConsensusSettings, firsts: &HashMap<String, i32>) -> Option<RackStanding> {
     let results: i32 = firsts.values().sum();
     let (top_move, top_count) = firsts
         .iter()
         .max_by(|(a_move, a), (b_move, b)| a.cmp(b).then_with(|| b_move.cmp(a_move)))?;
-    let agreed = results >= config.min_results_per_rack
-        && f64::from(*top_count) * 100.0 >= config.consensus_pct * f64::from(results);
+    let runner_up_count =
+        firsts.iter().filter(|(play, _)| *play != top_move).map(|(_, n)| *n).max().unwrap_or(0);
+    // A job wanting one analysis per rack seeks no agreement: its racks are
+    // settled, and agreed, at their first, as they always were. Analysed
+    // more than once before its maximum was lowered, a rack whose analyses
+    // split is still without a consensus.
+    let agreed = top_count - runner_up_count >= config.win_margin
+        || (!config.reissues() && runner_up_count == 0);
     let settled = agreed || results >= config.max_results_per_rack;
     Some(RackStanding {
         results,
         top_move: top_move.clone(),
         top_count: *top_count,
+        runner_up_count,
         settled,
         without_consensus: settled && !agreed,
     })
@@ -458,6 +582,7 @@ struct StandingColumns {
     results: Vec<i32>,
     top_moves: Vec<String>,
     top_counts: Vec<i32>,
+    runner_up_counts: Vec<i32>,
     settled: Vec<bool>,
     without_consensus: Vec<bool>,
 }
@@ -534,23 +659,27 @@ pub async fn record_consensus(
         rows.results.push(now.results);
         rows.top_moves.push(now.top_move);
         rows.top_counts.push(now.top_count);
+        rows.runner_up_counts.push(now.runner_up_count);
         rows.settled.push(now.settled);
         rows.without_consensus.push(now.without_consensus);
     }
     sqlx::query(
         "INSERT INTO opening_rack_progress
-             (job_id, rack, results, top_move, top_count, settled, without_consensus)
-         SELECT $1, * FROM unnest($2::text[], $3::int[], $4::text[], $5::int[], $6::bool[], $7::bool[])
+             (job_id, rack, results, top_move, top_count, runner_up_count, settled,
+              without_consensus)
+         SELECT $1, * FROM unnest($2::text[], $3::int[], $4::text[], $5::int[], $6::int[],
+                                  $7::bool[], $8::bool[])
          ON CONFLICT (job_id, rack) DO UPDATE
          SET results = EXCLUDED.results, top_move = EXCLUDED.top_move,
-             top_count = EXCLUDED.top_count, settled = EXCLUDED.settled,
-             without_consensus = EXCLUDED.without_consensus",
+             top_count = EXCLUDED.top_count, runner_up_count = EXCLUDED.runner_up_count,
+             settled = EXCLUDED.settled, without_consensus = EXCLUDED.without_consensus",
     )
     .bind(job_id)
     .bind(rows.racks)
     .bind(rows.results)
     .bind(rows.top_moves)
     .bind(rows.top_counts)
+    .bind(rows.runner_up_counts)
     .bind(rows.settled)
     .bind(rows.without_consensus)
     .execute(&mut *conn)
@@ -559,8 +688,8 @@ pub async fn record_consensus(
 }
 
 /// A job's racks restated under new consensus settings, and its rack totals
-/// with them: raising the fewest or most analyses, or the share that must
-/// agree, unsettles racks, and lowering them settles racks. One statement
+/// with them: raising the most analyses or the lead that settles a rack
+/// unsettles racks, and lowering them settles racks. One statement
 /// over the job's progress rows -- [`standing`]'s rule on the counts they
 /// keep, writing only the rows whose standing changes -- then the totals
 /// counted from them. `racks_analyzed` is untouched: no rack gains or loses an
@@ -577,8 +706,9 @@ pub async fn restate_racks(
     sqlx::query(
         "WITH s AS (
              SELECT rack,
-                    results >= $2 AND top_count::float8 * 100.0 >= $3 * results::float8 AS agreed,
-                    results >= $4 AS at_most
+                    (top_count - runner_up_count >= $2
+                     OR ($3 <= 1 AND runner_up_count = 0)) AS agreed,
+                    results >= $3 AS at_most
              FROM opening_rack_progress WHERE job_id = $1
          )
          UPDATE opening_rack_progress p
@@ -590,8 +720,7 @@ pub async fn restate_racks(
                IS DISTINCT FROM (s.agreed OR s.at_most, s.at_most AND NOT s.agreed)",
     )
     .bind(job_id)
-    .bind(config.min_results_per_rack)
-    .bind(config.consensus_pct)
+    .bind(config.win_margin)
     .bind(config.max_results_per_rack)
     .execute(&mut *conn)
     .await?;
@@ -659,57 +788,68 @@ mod tests {
         assert!(process(vec![analysis("AEINRST", 5, Some(2))]).is_err());
     }
 
-    fn consensus(pct: f64, min: i32, max: i32) -> ConsensusSettings {
-        ConsensusSettings { consensus_pct: pct, min_results_per_rack: min, max_results_per_rack: max }
+    fn consensus(max: i32, margin: i32) -> ConsensusSettings {
+        ConsensusSettings { max_results_per_rack: max, reissue_top_moves: 10, win_margin: margin }
     }
 
     fn firsts(counts: &[(&str, i32)]) -> HashMap<String, i32> {
         counts.iter().map(|(m, n)| (m.to_string(), *n)).collect()
     }
 
-    /// A rack settles once it has its fewest analyses and they agree in the
-    /// share asked for -- and not before, however much they agree.
+    /// A rack settles once one move leads the runner-up by the margin, the
+    /// first analysis counted: 2-0 at two analyses, 3-1 at four, 4-2 at six.
+    /// 1-0 and 2-1 are a lead of one.
     #[test]
-    fn a_rack_settles_at_its_minimum_once_its_analyses_agree() {
-        let config = consensus(80.0, 3, 7);
-        let two = standing(&config, &firsts(&[("8D AA", 2)])).unwrap();
-        assert!(!two.settled, "two analyses are fewer than three, agreed or not");
-        let three = standing(&config, &firsts(&[("8D AA", 3)])).unwrap();
-        assert_eq!((three.results, three.top_count, three.settled), (3, 3, true));
-        assert!(!three.without_consensus);
-        // 4 of 5 is 80%: enough.
-        assert!(standing(&config, &firsts(&[("8D AA", 4), ("8D BB", 1)])).unwrap().settled);
-        // 3 of 4 is 75%: not.
-        assert!(!standing(&config, &firsts(&[("8D AA", 3), ("8D BB", 1)])).unwrap().settled);
+    fn a_rack_settles_once_one_move_leads_by_the_margin() {
+        let config = consensus(7, 2);
+        for counts in [&[("8D AA", 2)][..], &[("8D AA", 3), ("8D BB", 1)], &[("8D AA", 4), ("8D BB", 2)]] {
+            let now = standing(&config, &firsts(counts)).unwrap();
+            assert!(now.settled && !now.without_consensus, "{counts:?}");
+            assert_eq!(now.top_move, "8D AA");
+        }
+        let one = standing(&config, &firsts(&[("8D AA", 1)])).unwrap();
+        assert_eq!((one.results, one.runner_up_count, one.settled), (1, 0, false));
+        let close = standing(&config, &firsts(&[("8D AA", 2), ("8D BB", 1)])).unwrap();
+        assert_eq!((close.top_count, close.runner_up_count, close.settled), (2, 1, false));
+        // The runner-up is the second-highest count, however many moves split
+        // the rest.
+        let spread = standing(&config, &firsts(&[("8D AA", 3), ("8D BB", 1), ("8D CC", 1)])).unwrap();
+        assert_eq!((spread.runner_up_count, spread.settled), (1, true));
     }
 
-    /// A rack whose analyses never agree enough stops at its most, settled
-    /// without a consensus, on its most common move.
+    /// A rack still within the margin at its most analyses settles without a
+    /// consensus, on its most common move -- or, tied, the alphabetically
+    /// first, so the same analyses always read the same.
     #[test]
-    fn a_split_rack_settles_at_its_maximum_without_a_consensus() {
-        let config = consensus(80.0, 3, 7);
+    fn a_close_rack_settles_at_its_maximum_without_a_consensus() {
+        let config = consensus(7, 2);
         let split = standing(&config, &firsts(&[("8D AA", 4), ("8D BB", 3)])).unwrap();
         assert_eq!(split.results, 7);
         assert!(split.settled && split.without_consensus);
         assert_eq!(split.top_move, "8D AA");
+        let tie = standing(&config, &firsts(&[("8D BB", 3), ("8D AA", 3), ("8D CC", 1)])).unwrap();
+        assert_eq!((tie.top_move.as_str(), tie.runner_up_count), ("8D AA", 3));
+        assert!(tie.settled && tie.without_consensus);
+        let short = standing(&config, &firsts(&[("8D BB", 1), ("8D AA", 1)])).unwrap();
+        assert_eq!(short.top_move, "8D AA");
+        assert!(!short.settled);
     }
 
-    /// A tie names the alphabetically first move, so the same analyses always
-    /// read the same.
-    #[test]
-    fn a_tie_names_the_first_move_alphabetically() {
-        let config = consensus(80.0, 2, 4);
-        let tie = standing(&config, &firsts(&[("8D BB", 1), ("8D AA", 1)])).unwrap();
-        assert_eq!(tie.top_move, "8D AA");
-        assert!(!tie.settled);
-    }
-
-    /// One analysis per rack settles at the first.
+    /// One analysis per rack settles, agreed, at the first: it seeks no
+    /// agreement, whatever its margin, and nothing is reissued.
     #[test]
     fn one_analysis_per_rack_settles_at_the_first() {
-        let config = consensus(100.0, 1, 1);
-        assert!(!config.reissues());
-        let one = standing(&config, &firsts(&[("8D AA", 1)])).unwrap();
-        assert!(one.settled && !one.without_consensus);
+        for margin in [1, 2, 5] {
+            let config = consensus(1, margin);
+            assert!(!config.reissues());
+            let one = standing(&config, &firsts(&[("8D AA", 1)])).unwrap();
+            assert!(one.settled && !one.without_consensus, "margin {margin}");
+        }
+        // Analysed twice before the maximum came down to one: two that agree
+        // are agreed, two that split are not.
+        let config = consensus(1, 5);
+        assert!(!standing(&config, &firsts(&[("8D AA", 2)])).unwrap().without_consensus);
+        let split = standing(&config, &firsts(&[("8D AA", 1), ("8D BB", 1)])).unwrap();
+        assert!(split.settled && split.without_consensus);
     }
 }

@@ -204,6 +204,22 @@ async fn update_min_magpie_version(
     .await?
     .ok_or_else(|| AppError::not_found("no such job"))?;
     let before = Version::new(major, minor, patch);
+    // An opening-rack job that reissues needs the builds that read its
+    // reissues' candidates (`reissue_floor_problem`).
+    let reissuing: Option<i32> = sqlx::query_scalar(
+        "SELECT max_results_per_rack FROM job_opening_rack_config WHERE job_id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let err = reissue_floor_problem(
+        AppError::bad_request("the MAGPIE version is too old for this job"),
+        reissuing.unwrap_or(1),
+        floor,
+    );
+    if !err.fields.is_empty() {
+        return Err(err);
+    }
     if before != floor {
         sqlx::query(
             "UPDATE jobs SET min_magpie_major = $2, min_magpie_minor = $3, min_magpie_patch = $4
@@ -1499,15 +1515,24 @@ enum JobTypeConfig {
         racks_per_batch: i32,
         #[serde(default = "default_rack_size")]
         rack_size: i32,
-        /// Consensus: a rack is analysed until at least `min_results_per_rack`
-        /// analyses agree on its best move in this share (percent), or until
-        /// it has `max_results_per_rack`. One analysis per rack by default.
-        #[serde(default = "default_consensus_pct")]
-        consensus_pct: f64,
-        #[serde(default = "one")]
-        min_results_per_rack: i32,
+        /// Consensus: a rack is analysed until its most common rank-1 move
+        /// leads the runner-up by `win_margin` analyses, or until it has
+        /// `max_results_per_rack` (its passes, the first included). Every
+        /// pass after the first ranks only the first's top
+        /// `reissue_top_moves`. One analysis per rack by default.
         #[serde(default = "one")]
         max_results_per_rack: i32,
+        #[serde(default = "default_reissue_top_moves")]
+        reissue_top_moves: i32,
+        #[serde(default = "default_win_margin")]
+        win_margin: i32,
+        /// The share-of-analyses rule's settings, which the lead replaced:
+        /// named only so a request still sending them is refused on them
+        /// rather than created under settings it did not ask for.
+        #[serde(default)]
+        consensus_pct: Option<serde_json::Value>,
+        #[serde(default)]
+        min_results_per_rack: Option<serde_json::Value>,
     },
     Game {
         /// The configs to play each other: one is a self-play job, and n ≥ 2
@@ -1599,8 +1624,11 @@ impl TestRequest {
 fn default_threading_mode() -> String {
     "igp".to_string()
 }
-fn default_consensus_pct() -> f64 {
-    100.0
+fn default_reissue_top_moves() -> i32 {
+    10
+}
+fn default_win_margin() -> i32 {
+    2
 }
 fn default_racks_per_batch() -> i32 {
     500
@@ -1872,6 +1900,8 @@ async fn insert_job(
 const MAX_RACKS_PER_BATCH: i32 = 10_000;
 /// The most analyses an opening-rack consensus may ask of one rack.
 const MAX_RESULTS_PER_RACK: i32 = 100;
+/// The most first-pass moves a reissue may rank: the column's CHECK.
+const MAX_REISSUE_TOP_MOVES: i32 = 100;
 
 /// The most games one task may play (a pair counts two), and the most when
 /// the job captures positions. A captured position's game is an `i16`, so a
@@ -1917,24 +1947,69 @@ fn job_title(body: &CreateJobBody) -> String {
 /// An opening-rack job's consensus settings, checked alike at creation and
 /// when an admin changes them (`update_consensus`): each problem is a field
 /// error added to `err`.
-fn consensus_problems(mut err: AppError, consensus_pct: f64, min: i32, max: i32) -> AppError {
-    // Above half: at or below it two moves could each hold the consensus, and
-    // a tie would settle a rack on whichever sorted first.
-    if !(consensus_pct.is_finite() && consensus_pct > 50.0 && consensus_pct <= 100.0) {
-        err = err.with_field("consensus_pct", "must be above 50 and at most 100");
-    }
-    if !(1..=MAX_RESULTS_PER_RACK).contains(&min) {
-        err = err.with_field(
-            "min_results_per_rack",
-            format!("must be between 1 and {MAX_RESULTS_PER_RACK}"),
-        );
-    } else if !(min..=MAX_RESULTS_PER_RACK).contains(&max) {
+fn consensus_problems(mut err: AppError, settings: &ConsensusSettings) -> AppError {
+    if !(1..=MAX_RESULTS_PER_RACK).contains(&settings.max_results_per_rack) {
         err = err.with_field(
             "max_results_per_rack",
-            format!("must be between min_results_per_rack ({min}) and {MAX_RESULTS_PER_RACK}"),
+            format!("must be between 1 and {MAX_RESULTS_PER_RACK}"),
         );
     }
+    // Two at least: one candidate would rank itself first on every pass.
+    if !(2..=MAX_REISSUE_TOP_MOVES).contains(&settings.reissue_top_moves) {
+        err = err.with_field(
+            "reissue_top_moves",
+            format!("must be between 2 and {MAX_REISSUE_TOP_MOVES}"),
+        );
+    }
+    if !(1..=MAX_RESULTS_PER_RACK).contains(&settings.win_margin) {
+        err = err.with_field("win_margin", format!("must be between 1 and {MAX_RESULTS_PER_RACK}"));
+    }
     err
+}
+
+/// The fields of the consensus rule the lead replaced, refused by name where
+/// a request still sends them: created or edited without them, a job would
+/// run under settings its sender did not ask for.
+fn removed_consensus_fields(
+    mut err: AppError,
+    consensus_pct: &Option<serde_json::Value>,
+    min_results_per_rack: &Option<serde_json::Value>,
+) -> AppError {
+    const REMOVED: &str = "no longer a setting: a rack settles when one move leads the \
+                           runner-up by win_margin analyses, or at max_results_per_rack";
+    if consensus_pct.is_some() {
+        err = err.with_field("consensus_pct", REMOVED);
+    }
+    if min_results_per_rack.is_some() {
+        err = err.with_field("min_results_per_rack", REMOVED);
+    }
+    err
+}
+
+/// An opening-rack job that reissues racks sends their candidates, which only
+/// MAGPIE 0.1.5 and later read: a job whose floor is lower would hand its
+/// reissues to builds that rank every play instead, and every one of those
+/// submissions would be refused. The floor is the admin's to raise -- in the
+/// job's creation, or on its own (`PATCH .../min-magpie-version`) -- so this
+/// refuses rather than raising it.
+fn reissue_floor_problem(
+    err: AppError,
+    max_results_per_rack: i32,
+    floor: crate::version::Version,
+) -> AppError {
+    let needed = crate::jobs::opening_rack::CANDIDATES_MIN_MAGPIE_VERSION;
+    if max_results_per_rack > 1 && floor < needed {
+        err.with_field(
+            "min_magpie_version",
+            format!(
+                "a job that analyses a rack more than once needs MAGPIE {needed} or later, \
+                 which reads the candidates its later passes send: raise the job's oldest \
+                 MAGPIE (now {floor}) first"
+            ),
+        )
+    } else {
+        err
+    }
 }
 
 /// The largest bingo bonus a job may set; real variants use 0 to 50.
@@ -2095,8 +2170,8 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
 
     err = match &body.config {
         JobTypeConfig::OpeningRack {
-            racks_per_batch, rack_size, consensus_pct, min_results_per_rack,
-            max_results_per_rack, ..
+            racks_per_batch, rack_size, max_results_per_rack, reissue_top_moves, win_margin,
+            consensus_pct, min_results_per_rack, ..
         } => {
             if !(1..=MAX_RACKS_PER_BATCH).contains(racks_per_batch) {
                 err = err.with_field(
@@ -2107,7 +2182,21 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
             if !(1..=RACK_SIZE as i32).contains(rack_size) {
                 err = err.with_field("rack_size", format!("must be between 1 and {RACK_SIZE}"));
             }
-            consensus_problems(err, *consensus_pct, *min_results_per_rack, *max_results_per_rack)
+            let err = removed_consensus_fields(err, consensus_pct, min_results_per_rack);
+            let err = consensus_problems(
+                err,
+                &ConsensusSettings {
+                    max_results_per_rack: *max_results_per_rack,
+                    reissue_top_moves: *reissue_top_moves,
+                    win_margin: *win_margin,
+                },
+            );
+            // The floor as the job will have it: the one typed, or the
+            // fleet's (checked against the job below, where it is known).
+            match body.min_magpie_version.as_deref().map(crate::version::Version::parse_strict) {
+                Some(Some(floor)) => reissue_floor_problem(err, *max_results_per_rack, floor),
+                _ => err,
+            }
         }
         JobTypeConfig::Game {
             player_config_ids, games_per_batch, min_games, max_games, test, capture_positions,
@@ -2282,8 +2371,21 @@ async fn validate_opening_rack_player(
         )
         .with_field(
             "max_results_per_rack",
-            "a static player analyses each rack once: set min_results_per_rack and \
-             max_results_per_rack to 1, or use a simulating player",
+            "a static player analyses each rack once: set max_results_per_rack to 1, or use \
+             a simulating player",
+        ));
+    }
+    // A rack's later passes rank the moves its first pass stored, and one
+    // move can only rank itself first.
+    if recorded < 2 && max_results_per_rack > 1 {
+        return Err(AppError::bad_request(
+            "a rack's later analyses rank its first analysis's stored moves, and this player \
+             stores one",
+        )
+        .with_field(
+            "player_config_id",
+            "a job that analyses a rack more than once needs a player with num_plays_recorded \
+             of at least 2",
         ));
     }
     Ok(())
@@ -2552,10 +2654,19 @@ async fn insert_job_config(
         (
             JobType::OpeningRack,
             JobTypeConfig::OpeningRack {
-                player_config_id, racks_per_batch, rack_size, consensus_pct,
-                min_results_per_rack, max_results_per_rack,
+                player_config_id, racks_per_batch, rack_size, max_results_per_rack,
+                reissue_top_moves, win_margin, ..
             },
         ) => {
+            // The job's floor as created, the fleet's when none was typed.
+            let err = reissue_floor_problem(
+                AppError::bad_request("the job's MAGPIE floor is too old for its consensus"),
+                *max_results_per_rack,
+                job.min_magpie_version(),
+            );
+            if !err.fields.is_empty() {
+                return Err(err);
+            }
             validate_player_compatibility(
                 &mut *conn,
                 &[("player", *player_config_id)],
@@ -2576,7 +2687,7 @@ async fn insert_job_config(
             sqlx::query(
                 "INSERT INTO job_opening_rack_config
                      (job_id, player_config_id, racks_per_batch, rack_size, total_racks,
-                      consensus_pct, min_results_per_rack, max_results_per_rack)
+                      max_results_per_rack, reissue_top_moves, win_margin)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
             )
             .bind(job.id)
@@ -2584,9 +2695,9 @@ async fn insert_job_config(
             .bind(racks_per_batch)
             .bind(rack_size)
             .bind(total_racks)
-            .bind(consensus_pct)
-            .bind(min_results_per_rack)
             .bind(max_results_per_rack)
+            .bind(reissue_top_moves)
+            .bind(win_margin)
             .execute(conn)
             .await?;
         }
@@ -2967,9 +3078,15 @@ async fn complete_job(
 
 #[derive(Deserialize)]
 struct ConsensusBody {
-    consensus_pct: Option<f64>,
-    min_results_per_rack: Option<i32>,
     max_results_per_rack: Option<i32>,
+    reissue_top_moves: Option<i32>,
+    win_margin: Option<i32>,
+    /// The replaced rule's settings, refused by name (see
+    /// [`removed_consensus_fields`]).
+    #[serde(default)]
+    consensus_pct: Option<serde_json::Value>,
+    #[serde(default)]
+    min_results_per_rack: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -2986,11 +3103,15 @@ struct ConsensusResult {
     reopened: bool,
 }
 
-/// Changes an opening-rack job's consensus settings -- the fewest and most
-/// analyses a rack gets, and the share of them that must agree on its best
-/// move -- and restates every rack under them (`opening_rack::restate_racks`).
-/// The only part of a job's configuration that changes after creation. Only
-/// the fields given change; none that differ is a `200` that writes nothing.
+/// Changes an opening-rack job's consensus settings -- the most analyses a
+/// rack gets, the lead over the runner-up that settles it, and how many of
+/// its first analysis's moves its later ones rank -- and restates every rack
+/// under them (`opening_rack::restate_racks`). How many moves a reissue ranks
+/// decides no rack's standing, so a change to it alone restates nothing: it
+/// applies to the reissues dispatched after it. The only part of a job's
+/// configuration that changes after creation, with its MAGPIE floor
+/// (`update_min_magpie_version`). Only the fields given change; none that
+/// differ is a `200` that writes nothing.
 ///
 /// The job then starts or stops to match. A completed job the change leaves
 /// with unsettled racks is reopened, inactive at 0%: the admin gives it an
@@ -3086,26 +3207,37 @@ async fn consensus_body(
 
     let config = sqlx::query_as::<_, OpeningRackConfig>(
         "UPDATE job_opening_rack_config
-         SET consensus_pct = $2, min_results_per_rack = $3, max_results_per_rack = $4
+         SET max_results_per_rack = $2, reissue_top_moves = $3, win_margin = $4
          WHERE job_id = $1 RETURNING *",
     )
     .bind(id)
-    .bind(new.consensus_pct)
-    .bind(new.min_results_per_rack)
     .bind(new.max_results_per_rack)
+    .bind(new.reissue_top_moves)
+    .bind(new.win_margin)
     .fetch_one(&mut *tx)
     .await?;
-    let unsettled = crate::jobs::opening_rack::restate_racks(&mut tx, id, &new).await?;
+    let restates = new.max_results_per_rack != old.max_results_per_rack
+        || new.win_margin != old.win_margin;
+    let unsettled = if restates {
+        crate::jobs::opening_rack::restate_racks(&mut tx, id, &new).await?
+    } else {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM opening_rack_progress WHERE job_id = $1 AND NOT settled",
+        )
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?
+    };
 
     let mut changes = Vec::new();
-    if new.min_results_per_rack != old.min_results_per_rack {
-        changes.push(format!("min {} -> {}", old.min_results_per_rack, new.min_results_per_rack));
-    }
     if new.max_results_per_rack != old.max_results_per_rack {
         changes.push(format!("max {} -> {}", old.max_results_per_rack, new.max_results_per_rack));
     }
-    if new.consensus_pct != old.consensus_pct {
-        changes.push(format!("consensus {}% -> {}%", old.consensus_pct, new.consensus_pct));
+    if new.win_margin != old.win_margin {
+        changes.push(format!("margin {} -> {}", old.win_margin, new.win_margin));
+    }
+    if new.reissue_top_moves != old.reissue_top_moves {
+        changes.push(format!("top {} -> {}", old.reissue_top_moves, new.reissue_top_moves));
     }
     audit::log_detail(
         &mut tx,
@@ -3139,13 +3271,13 @@ async fn consensus_body(
         audit::log_status_change(&mut tx, "job.deactivated", admin_id, id, "completed", "inactive", None)
             .await?;
     }
-    // Any change to a completed job's settings, not only one that reopens
-    // it: each line of an export carries its rack's standing under the
-    // settings it was read with, and an edit that leaves every rack settled
-    // still restates them (a lower share turns racks settled without a
-    // consensus into agreed ones). Left final, the export went on being
-    // served as the completed job's corpus with the old standings.
-    if job.status == JobStatus::Completed {
+    // Any restating change to a completed job's settings, not only one that
+    // reopens it: each line of an export carries its rack's standing under
+    // the settings it was read with, and an edit that leaves every rack
+    // settled still restates them (a smaller margin turns racks settled
+    // without a consensus into agreed ones). Left final, the export went on
+    // being served as the completed job's corpus with the old standings.
+    if job.status == JobStatus::Completed && restates {
         crate::exports::unfinalize(&mut tx, id).await?;
     }
     let job = sqlx::query_as::<_, Job>("SELECT * FROM jobs WHERE id = $1")
@@ -3207,16 +3339,17 @@ async fn consensus_request(
     .await?;
     let old = before.consensus();
     let new = ConsensusSettings {
-        consensus_pct: body.consensus_pct.unwrap_or(old.consensus_pct),
-        min_results_per_rack: body.min_results_per_rack.unwrap_or(old.min_results_per_rack),
         max_results_per_rack: body.max_results_per_rack.unwrap_or(old.max_results_per_rack),
+        reissue_top_moves: body.reissue_top_moves.unwrap_or(old.reissue_top_moves),
+        win_margin: body.win_margin.unwrap_or(old.win_margin),
     };
-    let err = consensus_problems(
+    let err = removed_consensus_fields(
         AppError::bad_request("consensus settings are invalid"),
-        new.consensus_pct,
-        new.min_results_per_rack,
-        new.max_results_per_rack,
+        &body.consensus_pct,
+        &body.min_results_per_rack,
     );
+    let err = consensus_problems(err, &new);
+    let err = reissue_floor_problem(err, new.max_results_per_rack, job.min_magpie_version());
     if !err.fields.is_empty() {
         return Err(err);
     }

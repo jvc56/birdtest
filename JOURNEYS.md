@@ -315,13 +315,14 @@ Open "dev opening racks (english_ab)".
   first.", and once it has finished (within minutes) "Finished. Every rack is
   settled: N agreed, N without a consensus after 5 analyses." Under it the
   figures Waiting for agreement, Agreed ("x% of settled racks"), Without
-  consensus ("split after 5 analyses") and Racks analyzed ("of 8"), and
-  "Each rack is analysed 2 to 5, until 80% agree on the best move; …" (A job
+  consensus ("still close after 5 analyses") and Racks analyzed ("of 8"), and
+  "Each rack is analysed up to 5, until one move leads by 2; later analyses
+  rank the first's top 10 moves. …" (A job
   analysing each rack once says instead "Each rack is analysed once, by one
   contributor. No second analysis checks it." over Racks analyzed, and its
   Progress table has one row, **Analysed and settled**.) (Its player, `ab-sim-2ply-rack`, simulates; its Job settings
-  say Minimum Analyses Per Rack 2, Maximum Analyses Per Rack 5, Consensus %
-  80%, and no Racks in all or Rack size rows), a **Look up a rack** box, and
+  say Max Passes Per Rack 5, Win By 2, Reanalyse Top Moves 10 and Oldest
+  MAGPIE 0.1.5, and no Racks in all or Rack size rows), a **Look up a rack** box, and
   under it "Analysed racks to try:" with its racks as buttons, each of A and B
   only and none twice, in random order, then **Shuffle**. **Do** press
   **Shuffle**. **Expect** the racks drawn again (on a job this small, the
@@ -829,28 +830,37 @@ board start on "Choose…": pick `english` and `standard15` each time.
   and no number boxes; on its admin page, a Consensus card saying its player
   is static, with no consensus to change.
 - [ ] **Opening Rack Analysis** "tester consensus" on english_ab with the
-  seeded simmer `ab-sim-2ply-rack`: **Minimum Analyses Per Rack** 2,
-  **Maximum Analyses Per Rack** 3, **Consensus %** 100. **Expect** the note
-  under them to say each rack is analysed at least 2 times until 100% agree,
-  or 3 times. **Do** set the maximum to 1 first. **Expect** the Consensus %
-  box disabled and "One analysis per rack." Created and activated, **expect**
-  its Job settings to say Minimum Analyses Per Rack 2, Maximum Analyses Per
-  Rack 3 and Consensus % 100%, the consensus stage and its Waiting for
-  agreement / Agreed / Without consensus / Racks analyzed figures, and, once
-  it finishes, "Finished. Every rack is settled: …" with all 8 racks. **Do** look up one of its racks. **Expect** "MOVE is the best
-  move in k of n analyses (…%)" and an Analysis column numbering each
-  analysis's ranked moves, each with its Win % and P1-S…P2-BP.
+  seeded simmer `ab-sim-2ply-rack`: **Max Passes Per Rack** 3, **Win By** 2,
+  **Reanalyse Top Moves** 5. **Do** set the maximum to 1 first. **Expect** the
+  Win By and Reanalyse Top Moves boxes disabled and "One analysis per rack."
+  **Do** set it to 3. **Expect** Oldest MAGPIE raised to 0.1.5 if it was
+  older, and the note under the boxes to say each rack is analysed again over
+  its first analysis's top 5 moves until one move leads by 2, none settling
+  before its 2nd, or 3 times. **Do** set Oldest MAGPIE back to 0.1.4.
+  **Expect** "Analysing a rack more than once needs MAGPIE 0.1.5 or later: …"
+  and creation refused; set it to 0.1.5. Created and activated (with a MAGPIE
+  of 0.1.5 or later contributing), **expect** its Job settings to say Max
+  Passes Per Rack 3, Win By 2 and Reanalyse Top Moves 5, the consensus stage
+  and its Waiting for agreement / Agreed / Without consensus / Racks analyzed
+  figures, and, once it finishes, "Finished. Every rack is settled: …" with
+  all 8 racks. **Do** look up one of its racks. **Expect** "MOVE is the best
+  move in k of n analyses (…%), a lead of d over the runner-up" and an
+  Analysis column numbering each analysis's ranked moves -- the first with
+  every move it kept, each later one with at most 5, all among the first's top
+  5 -- each with its Win % and P1-S…P2-BP.
 - [ ] **Do** change "tester consensus" once it has completed, on its
   **Manage** page's **Consensus** card: the same three boxes, filled with its
-  settings, **Save** disabled until one changes. Set the minimum above the
-  maximum. **Expect** "The most analyses must be at least the fewest, and at
-  most 100." Set Minimum 3 and Maximum 4. **Expect** "Saved: N racks
-  unsettled, so the job reopened, inactive at 0% — give it an allocation on the
-  Allocation page to run it." -- inactive at 0%, any final export of it now a
-  snapshot, and its Job settings saying 3 and 4. The audit log has
-  `job.consensus_changed` ("min 2 -> 3, max 3 -> 4; N racks unsettled") and
-  `job.deactivated` (from completed). **Do** give it 25% on **Allocation**.
-  Once it has completed again, set Consensus % to 60. **Expect** "Saved: the job is
+  settings, **Save** disabled until one changes. Set Reanalyse Top Moves to 1.
+  **Expect** "The moves reanalysed must be a whole number from 2 to 100." Set
+  Win By 3 and Max Passes 4. **Expect** "Saved: N racks unsettled, so the job
+  reopened, inactive at 0% — give it an allocation on the Allocation page to
+  run it." -- inactive at 0%, any final export of it now a snapshot, and its
+  Job settings saying 4 and 3. The audit log has `job.consensus_changed` ("max
+  3 -> 4, margin 2 -> 3; N racks unsettled") and `job.deactivated` (from
+  completed). **Do** set Reanalyse Top Moves to 3 alone. **Expect** "Saved: N
+  racks unsettled." with the same N: nothing restated, and the reissues sent
+  from then on list three moves a rack. **Do** give it 25% on **Allocation**.
+  Once it has completed again, set Win By to 1. **Expect** "Saved: the job is
   completed, with 0 racks unsettled." Lowering the settings on an active job
   until no rack is unsettled completes it.
 - [ ] **Do** leave the letter distribution on "Choose…" and submit. **Expect**
@@ -1263,7 +1273,7 @@ another type, or settings creation would refuse, is a `400`.
 
 ```bash
 curl -s -b "$JAR" -H "X-CSRF-Token: $CSRF" -H 'Content-Type: application/json' \
-  -X PATCH -d '{"min_results_per_rack":2,"max_results_per_rack":3,"consensus_pct":80}' \
+  -X PATCH -d '{"max_results_per_rack":3,"win_margin":2,"reissue_top_moves":10}' \
   "$SITE/api/admin/jobs/<opening-rack job id>/consensus" | jq '{unsettled_racks, reopened, status: .job.status}'
 ```
 

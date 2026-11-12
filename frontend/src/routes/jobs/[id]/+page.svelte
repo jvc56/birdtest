@@ -189,7 +189,7 @@
               <dd class="text-xs tabular-nums text-muted-foreground">
                 {racks.racks_settled
                   ? `${((100 * (racks.racks_settled - racks.racks_without_consensus)) / racks.racks_settled).toFixed(1)}% of settled racks`
-                  : `needs ${racks.min_results_per_rack} analyses`}
+                  : `needs a lead of ${racks.win_margin}`}
               </dd>
             </div>
             <div class="min-w-0">
@@ -197,7 +197,7 @@
                 Without consensus
               </dt>
               <dd class="text-xl tabular-nums">{racks.racks_without_consensus.toLocaleString()}</dd>
-              <dd class="text-xs text-muted-foreground">split after {racks.max_results_per_rack} analyses</dd>
+              <dd class="text-xs text-muted-foreground">still close after {racks.max_results_per_rack} analyses</dd>
             </div>
             <div class="min-w-0">
               <dt class="text-muted-foreground">Racks analyzed</dt>
@@ -207,8 +207,8 @@
           </dl>
           {#if config?.opening_racks}
             <p class="text-xs text-muted-foreground">
-              Each rack is analysed {analysesPerRack(config.opening_racks)}; a rack is settled once
-              they agree, or once it has been analysed the most times, and is not analysed again.
+              Each rack is analysed {analysesPerRack(config.opening_racks)}. A rack is settled once
+              one move leads, or once it has been analysed the most times, and is not analysed again.
             </p>
           {/if}
         {:else}
@@ -261,7 +261,8 @@
           {#if lookupConsensus && lookupConsensus.analyses > 1}
             <p class="text-sm" data-testid="rack-consensus">
               <span class="font-mono">{lookupConsensus.top}</span> is the best move in
-              {lookupConsensus.count} of {lookupConsensus.analyses} analyses ({lookupConsensus.share}%).
+              {lookupConsensus.count} of {lookupConsensus.analyses} analyses ({lookupConsensus.share}%), a
+              lead of {lookupConsensus.count - lookupConsensus.runnerUp} over the runner-up.
             </p>
           {/if}
           {#if rackMoves?.length}

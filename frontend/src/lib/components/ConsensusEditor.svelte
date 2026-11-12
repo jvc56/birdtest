@@ -1,16 +1,18 @@
 <script lang="ts">
   /**
    * An opening-rack job's consensus settings, changed after creation: the
-   * fewest and most analyses a rack gets, and the share of them that must
-   * agree on its best move. Saving restates every rack, and the job follows:
-   * a completed job with racks unsettled again reopens, and an active one
-   * with every rack settled completes. A static player analyses each rack
-   * once, so its job has nothing to change here. `saved` fires after a save,
-   * for the page to read the job and its settings again.
+   * most analyses a rack gets, the lead over the runner-up that settles it,
+   * and how many of its first analysis's moves its later ones rank. Saving the
+   * most or the lead restates every rack, and the job follows: a completed
+   * job with racks unsettled again reopens, and an active one with every rack
+   * settled completes. The moves reanalysed apply to the reissues sent from
+   * then on. A static player analyses each rack once, so its job has nothing
+   * to change here. `saved` fires after a save, for the page to read the job
+   * and its settings again.
    */
   import { createEventDispatcher } from 'svelte';
   import { api, errorText } from '$lib/api';
-  import { consensusFields, consensusProblem } from '$lib/consensus';
+  import { CANDIDATES_MIN_MAGPIE, consensusFields, consensusProblem, versionAtLeast } from '$lib/consensus';
   import type { JobConfig } from '$lib/jobSettings';
 
   export let jobId: string;
@@ -22,37 +24,41 @@
 
   $: settings = config.opening_racks!;
   $: simulates = config.players.some((p) => p.num_plies > 0);
+  // A job analysing a rack more than once sends its later analyses' moves,
+  // which only MAGPIE 0.1.5 and later read; the server refuses the save below it.
+  $: floorTooOld = !versionAtLeast(config.job.min_magpie_version, CANDIDATES_MIN_MAGPIE);
 
   // Filled from the settings once, and again after each save: what the admin
   // types is not overwritten by a read in between.
-  let minResults = 1;
   let maxResults = 1;
-  let consensusPct = 80;
+  let topMoves = 10;
+  let winMargin = 2;
   let filledFrom: JobConfig | null = null;
   $: if (filledFrom !== config) {
     filledFrom = config;
-    minResults = settings.min_results_per_rack;
     maxResults = settings.max_results_per_rack;
-    consensusPct = settings.consensus_pct;
+    topMoves = settings.reissue_top_moves;
+    winMargin = settings.win_margin;
   }
 
   let busy = false;
   let error = '';
   let notice = '';
 
-  $: typed = {
-    min_results_per_rack: minResults,
+  $: fields = consensusFields({
     max_results_per_rack: maxResults,
-    consensus_pct: consensusPct
-  };
-  $: problem = consensusProblem(typed);
-  // What a save sends: no share at one analysis per rack, whose box is
-  // disabled, so the job keeps its stored one.
-  $: fields = consensusFields(typed);
+    reissue_top_moves: topMoves,
+    win_margin: winMargin
+  });
+  $: problem =
+    consensusProblem(fields) ??
+    (fields.max_results_per_rack > 1 && floorTooOld
+      ? `Analysing a rack more than once needs MAGPIE ${CANDIDATES_MIN_MAGPIE} or later: raise the job's Oldest MAGPIE (now ${config.job.min_magpie_version}) in its Controls first.`
+      : null);
   $: unchanged =
-    fields.min_results_per_rack === settings.min_results_per_rack &&
     fields.max_results_per_rack === settings.max_results_per_rack &&
-    (fields.consensus_pct === undefined || fields.consensus_pct === settings.consensus_pct);
+    fields.reissue_top_moves === settings.reissue_top_moves &&
+    fields.win_margin === settings.win_margin;
 
   async function save() {
     if (busy || problem) return;
@@ -87,33 +93,42 @@
     <form class="space-y-3" on:submit|preventDefault={save}>
       <div class="grid grid-cols-1 gap-3 sm:grid-cols-3">
         <div>
-          <label class="label" for="edit-minres">Minimum Analyses Per Rack</label>
-          <input id="edit-minres" type="number" min="1" max="100" class="input" bind:value={minResults} />
-        </div>
-        <div>
-          <label class="label" for="edit-maxres">Maximum Analyses Per Rack</label>
+          <label class="label" for="edit-maxres">Max Passes Per Rack</label>
           <input id="edit-maxres" type="number" min="1" max="100" class="input" bind:value={maxResults} />
         </div>
-        <!-- No `min`: the share must be above 50, which no `min` can say (51 blocked the
-             50.5 the server takes); `consensusProblem` says what it must be. -->
         <div>
-          <label class="label" for="edit-consensus">Consensus %</label>
+          <label class="label" for="edit-margin">Win By</label>
           <input
-            id="edit-consensus"
+            id="edit-margin"
             type="number"
-              max="100"
-            step="any"
+            min="1"
+            max="100"
             class="input"
-            bind:value={consensusPct}
+            bind:value={winMargin}
+            disabled={maxResults <= 1}
+          />
+        </div>
+        <div>
+          <label class="label" for="edit-top">Reanalyse Top Moves</label>
+          <input
+            id="edit-top"
+            type="number"
+            min="2"
+            max="100"
+            class="input"
+            bind:value={topMoves}
             disabled={maxResults <= 1}
           />
         </div>
       </div>
       {#if problem}<p class="field-error">{problem}</p>{/if}
       <p class="text-xs text-muted-foreground">
-        Saving restates every rack under the new settings. Raising them unsettles racks, which a
-        completed job reopens to analyse again (inactive at 0%, until you give it an allocation);
-        lowering them settles racks, and an active job with none left unsettled completes.
+        A rack's first analysis ranks every play; each later one ranks only the first's top moves, and
+        the rack settles once one move has been ranked first that many more times than any other (the
+        first analysis counts), or after the most passes. Changing the most or the lead restates every
+        rack: raising them unsettles racks, which a completed job reopens to analyse again (inactive at
+        0%, until you give it an allocation); lowering them settles racks, and an active job with none
+        left unsettled completes. Changing the moves reanalysed applies to the reanalyses sent from now on.
       </p>
       <button class="btn-primary" type="submit" disabled={disabled || busy || !!problem || unchanged}>
         Save

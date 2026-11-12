@@ -1643,6 +1643,35 @@ mod contract_fixtures {
     const RESULT_LEAVE_GENERATION: &str =
         include_str!("../../../contract-fixtures/result-leave-generation.json");
 
+    const OPENING_RACK_CANDIDATES_ASSIGNMENT: &str =
+        include_str!("../../../contract-fixtures/assignment-opening-rack-candidates.json");
+
+    /// A reissue's request names its candidates, one list per rack, and a
+    /// first pass's names none: the key is left out rather than sent null,
+    /// so a first-pass request is what it was before reissues sent them.
+    #[test]
+    fn a_reissue_carries_one_candidate_list_per_rack() {
+        let value: Value = serde_json::from_str(OPENING_RACK_CANDIDATES_ASSIGNMENT).unwrap();
+        let TaskRequest::OpeningRack(request) = serde_json::from_value(value["task_request"].clone()).unwrap()
+        else {
+            panic!("assignment-opening-rack-candidates.json is an opening_rack assignment");
+        };
+        let candidates = request.candidates.as_ref().expect("a reissue sends candidates");
+        assert_eq!(candidates.len(), request.racks.len());
+        assert!(candidates.iter().all(|moves| !moves.is_empty()));
+
+        let first_pass = include_str!("../../../contract-fixtures/assignment-opening-rack.json");
+        let value: Value = serde_json::from_str(first_pass).unwrap();
+        assert!(value["task_request"].get("candidates").is_none());
+        let TaskRequest::OpeningRack(request) = serde_json::from_value(value["task_request"].clone()).unwrap()
+        else {
+            panic!("assignment-opening-rack.json is an opening_rack assignment");
+        };
+        assert!(request.candidates.is_none());
+        let written = serde_json::to_value(TaskRequest::OpeningRack(request)).unwrap();
+        assert!(written.get("candidates").is_none(), "{written}");
+    }
+
     #[test]
     fn assignments_carry_a_task_request_this_build_understands() {
         for (name, fixture) in [
@@ -1651,6 +1680,7 @@ mod contract_fixtures {
                 "opening-rack",
                 include_str!("../../../contract-fixtures/assignment-opening-rack.json"),
             ),
+            ("opening-rack-candidates", OPENING_RACK_CANDIDATES_ASSIGNMENT),
             (
                 "leave-generation",
                 include_str!("../../../contract-fixtures/assignment-leave-generation.json"),

@@ -61,7 +61,8 @@ pub const DOWNLOAD_URL_TTL: std::time::Duration = std::time::Duration::from_secs
 /// Nested rather than joined, so the unit stays one line per record and
 /// `row_count` still counts records. A consensus job analyses a rack more than
 /// once, so each of its lines also carries its rack's standing (`consensus`:
-/// its analyses, its most common best move and how many ranked it first, and
+/// its analyses, its most common best move and how many ranked it first, how
+/// many ranked the runner-up first, and
 /// whether it is settled, and without a consensus) from
 /// `opening_rack_progress`, a primary-key probe per line; null for a rack of
 /// one analysis in a job wanting one per rack (which keeps the rows too, see
@@ -104,7 +105,8 @@ const OPENING_RACK_CORPUS: &str = "
            'consensus', (
                SELECT jsonb_build_object(
                           'results', c.results, 'top_move', c.top_move,
-                          'top_count', c.top_count, 'settled', c.settled,
+                          'top_count', c.top_count, 'runner_up_count', c.runner_up_count,
+                          'settled', c.settled,
                           'without_consensus', c.without_consensus)
                FROM opening_rack_progress c
                JOIN job_opening_rack_config o ON o.job_id = c.job_id

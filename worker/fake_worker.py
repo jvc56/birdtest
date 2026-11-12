@@ -560,6 +560,26 @@ def _result_for(request: dict, rng: random.Random, p1_win_probability: float) ->
         # it is, which is what the server stores the analysis as.
         player = request.get("player") or {}
         analyses = []
+        # A reissue ranks only the moves it was sent for each rack (its
+        # first analysis's leaders), as MAGPIE 0.1.5 does: the first of them
+        # usually stays first, so most racks settle at their second analysis
+        # and some split, and every move reported is one it was sent.
+        candidates = request.get("candidates")
+        if candidates is not None:
+            for rack, sent in zip(request["racks"], candidates):
+                ranked = list(sent)
+                if len(ranked) > 1 and rng.random() >= 0.75:
+                    ranked.insert(0, ranked.pop(rng.randrange(1, len(ranked))))
+                moves = []
+                equity = rng.uniform(20.0, 45.0)
+                for move in ranked:
+                    equity -= rng.uniform(0.5, 4.0)
+                    play = {"move": move, "score": rng.randint(12, 90), "equity": round(equity, 3)}
+                    moves.append(
+                        _ranked_move(rng, play, player, player.get("num_plies_recorded") or 0)
+                    )
+                analyses.append({"rack": rack, "moves": moves, "num_moves": len(ranked)})
+            return {"racks": analyses}
         for rack in request["racks"]:
             count = min(rng.randint(2, 6), player.get("num_plays_recorded") or 10)
             moves = []

@@ -450,9 +450,9 @@ the same names.
 | 6 | Games To Play / Pairs To Play (with the significance test: Maximum Games / Maximum Pairs) | games, pairs | `max_games` / `max_pairs` | `autoplay` total |
 | 7 | Significance Test ("no", or "yes (95%)" with its confidence) | games, pairs | `test_enabled`, `confidence_pct` | n/a |
 | 8 | Position Recorder ("yes", "no", or "yes (first divergences)") | games, pairs | `capture_positions`, `capture_first_divergence` | `autoplay` recorder `positions`, or `divergentpositions` |
-| 9 | Minimum Analyses Per Rack | opening racks | `min_results_per_rack` | n/a (birdtest reissues the racks) |
-| 10 | Maximum Analyses Per Rack | opening racks | `max_results_per_rack` | n/a |
-| 11 | Consensus % ("—" at a maximum of 1) | opening racks | `consensus_pct` | n/a |
+| 9 | Max Passes Per Rack | opening racks | `max_results_per_rack` | n/a (birdtest reissues the racks) |
+| 10 | Win By ("—" at a maximum of 1) | opening racks | `win_margin` | n/a |
+| 11 | Reanalyse Top Moves ("—" at a maximum of 1) | opening racks | `reissue_top_moves` | the request's `candidates` (MAGPIE 0.1.5) |
 | 12 | Generations | leave | `cardinality(target_rack_counts)` | `leavegen` |
 | 13 | Target Per Rack | leave | `target_rack_counts` | `leavegen` targets |
 | 14 | Sim Cutoff | games, pairs, opening racks | `jobs.sim_cutoff` | `cutoff` |

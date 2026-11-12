@@ -55,7 +55,7 @@ const opening: JobConfig = {
   job: { ...config.job, job_type: 'opening_rack' },
   opening_racks: {
     racks_per_batch: 500, rack_size: 7, total_racks: 3199724,
-    consensus_pct: 80, min_results_per_rack: 3, max_results_per_rack: 7
+    max_results_per_rack: 7, reissue_top_moves: 10, win_margin: 2
   },
   players: [{ ...simPlayer, role: 'player' }]
 };
@@ -136,17 +136,18 @@ describe('F-SET-1 job settings', () => {
 
   it("lists an opening-rack job's analyses per rack, and a leave job's generations and no sim cutoff", () => {
     expect(labels(jobSettings(opening))).toEqual([
-      'Type', 'Variant', 'Letter Distribution', 'Board', 'Bingo Bonus', 'Minimum Analyses Per Rack',
-      'Maximum Analyses Per Rack', 'Consensus %', 'Sim Cutoff', 'Racks Per Task', 'Task Time Limit',
+      'Type', 'Variant', 'Letter Distribution', 'Board', 'Bingo Bonus', 'Max Passes Per Rack',
+      'Win By', 'Reanalyse Top Moves', 'Sim Cutoff', 'Racks Per Task', 'Task Time Limit',
       'Oldest MAGPIE'
     ]);
     const value = (label: string, o: Partial<NonNullable<JobConfig['opening_racks']>> = {}) =>
       byLabel(jobSettings({ ...opening, opening_racks: { ...opening.opening_racks!, ...o } }), label).value;
-    expect(value('Minimum Analyses Per Rack')).toBe('3');
-    expect(value('Maximum Analyses Per Rack')).toBe('7');
-    expect(value('Consensus %')).toBe('80%');
-    // One analysis per rack seeks no agreement.
-    expect(value('Consensus %', { min_results_per_rack: 1, max_results_per_rack: 1 })).toBe('—');
+    expect(value('Max Passes Per Rack')).toBe('7');
+    expect(value('Win By')).toBe('2');
+    expect(value('Reanalyse Top Moves')).toBe('10');
+    // One analysis per rack seeks no agreement and reanalyses nothing.
+    expect(value('Win By', { max_results_per_rack: 1 })).toBe('—');
+    expect(value('Reanalyse Top Moves', { max_results_per_rack: 1 })).toBe('—');
     const rows = jobSettings(leave);
     expect(labels(rows)).toEqual([
       'Type', 'Variant', 'Letter Distribution', 'Board', 'Bingo Bonus', 'Generations', 'Target Per Rack',

@@ -16,6 +16,7 @@ other then fails a test rather than a contributor's run.
 | `claim-request.json` | client → server | The required claim body: version, the build's board dimension and rack size, and unsupported set |
 | `assignment-games.json` | server → client | A games assignment with `expected_data`, two lexicons, a player 1 with a rack info table and a word info table (all three derived files pinned), and a player 2 that solves its endgame and a nested pre-endgame (every solver key stated) |
 | `assignment-opening-rack.json` | server → client | A rack batch for a simming player: the one job type whose request carries `racks` and a single `player` |
+| `assignment-opening-rack-candidates.json` | server → client | A reissue of two racks for a simming player, with `candidates`: one list of moves per rack, in the form a ranked play reports its `move`, which MAGPIE 0.1.5 and later rank in place of every play |
 | `assignment-leave-generation.json` | server → client | Generation 1, reading the server-built zeroed KLV, and the static `player` the bot plays both seats as |
 | `decline-missing-data.json` | client → server | A decline naming a missing file and a mismatched one |
 | `decline-time-limit.json` | client → server | A task stopped at the assignment's `max_task_seconds`: the token and `"reason": "time_limit"`, no `missing` |

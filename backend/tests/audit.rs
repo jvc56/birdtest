@@ -309,6 +309,12 @@ async fn every_destructive_admin_action_writes_exactly_its_record() {
     .execute(&db.pool)
     .await
     .unwrap();
+    // The floor a job that reissues racks needs.
+    sqlx::query("UPDATE jobs SET min_magpie_major = 0, min_magpie_minor = 1, min_magpie_patch = 5 WHERE id = $1")
+        .bind(racks)
+        .execute(&db.pool)
+        .await
+        .unwrap();
     let racks_floor: String = sqlx::query_scalar(
         "SELECT format('%s.%s.%s', min_magpie_major, min_magpie_minor, min_magpie_patch)
          FROM jobs WHERE id = $1",
@@ -385,10 +391,10 @@ async fn every_destructive_admin_action_writes_exactly_its_record() {
         (
             "PATCH",
             format!("/api/admin/jobs/{racks}/consensus"),
-            Some(json!({ "min_results_per_rack": 2, "max_results_per_rack": 3 })),
+            Some(json!({ "max_results_per_rack": 3, "win_margin": 3 })),
             vec![census(
                 "job.consensus_changed", "job", racks.to_string(), Some(racks),
-                "min 1 -> 2, max 1 -> 3; 0 racks unsettled",
+                "max 1 -> 3, margin 2 -> 3; 0 racks unsettled",
             )],
         ),
         (

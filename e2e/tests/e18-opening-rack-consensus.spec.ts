@@ -5,8 +5,10 @@ import { ADMIN_STATE, SEEDED_DATA } from '../lib/env';
 /**
  * E-18: an admin changes an opening-rack job's consensus settings after
  * creating it, from the job's admin page, and the job's settings say so on
- * its public page. The job is left inactive, so nothing analyses its racks
- * meanwhile and the edit has no rack to restate.
+ * its public page. Analysing a rack more than once needs MAGPIE 0.1.5, so
+ * the job's floor is raised first, in its Controls. The job is left
+ * inactive, so nothing analyses its racks meanwhile and the edit has no
+ * rack to restate.
  */
 test.use({ storageState: ADMIN_STATE });
 
@@ -21,7 +23,8 @@ test.beforeAll(async () => {
     job_type: 'opening_rack',
     player_config_id: await api.createSimConfig(`e18-sim-${suffix}`),
     racks_per_batch: 5,
-    rack_size: 7
+    rack_size: 7,
+    min_magpie_version: '0.1.2'
   });
 });
 
@@ -33,20 +36,32 @@ test("E-18: an opening-rack job's consensus can be changed after it is created",
   await page.goto(`/admin/jobs/${jobId}`);
   const card = page.getByTestId('consensus-editor');
   await expect(card.getByRole('heading', { name: 'Consensus' })).toBeVisible();
-  const min = card.getByLabel('Minimum Analyses Per Rack');
-  const max = card.getByLabel('Maximum Analyses Per Rack');
-  const pct = card.getByLabel('Consensus %');
-  await expect(min).toHaveValue('1');
+  const max = card.getByLabel('Max Passes Per Rack');
+  const margin = card.getByLabel('Win By');
+  const top = card.getByLabel('Reanalyse Top Moves');
   await expect(max).toHaveValue('1');
-  // One analysis per rack seeks no agreement: the share waits for a maximum.
-  await expect(pct).toBeDisabled();
+  await expect(margin).toHaveValue('2');
+  await expect(top).toHaveValue('10');
+  // One analysis per rack seeks no agreement and reanalyses nothing.
+  await expect(margin).toBeDisabled();
+  await expect(top).toBeDisabled();
   await expect(card.getByRole('button', { name: 'Save' })).toBeDisabled();
 
-  await min.fill('2');
-  await max.fill('1');
-  await expect(card.getByText('The most analyses must be at least the fewest')).toBeVisible();
   await max.fill('3');
-  await pct.fill('80');
+  await top.fill('1');
+  await expect(card.getByText('The moves reanalysed must be a whole number from 2 to 100.')).toBeVisible();
+  await top.fill('5');
+  // Below the floor that reads a reanalysis's moves: raised in the Controls first.
+  await expect(card.getByText(/needs MAGPIE 0\.1\.5 or later/)).toBeVisible();
+  await expect(card.getByRole('button', { name: 'Save' })).toBeDisabled();
+  await page.getByTestId('job-min-magpie').getByLabel('Oldest MAGPIE').fill('0.1.5');
+  await page.getByTestId('job-min-magpie').getByRole('button', { name: 'Save' }).click();
+  await expect(page.getByText(/need this MAGPIE version or newer/)).toBeVisible();
+
+  await expect(card.getByText(/needs MAGPIE 0\.1\.5 or later/)).toBeHidden();
+  await max.fill('3');
+  await margin.fill('2');
+  await top.fill('5');
   await card.getByRole('button', { name: 'Save' }).click();
   await expect(card.getByTestId('consensus-notice')).toHaveText('Saved: 0 racks unsettled.');
 
@@ -54,9 +69,10 @@ test("E-18: an opening-rack job's consensus can be changed after it is created",
   const settings = page.getByTestId('job-settings');
   const row = (label: string) =>
     settings.getByRole('row').filter({ has: page.getByRole('cell', { name: label, exact: true }) });
-  await expect(row('Minimum Analyses Per Rack').getByRole('cell')).toHaveText(['Minimum Analyses Per Rack', '2']);
-  await expect(row('Maximum Analyses Per Rack').getByRole('cell')).toHaveText(['Maximum Analyses Per Rack', '3']);
-  await expect(row('Consensus %').getByRole('cell')).toHaveText(['Consensus %', '80%']);
+  await expect(row('Max Passes Per Rack').getByRole('cell')).toHaveText(['Max Passes Per Rack', '3']);
+  await expect(row('Win By').getByRole('cell')).toHaveText(['Win By', '2']);
+  await expect(row('Reanalyse Top Moves').getByRole('cell')).toHaveText(['Reanalyse Top Moves', '5']);
+  await expect(row('Oldest MAGPIE').getByRole('cell')).toHaveText(['Oldest MAGPIE', '0.1.5']);
 });
 
 test("E-18: an opening-rack job made on the form has the Racks Per Task it was given", async ({ page }) => {

@@ -477,7 +477,8 @@ async fn job_detail_carries_the_stats_block_of_its_type() {
             "racks_analyzed": 0, "racks_settled": 0, "racks_without_consensus": 0, "racks_total": 100,
             // 100 racks in tasks of 6, rounded up; one analysis a rack seeks no consensus.
             "first_pass_tasks_done": 0, "first_pass_tasks_total": 17, "reissue_tasks_done": 0,
-            "fewest_open_analyses": null, "min_results_per_rack": 1, "max_results_per_rack": 1
+            "fewest_open_analyses": null, "max_results_per_rack": 1, "win_margin": 2,
+            "reissue_top_moves": 10
         })
     );
     let (_, settings) = send(&app, get_request(&format!("/api/jobs/{leave}/config"), &[])).await;

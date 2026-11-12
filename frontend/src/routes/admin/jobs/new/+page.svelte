@@ -3,7 +3,14 @@
   import { goto } from '$app/navigation';
   import { api, errorText, type InputData, type JobType, type PlayerConfig } from '$lib/api';
   import { blankFields, computeTime, jobTypeLabel, leavePlayerConflict, parseTargetRackCounts, targetsText, unchosenText } from '$lib/format';
-  import { consensusFields, consensusProblem as checkConsensus } from '$lib/consensus';
+  import {
+    CANDIDATES_MIN_MAGPIE,
+    consensusFields,
+    consensusProblem as checkConsensus,
+    fewestToSettle,
+    ordinal,
+    versionAtLeast
+  } from '$lib/consensus';
   import { confidenceProblem as checkConfidence } from '$lib/matchTest';
   import { matchups as matchupsOf, matchupsAllowed, matchupSummary } from '$lib/roundRobin';
 
@@ -88,9 +95,9 @@
   // leave job's racksPerTask: the two defaults differ by ten times.
   let racksPerBatch = 500;
   // An opening-rack job's consensus: one analysis per rack unless asked.
-  let minResults = 1;
   let maxResults = 1;
-  let consensusPct = 80;
+  let topMoves = 10;
+  let winMargin = 2;
 
   const types: JobType[] = ['opening_rack', 'games', 'game_pairs', 'leave_generation'];
 
@@ -105,11 +112,28 @@
   $: consensusProblem =
     jobType !== 'opening_rack' || selectedStatic
       ? null
-      : checkConsensus({
-          min_results_per_rack: minResults,
+      : (checkConsensus({
           max_results_per_rack: maxResults,
-          consensus_pct: consensusPct
-        });
+          reissue_top_moves: topMoves,
+          win_margin: winMargin
+        }) ??
+        (maxResults > 1 && /^\d+\.\d+(\.\d+)?$/.test(minMagpieVersion.trim()) &&
+        !versionAtLeast(minMagpieVersion, CANDIDATES_MIN_MAGPIE)
+          ? `Analysing a rack more than once needs MAGPIE ${CANDIDATES_MIN_MAGPIE} or later: set Oldest MAGPIE to at least that.`
+          : null));
+  $: settleAt = ordinal(
+    fewestToSettle({ max_results_per_rack: maxResults, reissue_top_moves: topMoves, win_margin: winMargin })
+  );
+  // A job analysing a rack more than once sends its later analyses' moves,
+  // which only MAGPIE 0.1.5 and later read: raising the most passes past one
+  // raises the job's floor to match, once, when it is older. Keyed on the
+  // most alone, so what the admin types in the floor afterwards stands.
+  function raiseFloorFor(max: number) {
+    if (max > 1 && minMagpieVersion && !versionAtLeast(minMagpieVersion, CANDIDATES_MIN_MAGPIE)) {
+      minMagpieVersion = CANDIDATES_MIN_MAGPIE;
+    }
+  }
+  $: if (jobType === 'opening_rack' && !selectedStatic) raiseFloorFor(maxResults);
   $: confidenceProblem =
     (jobType === 'games' || jobType === 'game_pairs') && testEnabled
       ? checkConfidence(confidencePct)
@@ -171,11 +195,11 @@
           racks_per_batch: racksPerBatch,
           // A static player's analyses always agree, so it gets one per rack.
           ...(selectedStatic
-            ? { min_results_per_rack: 1, max_results_per_rack: 1 }
+            ? { max_results_per_rack: 1 }
             : consensusFields({
-                min_results_per_rack: minResults,
                 max_results_per_rack: maxResults,
-                consensus_pct: consensusPct
+                reissue_top_moves: topMoves,
+                win_margin: winMargin
               }))
         };
       case 'games':
@@ -440,26 +464,32 @@
           until its analyses agree.
         </p>
       {:else}
-        <div class="grid grid-cols-3 gap-3">
+        <div class="grid grid-cols-1 gap-3 sm:grid-cols-3">
           <div>
-            <label class="label" for="minres">Minimum Analyses Per Rack</label>
-            <input id="minres" type="number" min="1" max="100" class="input" bind:value={minResults} />
-          </div>
-          <div>
-            <label class="label" for="maxres">Maximum Analyses Per Rack</label>
+            <label class="label" for="maxres">Max Passes Per Rack</label>
             <input id="maxres" type="number" min="1" max="100" class="input" bind:value={maxResults} />
           </div>
-          <!-- No `min`: the share must be above 50, which no `min` can say (51 blocked the
-               50.5 the server takes); `consensusProblem` says what it must be. -->
           <div>
-            <label class="label" for="consensus">Consensus %</label>
+            <label class="label" for="winmargin">Win By</label>
             <input
-              id="consensus"
+              id="winmargin"
               type="number"
-                max="100"
-              step="any"
+              min="1"
+              max="100"
               class="input"
-              bind:value={consensusPct}
+              bind:value={winMargin}
+              disabled={maxResults <= 1}
+            />
+          </div>
+          <div>
+            <label class="label" for="topmoves">Reanalyse Top Moves</label>
+            <input
+              id="topmoves"
+              type="number"
+              min="2"
+              max="100"
+              class="input"
+              bind:value={topMoves}
               disabled={maxResults <= 1}
             />
           </div>
@@ -467,13 +497,17 @@
         {#if consensusProblem}<p class="field-error">{consensusProblem}</p>{/if}
         <p class="text-xs text-muted-foreground">
           {#if maxResults <= 1}
-            One analysis per rack. Raise <strong>Maximum Analyses Per Rack</strong> to analyse a rack until its
-            analyses agree.
+            One analysis per rack. Raise <strong>Max Passes Per Rack</strong> to analyse a rack again
+            until one move wins.
           {:else}
-            Each rack is analysed at least {minResults} time{minResults === 1 ? '' : 's'}, and again
-            — by other workers where there are any — until {consensusPct}% of its analyses
-            agree on its best move, or until it has been analysed {maxResults} times, when it is
-            settled without a consensus. The job is done once every rack is settled.
+            Each rack is analysed once over every play, then again — by other workers where there are
+            any — over only the first analysis's top {topMoves} moves, until one move has been ranked
+            first {winMargin} more time{winMargin === 1 ? '' : 's'} than any other (the first analysis
+            counts, so no rack settles before its {settleAt}),
+            or until it has been analysed {maxResults} times, when it is settled without a consensus.
+            Later analyses need MAGPIE {CANDIDATES_MIN_MAGPIE} or later. The job is done once every rack
+            is settled. Its player should record at least the top {topMoves} moves: a rack's later
+            analyses can rank only the moves its first stored.
           {/if}
         </p>
       {/if}

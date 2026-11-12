@@ -25,9 +25,10 @@ use uuid::Uuid;
 /// itself is built by `db::migrate`, which applies them properly; this is what
 /// makes an edit to any of them produce a fresh template rather than a stale
 /// one.
-const MIGRATIONS: [&str; 2] = [
+const MIGRATIONS: [&str; 3] = [
     include_str!("../../migrations/0001_initial.sql"),
     include_str!("../../migrations/0002_best_attempt_tables.sql"),
+    include_str!("../../migrations/0003_opening_rack_narrowing.sql"),
 ];
 const TESTDIST: &[u8] = include_bytes!("../../src/jobs/testdata/testdist.csv");
 

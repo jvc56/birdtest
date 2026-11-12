@@ -236,12 +236,15 @@ pub struct OpeningRackConfig {
     pub racks_per_batch: i32,
     pub rack_size: i32,
     pub total_racks: i64,
-    /// A rack is analysed until at least `min_results_per_rack` analyses
-    /// agree on its best move in this share (percent), or until it has
-    /// `max_results_per_rack` of them. One and one is one analysis per rack.
-    pub consensus_pct: f64,
-    pub min_results_per_rack: i32,
+    /// The most analyses a rack gets (its passes, the first included). 1 is
+    /// one analysis per rack: no reissues.
     pub max_results_per_rack: i32,
+    /// How many of a rack's first-pass moves, best first, its later passes
+    /// rank (X): every reissue sends them as the rack's candidates.
+    pub reissue_top_moves: i32,
+    /// How far a rack's most common rank-1 move must lead the runner-up's
+    /// count for the rack to settle.
+    pub win_margin: i32,
 }
 
 impl OpeningRackConfig {
@@ -250,26 +253,29 @@ impl OpeningRackConfig {
     /// so anything that acts on them reads [`ConsensusSettings::load`] instead.
     pub fn consensus(&self) -> ConsensusSettings {
         ConsensusSettings {
-            consensus_pct: self.consensus_pct,
-            min_results_per_rack: self.min_results_per_rack,
             max_results_per_rack: self.max_results_per_rack,
+            reissue_top_moves: self.reissue_top_moves,
+            win_margin: self.win_margin,
         }
     }
 }
 
-/// An opening-rack job's consensus settings: a rack is analysed until at
-/// least `min_results_per_rack` analyses agree on its best move in
-/// `consensus_pct` percent of them, or until it has `max_results_per_rack`.
+/// An opening-rack job's consensus settings. A rack's first analysis ranks
+/// every play; each later one ranks only the first analysis's top
+/// `reissue_top_moves`. The rack settles once its most common rank-1 move
+/// has `win_margin` more rank-1 finishes than the runner-up -- the first
+/// analysis's counting -- or once it has `max_results_per_rack` analyses
+/// (settled without a consensus).
 ///
 /// The one part of a job's configuration that changes after creation, so it
 /// is never taken from the cached [`crate::jobs::dispatch::JobTemplate`]: a
 /// claim reads it under the job's dispatch lock and a submission under its
 /// claim's lock, both of which the edit holds while it writes.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, sqlx::FromRow)]
 pub struct ConsensusSettings {
-    pub consensus_pct: f64,
-    pub min_results_per_rack: i32,
     pub max_results_per_rack: i32,
+    pub reissue_top_moves: i32,
+    pub win_margin: i32,
 }
 
 impl ConsensusSettings {
@@ -282,7 +288,7 @@ impl ConsensusSettings {
     /// The job's settings as they stand now.
     pub async fn load(conn: &mut sqlx::PgConnection, job_id: Uuid) -> crate::error::AppResult<Self> {
         Ok(sqlx::query_as::<_, Self>(
-            "SELECT consensus_pct, min_results_per_rack, max_results_per_rack
+            "SELECT max_results_per_rack, reissue_top_moves, win_margin
              FROM job_opening_rack_config WHERE job_id = $1",
         )
         .bind(job_id)
