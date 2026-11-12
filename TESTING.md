@@ -4396,14 +4396,18 @@ surfacing the mismatch as a red build rather than as a dead job in production.
   MAGPIE's own side, including that a pair played identically keeps nothing,
   is `magpie_test contribute`'s
   `test_a_pairs_first_divergence_is_both_games_at_one_turn`.
-- `M-15` An opening-rack job seeking a consensus (at least 2, at most 3
-  analyses a rack, 100%), with a real 1-ply simmer on the two-letter data,
-  covers its eight racks, reissues them as lists from seeds past the end of
-  the space, and completes with every rack settled after at least two
-  analyses; its page's stats split the completed tasks into two first-pass
-  tasks and the re-analysis ones (adding up to `tasks_completed`), count
-  throughput in analyses, and leave no open rack (`fewest_open_analyses`
-  null). *(Covered: `case_consensus`, one task a run until the job
+- `M-15` An opening-rack job seeking a consensus (one move ahead of the
+  runner-up by 2, at most 3 analyses a rack, reanalysing each rack's
+  first-pass top 3), with a real 1-ply simmer on the two-letter data and a
+  job floor of 0.1.5, covers its eight racks, reissues them as lists from
+  seeds past the end of the space, and completes with every rack settled
+  after at least two analyses. Every reissue sent its racks' candidates, and
+  every move it stored is among them. Its page's stats split the completed
+  tasks into two first-pass tasks and the re-analysis ones (adding up to
+  `tasks_completed`), count throughput in analyses, and leave no open rack
+  (`fewest_open_analyses` null). Skipped, saying so, when the MAGPIE under
+  test is older than 0.1.5: the nightly's pinned leg builds the server
+  image's MAGPIE. *(Covered: `case_consensus`, one task a run until the job
   completes.)*
 - `M-16` A games job between two real 2-ply simmers that infer, capturing
   positions: every position past a game's first turn keeps its inference

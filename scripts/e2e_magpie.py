@@ -46,7 +46,8 @@ Each case is selectable with `--cases` (default: every M case):
 - `M-15` An opening-rack job seeking a consensus, with a real simmer on the
   two-letter data: it covers its eight racks, then reissues them -- as lists,
   from seeds past the end of the space -- until each is settled, and
-  completes once all are; every rack has at least its fewest analyses.
+  completes once all are; every rack has at least its fewest analyses, and
+  every reissue ranks only its candidates. Skipped below MAGPIE 0.1.5.
 - `M-17` A worker at 24 threads runs a job whose players solve: each of its
   24 concurrent games gives its solves one thread. Given every thread each,
   as before, the solves needed 24 + 24 x 24 move generators of a pool of 512,
@@ -137,6 +138,22 @@ class Failure(RuntimeError):
 def expect(condition: bool, message: str) -> None:
     if not condition:
         raise Failure(message)
+
+
+def magpie_version(ctx: "Context") -> str:
+    """The version the binary under test reports, from `magpie builders`.
+
+    MAGPIE prints a line about its tables at startup, so this takes the last
+    line that parses.
+    """
+    output = subprocess.run([str(ctx.args.magpie), "builders"], cwd=ctx.args.magpie_root,
+                            capture_output=True, text=True, timeout=60).stdout
+    for line in reversed(output.splitlines()):
+        try:
+            return json.loads(line)["magpie_version"]
+        except (ValueError, KeyError, TypeError):
+            continue
+    raise Failure(f"magpie builders printed no version:\n{output}")
 
 
 def sha256_file(path: Path) -> str:
@@ -1303,6 +1320,13 @@ def case_derived_mismatch(ctx: Context) -> None:
 
 def case_consensus(ctx: Context) -> None:
     """M-15"""
+    # Reissues send candidates, which MAGPIE reads from 0.1.5. The nightly's
+    # pinned leg builds the server image's MAGPIE, which may be older.
+    version = magpie_version(ctx)
+    if seed.version_key(version) < seed.version_key(seed.CANDIDATES_MIN_MAGPIE):
+        log(f"M-15: skipped: MAGPIE {version} is older than {seed.CANDIDATES_MIN_MAGPIE}, "
+            "the first to read a reissue's candidates")
+        return
     deactivate_everything(ctx)
     remove_small_data(ctx)
     worker = None
