@@ -191,7 +191,10 @@ if [[ "$deploying" == *" backend "* ]]; then
   magpie=${MAGPIE_DIR:-$HOME/MAGPIE}
   [[ -d "$magpie/.git" ]] || ops_die "no MAGPIE checkout at $magpie (set MAGPIE_DIR)"
   git -C "$magpie" fetch -q origin || ops_die "git fetch in $magpie failed"
-  git -C "$magpie" branch -r --contains "$pin" 2>/dev/null | grep -qx '[[:space:]]*origin/main' \
+  # Not `branch -r --contains | grep -q`: grep stops at the first match, and
+  # under pipefail a git still writing (it writes 4 KB at a time) dies of
+  # SIGPIPE and fails the pipeline, refusing a pin that is on main.
+  git -C "$magpie" merge-base --is-ancestor "$pin" origin/main 2>/dev/null \
     || ops_die "MAGPIE $pin is not on origin/main: merge it first (the backend image fetches it)"
   ops_say "MAGPIE pin ${pin:0:12} is on main"
 fi
