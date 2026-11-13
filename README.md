@@ -482,9 +482,17 @@ compared" below.
 
 ### What happens, end to end
 
-1. **Import keeps lexica and leaves.** The tarball import stores every `.kwg`
-   and `.klv2` in the object store, keyed by SHA-256, so the server holds the
-   exact inputs a job pins.
+1. **Import keeps lexica, leaves and win% models.** The tarball import stores
+   every `.kwg`, `.klv2` and win% model in the object store, keyed by SHA-256
+   (and letter distributions and layouts on their rows), so the server holds
+   the exact inputs a job pins. It builds from the first two, and serves any
+   of them to a worker whose own copy is not the pinned one
+   (`GET /api/worker/input`, read by MAGPIE 0.1.6 and later): a job pins
+   bytes, and a tarball rebuilt under its old name must not leave it pinning
+   files nobody can install. A win% model imported before 2026-11 has no
+   object until a tarball that carries it is imported again; the import gives
+   every row it recognises the object it lacks, whether or not it has anything
+   new to insert.
 2. **A job that needs a derived file queues a build** in `derived_data`: a
    wordmap for a `.kwg` when a player (or a leave job) uses one, a rack info
    table for a `(.kwg, .klv2)` pair when a player uses one, and a word info

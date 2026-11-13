@@ -290,6 +290,7 @@ const ROUTES: &[(&str, &str, Access, &str)] = &[
         r#"{"claim_token":"00000000-0000-4000-8000-000000000001","result":{}}"#,
     ),
     ("GET", "/api/worker/artifact", Worker, ""),
+    ("GET", "/api/worker/input", Worker, ""),
     // --- Public API ---------------------------------------------------------
     ("GET", "/api/jobs", Public, ""),
     ("GET", "/api/jobs/:id", Public, ""),
@@ -622,7 +623,9 @@ async fn a_deactivated_or_revoked_api_key_is_refused_by_every_worker_endpoint() 
 
     // A fresh app, and so fresh rate limiters, for each round: every
     // presented key is charged its own bucket (burst 5) before its lookup,
-    // live or dead, and a round is five requests on top of the claim above.
+    // live or dead, and a round is six requests -- a claim, and five for
+    // work in hand, which is that bucket's whole burst -- on top of the claim
+    // above.
     let refused_everywhere = |label: &'static str| {
         let db = &db;
         let bearer = bearer.clone();
@@ -635,7 +638,7 @@ async fn a_deactivated_or_revoked_api_key_is_refused_by_every_worker_endpoint() 
                 assert_eq!(response["message"], "unknown or inactive API key", "{label}: {path}");
                 checked += 1;
             }
-            assert_eq!(checked, 5);
+            assert_eq!(checked, 6);
         }
     };
 

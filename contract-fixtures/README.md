@@ -68,6 +68,18 @@ A decline's `reason` is one of `missing_data`, `magpie_version`,
 `unknown_job_type`, `derived_mismatch`, `task_failed` and `time_limit`;
 anything else is a `400` listing them.
 
+## Input files: their sizes, and where to fetch them
+
+Each entry of `expected_data.files` states, beside its role, name, path,
+digest and the tarball it was first imported from, `bytes` -- the file's size
+-- and `sources`: where a worker whose own copy is missing or is other bytes
+can fetch it, best first. A source that starts with `/` is a path on the
+birdtest server (`/api/worker/input?sha256=<digest>`); the list is empty for a
+file the server holds no copy of. MAGPIE 0.1.6 fetches from the first source
+it can use, keeps the file only if it is `bytes` long and hashes to `sha256`,
+and declines `missing_data` as before when no source works. An older MAGPIE
+reads neither key.
+
 ## Derived files: their sizes, and what a worker skipped
 
 Each entry of `expected_data.derived` states, beside its role, name, hash,

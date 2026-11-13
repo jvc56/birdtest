@@ -51,6 +51,7 @@ pub fn router() -> Router<AppState> {
             post(submit_result).layer(DefaultBodyLimit::max(MAX_RESULT_BYTES)),
         )
         .route("/artifact", get(artifact))
+        .route("/input", get(input))
         // The result route's own limit, set on the route, is the one it gets.
         .layer(DefaultBodyLimit::max(WORKER_BODY_BYTES))
 }
@@ -100,7 +101,7 @@ async fn artifact(
     .await?
     .ok_or_else(|| AppError::not_found("no such artifact"))?;
 
-    let body = recent_artifacts::get(&state, &query.key, &served).await?;
+    let body = recent_artifacts::LEAVES.get(&state, &query.key, &served).await?;
     Ok((
         [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
         body,
@@ -108,7 +109,71 @@ async fn artifact(
         .into_response())
 }
 
-/// The last few KLVs served, kept in memory.
+#[derive(Deserialize)]
+struct InputQuery {
+    sha256: String,
+}
+
+/// A pinned input file, by digest: what `ExpectedFile::sources` points a
+/// worker at when its own copy of a file a job pins is missing or is other
+/// bytes.
+///
+/// A job pins bytes; where a worker gets them was, until this route, "the
+/// tarball that carries them", and MAGPIE-DATA rebuilt a tarball under the
+/// name it already had (2026-11-02). The CSW24 jobs went on pinning the leaves
+/// it replaced, which no download installed any more, and the advice a
+/// declined worker was given -- run `download_data.sh` -- reinstalled the
+/// file it had just been declined for (MAGPIE issue 982). The server has
+/// held every lexicon and leaves file since it began building derived files
+/// from them, so it is the one place a pinned file can always be had.
+///
+/// Any file in `input_data` whose bytes the server holds, whether or not a
+/// job pins it today: all of it is MAGPIE-DATA's, which is public, and the
+/// digest is not a key into anything else -- the object read is the one the
+/// row names, never one built from the query. A worker identity is required
+/// as for every worker route, so the downloads are rate limited with the
+/// rest of that worker's requests.
+///
+/// The worker checks what it is sent against the digest it asked for, so a
+/// damaged object costs it a decline and never a wrong game; nothing is
+/// verified here beyond what the cache keeps.
+async fn input(
+    State(state): State<AppState>,
+    RegisteredWorker(_identity): RegisteredWorker,
+    Query(query): Query<InputQuery>,
+) -> AppResult<Response> {
+    // Before the database sees it: the column holds only lowercase hex.
+    let well_formed = query.sha256.len() == 64
+        && query.sha256.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if !well_formed {
+        return Err(AppError::not_found("no such input file"));
+    }
+    // The same bytes under two paths are two rows; either will do, and one
+    // with its bytes on the row saves a read of the object store.
+    let row = sqlx::query_as::<_, (Option<Vec<u8>>, Option<String>)>(
+        "SELECT content, object_key FROM input_data
+         WHERE sha256 = $1 AND (content IS NOT NULL OR object_key IS NOT NULL)
+         ORDER BY content IS NULL
+         LIMIT 1",
+    )
+    .bind(&query.sha256)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| AppError::not_found("no such input file"))?;
+
+    let body = match row {
+        (Some(content), _) => axum::body::Bytes::from(content),
+        (None, Some(key)) => recent_artifacts::INPUTS.get(&state, &key, &query.sha256).await?,
+        (None, None) => unreachable!("the query selects only rows with bytes"),
+    };
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+        body,
+    )
+        .into_response())
+}
+
+/// The last few objects served, kept in memory.
 ///
 /// Every leave worker fetches the new KLV within one idle interval of a
 /// generation opening, and each fetch was an S3 GET buffered whole (a few
@@ -119,86 +184,113 @@ async fn artifact(
 /// is served is never answered from here, and only bytes that hash to it are
 /// kept; misses of one key are fetched one at a time, so a generation's
 /// opening is one S3 GET, not one per worker.
+///
+/// Pinned input files (`/api/worker/input`) arrive the same way -- a job that
+/// pins a file few workers have is fetched by each of them as it first claims
+/// -- and are kept apart from the KLVs, so that neither kind's burst empties
+/// the other's.
 mod recent_artifacts {
     use crate::error::AppResult;
     use crate::state::AppState;
     use axum::body::Bytes;
 
-    const KEPT: usize = 8;
-
     type Entry = (String, String, Bytes);
-    static ENTRIES: std::sync::Mutex<Vec<Entry>> = std::sync::Mutex::new(Vec::new());
     type Fetching = std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>;
-    static FETCHING: std::sync::LazyLock<std::sync::Mutex<Fetching>> =
-        std::sync::LazyLock::new(Default::default);
+
+    pub(super) struct Recent {
+        /// How many objects are kept.
+        kept: usize,
+        entries: std::sync::Mutex<Vec<Entry>>,
+        fetching: std::sync::LazyLock<std::sync::Mutex<Fetching>>,
+    }
+
+    /// Leave-generation KLVs: 3.7 MB each, and a job serves one at a time.
+    pub(super) static LEAVES: Recent = Recent::new(8);
+    /// Pinned inputs: a lexicon is some 6 MB, leaves 3.7 MB, a win% model
+    /// under 1 MB, so this is at most a few tens of megabytes -- two jobs'
+    /// worth of files with room to spare.
+    pub(super) static INPUTS: Recent = Recent::new(8);
+
     /// A fetch that has not answered in this long is given up, as a 503 the
     /// worker retries: the object store's client sets no timeout of its own,
     /// and a hung read held every worker waiting on that key.
     const FETCH_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
 
-    fn cached(key: &str, served: &str) -> Option<Bytes> {
-        ENTRIES
-            .lock()
-            .expect("artifact cache poisoned")
-            .iter()
-            .find(|(k, s, _)| k == key && s == served)
-            .map(|(_, _, bytes)| bytes.clone())
-    }
-
-    pub(super) async fn get(state: &AppState, key: &str, served: &str) -> AppResult<Bytes> {
-        if let Some(bytes) = cached(key, served) {
-            return Ok(bytes);
-        }
-        // One fetch per key at a time -- per key, so a slow read of one
-        // generation's KLV holds up nobody asking for another.
-        let lock = FETCHING
-            .lock()
-            .expect("artifact fetches poisoned")
-            .entry(key.to_string())
-            .or_default()
-            .clone();
-        let result = {
-            let _turn = lock.lock().await;
-            match cached(key, served) {
-                Some(bytes) => Ok(bytes),
-                None => fetch_and_keep(state, key, served).await,
+    impl Recent {
+        const fn new(kept: usize) -> Self {
+            Recent {
+                kept,
+                entries: std::sync::Mutex::new(Vec::new()),
+                fetching: std::sync::LazyLock::new(Default::default),
             }
-        };
-        let mut fetching = FETCHING.lock().expect("artifact fetches poisoned");
-        drop(lock);
-        if fetching.get(key).is_some_and(|l| std::sync::Arc::strong_count(l) == 1) {
-            fetching.remove(key);
         }
-        result
-    }
 
-    async fn fetch_and_keep(state: &AppState, key: &str, served: &str) -> AppResult<Bytes> {
-        let bytes = tokio::time::timeout(FETCH_LIMIT, state.artifacts.get_bytes(key))
-            .await
-            .unwrap_or_else(|_| {
-                Err(crate::error::AppError {
-                    retry_after: Some(30),
-                    ..crate::error::AppError::new(
-                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                        "unavailable",
-                        format!("reading {key} from the object store timed out"),
-                    )
-                })
-            })?;
-        // Only bytes that are what workers are told to expect. An object that
-        // is not (RUNBOOK §3) is refused by every worker; kept here, it would
-        // go on being served after an admin had put the right one back.
-        use sha2::Digest;
-        if hex::encode(sha2::Sha256::digest(&bytes)) != served {
-            return Ok(bytes);
+        fn cached(&self, key: &str, served: &str) -> Option<Bytes> {
+            self.entries
+                .lock()
+                .expect("artifact cache poisoned")
+                .iter()
+                .find(|(k, s, _)| k == key && s == served)
+                .map(|(_, _, bytes)| bytes.clone())
         }
-        let mut entries = ENTRIES.lock().expect("artifact cache poisoned");
-        entries.retain(|(k, _, _)| k != key);
-        if entries.len() >= KEPT {
-            entries.remove(0);
+
+        pub(super) async fn get(&self, state: &AppState, key: &str, served: &str) -> AppResult<Bytes> {
+            if let Some(bytes) = self.cached(key, served) {
+                return Ok(bytes);
+            }
+            // One fetch per key at a time -- per key, so a slow read of one
+            // generation's KLV holds up nobody asking for another.
+            let lock = self
+                .fetching
+                .lock()
+                .expect("artifact fetches poisoned")
+                .entry(key.to_string())
+                .or_default()
+                .clone();
+            let result = {
+                let _turn = lock.lock().await;
+                match self.cached(key, served) {
+                    Some(bytes) => Ok(bytes),
+                    None => self.fetch_and_keep(state, key, served).await,
+                }
+            };
+            let mut fetching = self.fetching.lock().expect("artifact fetches poisoned");
+            drop(lock);
+            if fetching.get(key).is_some_and(|l| std::sync::Arc::strong_count(l) == 1) {
+                fetching.remove(key);
+            }
+            result
         }
-        entries.push((key.to_string(), served.to_string(), bytes.clone()));
-        Ok(bytes)
+
+        async fn fetch_and_keep(&self, state: &AppState, key: &str, served: &str) -> AppResult<Bytes> {
+            let bytes = tokio::time::timeout(FETCH_LIMIT, state.artifacts.get_bytes(key))
+                .await
+                .unwrap_or_else(|_| {
+                    Err(crate::error::AppError {
+                        retry_after: Some(30),
+                        ..crate::error::AppError::new(
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                            "unavailable",
+                            format!("reading {key} from the object store timed out"),
+                        )
+                    })
+                })?;
+            // Only bytes that are what workers are told to expect. An object
+            // that is not (RUNBOOK §3) is refused by every worker; kept here,
+            // it would go on being served after an admin had put the right
+            // one back.
+            use sha2::Digest;
+            if hex::encode(sha2::Sha256::digest(&bytes)) != served {
+                return Ok(bytes);
+            }
+            let mut entries = self.entries.lock().expect("artifact cache poisoned");
+            entries.retain(|(k, _, _)| k != key);
+            if entries.len() >= self.kept {
+                entries.remove(0);
+            }
+            entries.push((key.to_string(), served.to_string(), bytes.clone()));
+            Ok(bytes)
+        }
     }
 }
 
@@ -1711,6 +1803,8 @@ mod contract_fixtures {
                 path: "lexica/NWL23.kwg".into(),
                 sha256: "3e74af98".into(),
                 tarball_date: "20251004".into(),
+                bytes: 4_719_596,
+                sources: vec![crate::jobs::input_source("3e74af98")],
             }]),
             derived: std::sync::Arc::new(vec![crate::derived::ExpectedDerived {
                 role: "wmp".into(),

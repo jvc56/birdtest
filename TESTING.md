@@ -1805,6 +1805,10 @@ The single most important group. Every entry is about a decision made in SQL.
 - `I-EXPECT-6` An `opening_rack` job yields its single player's files plus the
   job's distribution and layout. *(Covered:
   `scheduler::an_opening_rack_job_needs_its_players_files_and_the_jobs_bag_and_board`.)*
+- `I-EXPECT-7` Every file states its size and its sources: this server's
+  input route, by digest, when the server holds the file's bytes (on the row
+  or in the object store), and none when it does not. *(Covered:
+  `scheduler::a_file_names_this_server_as_a_source_only_when_its_bytes_are_held`.)*
 
 ### `I-JOB-*` — job creation and lifecycle (`routes/admin.rs` SQL, `jobs/registry.rs`)
 
@@ -2588,13 +2592,15 @@ import can be watched) and a per-test MinIO bucket.
   the CHECK — assert the CHECK fires, not just that the code does it. *(Covered:
   `input_data::only_server_read_roles_keep_their_bytes_and_the_schema_insists`,
   `inputdata::tests::only_server_read_roles_keep_their_bytes`.)*
-- `I-INPUT-8` `kwg` and `klv` rows carry an `object_key` and their bytes are in
-  the object store, because the server builds wordmaps, rack info tables and
-  word info tables from them (a word info table needs only the `kwg`); `winpct` rows carry neither, because nothing server-side builds
-  anything from a win% model. The key is the digest, so re-importing a tarball
-  whose lexica have not changed uploads nothing. *(Covered:
+- `I-INPUT-8` `kwg`, `klv` and `winpct` rows carry an `object_key` and their bytes are in
+  the object store: the server builds wordmaps, rack info tables and
+  word info tables from the first two (a word info table needs only the `kwg`), and serves any of the three
+  to a worker that lacks the pinned file (`A-WORKER-31`). The key is the digest, so re-importing a tarball
+  whose files have not changed uploads nothing. A row already known that names no object — a win% model
+  imported before they were stored — names it once an import carrying the same bytes has run, confirmed or not
+  (`input_data::confirming_inserts_what_is_new_and_reports_what_was_already_there`). *(Covered:
   `input_data::lexica_and_leaves_are_stored_once_by_digest`,
-  `inputdata::tests::the_roles_a_derived_build_needs_go_to_the_object_store`.)*
+  `inputdata::tests::the_roles_a_build_or_a_worker_needs_go_to_the_object_store`.)*
 - `I-INPUT-8b` A lexicon object whose bytes are not those imported is deleted
   by the build that finds it, and the next import uploads it again whole. An
   import skips an object that exists, so while the damaged one stayed, the
@@ -3132,6 +3138,12 @@ below.
 - `A-WORKER-13` **Artifact fetch resolves only keys the server minted**; an
   arbitrary key is 404. Otherwise this is a read primitive for the whole bucket.
   *(Covered: `worker_routes::an_artifact_is_served_only_under_a_key_the_server_minted`.)*
+- `A-WORKER-31` **A pinned input file is served by its digest**: a lexicon,
+  leaves file or win% model from the object store, a letter distribution or
+  layout from its row, byte for byte, to a worker the server knows. A digest
+  no row has, a row whose bytes the server does not hold, and anything that is
+  not a digest (an object key, a path) are 404. *(Covered:
+  `worker_routes::a_pinned_input_file_is_served_by_its_digest`.)*
 - `A-WORKER-14` Worker endpoints are rate limited per identity: the 6th request
   in a second is 429, and a different identity is unaffected. *(Covered:
   `worker_routes::worker_requests_are_limited_per_identity`.)*
@@ -4349,9 +4361,19 @@ surfacing the mismatch as a red build rather than as a dead job in production.
   *(Covered:
   `case_leave`, which also checks that nothing is written into MAGPIE's data
   directory.)*
-- `M-5` A worker whose data digests do not match declines with `missing_data`
+- `M-5` A worker whose data digests do not match, for a file the server cannot
+  send it, declines with `missing_data`
   rather than contributing unverified results. *(Covered: `case_missing_data`
-  — the gap names the file with both digests, and nothing is stored.)*
+  — the gap names the file with both digests, and nothing is stored. From
+  MAGPIE 0.1.6 the file is the job's leaves, with the object taken off their
+  row for the case; an older MAGPIE fetches nothing, and is given an altered
+  letter distribution as before.)*
+- `M-20` A worker whose letter distribution and leaves are not the ones the job
+  pins fetches both from the server — one from its row, one from the object
+  store — into `data/birdtest/<digest>/`, and plays: nothing is declined, the
+  fetched files have the pinned digests, its own files are untouched, and a
+  second run fetches nothing. Skipped below MAGPIE 0.1.6. *(Covered:
+  `case_fetched_inputs`.)*
 - `M-6` A worker below the job's version floor never runs the job. The real
   server filters below-floor jobs out before dispatch, so a real worker is told
   `magpie_too_old` and claims nothing; MAGPIE's own `magpie_version` decline
@@ -4377,7 +4399,9 @@ surfacing the mismatch as a red build rather than as a dead job in production.
   real `magpie contribute` builds a table whose hash matches the server's and
   plays with it. *(Covered: `case_rack_info_table`, on MAGPIE's two-letter test
   lexicon and distribution (`CSW21_ab`, `english_ab`), so the table is small
-  and quick rather than 1.9 GB.)*
+  and quick rather than 1.9 GB. From MAGPIE 0.1.6 a second worker, whose
+  leaves are not the job's, fetches them and builds the same table from the
+  fetched file, beside it in `data/birdtest/` and not in its own lexica.)*
 - `M-11` A worker whose derived file does not match declines with
   `derived_mismatch` and both digests reach `worker_data_gaps`. *(Covered:
   `case_derived_mismatch`: the server's recorded wordmap hash is made one this

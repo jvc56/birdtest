@@ -821,6 +821,14 @@ pub(crate) async fn insert_game_results(
 /// `role` and `name` are what the client resolves through its own data path
 /// search; `path` and `tarball_date` exist for the message it prints when the
 /// file is missing or wrong.
+///
+/// `bytes` and `sources` are for a client whose own copy is not this one: it
+/// fetches the file from a source, expecting `bytes` of it, and keeps it only
+/// if it hashes to `sha256`. A job pins bytes, and a tarball is only where a
+/// worker usually has them from -- a tarball rebuilt under the same name
+/// (MAGPIE-DATA `data-20260925`, 2026-11-02) left every job pinning the files
+/// it replaced with nothing a new contributor could install. A MAGPIE from
+/// before 0.1.6 ignores both and declines as it always did.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ExpectedFile {
     pub role: String,
@@ -828,6 +836,22 @@ pub struct ExpectedFile {
     pub path: String,
     pub sha256: String,
     pub tarball_date: String,
+    /// The file's size, which bounds what a client will read from a source.
+    pub bytes: i64,
+    /// Where the file can be fetched, best first; a source that starts with
+    /// `/` is a path on this server. Empty when the server holds no copy (a
+    /// win% model imported before they were stored, until its tarball is
+    /// imported again): the client then has only its own data to go on.
+    /// A list, so that another place -- MAGPIE-DATA at the commit the file was
+    /// imported from -- can be added without changing the shape; a client
+    /// skips a source it does not know how to use.
+    pub sources: Vec<String>,
+}
+
+/// The path a worker fetches a pinned input file from: [`ExpectedFile::sources`]
+/// names it and `routes::worker` serves it.
+pub fn input_source(sha256: &str) -> String {
+    format!("/api/worker/input?sha256={sha256}")
 }
 
 /// Every file the job's tasks will actually load, deduplicated.
@@ -872,7 +896,8 @@ pub async fn expected_data(
              -- joins to nothing and so contributes no entry.
              UNION SELECT pc.winpct_id FROM player_configs pc JOIN players p ON p.id = pc.id
          )
-         SELECT d.role, d.name, d.path, d.sha256, d.tarball_date
+         SELECT d.role, d.name, d.path, d.sha256, d.tarball_date, d.bytes,
+                (d.content IS NOT NULL OR d.object_key IS NOT NULL) AS served
          FROM input_data d JOIN ids ON ids.id = d.id
          ORDER BY d.role, d.name",
     )
@@ -882,12 +907,22 @@ pub async fn expected_data(
 
     Ok(rows
         .into_iter()
-        .map(|row| ExpectedFile {
-            role: row.get("role"),
-            name: row.get("name"),
-            path: row.get("path"),
-            sha256: row.get("sha256"),
-            tarball_date: row.get("tarball_date"),
+        .map(|row| {
+            let sha256: String = row.get("sha256");
+            let sources = if row.get::<bool, _>("served") {
+                vec![input_source(&sha256)]
+            } else {
+                Vec::new()
+            };
+            ExpectedFile {
+                role: row.get("role"),
+                name: row.get("name"),
+                path: row.get("path"),
+                tarball_date: row.get("tarball_date"),
+                bytes: row.get("bytes"),
+                sources,
+                sha256,
+            }
         })
         .collect())
 }
