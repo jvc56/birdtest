@@ -926,6 +926,43 @@ async fn players_on_different_lexicons_each_contribute_a_kwg_and_a_klv() {
     assert_eq!(files.len(), 6, "{files:?}");
 }
 
+/// I-EXPECT-7: every file states its size and where it can be fetched: this
+/// server's input route, by digest, for a file whose bytes the server holds
+/// (on the row or in the object store), and nowhere for one it does not.
+#[tokio::test]
+async fn a_file_names_this_server_as_a_source_only_when_its_bytes_are_held() {
+    let db = TestDb::new().await;
+    let job = db.games_job(1).await;
+    let before = expected(&db, job).await;
+    // The helper's lexica and leaves are rows with no bytes anywhere; its
+    // distribution and layout carry theirs.
+    for file in &before {
+        let held = matches!(file.role.as_str(), "letterdist" | "layout");
+        let want = if held { vec![birdtest::jobs::input_source(&file.sha256)] } else { Vec::new() };
+        assert_eq!(file.sources, want, "{file:?}");
+    }
+    let layout = before.iter().find(|f| f.role == "layout").unwrap();
+    let stored: i64 = sqlx::query_scalar("SELECT bytes FROM input_data WHERE sha256 = $1")
+        .bind(&layout.sha256)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(layout.bytes, stored);
+
+    // Once a row names an object, it is served.
+    sqlx::query("UPDATE input_data SET object_key = 'inputs/' || sha256 WHERE role = 'klv'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    for file in expected(&db, job).await {
+        let held = file.role != "kwg";
+        assert_eq!(file.sources.is_empty(), !held, "{file:?}");
+        if held {
+            assert_eq!(file.sources, vec![format!("/api/worker/input?sha256={}", file.sha256)]);
+        }
+    }
+}
+
 /// I-EXPECT-4: a leave-generation job needs its player's lexicon, the
 /// distribution and the board, and never a `klv` -- its leaves are the
 /// server-built artifact -- not even the leaves its own player names, and

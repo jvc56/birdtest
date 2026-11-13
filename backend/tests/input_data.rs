@@ -327,6 +327,10 @@ async fn a_staged_import_writes_its_diff_and_no_input_data() {
 /// `known` and not inserted again; a known path with different bytes is
 /// reported `collision` and inserted as the new row it is. The import says
 /// which was which, and the confirmation how many it inserted.
+///
+/// A known row that names no object -- a win% model imported before the
+/// server stored them -- names it once the import has run, confirmed or not:
+/// the bytes are the row's by digest and are in the store by then.
 #[tokio::test]
 async fn confirming_inserts_what_is_new_and_reports_what_was_already_there() {
     let db = TestDb::new().await;
@@ -372,6 +376,23 @@ async fn confirming_inserts_what_is_new_and_reports_what_was_already_there() {
             ("lexica/NWL23.kwg".into(), "new".into()),
             ("lexica/NWL23.klv2".into(), "new".into()),
         ])
+    );
+
+    let winpct_bytes = fixture_file("strategy/winpct.csv");
+    let backfilled: Option<String> =
+        sqlx::query_scalar("SELECT object_key FROM input_data WHERE id = $1")
+            .bind(known)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        backfilled,
+        Some(format!("inputs/{}", sha(&winpct_bytes))),
+        "a known row gains its object before anything is confirmed"
+    );
+    assert_eq!(
+        state.artifacts.get(backfilled.as_deref().unwrap()).await.unwrap(),
+        winpct_bytes
     );
 
     let (status, confirmed) = admin.confirm(import).await;
@@ -455,9 +476,9 @@ async fn only_server_read_roles_keep_their_bytes_and_the_schema_insists() {
     assert!(definition.contains("content IS NOT NULL"), "{definition}");
 }
 
-/// I-INPUT-8: `kwg` and `klv` rows carry an `object_key` -- the digest -- and
-/// their bytes are in the object store under it; `winpct`, `letterdist` and
-/// `layout` rows carry none, and nothing else is uploaded. Re-importing a
+/// I-INPUT-8: `kwg`, `klv` and `winpct` rows carry an `object_key` -- the
+/// digest -- and their bytes are in the object store under it; `letterdist`
+/// and `layout` rows carry none, and nothing else is uploaded. Re-importing a
 /// tarball whose lexica have not changed uploads nothing: the objects are
 /// found by key and left as they are.
 #[tokio::test]
@@ -477,7 +498,7 @@ async fn lexica_and_leaves_are_stored_once_by_digest() {
     let mut stored = Vec::new();
     for (path, role, key) in rows {
         match role.as_str() {
-            "kwg" | "klv" => {
+            "kwg" | "klv" | "winpct" => {
                 let key = key.unwrap_or_else(|| panic!("{path} names its object"));
                 assert_eq!(key, format!("inputs/{}", sha(&fixture_file(&path))), "{path}");
                 assert_eq!(state.artifacts.get(&key).await.unwrap(), fixture_file(&path), "{path}");
@@ -489,7 +510,7 @@ async fn lexica_and_leaves_are_stored_once_by_digest() {
     stored.sort();
     let mut keys = bucket.keys().await;
     keys.sort();
-    assert_eq!(keys, stored, "only the lexicon and its leaves were uploaded");
+    assert_eq!(keys, stored, "only the lexicon, its leaves and the win% model were uploaded");
 
     // Marks the stored objects, then imports the same lexica again: an upload
     // would replace the marks.

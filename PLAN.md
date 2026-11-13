@@ -2108,18 +2108,26 @@ is the first thing that breaks.
    does not pin, so no job can be made on it: the worker checks every name a
    task carries and fails the task (after claiming it) otherwise, so a job
    pinned to `CSW24.v2` would have stopped every worker it reached.
-4. Upload every `kwg` and `klv` entry's bytes to the object store, keyed by
+4. Upload every `kwg`, `klv` and `winpct` entry's bytes to the object store, keyed by
    digest, while the archive is still in memory — re-downloading 190 MB at
    confirmation time for files already hashed would be pure waste. The server
-   builds reference wordmaps, rack info tables and word info tables from these;
-   a `winpct` file is neither read nor built from server-side, so it stays
-   digest-only. An object already present is skipped, so a tarball whose
-   lexica have not changed uploads nothing. This happens **before** anything is staged: a row that names
+   builds reference wordmaps, rack info tables and word info tables from the first two,
+   and serves any of the three to a worker whose own copy is not the one a job pins
+   ([`GET /api/worker/input`](#get-apiworkerinputsha256digest)); a `winpct` file is
+   neither read nor built from server-side and is stored for that alone (from 2026-11;
+   before, it stayed digest-only). An object already present is skipped, so a tarball whose
+   files have not changed uploads nothing. This happens **before** anything is staged: a row that names
    an object has to be a row whose object is there, or the first derived build
    from it fails with a missing key instead of a reason.
 5. Compare each `(path, sha256)` against `input_data`. Stage the result, keeping
    the bytes of every `letterdist` and `layout` entry, and the object key of
-   every `kwg` and `klv` entry, so confirmation does not have to download again.
+   every `kwg`, `klv` and `winpct` entry, so confirmation does not have to download again.
+   A row already known that names no object — a win% model imported before
+   they were stored — is given the key here, since its object is in the store
+   by now and is those bytes by digest; and every job's remembered template is
+   dropped (`JobTemplates::forget_all`), because whether a file can be fetched
+   from the server is part of what a claim states. So importing a tarball
+   again, with nothing new in it, is how older rows become fetchable.
 6. Mark the row `staged`, or `failed` with the reason in `error` — or, when
    every file is already known, `nothing_new`, audited as
    `input_data.import_nothing_new`: there is nothing to confirm, and left
@@ -2308,16 +2316,41 @@ time no other worker could be claiming from that job. Task requests still carry
    collides when a file is replaced with different bytes of the same size inside
    one mtime tick, which is exactly what archive extraction does, and a stale
    cache entry is the one way a bad file passes verification.
-3. **Any missing or mismatched file:** `POST /api/worker/decline` with the
-   details, add the `job_id` to an in-memory unsupported set, do not start the
+3. **A missing or mismatched file the server can send is fetched** (MAGPIE
+   0.1.6). Each entry states its size (`bytes`) and where it can be had
+   (`sources`; a source that starts with `/` is a path on the birdtest server,
+   and it is [`GET /api/worker/input`](#get-apiworkerinputsha256digest)). If
+   every file the contributor lacks has a source this build can use, each is
+   fetched, kept only if it is `bytes` long and hashes to `sha256`, and
+   written into a directory of its own inside the first data path —
+   `birdtest/<16 hex>/`, laid out as a data directory is, the name a digest of
+   the files fetched — never over the contributor's own file. The task then
+   runs with that directory ahead of the contributor's in its data paths, so
+   the fetched file keeps its name, the tables built from it are written
+   beside it, and everything else is read from where it was. The directory is
+   kept: the next task of the job, or of any job that needs the same files,
+   finds them there and asks for nothing. The heartbeat starts with the first
+   fetch, since a download is not milliseconds.
+
+   This exists because a job pins bytes and a tarball is only where a
+   contributor usually has them from. MAGPIE-DATA rebuilt `data-20260925` in
+   place on 2026-11-02 with new leaves for every lexicon; the CSW24 jobs went
+   on pinning the leaves it replaced, which no download installed any more,
+   and the advice a declined worker was given — run `download_data.sh` —
+   reinstalled the file it had just been declined for (MAGPIE issue 982).
+4. **Any missing or mismatched file that cannot be fetched** — a source-less
+   entry (a file the server does not hold, or a MAGPIE before 0.1.6, which
+   reads no `sources`), a download that fails or is not the pinned bytes, or
+   one such file among several: `POST /api/worker/decline` with the
+   details (only the files that could not be had), add the `job_id` to an in-memory unsupported set, do not start the
    heartbeat, do not run the task, and go straight back to claiming. Print one
    line per newly-discovered gap — keyed by (resolved path, expected digest), so
    the first occurrence logs at warn and repeats are silent until the key
    changes. Not once per claim, or a client with a missing lexicon becomes a log
    firehose.
-4. **All files match:** proceed as normal — heartbeat, execute, submit.
-5. Send the unsupported set with every subsequent claim.
-6. **On a `shutdown` directive:** print the accumulated gaps, which the client
+5. **All files match:** proceed as normal — heartbeat, execute, submit.
+6. Send the unsupported set with every subsequent claim.
+7. **On a `shutdown` directive:** print the accumulated gaps, which the client
    knows file by file, followed by the server's message and the
    `download_data.sh` remedy, then exit cleanly through the `ErrorStack` the
    other `impl_*` entry points use, so a GUI driving `contribute` in `-mode
@@ -4261,8 +4294,10 @@ not silently inherit whatever a user last set for simulation.
 3. **Verify the input data.** Resolve every `expected_data` entry through
    `data_filepaths_get_readable_filename` — the same lookup the executor uses, so
    the check cannot certify a different file from the one that loads — hash it,
-   and compare. Any file missing or mismatched: decline, record the job as
-   unsupported, and claim again without starting the heartbeat or running the
+   and compare. A file missing or mismatched is fetched from the source the
+   entry names, into a directory of its own that the task reads ahead of the
+   contributor's data; if any such file cannot be fetched: decline, record the job as
+   unsupported, and claim again without running the
    task. An assignment with no `expected_data`, or one naming an `algorithm`
    other than `sha256`, or listing a file without a role, name or digest, or
    with a role this build does not know, fails the claim like any malformed
@@ -4855,7 +4890,9 @@ MAGPIE's defaults fixes it).
     "algorithm": "sha256",
     "files": [
       { "role": "kwg", "name": "NWL23", "path": "lexica/NWL23.kwg",
-        "sha256": "3e74af98...", "tarball_date": "20260925" }
+        "sha256": "3e74af98...", "tarball_date": "20260925",
+        "bytes": 4719596,
+        "sources": ["/api/worker/input?sha256=3e74af98..."] }
     ]
   },
   "task_request": { "job_type": "games", "...": "..." }
@@ -4865,9 +4902,15 @@ MAGPIE's defaults fixes it).
 `expected_data` lists every file this task will load — the deduplicated union over
 the job and its players — with the digest the job pins. `role` and `name` are what
 the client resolves through `data_filepaths`; `path` and `tarball_date` are for the
-message it prints when something does not match. No entry states a size, here or in
-`derived`: the client reads none (the thirty-third audit removed a `bytes` key that
-every entry carried and nothing on the worker side read). A `leave_generation` task carries
+message it prints when something does not match. `bytes` and `sources` are for a
+client whose own copy is missing or is other bytes: the file's size, and where it can
+be fetched, best first — today one entry, this server's
+[`GET /api/worker/input`](#get-apiworkerinputsha256digest), or none when the server
+holds no copy (a win% model imported before 2026-11, until its tarball is imported
+again). It is a list so that another place can be added without changing the shape;
+a client skips a source it cannot use. MAGPIE reads both from 0.1.6; an older one
+ignores them. (The thirty-third audit removed a `bytes` key that every entry carried
+and nothing on the worker side read; this one is read.) A `leave_generation` task carries
 exactly three entries: `kwg`, `letterdist`, `layout`.
 
 `job_name` and `max_task_seconds` are always present. `job_name` is what the
@@ -5095,6 +5138,21 @@ Server-side validation, so the client must satisfy it:
 
 Returns `application/octet-stream`. Only keys the server itself minted resolve;
 anything else is `404`. Used for a generation's KLV.
+
+#### `GET /api/worker/input?sha256=<digest>`
+
+Returns `application/octet-stream`: the bytes of the `input_data` file with that
+SHA-256 — a lexicon, leaves file or win% model from the object store
+(`inputs/<digest>`), a letter distribution or layout from its row. `404` for a
+digest no row has, for a row whose bytes the server does not hold, and for
+anything that is not 64 lowercase hex digits; an object-store failure is `503`
+with `Retry-After`, as for an artifact. The digest is looked up and never
+becomes an object key itself. Any imported file can be fetched, pinned by a
+job or not: it is all MAGPIE-DATA's, which is public. The last few objects
+served are kept in memory, apart from the leave KLVs' (`recent_artifacts`), so
+a job whose pinned file few workers have costs one object-store read, not one
+per worker. The worker verifies what it receives; see
+[Capability negotiation](#capability-negotiation).
 
 #### `GET /api/worker/client-version`
 
@@ -5521,7 +5579,7 @@ In-memory token buckets, per process, reset on restart.
 | `POST /api/auth/login` | 10 / minute, and 100 / minute | Client IP; and, separately, the account the name matched (or, for a name that matches none, the name) from anywhere — ten times the address's, so that one address cannot lock an account out |
 | `POST /api/auth/reset-password/request` | 5 / hour | Client IP **and**, separately, the address asked for |
 | `POST /api/worker/task` | 1 / second, **burst 5** | Per credential: the API key (`k:<the key's SHA-256>`) or the anonymous UUID (`a:<uuid>`). Claims only. A worker runs one task at a time, so this caps a job whose tasks take under a second — a small batch of static games — at about a task a second per worker (KL-93). |
-| `POST /api/worker/{result,heartbeat,decline}`, `GET /api/worker/artifact` | 1 / second, **burst 5** | Per credential again, in a second bucket (`…#work`): work in hand never waits behind claims — idle machines sharing a key or a copied `uuid` took every token, and a busy one's heartbeats, sent once and never retried, were refused until its claim lapsed (thirty-first audit). So one credential makes up to two requests a second, five and five in a burst. Per key, not per account: keyed on the account, every machine a contributor ran under it shared one request a second, and six idle machines used it all. (An account-wide bucket beside it, 10 / second, was too tight for the hundred keys an account may hold: fifty idle machines filled it, and heartbeats, which are not retried, lapsed. Key churn is bounded at creation instead, below) |
+| `POST /api/worker/{result,heartbeat,decline}`, `GET /api/worker/{artifact,input}` | 1 / second, **burst 5** | Per credential again, in a second bucket (`…#work`): work in hand never waits behind claims — idle machines sharing a key or a copied `uuid` took every token, and a busy one's heartbeats, sent once and never retried, were refused until its claim lapsed (thirty-first audit). So one credential makes up to two requests a second, five and five in a burst. Per key, not per account: keyed on the account, every machine a contributor ran under it shared one request a second, and six idle machines used it all. (An account-wide bucket beside it, 10 / second, was too tight for the hundred keys an account may hold: fifty idle machines filled it, and heartbeats, which are not retried, lapsed. Key churn is bounded at creation instead, below) |
 | `PATCH /api/me/api-keys/:id` resuming a key (`is_active: true`) | 60 / hour, **burst 100** | The account (`key_changes`). Suspending is not limited: an owner shutting keys after a takeover is never held back by a thief who drained the bucket, and a back-and-forth needs both. Only a change writes an audit row |
 | `POST /api/me/api-keys` | 10 / hour, **burst 100** | The account. Each key is a worker bucket of its own and revoking one frees a slot under the hundred-key cap, so unmetered churn was unmetered new capacity. The burst is the cap, so a contributor setting up a machine per key is not held back (at ten an hour from the start, fifty machines took five hours); what refills slowly is revoke-and-recreate |
 | `POST /api/worker/task` with no identity | 5 / second, **burst 30** | Client IP, shared by every new contributor behind one address until each is issued a UUID |
@@ -5687,6 +5745,7 @@ log exists to keep.
 | `POST` | `/api/worker/heartbeat` | Keep-alive ping for a claimed task. Updates `last_heartbeat_at`. |
 | `POST` | `/api/worker/result` | Submit the result for a claimed task. Requires the claim token. |
 | `GET` | `/api/worker/artifact?key=<artifact-key>` | Download a stored artifact — in v1, a generation's combined KLV for a leave-generation task. Proxied through the server so contributors never need AWS credentials; only keys the server itself minted are reachable. |
+| `GET` | `/api/worker/input?sha256=<digest>` | Download an input file a job pins, by digest, for a worker whose own copy is missing or is other bytes. Any file the import stored; proxied the same way. |
 
 The full request and response shapes are in [The Worker API Contract](#the-worker-api-contract).
 

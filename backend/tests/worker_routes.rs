@@ -400,11 +400,17 @@ async fn a_claim_states_its_digests_and_a_missing_data_decline_releases_it_at_on
     // Two static players on two lexicons of their own, one bag, one board.
     assert_eq!(roles, ["klv", "klv", "kwg", "kwg", "layout", "letterdist"], "{assignment}");
     for file in files {
-        // What MAGPIE reads, and nothing it does not: a size the client never
-        // looks at is a field to keep in step for no one.
+        // What MAGPIE reads, and nothing it does not: a field the client
+        // never looks at is one to keep in step for no one. (`bytes` and
+        // `sources` are read from MAGPIE 0.1.6, which fetches a file it does
+        // not have.)
         let mut keys: Vec<&str> = file.as_object().unwrap().keys().map(String::as_str).collect();
         keys.sort_unstable();
-        assert_eq!(keys, ["name", "path", "role", "sha256", "tarball_date"], "{file}");
+        assert_eq!(
+            keys,
+            ["bytes", "name", "path", "role", "sha256", "sources", "tarball_date"],
+            "{file}"
+        );
         let (sha256, date): (String, String) = sqlx::query_as(
             "SELECT sha256, tarball_date FROM input_data WHERE path = $1 AND role = $2",
         )
@@ -1008,6 +1014,104 @@ async fn an_artifact_is_served_only_under_a_key_the_server_minted() {
 
     // And only for a worker the server knows.
     let (status, _) = send(&app, get_request(&format!("/api/worker/artifact?key={minted}"), &[])).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// A-WORKER-31: a pinned input file is served by its digest -- a lexicon,
+/// leaves file or win% model from the object store, a letter distribution or
+/// layout from its row -- byte for byte, to a worker the server knows. A
+/// digest no row has, a row whose bytes the server does not hold, and
+/// anything that is not a digest are all `404`: the digest is looked up, and
+/// never becomes an object key itself.
+#[tokio::test]
+async fn a_pinned_input_file_is_served_by_its_digest() {
+    use sha2::{Digest, Sha256};
+    let db = TestDb::new().await;
+    let (state, _bucket) = db.state_with_object_store().await;
+    let app = birdtest::app(state.clone());
+    let sha = |bytes: &[u8]| hex::encode(Sha256::digest(bytes));
+
+    let leaves: Vec<u8> = (0..90_000u32).map(|i| (i.wrapping_mul(2_246_822_519) >> 9) as u8).collect();
+    let leaves_sha = sha(&leaves);
+    let key = birdtest::inputdata::input_object_key(&leaves_sha);
+    state.artifacts.put(&key, leaves.clone()).await.unwrap();
+    sqlx::query(
+        "INSERT INTO input_data (path, role, name, sha256, bytes, tarball_date, object_key)
+         VALUES ('lexica/CSW24.klv2', 'klv', 'CSW24', $1, $2, '20260925', $3)",
+    )
+    .bind(&leaves_sha)
+    .bind(leaves.len() as i64)
+    .bind(&key)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let dist = b"A,9,1,1\n".to_vec();
+    let dist_sha = sha(&dist);
+    sqlx::query(
+        "INSERT INTO input_data (path, role, name, sha256, bytes, tarball_date, content)
+         VALUES ('letterdistributions/tiny.csv', 'letterdist', 'tiny', $1, $2, '20260925', $3)",
+    )
+    .bind(&dist_sha)
+    .bind(dist.len() as i64)
+    .bind(&dist)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    // A win% model from before they were stored: a row, and no bytes.
+    let unstored = sha(b"a win% model nobody kept");
+    sqlx::query(
+        "INSERT INTO input_data (path, role, name, sha256, bytes, tarball_date)
+         VALUES ('strategy/winpct.csv', 'winpct', 'winpct', $1, 24, '20251004')",
+    )
+    .bind(&unstored)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    // In the bucket, and no input file.
+    state.artifacts.put("backups/secret.dump", b"not for workers".to_vec()).await.unwrap();
+
+    // A worker's requests share one rate-limit bucket of five (A-WORKER-14),
+    // so the refusals below are asked for by a second one.
+    let worker = registered_worker(&db).await;
+    let other = registered_worker(&db).await;
+    let fetch_as = |worker: &str, sha256: &str| {
+        Request::get(format!("/api/worker/input?sha256={sha256}"))
+            .header("x-worker-uuid", worker)
+            .body(Body::empty())
+            .unwrap()
+    };
+    let fetch = |sha256: &str| fetch_as(&worker, sha256);
+    // What an assignment names as the file's source is this route.
+    assert_eq!(
+        birdtest::jobs::input_source(&leaves_sha),
+        format!("/api/worker/input?sha256={leaves_sha}")
+    );
+
+    let (status, headers, body) = raw(&app, fetch(&leaves_sha)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["content-type"], "application/octet-stream");
+    assert_eq!(body, leaves, "the leaves came back altered");
+    let (status, _, body) = raw(&app, fetch(&dist_sha)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, dist, "the distribution came back altered");
+
+    for digest in [
+        unstored.clone(),
+        sha(b"nothing anybody imported"),
+        leaves_sha.to_uppercase(),
+        leaves_sha[..63].to_string(),
+        "backups/secret.dump".to_string(),
+        "../backups/secret.dump".to_string(),
+    ] {
+        let asker = if digest == unstored { &worker } else { &other };
+        let (status, body) = send(&app, fetch_as(asker, &digest)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{digest}: {body}");
+        assert_eq!(message(&body), "no such input file", "{digest}: {body}");
+    }
+
+    // And only for a worker the server knows.
+    let (status, _) =
+        send(&app, get_request(&format!("/api/worker/input?sha256={leaves_sha}"), &[])).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 

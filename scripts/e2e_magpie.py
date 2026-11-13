@@ -15,8 +15,11 @@ Each case is selectable with `--cases` (default: every M case):
   included, matching a rack of the universe -- and nothing is written into
   MAGPIE's data directory. Real English, so creating the job seeds a 3.2M-rack
   universe: the slow one.
-- `M-5` A worker whose data does not match the job's digests declines with
-  `missing_data`, the gap reaches `worker_data_gaps`, and nothing is stored.
+- `M-5` A worker whose data does not match the job's digests, for a file the
+  server cannot send it, declines with `missing_data`, the gap reaches
+  `worker_data_gaps`, and nothing is stored. (From MAGPIE 0.1.6 the file is
+  the job's leaves with their object taken off the row; before it, the letter
+  distribution, which that MAGPIE could not fetch.)
 - `M-6` A worker below a job's version floor never runs it. The real server
   filters on the floor before dispatching, so the worker is told
   `magpie_too_old` and claims nothing; and against a server that hands the job
@@ -52,6 +55,12 @@ Each case is selectable with `--cases` (default: every M case):
   24 concurrent games gives its solves one thread. Given every thread each,
   as before, the solves needed 24 + 24 x 24 move generators of a pool of 512,
   and magpie exited.
+
+- `M-20` A worker whose letter distribution and leaves are not the ones the
+  job pins fetches both from the server, into a directory of its own inside
+  its data directory, and plays: its own files are untouched, the fetched
+  ones have the pinned digests, nothing is declined, and a second run fetches
+  nothing. Skipped below MAGPIE 0.1.6.
 
 And one case that is not a test: `capture` runs one job of each type through
 `scripts/capture_contract.py`'s recording proxy and writes the contract
@@ -382,17 +391,22 @@ def link_tree(source: Path, target: Path, skip: Callable[[Path], bool]) -> None:
     """`target` as a directory of symlinks to `source`'s files, less `skip`."""
     target.mkdir(parents=True, exist_ok=True)
     for entry in sorted(source.iterdir()):
+        if skip(entry):
+            continue
         if entry.is_dir():
             link_tree(entry, target / entry.name, skip)
-        elif not skip(entry):
+        else:
             (target / entry.name).symlink_to(entry.resolve())
 
 
 def derived_file(path: Path) -> bool:
-    # Anything a worker builds for itself: a wordmap, a rack info table, a word
-    # info table, and leave generation's outputs.
+    # Anything a worker builds or fetches for itself: a wordmap, a rack info
+    # table, a word info table, leave generation's outputs, and the pinned
+    # input files a contribute run fetched into `data/birdtest/` (which an
+    # install whose own files are not the server's has, after any run).
     return (path.name.endswith((".wmp", ".rit", ".wit", "_report.txt"))
-            or "_gen_" in path.name)
+            or "_gen_" in path.name
+            or (path.name == "birdtest" and path.is_dir()))
 
 
 class Worker:
@@ -789,33 +803,113 @@ def case_leave(ctx: Context) -> None:
 # --- M-5 to M-11 -------------------------------------------------------------
 
 
+# The first MAGPIE that fetches a pinned file it does not have.
+FETCH_MIN_MAGPIE = "0.1.6"
+
+
+def fetches_inputs(ctx: Context) -> bool:
+    return seed.version_key(magpie_version(ctx)) >= seed.version_key(FETCH_MIN_MAGPIE)
+
+
 def case_missing_data(ctx: Context) -> None:
-    """M-5: a worker whose english.csv differs from the one the job pins
-    declines with `missing_data` rather than contributing."""
+    """M-5: a worker whose copy of a file differs from the one the job pins,
+    and that cannot get the pinned one from the server, declines with
+    `missing_data` rather than contributing.
+
+    A MAGPIE that fetches (0.1.6) is given a file the server does not hold:
+    the job's leaves, with the object taken off their row for the length of
+    the case -- what a win% model imported before the server stored them
+    looks like. An older one cannot fetch anything, so any file will do, and
+    it keeps the letter distribution it has always been tested with."""
     deactivate_everything(ctx)
+    fetching = fetches_inputs(ctx)
+    row = ctx.data["klv"] if fetching else ctx.data["letterdist"]
+    role, name, inside = ctx.psql(
+        f"SELECT role || ' ' || name || ' ' || path FROM input_data WHERE id = '{row}'").split()
+    if fetching:
+        ctx.psql(f"UPDATE input_data SET object_key = NULL WHERE id = '{row}'")
+    # Created after the row lost its object: a job's expected files, with
+    # where each can be fetched, are read once per job.
     job_id = create_and_activate(ctx, ctx.data, games_body(static_players(ctx), 2))
-    worker = Worker(ctx, "m5", altered={"letterdistributions/english.csv": b"\n"})
+    worker = Worker(ctx, "m5", altered={inside: b"\n"})
     try:
         output = worker.run(tasks=1, succeed=False)
-        actual = sha256_file(worker.data / "letterdistributions" / "english.csv")
-        expected = ctx.psql("SELECT sha256 FROM input_data "
-                            f"WHERE id = '{ctx.data['letterdist']}'")
-        expect(actual != expected, "the altered english.csv still matches")
+        actual = sha256_file(worker.data / inside)
+        expected = ctx.psql(f"SELECT sha256 FROM input_data WHERE id = '{row}'")
+        expect(actual != expected, f"the altered {inside} still matches")
 
         expect(claim_states(ctx, job_id) == ["declined"],
                f"expected one declined claim, found {claim_states(ctx, job_id)}:\n{output[-2000:]}")
         expect(decline_reasons(ctx, job_id) == ["missing_data"],
                f"decline reasons: {decline_reasons(ctx, job_id)}")
         gaps = data_gaps(ctx, job_id)
-        expect(gaps == [["letterdist", "english", expected, actual]],
-               f"worker_data_gaps: {gaps}, expected english with {expected} / {actual}")
+        expect(gaps == [[role, name, expected, actual]],
+               f"worker_data_gaps: {gaps}, expected {name} with {expected} / {actual}")
         expect(stored_results(ctx, job_id) == 0, "a result was stored for a declined task")
+        expect(not (worker.data / "birdtest").exists(),
+               "a worker that fetched nothing made a directory for fetched files")
         # The job is now in the worker's unsupported set, and it is the only
         # one active: the server's answer is a data shutdown, and MAGPIE stops.
         expect("Cannot contribute to any available job" in output
                and "download_data.sh" in output,
                f"MAGPIE did not report the data shutdown:\n{output[-2000:]}")
-        log("M-5: declined with missing_data; the gap names english.csv with both digests")
+        log(f"M-5: declined with missing_data; the gap names {inside} with both digests")
+    finally:
+        delete_job(ctx, job_id)
+        worker.remove()
+        if fetching:
+            ctx.psql("UPDATE input_data SET object_key = 'inputs/' || sha256 "
+                     f"WHERE id = '{row}'")
+
+
+def case_fetched_inputs(ctx: Context) -> None:
+    """M-20: a worker whose letter distribution and leaves are not the ones
+    the job pins fetches both from the server and plays, leaving its own files
+    as they were."""
+    if not fetches_inputs(ctx):
+        log(f"M-20: skipped: MAGPIE {magpie_version(ctx)} is older than {FETCH_MIN_MAGPIE}, "
+            "the first that fetches a pinned file")
+        return
+    deactivate_everything(ctx)
+    pinned = {}
+    for row in (ctx.data["letterdist"], ctx.data["klv"]):
+        inside, digest = ctx.psql(
+            f"SELECT path || ' ' || sha256 FROM input_data WHERE id = '{row}'").split()
+        pinned[inside] = digest
+    job_id = create_and_activate(ctx, ctx.data, games_body(static_players(ctx), 2))
+    # One from the row (the distribution) and one from the object store (the
+    # leaves): the two places the server keeps a file's bytes.
+    worker = Worker(ctx, "m20", altered={inside: b"\n" for inside in pinned})
+    own = {inside: sha256_file(worker.data / inside) for inside in pinned}
+    try:
+        output = worker.run(ctx.args.tasks)
+        claims = completed_claims(ctx, job_id)
+        expect(claims >= ctx.args.tasks,
+               f"{claims} accepted claims, expected at least {ctx.args.tasks}:\n{output[-3000:]}")
+        expect(decline_reasons(ctx, job_id) == [],
+               f"declined: {decline_reasons(ctx, job_id)}:\n{output[-3000:]}")
+        expect(data_gaps(ctx, job_id) == [], f"worker_data_gaps: {data_gaps(ctx, job_id)}")
+        directories = list((worker.data / "birdtest").iterdir())
+        expect(len(directories) == 1,
+               f"one directory of fetched files, found {[d.name for d in directories]}")
+        for inside, digest in pinned.items():
+            expect(f"fetched {inside} from the server" in output,
+                   f"no line says {inside} was fetched:\n{output[-3000:]}")
+            expect(sha256_file(directories[0] / inside) == digest,
+                   f"the fetched {inside} is not the pinned file")
+            expect(sha256_file(worker.data / inside) == own[inside],
+                   f"the worker's own {inside} was written over")
+        fetched = {str(path.relative_to(directories[0]))
+                   for path in directories[0].rglob("*") if path.is_file()}
+        expect(fetched == set(pinned),
+               f"fetched {sorted(fetched)}, expected only {sorted(pinned)}")
+
+        # What it fetched is kept: the next run asks the server for nothing.
+        again = worker.run(1)
+        expect("fetched " not in again, f"a kept file was fetched again:\n{again[-3000:]}")
+        expect(completed_claims(ctx, job_id) > claims, "the second run completed no task")
+        log(f"M-20: fetched {', '.join(sorted(pinned))} and completed "
+            f"{completed_claims(ctx, job_id)} tasks; its own files are untouched")
     finally:
         delete_job(ctx, job_id)
         worker.remove()
@@ -1197,6 +1291,28 @@ def case_rack_info_table(ctx: Context) -> None:
         expect(stats["games"]["units_completed"] == 4, f"games: {stats['games']}")
         log(f"M-10: dispatched only after the build; the worker's {table}.rit matches "
             f"{server_hash[:12]} and played 4 games with it")
+
+        # A worker whose leaves are not the job's fetches them (MAGPIE 0.1.6)
+        # and builds the table from the fetched file, beside it: the same
+        # bytes as the server's, and nothing built into its own lexica, where
+        # a table of that name would be one made from its own leaves.
+        if fetches_inputs(ctx):
+            worker.remove()
+            worker = Worker(ctx, "m10-fetch", small=True,
+                            altered={"lexica/CSW21_ab.klv2": b"\0"})
+            output = worker.run(tasks=1)
+            expect("fetched lexica/CSW21_ab.klv2 from the server" in output,
+                   f"the leaves were not fetched:\n{output[-3000:]}")
+            built = list(worker.data.rglob(f"{table}.rit"))
+            expect(len(built) == 1 and built[0].parent.parent.parent.name == "birdtest",
+                   f"expected one {table}.rit, beside the fetched leaves: {built}")
+            expect(sha256_file(built[0]) == server_hash,
+                   f"the table built from fetched leaves, {sha256_file(built[0])}, "
+                   f"is not the server's {server_hash}")
+            expect(completed_claims(ctx, job_id) == 3,
+                   f"the worker with fetched leaves completed no task:\n{output[-3000:]}")
+            log("M-10: a worker with other leaves fetched the job's and built the same table "
+                "from them, apart from its own data")
     finally:
         remove_small_data(ctx)
         if worker:
@@ -1302,9 +1418,11 @@ def case_derived_mismatch(ctx: Context) -> None:
         gaps = data_gaps(ctx, job_id)
         expect(gaps == [["wmp", "NWL23", altered, original]],
                f"worker_data_gaps: {gaps}, expected wmp NWL23 {altered} / {original}")
-        built = worker.data / "lexica" / "NWL23.wmp"
-        expect(built.is_file() and sha256_file(built) == original,
-               "the worker's own wordmap is not the one the server built")
+        # In its lexica, or beside a pinned file it fetched (an install whose
+        # leaves are not the server's): wherever its builds go.
+        built = list(worker.data.rglob("NWL23.wmp"))
+        expect(len(built) == 1 and sha256_file(built[0]) == original,
+               f"the worker's own wordmap is not the one the server built: {built}")
         expect(stored_results(ctx, job_id) == 0, "a result was stored for a declined task")
         log("M-11: declined with derived_mismatch; both digests reached worker_data_gaps")
     finally:
@@ -1543,6 +1661,7 @@ CASES = {
     "M-17": case_solvers_many_threads,
     "M-18": case_movegen_budget,
     "M-19": case_best_attempt_tables,
+    "M-20": case_fetched_inputs,
     "capture": case_capture,
 }
 DEFAULT_CASES = [name for name in CASES if name.startswith("M-")]

@@ -198,11 +198,21 @@ impl JobTemplates {
         Ok(template)
     }
 
-    /// Drop a job's entry. Only a deleted job has one that is no longer
-    /// wanted; nothing else can make a remembered template wrong.
+    /// Drop a job's entry. A deleted job has one that is no longer wanted;
+    /// see [`Self::forget_all`] for the one thing that makes a kept one stale.
     pub fn forget(&self, job_id: Uuid) {
         self.0.lock().expect("job template cache poisoned").remove(&job_id);
         self.1.lock().expect("job template cache poisoned").remove(&job_id);
+    }
+
+    /// Drop every entry, to be read again by the next claim. For an import
+    /// that gave an `input_data` row the object it lacked: what a job pins is
+    /// unchanged, but whether the server can serve it (`ExpectedFile::sources`)
+    /// is part of the template, and a job read before the import would go on
+    /// telling workers the file cannot be fetched until the process restarted.
+    pub fn forget_all(&self) {
+        self.0.lock().expect("job template cache poisoned").clear();
+        self.1.lock().expect("job template cache poisoned").clear();
     }
 
     #[cfg(test)]

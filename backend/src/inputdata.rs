@@ -148,19 +148,24 @@ fn keeps_content(role: &str) -> bool {
     matches!(role, "letterdist" | "layout")
 }
 
-/// Roles whose bytes go to the object store, because the server builds derived
-/// files from them.
+/// Roles whose bytes go to the object store: the files a worker cannot do
+/// without and that are too large for a row.
 ///
 /// Not the row, unlike [`keeps_content`]: a 6 MB lexicon and a 3.7 MB KLV per
 /// row is a different proposition from a 489-byte distribution, nothing
 /// queries their contents, and a full tarball is fifty of each. The key is the
 /// digest, so two tarballs carrying the same lexicon upload it once.
 ///
-/// Win% models stay out. The server neither reads one nor builds anything from
-/// one -- only a simulating player on a worker opens it -- so storing it would
-/// be 800 KB a row for nothing.
+/// The server builds derived files from a lexicon and its leaves, and it
+/// serves any of the three to a worker whose own copy is not the one a job
+/// pins (`/api/worker/input`). A win% model is here for the second reason
+/// alone: the server neither reads one nor builds from one, but a job that
+/// pins bytes no tarball carries any more is a job nobody new can run unless
+/// the server can hand them over. Until 2026-11 win% models were not stored;
+/// a row imported before then gets its object from the next import of a
+/// tarball that carries the same bytes (see `stage`).
 fn stores_object(role: &str) -> bool {
-    matches!(role, "kwg" | "klv")
+    matches!(role, "kwg" | "klv" | "winpct")
 }
 
 /// The object-store key for a file's bytes. Keyed by digest, not by path:
@@ -1013,8 +1018,8 @@ async fn finish_staging(pool: &sqlx::PgPool, import_id: Uuid, tarball_sha256: &s
     Ok(())
 }
 
-/// Puts every lexicon and leaves file into the object store, and takes its
-/// bytes back out of memory.
+/// Puts every lexicon, leaves file and win% model into the object store, and
+/// takes its bytes back out of memory.
 ///
 /// Uploaded at staging time because that is when the bytes exist: the archive
 /// is in memory, and re-downloading it at confirmation would mean fetching
@@ -1036,7 +1041,7 @@ async fn upload_inputs(state: &AppState, files: &mut [ImportedFile]) -> AppResul
         state.artifacts.put(&key, bytes).await?;
         uploaded += 1;
     }
-    tracing::info!(uploaded, "stored lexicon and leaves bytes for derived builds");
+    tracing::info!(uploaded, "stored lexicon, leaves and win% bytes");
     Ok(())
 }
 
@@ -1072,6 +1077,7 @@ async fn stage(
     drop(body);
 
     let mut tx = state.pool.begin().await?;
+    let mut backfilled = 0;
     for file in &files {
         // Three dispositions, and the third is the one that deserves a second
         // look: a path already known under a different digest is either a
@@ -1090,6 +1096,27 @@ async fn stage(
         .bind(&file.sha256)
         .fetch_one(&mut *tx)
         .await?;
+
+        // A row from before its role was stored (a win% model imported before
+        // 2026-11), or one whose key was cleared by hand: the object is in the
+        // store now -- `upload_inputs` has just put it there or found it --
+        // and it is these bytes by construction, so the row can name it. Done
+        // here rather than at confirmation because an import with nothing new
+        // is never confirmed, and that is exactly the import that backfills.
+        if known_exact {
+            if let Some(key) = file.object_key.as_deref() {
+                backfilled += sqlx::query(
+                    "UPDATE input_data SET object_key = $3
+                     WHERE path = $1 AND sha256 = $2 AND object_key IS NULL",
+                )
+                .bind(&file.path)
+                .bind(&file.sha256)
+                .bind(key)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+            }
+        }
 
         let disposition = if known_exact {
             "known"
@@ -1119,6 +1146,12 @@ async fn stage(
         .await?;
     }
     tx.commit().await?;
+    if backfilled > 0 {
+        tracing::info!(backfilled, "rows that named no object now name the one just stored");
+        // A job read before this told its workers the file could not be
+        // fetched from here; the next claim reads it again.
+        state.templates.forget_all();
+    }
 
     Ok(tarball_sha256)
 }
@@ -1232,14 +1265,15 @@ mod tests {
     }
 
     /// The server builds a reference wordmap from a lexicon and a reference
-    /// rack info table from a lexicon and its leaves, so those two roles have
-    /// to be fetchable afterwards. A win% model is neither read by the server
-    /// nor built from, so storing one would be 800 KB a row for nothing.
+    /// rack info table from a lexicon and its leaves, and serves a worker any
+    /// pinned lexicon, leaves file or win% model it does not have, so all
+    /// three have to be fetchable afterwards. Distributions and layouts are
+    /// served from the row.
     #[test]
-    fn the_roles_a_derived_build_needs_go_to_the_object_store() {
+    fn the_roles_a_build_or_a_worker_needs_go_to_the_object_store() {
         assert!(stores_object("kwg"));
         assert!(stores_object("klv"));
-        assert!(!stores_object("winpct"));
+        assert!(stores_object("winpct"));
         assert!(!stores_object("letterdist"));
         assert!(!stores_object("layout"));
         // Keyed by digest, so the same bytes under two paths are one object
@@ -1255,6 +1289,7 @@ mod tests {
         // server-side reads one.
         assert!(!keeps_content("kwg"));
         assert!(!keeps_content("klv"));
+        // 800 KB, and nothing server-side reads one either: the object store.
         assert!(!keeps_content("winpct"));
     }
 
