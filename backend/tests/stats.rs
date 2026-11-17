@@ -660,20 +660,56 @@ async fn the_stats_cache_follows_admin_changes() {
         serde_json::from_str::<serde_json::Value>(json).unwrap()["job"]["allocation"].clone()
     };
 
-    let first = jobstats::payload(&db.pool, &before, ttl).await.unwrap();
+    let first = jobstats::payload(&db.pool, &before, ttl, ttl).await.unwrap();
     assert_eq!(allocation(&first), json!(50));
     sqlx::query("UPDATE jobs SET allocation = 30 WHERE id = $1").bind(job).execute(&db.pool).await.unwrap();
-    let cached = jobstats::payload(&db.pool, &before, ttl).await.unwrap();
+    let cached = jobstats::payload(&db.pool, &before, ttl, ttl).await.unwrap();
     assert_eq!(allocation(&cached), json!(50), "served from the cache until it is forgotten");
 
     jobstats::forget(job);
     // `before` still says 50: the build reads the row, not the caller's copy.
-    let fresh = jobstats::payload(&db.pool, &before, ttl).await.unwrap();
+    let fresh = jobstats::payload(&db.pool, &before, ttl, ttl).await.unwrap();
     assert_eq!(allocation(&fresh), json!(30));
     // A build that starts after a forget is kept, and so is what a live push
     // sends.
     jobstats::forget(job);
-    assert!(jobstats::refresh_payload(&db.pool, job, ttl).await.unwrap().is_some());
+    assert!(jobstats::refresh_payload(&db.pool, job, ttl, ttl).await.unwrap().is_some());
+}
+
+/// I-STATS-12: the contributor list is kept for its own age, apart from the
+/// payload. A payload built fresh -- for a page or a live push -- carries the
+/// list as last read while the job's counters move on; at zero the list is
+/// read with every build; and `forget` (a purge or a merge among the admin
+/// actions that call it) makes the next build read it again.
+#[tokio::test]
+async fn the_contributor_list_is_kept_apart_from_the_payload() {
+    let db = TestDb::new().await;
+    let job = db.games_job(10).await;
+    let alice = db.user("alice", false).await;
+    let bob = db.user("bob", false).await;
+    let row = jobstats::load_job(&db.pool, job).await.unwrap();
+    let (fresh, kept) = (std::time::Duration::ZERO, std::time::Duration::from_secs(600));
+    let read = |json: &str| -> (usize, serde_json::Value) {
+        let stats: serde_json::Value = serde_json::from_str(json).unwrap();
+        (stats["workers"].as_array().unwrap().len(), stats["tasks_completed"].clone())
+    };
+
+    claim(&db, job, Owner::User(alice), "completed", 5).await;
+    let first = jobstats::payload(&db.pool, &row, fresh, kept).await.unwrap();
+    assert_eq!(read(&first), (1, json!(1)));
+
+    claim(&db, job, Owner::User(bob), "completed", 5).await;
+    let page = jobstats::payload(&db.pool, &row, fresh, kept).await.unwrap();
+    assert_eq!(read(&page), (1, json!(2)), "the counters move on; the list is as last read");
+    let pushed = jobstats::refresh_payload(&db.pool, job, fresh, kept).await.unwrap().unwrap();
+    assert_eq!(read(&pushed), (1, json!(2)), "a live push reads the same list");
+
+    let uncached = jobstats::payload(&db.pool, &row, fresh, fresh).await.unwrap();
+    assert_eq!(read(&uncached), (2, json!(2)), "at zero the list is read every build");
+
+    jobstats::forget(job);
+    let after = jobstats::payload(&db.pool, &row, fresh, kept).await.unwrap();
+    assert_eq!(read(&after), (2, json!(2)), "forget makes the next build read it again");
 }
 
 // ---------------------------------------------------------------------------
@@ -898,7 +934,9 @@ async fn a_stats_build_takes_one_connection() {
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     acquired.store(0, std::sync::atomic::Ordering::SeqCst);
 
-    birdtest::jobstats::refresh_payload(&pool, job, std::time::Duration::ZERO).await.unwrap();
+    birdtest::jobstats::refresh_payload(&pool, job, std::time::Duration::ZERO, std::time::Duration::ZERO)
+        .await
+        .unwrap();
     assert_eq!(acquired.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
@@ -924,7 +962,8 @@ async fn viewers_waiting_on_a_failed_build_are_answered_together() {
         .map(|_| {
             let (pool, job) = (pool.clone(), job.clone());
             tokio::spawn(async move {
-                birdtest::jobstats::payload(&pool, &job, std::time::Duration::from_secs(10)).await
+                birdtest::jobstats::payload(&pool, &job, std::time::Duration::from_secs(10), std::time::Duration::ZERO)
+                    .await
             })
         })
         .collect();

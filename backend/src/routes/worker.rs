@@ -1347,7 +1347,14 @@ async fn push_stats_until_idle(state: &AppState, job_id: Uuid) {
             if let Some(urgent) = state.sse.urgent(job_id) {
                 let _ = futures::FutureExt::now_or_never(urgent.notified());
             }
-            match jobstats::refresh_payload(&state.read_pool, job_id, state.cfg.stats_cache).await {
+            let built = jobstats::refresh_payload(
+                &state.read_pool,
+                job_id,
+                state.cfg.stats_cache,
+                state.cfg.contributors_cache,
+            )
+            .await;
+            match built {
                 Ok(Some(payload)) => {
                     state.sse.publish(job_id, payload);
                     break;

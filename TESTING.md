@@ -2568,6 +2568,13 @@ permanent.
   forgotten (every admin action), and a build reads the job's row itself, so a
   copy read before an admin action is not cached as newer than it. *(Covered:
   `stats::the_stats_cache_follows_admin_changes`.)* (Seventeenth audit.)
+- `I-STATS-12` The contributor list is kept for `contributors_cache`, apart
+  from the payload: a fresh build, for a page or a live push, carries the list
+  as last read while the job's counters move on; at zero it is read every
+  build; and `forget` makes the next build read it again. The list grouped the
+  job's every completed claim on every build: 354k of them for the CSW24
+  opening-rack job, every ~12 s while its page was open. *(Covered:
+  `stats::the_contributor_list_is_kept_apart_from_the_payload`.)* (2026-11-17.)
 
 ### `I-INPUT-*` — input data import (`inputdata.rs`)
 

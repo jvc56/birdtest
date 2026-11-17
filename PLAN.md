@@ -1786,6 +1786,7 @@ start. The process has no SSM code path of its own.
 | `PUBLIC_URL` | `http://localhost:5173` | The base for links in emails; a trailing slash is dropped. Required under `ses`, whose links must reach the real site. |
 | `HEARTBEAT_TIMEOUT_SECONDS` | `300` | How long a claim survives without a heartbeat. 180 to 86,400; anything else fails startup: below MAGPIE's thirty-second cadence a live worker's claim lapses and is handed to the next claimant. 180 is six heartbeats and no more: one heartbeat stalled until MAGPIE gives up on it (about 127 s) leaves some 187 s between recorded ones, and one that crawls lapses its claim at any setting (KL-83). |
 | `JOB_STATS_CACHE_SECONDS` | `10` | How old a job's stats payload (`GET /api/jobs/:id`, the stream's first event) may be, and the least spacing of its live pushes. The payload reads the job's whole history; rebuilt on every view and every second a busy job was watched, it cost about a second of database time per second on a large job. Built one at a time per job; dropped by every admin action on the job, by its completion and by a leave generation closing, so the admin page reloading after an action reads the change. `0` builds it on every request (the tests). |
+| `JOB_CONTRIBUTORS_CACHE_SECONDS` | `300` | How old the contributor list in that payload may be. Kept apart from the rest of it, for longer: it is the one read that groups the job's every completed claim (KL-58). Dropped by `forget` with the payload (a purge or a merge changes it). The totals row beside it is live, so the listed rows can lag it by this much. `0` reads it with every build (the tests). |
 | `S3_BUCKET` | `birdtest-artifacts` | |
 | `S3_ENDPOINT` | unset | Set to MinIO's address locally; the AWS SDK works against it unmodified. |
 | `S3_PUBLIC_ENDPOINT` | unset | The object store as a browser reaches it, when that differs from `S3_ENDPOINT`: export download links are signed for it. The compose stack sets `http://localhost:${MINIO_PORT}`, since its backend reaches MinIO as `minio:9000`; production leaves it unset. |
@@ -9050,10 +9051,16 @@ says so in its implemented option, rather than being removed.
   push overtaken by a page build more (KL-78).
 - **Options considered:** read `task_claims` by `job_id` alone; keep running
   totals per contributor.
-- **Option implemented:** None.
-- **Justification:** Within the "decide on evidence" stance
-  (`SLOW_STATS_THRESHOLD`, one second, logs the whole stats computation this is
-  part of). Revisit when it is logged.
+- **Option implemented:** Partial (2026-11-17): the list is kept for
+  `JOB_CONTRIBUTORS_CACHE_SECONDS` (300) apart from the rest of the payload,
+  so a watched job groups its claims at most once in five minutes, not once
+  per push; production also raised `JOB_STATS_CACHE_SECONDS` to 60. The list
+  can lag the totals row by that much.
+- **Justification:** It was logged. The CSW24 opening-rack job's builds,
+  grouping 354k claims every ~12 s while its page was open, took 1-5 s, then up
+  to 97 s once the db.t3.micro ran short of memory and EBS credits; its page
+  and `/api/workers` (on the same eight-connection display pool) answered
+  `503`. The running totals remain the fix that stops it growing at all.
 
 ### Abuse and input
 
