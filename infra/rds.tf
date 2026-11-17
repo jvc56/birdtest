@@ -50,6 +50,18 @@ resource "aws_db_parameter_group" "main" {
     value = tostring(var.db_max_wal_size_mb)
   }
 
+  # RDS sets 2048 MB by default: that much spent WAL kept on the volume past
+  # checkpoints, for a standby streaming from this server to catch up from.
+  # Nothing streams from it -- no read replica, and Multi-AZ replicates at the
+  # block level -- and point-in-time recovery reads the WAL RDS archives to
+  # S3, never these copies. So it was 2.35 GB of the 20 GB volume held flat
+  # for nothing, found on 2026-11-17 with the volume down to 2.4 GB free. Revisit
+  # before adding a read replica.
+  parameter {
+    name  = "wal_keep_size" # in MB
+    value = "0"
+  }
+
   lifecycle {
     create_before_destroy = true
   }
