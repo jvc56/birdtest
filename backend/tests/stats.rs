@@ -678,9 +678,11 @@ async fn the_stats_cache_follows_admin_changes() {
 
 /// I-STATS-12: the contributor list is kept for its own age, apart from the
 /// payload. A payload built fresh -- for a page or a live push -- carries the
-/// list as last read while the job's counters move on; at zero the list is
-/// read with every build; and `forget` (a purge or a merge among the admin
-/// actions that call it) makes the next build read it again.
+/// list as last read while the job's counters move on -- but never an empty
+/// one, so a page open before the first result shows its contributor at once;
+/// at zero the list is read with every build; and `forget` (a purge or a
+/// merge among the admin actions that call it) makes the next build read it
+/// again.
 #[tokio::test]
 async fn the_contributor_list_is_kept_apart_from_the_payload() {
     let db = TestDb::new().await;
@@ -694,9 +696,12 @@ async fn the_contributor_list_is_kept_apart_from_the_payload() {
         (stats["workers"].as_array().unwrap().len(), stats["tasks_completed"].clone())
     };
 
+    // An empty list is not kept: the first contributor shows at once.
+    let empty = jobstats::payload(&db.pool, &row, fresh, kept).await.unwrap();
+    assert_eq!(read(&empty), (0, json!(0)));
     claim(&db, job, Owner::User(alice), "completed", 5).await;
     let first = jobstats::payload(&db.pool, &row, fresh, kept).await.unwrap();
-    assert_eq!(read(&first), (1, json!(1)));
+    assert_eq!(read(&first), (1, json!(1)), "the empty list was not kept");
 
     claim(&db, job, Owner::User(bob), "completed", 5).await;
     let page = jobstats::payload(&db.pool, &row, fresh, kept).await.unwrap();
