@@ -206,6 +206,7 @@ impl TestDb {
             heartbeat_timeout: Duration::from_secs(300),
             // Uncached: a test reads the stats a submission just changed.
             stats_cache: Duration::ZERO,
+            contributors_cache: Duration::ZERO,
             s3_bucket: "birdtest-test".into(),
             // Nothing in these tests touches the object store; an unroutable
             // endpoint makes an accidental call fail fast rather than reach AWS.

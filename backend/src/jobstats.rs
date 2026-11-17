@@ -37,7 +37,9 @@ pub struct JobStats {
     /// `tasks_completed`, the Contributors card's totals row. Every
     /// contributor's, the ones past [`MAX_WORKER_CONTRIBUTIONS`] included, and
     /// added by the same submission that adds the claim to its contributor,
-    /// so the listed rows add up to it when every contributor is listed.
+    /// so the listed rows add up to it when every contributor is listed --
+    /// as of the list's build, which may be up to `Config::contributors_cache`
+    /// older than this.
     pub compute_seconds: f64,
     /// How fast the job is going: the rate [`Self::eta_seconds`] extrapolates,
     /// in the job's own unit. `None` exactly when there is no recent work to
@@ -251,7 +253,7 @@ pub struct LeaveGenStats {
     pub progress_as_of: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct WorkerContribution {
     pub user_id: Option<Uuid>,
     /// An anonymous worker's public name, never its UUID (the UUID is its
@@ -286,18 +288,26 @@ async fn load_job_on(conn: &mut PgConnection, job_id: Uuid) -> AppResult<Job> {
 /// decision on whether to move them to a background refresh is meant to be
 /// made on evidence rather than guessed. This log line is that evidence: when
 /// it starts appearing for real jobs, the refresh is worth building.
+///
+/// It did, for the contributor list first: the CSW24 opening-rack job's builds
+/// grouped 354k claims each, every ~12 s while its page was open, and took 1-5
+/// s and then up to 97 s once the database ran short of memory and EBS
+/// credits (2026-11-17). That list is now kept for
+/// `Config::contributors_cache` ([`contributors_on`]).
 const SLOW_STATS_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// The job's stats as JSON, no older than `max_age`: from the last build
 /// when it is recent enough, built (and kept) otherwise. See
-/// `Config::stats_cache`.
+/// `Config::stats_cache`; the contributor list in it may be as old as
+/// `contributors_max_age` (`Config::contributors_cache`).
 pub async fn payload(
     pool: &PgPool,
     job: &Job,
     max_age: std::time::Duration,
+    contributors_max_age: std::time::Duration,
 ) -> AppResult<std::sync::Arc<str>> {
     if max_age.is_zero() {
-        return Ok(build_payload(pool, job.id, max_age).await?.0);
+        return Ok(build_payload(pool, job.id, max_age, contributors_max_age).await?.0);
     }
     if let Some(cached) = cached_payload(job.id, max_age, None) {
         return Ok(cached);
@@ -323,7 +333,8 @@ pub async fn payload(
         Some(cached) => Ok(cached),
         None if failed_since(job.id, asked) => Err(busy()),
         None => {
-            let built = build_payload(pool, job.id, max_age).await.map(|(json, _)| json);
+            let built =
+                build_payload(pool, job.id, max_age, contributors_max_age).await.map(|(json, _)| json);
             if built.is_err() {
                 FAILED.lock().expect("stats cache poisoned").insert(job.id, std::time::Instant::now());
             }
@@ -367,8 +378,9 @@ pub async fn refresh_payload(
     pool: &PgPool,
     job_id: Uuid,
     max_age: std::time::Duration,
+    contributors_max_age: std::time::Duration,
 ) -> AppResult<Option<std::sync::Arc<str>>> {
-    let (json, kept) = build_payload(pool, job_id, max_age).await?;
+    let (json, kept) = build_payload(pool, job_id, max_age, contributors_max_age).await?;
     Ok((kept || max_age.is_zero()).then_some(json))
 }
 
@@ -384,6 +396,11 @@ pub fn forget(job_id: Uuid) {
     // as current, from before the action.
     let mut payloads = PAYLOADS.lock().expect("stats cache poisoned");
     payloads.remove(&job_id);
+    // The contributor list too: a purge or a merge changes it. Its lock is
+    // taken between the other two, the order every holder of more than one
+    // of the three takes them in.
+    let mut contributors = CONTRIBUTORS.lock().expect("stats cache poisoned");
+    contributors.remove(&job_id);
     // Kept apart from the payloads, and for longer than any build takes:
     // pruned with them after `max_age`, a marker was gone by the time a build
     // slower than that finished, and the build -- begun before the action --
@@ -392,6 +409,7 @@ pub fn forget(job_id: Uuid) {
     forgotten.retain(|_, at| now.duration_since(*at) < FORGOTTEN_KEPT);
     forgotten.insert(job_id, now);
     drop(forgotten);
+    drop(contributors);
     drop(payloads);
 }
 
@@ -409,6 +427,7 @@ async fn build_payload(
     pool: &PgPool,
     job_id: Uuid,
     max_age: std::time::Duration,
+    contributors_max_age: std::time::Duration,
 ) -> AppResult<(std::sync::Arc<str>, bool)> {
     // Freshness runs from when the build *started* -- what it read -- and a
     // build replaces only an entry that started before it: two builds
@@ -416,7 +435,7 @@ async fn build_payload(
     let started = std::time::Instant::now();
     let mut conn = pool.acquire().await?;
     let job = load_job_on(&mut conn, job_id).await?;
-    let stats = compute_on(&mut conn, &job).await?;
+    let stats = compute_on(&mut conn, &job, contributors_max_age).await?;
     drop(conn);
     let json: std::sync::Arc<str> = serde_json::to_string(&stats)
         .map_err(|e| crate::error::AppError::internal(format!("serializing job stats failed: {e}")))?
@@ -487,17 +506,23 @@ fn cached_payload(
         .map(|entry| entry.json.clone())
 }
 
+/// The job's stats, all of them read now: nothing cached, the contributor
+/// list included.
 pub async fn compute(pool: &PgPool, job: &Job) -> AppResult<JobStats> {
-    compute_on(&mut *pool.acquire().await?, job).await
+    compute_on(&mut *pool.acquire().await?, job, std::time::Duration::ZERO).await
 }
 
 /// [`compute`] on one connection, for a build: taken from the pool for each
 /// of its statements, a build on a saturated pool waited out the acquire
 /// timeout once per statement and answered in tens of seconds, where one wait
 /// makes it a quick `503` (the audit's pass 10).
-async fn compute_on(conn: &mut PgConnection, job: &Job) -> AppResult<JobStats> {
+async fn compute_on(
+    conn: &mut PgConnection,
+    job: &Job,
+    contributors_max_age: std::time::Duration,
+) -> AppResult<JobStats> {
     let started = std::time::Instant::now();
-    let stats = compute_inner(conn, job).await;
+    let stats = compute_inner(conn, job, contributors_max_age).await;
     let elapsed = started.elapsed();
     if elapsed >= SLOW_STATS_THRESHOLD {
         tracing::warn!(
@@ -508,7 +533,11 @@ async fn compute_on(conn: &mut PgConnection, job: &Job) -> AppResult<JobStats> {
     stats
 }
 
-async fn compute_inner(conn: &mut PgConnection, job: &Job) -> AppResult<JobStats> {
+async fn compute_inner(
+    conn: &mut PgConnection,
+    job: &Job,
+    contributors_max_age: std::time::Duration,
+) -> AppResult<JobStats> {
     let counts = sqlx::query(
         "SELECT
              COUNT(*)                                            AS total,
@@ -552,7 +581,7 @@ async fn compute_inner(conn: &mut PgConnection, job: &Job) -> AppResult<JobStats
     let tasks_completed: i64 = counts.get("completed");
 
     let (throughput, eta_seconds) = estimate_pace(&mut *conn, job, &games).await?;
-    let (workers, other_workers) = worker_contributions_on(&mut *conn, job.id).await?;
+    let (workers, other_workers) = contributors_on(&mut *conn, job.id, contributors_max_age).await?;
 
     let completion = if job.status == crate::models::job::JobStatus::Completed {
         sqlx::query_as::<_, (chrono::DateTime<chrono::Utc>, bool, Option<String>)>(
@@ -1002,6 +1031,56 @@ async fn leave_gen_stats(conn: &mut PgConnection, job_id: Uuid) -> AppResult<Lea
 /// view and every live push. Matches the API's default page size, which is the
 /// size a table on a page is built for.
 pub const MAX_WORKER_CONTRIBUTIONS: i64 = 50;
+
+/// The top contributors and how many more there are, from the last read of
+/// them when it is younger than `max_age`, read (and kept) otherwise; read
+/// every time at zero.
+///
+/// Kept apart from the payload, for longer: the rest of the stats are counters
+/// and indexed probes, and this is the one read that walks the job's every
+/// completed claim. Two builds asking at once may both read it; one in five
+/// minutes is what this is for, and the per-job build lock already keeps page
+/// views to one build at a time.
+async fn contributors_on(
+    conn: &mut PgConnection,
+    job_id: Uuid,
+    max_age: std::time::Duration,
+) -> AppResult<(Vec<WorkerContribution>, i64)> {
+    if max_age.is_zero() {
+        return worker_contributions_on(conn, job_id).await;
+    }
+    let cached = CONTRIBUTORS
+        .lock()
+        .expect("stats cache poisoned")
+        .get(&job_id)
+        .filter(|entry| entry.started.elapsed() < max_age)
+        .map(|entry| entry.list.clone());
+    if let Some(list) = cached {
+        return Ok(list);
+    }
+    let started = std::time::Instant::now();
+    let list = worker_contributions_on(conn, job_id).await?;
+    // Not kept when the job was forgotten after this read started -- a purge
+    // or a merge it may predate -- or when a read that started later is kept
+    // already. Both checked under the contributors' lock, which `forget`
+    // holds while it drops the entry and marks the job.
+    let mut kept = CONTRIBUTORS.lock().expect("stats cache poisoned");
+    let forgotten_after_start =
+        FORGOTTEN.lock().expect("stats cache poisoned").get(&job_id).is_some_and(|at| *at > started);
+    kept.retain(|_, entry| entry.started.elapsed() < max_age);
+    if !forgotten_after_start && kept.get(&job_id).is_none_or(|entry| entry.started < started) {
+        kept.insert(job_id, CachedContributors { started, list: list.clone() });
+    }
+    Ok(list)
+}
+
+struct CachedContributors {
+    started: std::time::Instant,
+    list: (Vec<WorkerContribution>, i64),
+}
+
+static CONTRIBUTORS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<Uuid, CachedContributors>>> =
+    std::sync::LazyLock::new(Default::default);
 
 /// The top contributors, and how many more there are.
 pub async fn worker_contributions(

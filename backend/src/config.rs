@@ -49,6 +49,12 @@ pub struct Config {
     /// which grows without bound; rebuilt on every view and every second a
     /// busy job was watched, it cost a second of database time per second.
     pub stats_cache: Duration,
+    /// How old the contributor list in those stats may be: the one part of
+    /// them that reads every completed claim of the job, so the one whose cost
+    /// grows with the job's whole history (354k claims for the CSW24
+    /// opening-rack job, on every build). Kept longer than the rest, which
+    /// stay as fresh as `stats_cache`. Zero builds it with every payload.
+    pub contributors_cache: Duration,
     pub s3_bucket: String,
     pub s3_endpoint: Option<String>,
     /// The object store as a browser reaches it, when that is not
@@ -300,6 +306,7 @@ impl Config {
             // the restart grace and SQL intervals can hold.
             heartbeat_timeout: seconds_in(lookup, "HEARTBEAT_TIMEOUT_SECONDS", 300, 180, 86_400)?,
             stats_cache: Duration::from_secs(parsed_u64("JOB_STATS_CACHE_SECONDS", 10)?),
+            contributors_cache: Duration::from_secs(parsed_u64("JOB_CONTRIBUTORS_CACHE_SECONDS", 300)?),
             s3_bucket: var_or("S3_BUCKET", "birdtest-artifacts"),
             s3_endpoint: var("S3_ENDPOINT"),
             s3_public_endpoint: var("S3_PUBLIC_ENDPOINT"),
@@ -371,6 +378,9 @@ mod tests {
                 c.heartbeat_timeout.as_secs().to_string()
             }),
             ("JOB_STATS_CACHE_SECONDS", "10", "0", |c| c.stats_cache.as_secs().to_string()),
+            ("JOB_CONTRIBUTORS_CACHE_SECONDS", "300", "0", |c| {
+                c.contributors_cache.as_secs().to_string()
+            }),
             ("S3_BUCKET", "birdtest-artifacts", "other", |c| c.s3_bucket.clone()),
             ("S3_ENDPOINT", "None", "http://minio:9000", |c| {
                 c.s3_endpoint.clone().unwrap_or_else(|| "None".into())

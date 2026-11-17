@@ -443,6 +443,13 @@ resource "aws_ecs_task_definition" "backend" {
         # limits (registration, login, password reset) key on it. Without this
         # they key on the ALB's own address, one bucket for the whole site.
         { name = "TRUSTED_PROXY_HOPS", value = "1" },
+        # How old a job's stats may be when served, and the spacing of live
+        # pushes while a job page is open. At the 10 s default an open page
+        # of the CSW24 opening-rack job had the db.t3.micro rebuild them
+        # every ~12 s, around the clock, until it ran out of EBS credits
+        # (2026-11-17). A minute is still live enough for a job that runs
+        # for weeks.
+        { name = "JOB_STATS_CACHE_SECONDS", value = "60" },
         # The fleet-wide MAGPIE floor, and the default floor for new jobs.
         { name = "MIN_MAGPIE_VERSION", value = var.min_magpie_version }
       ]
