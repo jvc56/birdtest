@@ -2570,8 +2570,9 @@ permanent.
   `stats::the_stats_cache_follows_admin_changes`.)* (Seventeenth audit.)
 - `I-STATS-12` The contributor list is kept for `contributors_cache`, apart
   from the payload: a fresh build, for a page or a live push, carries the list
-  as last read while the job's counters move on; at zero it is read every
-  build; and `forget` makes the next build read it again. The list grouped the
+  as last read while the job's counters move on, but never an empty one (a
+  page open before the first result showed none for five minutes: E-4 caught
+  it); at zero it is read every build; and `forget` makes the next build read it again. The list grouped the
   job's every completed claim on every build: 354k of them for the CSW24
   opening-rack job, every ~12 s while its page was open. *(Covered:
   `stats::the_contributor_list_is_kept_apart_from_the_payload`.)* (2026-11-17.)

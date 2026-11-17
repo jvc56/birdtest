@@ -1060,10 +1060,16 @@ async fn contributors_on(
     }
     let started = std::time::Instant::now();
     let list = worker_contributions_on(conn, job_id).await?;
-    // Not kept when the job was forgotten after this read started -- a purge
-    // or a merge it may predate -- or when a read that started later is kept
-    // already. Both checked under the contributors' lock, which `forget`
-    // holds while it drops the entry and marks the job.
+    // Not kept when it is empty: a job with no completed claim costs nothing
+    // to read, and kept, a page opened before the first result said "No
+    // contributions yet" for five minutes after it. Nor when the job was
+    // forgotten after this read started -- a purge or a merge it may predate
+    // -- or when a read that started later is kept already. Both checked
+    // under the contributors' lock, which `forget` holds while it drops the
+    // entry and marks the job.
+    if list.0.is_empty() {
+        return Ok(list);
+    }
     let mut kept = CONTRIBUTORS.lock().expect("stats cache poisoned");
     let forgotten_after_start =
         FORGOTTEN.lock().expect("stats cache poisoned").get(&job_id).is_some_and(|at| *at > started);
